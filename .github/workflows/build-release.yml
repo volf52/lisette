@@ -1,0 +1,62 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Target commit SHA or ref"
+        required: true
+        type: string
+      tag_name:
+        description: "Release tag name (e.g. v0.1.17)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Linux (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.commit }}
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: musl
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl -p lisette
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/lis
+
+      - name: Tag commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ inputs.tag_name }}"
+          git push origin "${{ inputs.tag_name }}"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          generate_release_notes: true
+          files: target/x86_64-unknown-linux-musl/release/lis
