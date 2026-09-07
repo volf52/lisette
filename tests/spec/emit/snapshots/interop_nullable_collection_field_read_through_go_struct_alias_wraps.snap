@@ -1,0 +1,69 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:crypto/x509"
+  import "go:net/url"
+  
+  type Cert = x509.Certificate
+  
+  fn main() {
+    let u = url.URL {
+      Scheme: "https",
+      Host: "example.com",
+      ..,
+    }
+    let cert: Cert = x509.Certificate {
+      URIs: [Some(&u)],
+      PublicKey: 0,
+      ..,
+    }
+    let urls = cert.URIs
+    let first = urls[0]
+    match first {
+      Some(value) => { let _ = value },
+      None => { let _ = 0 },
+    }
+  }
+---
+package main
+
+import (
+	"crypto/x509"
+	lisette "github.com/ivov/lisette/prelude"
+	"net/url"
+)
+
+type Cert = x509.Certificate
+
+func main() {
+	u := url.URL{
+		Scheme: "https",
+		Host:   "example.com",
+	}
+	src_1 := []lisette.Option[*url.URL]{lisette.MakeOptionSome(&u)}
+	unwrapped_2 := make([]*url.URL, len(src_1))
+	for i_3, v_4 := range src_1 {
+		if v_4.Tag == lisette.OptionSome {
+			unwrapped_2[i_3] = v_4.SomeVal
+		}
+	}
+	cert := x509.Certificate{
+		URIs:      unwrapped_2,
+		PublicKey: 0,
+	}
+	raw_5 := cert.URIs
+	wrapped_6 := make([]lisette.Option[*url.URL], len(raw_5))
+	for i_7, v_8 := range raw_5 {
+		if v_8 != nil {
+			wrapped_6[i_7] = lisette.MakeOptionSome[*url.URL](v_8)
+		} else {
+			wrapped_6[i_7] = lisette.MakeOptionNone[*url.URL]()
+		}
+	}
+	urls := wrapped_6
+	first := urls[0]
+	if first.Tag == lisette.OptionSome {
+		_ = first.SomeVal
+	}
+}

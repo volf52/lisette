@@ -1,0 +1,29 @@
+---
+source: tests/spec/emit/functions.rs
+description: |
+  
+  fn apply(f: fn(mut Slice<int>) -> (), xs: mut Slice<int>) {
+    f(xs)
+  }
+  
+  fn test() {
+    let bump = |xs: mut Slice<int>| {
+      xs[0] += 1
+    }
+    let mut data = [41]
+    apply(bump, data)
+  }
+---
+package main
+
+func apply(f func([]int), xs []int) {
+	f(xs)
+}
+
+func test() {
+	bump := func(xs []int) {
+		xs[0]++
+	}
+	data := []int{41}
+	apply(bump, data)
+}

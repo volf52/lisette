@@ -1,39 +1,50 @@
+use crate::checker::EnvResolve;
+use crate::store::Store;
 use syntax::ast::{Expression, FormatStringPart, Literal, Span};
-use syntax::types::Type;
+use syntax::lex::{interpolation_holes, rune_codepoint};
+use syntax::types::{CompoundKind, SimpleKind, Type};
 
-use super::super::Checker;
+use crate::checker::infer::InferCtx;
+use crate::facts::EmptyLiteralCheck;
 
-impl Checker<'_, '_> {
+impl InferCtx<'_> {
     pub(super) fn infer_literal(
         &mut self,
         literal: Literal,
         expected_ty: &Type,
         span: Span,
     ) -> Expression {
+        let store = self.store;
         match literal {
             Literal::Boolean(boolean) => {
-                let bool_ty = self.type_bool();
-                self.unify(expected_ty, &bool_ty, &span);
+                let resolved = expected_ty.resolve_in(&self.env);
+                let ty = if adapts_to_named_type(&resolved, store, SimpleKind::Bool) {
+                    resolved.clone()
+                } else {
+                    let bool_ty = self.type_bool();
+                    self.unify(expected_ty, &bool_ty, &span);
+                    bool_ty
+                };
 
                 Expression::Literal {
                     literal: Literal::Boolean(boolean),
-                    ty: bool_ty,
+                    ty,
                     span,
                 }
             }
 
             Literal::Integer { value, text } => {
-                let resolved = expected_ty.resolve();
-                let ty = if resolved.is_numeric() {
+                let resolved = expected_ty.resolve_in(&self.env);
+                let ty = if let Some(numeric) = numeric_adapt_target(&resolved, store) {
                     let is_pre_negated = text.as_deref().is_some_and(|t| t.starts_with('-'));
                     if is_pre_negated {
                         self.check_negative_magnitude_overflow(
                             value.wrapping_neg(),
-                            &resolved,
+                            &numeric,
                             span,
                         );
-                    } else if !self.scopes.is_inside_negation() {
-                        self.check_integer_literal_overflow(value, &resolved, span);
+                    } else if !self.is_inside_negation() {
+                        self.check_integer_literal_overflow(value, &numeric, span);
                     }
                     resolved.clone()
                 } else {
@@ -50,10 +61,8 @@ impl Checker<'_, '_> {
             }
 
             Literal::Float { value, text } => {
-                let resolved = expected_ty.resolve();
-                let ty = if resolved.is_float() {
-                    // Float overflow is symmetric (absolute value matters), so check regardless
-                    // of negation context
+                let resolved = expected_ty.resolve_in(&self.env);
+                let ty = if numeric_adapt_target(&resolved, store).is_some_and(|n| n.is_float()) {
                     self.check_float_literal_overflow(value, &resolved, span);
                     resolved.clone()
                 } else {
@@ -80,22 +89,37 @@ impl Checker<'_, '_> {
                 }
             }
 
-            Literal::String(string) => {
-                let string_ty = self.type_string();
-                self.unify(expected_ty, &string_ty, &span);
+            Literal::String { value, raw } => {
+                let resolved = expected_ty.resolve_in(&self.env);
+                let ty = if adapts_to_named_type(&resolved, store, SimpleKind::String) {
+                    resolved.clone()
+                } else {
+                    let string_ty = self.type_string();
+                    self.unify(expected_ty, &string_ty, &span);
+                    string_ty
+                };
+
+                if !raw
+                    && !self.is_in_pattern()
+                    && let Some(names) = interpolation_holes(&value)
+                    && names.iter().all(|name| self.hole_would_interpolate(name))
+                {
+                    self.facts
+                        .add_unprefixed_fstring(span, names[0].to_string());
+                }
 
                 Expression::Literal {
-                    literal: Literal::String(string),
-                    ty: string_ty,
+                    literal: Literal::String { value, raw },
+                    ty,
                     span,
                 }
             }
 
             Literal::Char(char) => {
-                let resolved = expected_ty.resolve();
-                let ty = if resolved.is_numeric() {
-                    if let Some(codepoint) = char_literal_codepoint(&char) {
-                        self.check_integer_literal_overflow(codepoint, &resolved, span);
+                let resolved = expected_ty.resolve_in(&self.env);
+                let ty = if let Some(numeric) = numeric_adapt_target(&resolved, store) {
+                    if let Some(codepoint) = rune_codepoint(&char) {
+                        self.check_integer_literal_overflow(codepoint as u64, &numeric, span);
                     }
                     resolved.clone()
                 } else {
@@ -112,9 +136,37 @@ impl Checker<'_, '_> {
             }
 
             Literal::Slice(elements) => {
+                // Peel so an alias over Array/Slice takes the branch below.
+                let resolved = store.peel_alias(&expected_ty.resolve_in(&self.env));
+
+                if let Type::Array { length, element } = &resolved {
+                    let expected_length = *length;
+                    let elem_expected_ty = element.as_ref().clone();
+                    if elements.len() as u64 != expected_length {
+                        self.sink
+                            .push(diagnostics::infer::array_literal_length_mismatch(
+                                expected_length,
+                                elements.len(),
+                                span,
+                            ));
+                    }
+                    let new_elements: Vec<Expression> = elements
+                        .into_iter()
+                        .map(|e| {
+                            self.with_value_context(|s| s.infer_expression(e, &elem_expected_ty))
+                        })
+                        .collect();
+                    let array_ty = self.type_array(expected_length, elem_expected_ty);
+                    self.unify(expected_ty, &array_ty, &span);
+                    return Expression::Literal {
+                        literal: Literal::Slice(new_elements),
+                        ty: array_ty,
+                        span,
+                    };
+                }
+
                 // If expected type is Slice<T>, propagate T to element inference
                 // so literals can adapt (e.g., `let x: Slice<int8> = [1, 2, 3]` works)
-                let resolved = expected_ty.resolve();
                 let element_expected_ty = if resolved.get_name() == Some("Slice") {
                     resolved
                         .inner()
@@ -130,12 +182,19 @@ impl Checker<'_, '_> {
                     })
                     .collect();
 
-                for elem in &new_elements {
-                    self.check_not_temp_producing(elem);
-                }
+                // A literal is fresh storage, so it yields the writable form.
+                let slice_ty =
+                    Type::qualified_compound(CompoundKind::Slice, vec![element_expected_ty], true);
+                let unified = self.unify(expected_ty, &slice_ty, &span);
 
-                let slice_ty = self.type_slice(element_expected_ty);
-                self.unify(expected_ty, &slice_ty, &span);
+                if new_elements.is_empty() && unified {
+                    let package_id = self.cursor.package_id().to_string();
+                    self.facts.deferred.empty_literals.push(EmptyLiteralCheck {
+                        ty: slice_ty.clone(),
+                        span,
+                        package_id,
+                    });
+                }
 
                 Expression::Literal {
                     literal: Literal::Slice(new_elements),
@@ -155,7 +214,6 @@ impl Checker<'_, '_> {
                         FormatStringPart::Expression(expression) => {
                             let type_var = self.new_type_var();
                             let inferred_expression = self.infer_expression(*expression, &type_var);
-                            self.check_not_temp_producing(&inferred_expression);
                             FormatStringPart::Expression(Box::new(inferred_expression))
                         }
                     })
@@ -163,9 +221,10 @@ impl Checker<'_, '_> {
 
                 if is_single_expression
                     && let Some(FormatStringPart::Expression(expression)) = new_parts.first()
-                    && expression.get_type().resolve().is_string()
+                    && expression.get_type().resolve_in(&self.env).is_string()
                 {
-                    self.facts.add_expression_only_fstring(span);
+                    self.facts
+                        .add_expression_only_fstring(span, fstring_inner_needs_parens(expression));
                 }
 
                 let string_ty = self.type_string();
@@ -180,6 +239,14 @@ impl Checker<'_, '_> {
         }
     }
 
+    fn hole_would_interpolate(&self, name: &str) -> bool {
+        self.scopes.lookup_binding_id(name).is_some()
+            && self
+                .scopes
+                .lookup_value(name)
+                .is_some_and(|ty| self.store.is_interpolatable(&ty.resolve_in(&self.env)))
+    }
+
     pub(super) fn infer_unit(&mut self, span: Span, expected_ty: &Type) -> Expression {
         let new_ty = self.new_type_var();
         let unit_ty = self.type_unit();
@@ -189,19 +256,35 @@ impl Checker<'_, '_> {
     }
 }
 
-fn char_literal_codepoint(s: &str) -> Option<u64> {
-    if let Some(rest) = s.strip_prefix('\\') {
-        match rest.as_bytes().first()? {
-            b'n' => Some(10),
-            b't' => Some(9),
-            b'r' => Some(13),
-            b'0' => Some(0),
-            b'\\' => Some(92),
-            b'\'' => Some(39),
-            b'x' => u64::from_str_radix(&rest[1..], 16).ok(),
-            _ => None,
-        }
-    } else {
-        s.chars().next().map(|c| c as u64)
+/// Whether `expr` must be parenthesized to replace its f-string: true unless it
+/// binds at least as tightly as a postfix operator.
+fn fstring_inner_needs_parens(expression: &Expression) -> bool {
+    match expression {
+        Expression::Identifier { .. }
+        | Expression::Literal { .. }
+        | Expression::DotAccess { .. }
+        | Expression::IndexedAccess { .. }
+        | Expression::Paren { .. }
+        | Expression::Propagate { .. } => false,
+        // A `|>` pipeline lowers to a `Call` with its piped arg before the callee.
+        Expression::Call {
+            expression: callee,
+            args,
+            ..
+        } => !args
+            .iter()
+            .all(|arg| arg.get_span().byte_offset >= callee.get_span().byte_offset),
+        _ => true,
     }
+}
+
+fn numeric_adapt_target(ty: &Type, store: &Store) -> Option<Type> {
+    store.literal_adaptation_target(ty)
+}
+
+fn adapts_to_named_type(ty: &Type, store: &Store, kind: SimpleKind) -> bool {
+    let peeled = store.deep_resolve_alias(ty);
+    matches!(&peeled, Type::Nominal { id, .. }
+        if store.is_nominal_defined_type(id.as_str())
+            && store.underlying_simple_kind(&peeled) == Some(kind))
 }

@@ -856,7 +856,7 @@ fn lambda_composition() {
 }
 
 #[test]
-fn load_simple_module_with_function() {
+fn load_simple_package_with_function() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "mylib",
@@ -868,11 +868,48 @@ fn load_simple_module_with_function() {
         "#,
     );
 
-    infer_module("mylib", fs).assert_no_errors();
+    infer_package("mylib", fs).assert_no_errors();
 }
 
 #[test]
-fn module_with_multiple_files() {
+fn deferred_select_checks_are_completed_for_each_file() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "mylib",
+        "first.lis",
+        r#"
+fn first() -> int {
+  let ch = Channel.new<int>()
+  select { let Some(value) = ch.receive() => value }
+}
+"#,
+    );
+    fs.add_file(
+        "mylib",
+        "second.lis",
+        r#"
+fn second() -> bool {
+  let ch = Channel.new<bool>()
+  select { let Some(value) = ch.receive() => value }
+}
+"#,
+    );
+    fs.add_file(
+        "mylib",
+        "third.lis",
+        r#"
+fn third() {
+  let ch = Channel.new<int>()
+  select { let Some(_) = ch.receive() => {} }
+}
+"#,
+    );
+
+    infer_package("mylib", fs).assert_infer_code_count("non_exhaustive_select_expression", 2);
+}
+
+#[test]
+fn package_with_multiple_files() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "mylib",
@@ -894,11 +931,11 @@ fn module_with_multiple_files() {
         "#,
     );
 
-    infer_module("mylib", fs).assert_no_errors();
+    infer_package("mylib", fs).assert_no_errors();
 }
 
 #[test]
-fn module_with_struct_definition() {
+fn package_with_struct_definition() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "shapes",
@@ -911,11 +948,11 @@ fn module_with_struct_definition() {
         "#,
     );
 
-    infer_module("shapes", fs).assert_no_errors();
+    infer_package("shapes", fs).assert_no_errors();
 }
 
 #[test]
-fn module_with_enum_definition() {
+fn package_with_enum_definition() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "types",
@@ -929,11 +966,11 @@ fn module_with_enum_definition() {
         "#,
     );
 
-    infer_module("types", fs).assert_no_errors();
+    infer_package("types", fs).assert_no_errors();
 }
 
 #[test]
-fn module_using_imported_type_in_struct() {
+fn package_using_imported_type_in_struct() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -975,7 +1012,7 @@ fn module_using_imported_type_in_struct() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -1004,11 +1041,11 @@ fn import_and_use_function() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn import_multiple_modules() {
+fn import_multiple_packages() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1045,11 +1082,11 @@ fn import_multiple_modules() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn import_type_from_module() {
+fn import_type_from_package() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1075,7 +1112,7 @@ fn import_type_from_module() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -1105,11 +1142,11 @@ fn import_and_use_struct_in_function_param() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn cross_module_enum_variant_access() {
+fn cross_package_enum_variant_access() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1142,11 +1179,11 @@ fn cross_module_enum_variant_access() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn module_not_found() {
+fn package_not_found() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1159,7 +1196,7 @@ fn module_not_found() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("module_not_found");
+    infer_package("main", fs).assert_resolve_code("package_not_found");
 }
 
 #[test]
@@ -1180,7 +1217,7 @@ fn imported_function_not_found() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("not_found_in_module");
+    infer_package("main", fs).assert_resolve_code("not_found_in_package");
 }
 
 #[test]
@@ -1210,11 +1247,11 @@ fn imported_type_not_found() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("struct_not_found");
+    infer_package("main", fs).assert_resolve_code("struct_not_found");
 }
 
 #[test]
-fn private_type_not_accessible_cross_module() {
+fn private_type_not_accessible_cross_package() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1239,11 +1276,11 @@ fn private_type_not_accessible_cross_module() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("struct_not_found");
+    infer_package("main", fs).assert_resolve_code("struct_not_found");
 }
 
 #[test]
-fn private_enum_variant_not_accessible_cross_module() {
+fn private_enum_variant_not_accessible_cross_package() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1272,11 +1309,11 @@ fn private_enum_variant_not_accessible_cross_module() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("type_not_found");
+    infer_package("main", fs).assert_resolve_code("type_not_found");
 }
 
 #[test]
-fn type_error_across_modules() {
+fn type_error_across_packages() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file("math", "lib.lis", "pub fn square(x: int) -> int { x * x }");
@@ -1293,11 +1330,11 @@ fn type_error_across_modules() {
         "#,
     );
 
-    infer_module("main", fs).assert_type_mismatch();
+    infer_package("main", fs).assert_type_mismatch();
 }
 
 #[test]
-fn wrong_number_of_arguments_across_modules() {
+fn wrong_number_of_arguments_across_packages() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1318,7 +1355,7 @@ fn wrong_number_of_arguments_across_modules() {
         "#,
     );
 
-    infer_module("main", fs).assert_infer_code("arg_count_mismatch");
+    infer_package("main", fs).assert_infer_code("arg_count_mismatch");
 }
 
 #[test]
@@ -1359,7 +1396,7 @@ fn transitive_imports() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -1399,7 +1436,7 @@ fn diamond_dependency() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -1428,7 +1465,7 @@ fn import_generic_struct() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -1457,11 +1494,11 @@ fn import_generic_function() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn method_calls_across_modules() {
+fn method_calls_across_packages() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1494,11 +1531,11 @@ fn method_calls_across_modules() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn type_alias_across_modules() {
+fn type_alias_across_packages() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1521,7 +1558,7 @@ fn type_alias_across_modules() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -1531,7 +1568,7 @@ fn method_with_ref_receiver_can_mutate() {
     struct Point { x: int, y: int }
 
     impl Point {
-      fn set_x(self: Ref<Point>, x: int) {
+      fn set_x(self: mut Ref<Point>, x: int) {
         self.x = x;
       }
     }
@@ -1583,7 +1620,54 @@ fn lambda_implicit_unit_return_allows_any_body() {
 }
 
 #[test]
-fn private_function_not_accessible_via_module_struct() {
+fn lambda_contextual_unit_return_allows_call_returning_result() {
+    infer(
+        r#"
+import "go:fmt"
+
+fn take(f: fn() -> ()) { f() }
+
+fn main() {
+  take(|| { fmt.Println("hi") })
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn lambda_in_option_callback_allows_call_returning_result() {
+    infer(
+        r#"
+import "go:fmt"
+
+struct Cmd {
+  pub Run: Option<fn(string) -> ()>,
+}
+
+fn main() {
+  let _c = Cmd {
+    Run: Some(|name: string| { fmt.Println(name) }),
+  }
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn lambda_explicit_unit_annotation_still_rejects_non_unit_body() {
+    infer(
+        r#"
+fn take(f: fn() -> ()) { f() }
+fn main() { take(|| -> () { 42 }) }
+"#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn private_function_not_accessible_via_package_struct() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1607,7 +1691,7 @@ fn private_function_not_accessible_via_module_struct() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("not_found_in_module");
+    infer_package("main", fs).assert_resolve_code("not_found_in_package");
 }
 
 #[test]
@@ -1635,13 +1719,13 @@ fn private_function_not_accessible_via_bare_name() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("name_not_found");
+    infer_package("main", fs).assert_resolve_code("name_not_found");
 }
 
 #[test]
 fn compile_private_function_not_accessible_via_bare_name() {
     use crate::_harness::build::compile_check;
-    use semantics::store::ENTRY_MODULE_ID;
+    use semantics::store::ENTRY_PACKAGE_ID;
 
     let mut fs = MockFileSystem::new();
 
@@ -1655,7 +1739,7 @@ fn compile_private_function_not_accessible_via_bare_name() {
     );
 
     fs.add_file(
-        ENTRY_MODULE_ID,
+        ENTRY_PACKAGE_ID,
         "main.lis",
         r#"
     import "lib"
@@ -1669,16 +1753,16 @@ fn compile_private_function_not_accessible_via_bare_name() {
     let result = compile_check(fs);
     assert!(
         result
-            .errors
+            .errors()
             .iter()
             .any(|e| e.code_str() == Some("resolve.name_not_found")),
         "Expected name_not_found error for private_fn, got: {:?}",
-        result.errors
+        result.errors()
     );
 }
 
 #[test]
-fn private_function_not_accessible_through_module_struct() {
+fn private_function_not_accessible_through_package_struct() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1702,11 +1786,11 @@ fn private_function_not_accessible_through_module_struct() {
         "#,
     );
 
-    infer_module("main", fs).assert_resolve_code("not_found_in_module");
+    infer_package("main", fs).assert_resolve_code("not_found_in_package");
 }
 
 #[test]
-fn cross_module_enum_exhaustive() {
+fn cross_package_enum_exhaustive() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1737,11 +1821,11 @@ fn cross_module_enum_exhaustive() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn cross_module_enum_non_exhaustive() {
+fn cross_package_enum_non_exhaustive() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1771,11 +1855,11 @@ fn cross_module_enum_non_exhaustive() {
         "#,
     );
 
-    infer_module("main", fs).assert_exhaustiveness_error();
+    infer_package("main", fs).assert_exhaustiveness_error();
 }
 
 #[test]
-fn cross_module_enum_redundant() {
+fn cross_package_enum_redundant() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1805,7 +1889,7 @@ fn cross_module_enum_redundant() {
         "#,
     );
 
-    infer_module("main", fs).assert_redundancy_error();
+    infer_package("main", fs).assert_redundancy_error();
 }
 
 #[test]
@@ -1899,7 +1983,7 @@ fn lambda_in_if_infers_params_from_return_type() {
 }
 
 #[test]
-fn private_method_not_accessible_cross_module() {
+fn private_method_not_accessible_cross_package() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1932,7 +2016,7 @@ fn private_method_not_accessible_cross_module() {
         "#,
     );
 
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
     assert!(
         !result.errors.is_empty(),
         "Expected private method error, but no errors were raised"
@@ -1946,7 +2030,7 @@ fn private_method_not_accessible_cross_module() {
 }
 
 #[test]
-fn pub_method_accessible_cross_module() {
+fn pub_method_accessible_cross_package() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -1979,11 +2063,11 @@ fn pub_method_accessible_cross_module() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn cross_module_turbofish_on_static_method() {
+fn cross_package_turbofish_on_static_method() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -2023,11 +2107,11 @@ fn cross_module_turbofish_on_static_method() {
         "#,
     );
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn private_static_method_not_accessible_cross_module() {
+fn private_static_method_not_accessible_cross_package() {
     use crate::_harness::filesystem::MockFileSystem;
     let mut fs = MockFileSystem::new();
 
@@ -2059,7 +2143,7 @@ fn private_static_method_not_accessible_cross_module() {
         "#,
     );
 
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
     assert!(
         !result.errors.is_empty(),
         "Expected private method error, but no errors were raised"
@@ -2098,15 +2182,15 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
 fn mut_param_allows_mutation() {
     infer(
         r#"
-fn sort(mut items: Slice<int>) {
-  items = [1, 2, 3]
+fn sort(items: mut Slice<int>) {
+  items[0] = 1
 }
 
 fn main() {
@@ -2119,11 +2203,23 @@ fn main() {
 }
 
 #[test]
+fn parameter_binding_cannot_be_reassigned() {
+    infer(
+        r#"
+fn sort(items: mut Slice<int>) {
+  items = [1, 2, 3]
+}
+"#,
+    )
+    .assert_infer_code("immutable");
+}
+
+#[test]
 fn mut_param_requires_mut_arg() {
     infer(
         r#"
-fn sort(mut items: Slice<int>) {
-  items = [1, 2, 3]
+fn sort(items: mut Slice<int>) {
+  items[0] = 1
 }
 
 fn main() {
@@ -2132,18 +2228,18 @@ fn main() {
 }
 "#,
     )
-    .assert_infer_code("immutable_arg_to_mut_param");
+    .assert_infer_code("immutable");
 }
 
 #[test]
 fn mut_param_propagation_through_wrapper() {
     infer(
         r#"
-fn sort(mut items: Slice<int>) {
-  items = [1, 2, 3]
+fn sort(items: mut Slice<int>) {
+  items[0] = 1
 }
 
-fn my_sort(mut items: Slice<int>) {
+fn my_sort(items: mut Slice<int>) {
   sort(items)
 }
 
@@ -2160,8 +2256,8 @@ fn main() {
 fn mut_param_propagation_missing_mut_on_wrapper() {
     infer(
         r#"
-fn sort(mut items: Slice<int>) {
-  items = [1, 2, 3]
+fn sort(items: mut Slice<int>) {
+  items[0] = 1
 }
 
 fn my_sort(items: Slice<int>) {
@@ -2169,5 +2265,723 @@ fn my_sort(items: Slice<int>) {
 }
 "#,
     )
-    .assert_infer_code("immutable_arg_to_mut_param");
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn mut_param_non_severing_clone_arg_rejected() {
+    infer(
+        r#"
+struct Doc { tags: Slice<string> }
+
+fn touch(docs: mut Slice<Doc>) {
+  docs[0].tags[0] = "z"
+}
+
+fn main() {
+  let items = [Doc { tags: ["x"] }]
+  touch(items.clone())
+  let _ = items
+}
+"#,
+    )
+    .assert_infer_code("write_through_read_only");
+}
+
+#[test]
+fn mut_param_severing_clone_arg_accepted() {
+    infer(
+        r#"
+fn touch(m: mut Slice<mut Slice<int>>) {
+  m[0][0] = 9
+}
+
+fn main() {
+  let a = [[1]]
+  touch(a.clone())
+  let _ = a
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn mut_param_user_clone_arg_accepted() {
+    infer(
+        r#"
+struct Box { items: mut Slice<int> }
+
+impl Box {
+  fn clone(self) -> mut Box {
+    Box { items: self.items.clone() }
+  }
+}
+
+fn touch(b: mut Box) {
+  b.items[0] = 9
+}
+
+fn main() {
+  let b1 = Box { items: [1] }
+  touch(b1.clone())
+  let _ = b1
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn mut_param_fresh_clone_arg_accepted() {
+    infer(
+        r#"
+fn make() -> Slice<Slice<int>> {
+  [[1]]
+}
+
+fn touch(m: mut Slice<mut Slice<int>>) {
+  m[0][0] = 9
+}
+
+fn main() {
+  touch(make().clone())
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn mut_struct_containing_slice_requires_mut_arg() {
+    infer(
+        r#"
+struct Box { items: mut Slice<int> }
+
+fn write_first(b: mut Box) {
+  b.items[0] = 99
+}
+
+fn main() {
+  let b = Box { items: [1, 2, 3] }
+  write_first(b)
+}
+"#,
+    )
+    .assert_infer_code("immutable");
+}
+
+#[test]
+fn mut_enum_variant_carrying_slice_requires_mut_arg() {
+    infer(
+        r#"
+enum Payload { Items(Slice<int>), Empty }
+
+fn touch(items: mut Slice<int>) {
+  items[0] = 9
+}
+
+fn main() {
+  let p = Payload.Items([1, 2, 3])
+  match p {
+    Payload.Items(items) => touch(items),
+    Payload.Empty => {}
+  }
+}
+"#,
+    )
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn mut_ref_param_accepts_ref_to_mut_binding() {
+    infer(
+        r#"
+fn bump(r: mut Ref<int>) {
+  r.* = r.* + 1
+}
+
+fn main() {
+  let mut x = 10
+  bump(&x)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn mut_generic_struct_with_slice_requires_mut_arg() {
+    infer(
+        r#"
+struct Box<T> { item: T }
+
+fn write_first(items: mut Slice<int>) {
+  items[0] = 99
+}
+
+fn main() {
+  let b: Box<Slice<int>> = Box { item: [1, 2, 3] }
+  write_first(b.item)
+}
+"#,
+    )
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn mut_slice_param_does_not_unify_with_plain_function_type() {
+    infer(
+        r#"
+fn advance(data: mut Slice<byte>) -> int {
+  data[0] = 0
+  return data.length()
+}
+
+fn apply(f: fn(Slice<byte>) -> int, v: Slice<byte>) -> int {
+  return f(v)
+}
+
+fn main() {
+  let buf = Slice.make<byte>(3)
+  let _ = apply(advance, buf)
+}
+"#,
+    )
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn mut_struct_containing_slice_param_does_not_unify_with_plain_function_type() {
+    infer(
+        r#"
+struct Box { items: mut Slice<int> }
+
+fn write_first(b: mut Box) {
+  b.items[0] = 99
+}
+
+fn apply(f: fn(Box), b: Box) {
+  f(b)
+}
+
+fn main() {
+  let b = Box { items: [1, 2, 3] }
+  apply(write_first, b)
+}
+"#,
+    )
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn mut_interface_param_does_not_unify_with_plain_function_type() {
+    infer(
+        r#"
+struct Counter { n: int }
+
+impl Counter {
+  fn bump(self: Ref<Counter>) { let _ = self.n }
+}
+
+interface Bumper {
+  fn bump()
+}
+
+fn use_it(b: mut Bumper) {
+  b.bump()
+}
+
+fn call(f: fn(Bumper), b: Bumper) {
+  f(b)
+}
+
+fn main() {
+  let c = Counter { n: 0 }
+  call(use_it, &c)
+}
+"#,
+    )
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn mut_slice_param_does_not_satisfy_plain_interface_method() {
+    infer(
+        r#"
+interface Sink {
+  fn write(data: Slice<byte>) -> int
+}
+
+struct Impl { total: int }
+
+impl Impl {
+  fn write(self: Ref<Impl>, data: mut Slice<byte>) -> int {
+    data[0] = 0
+    return self.total + data.length()
+  }
+}
+
+fn use_it(s: Sink) -> int {
+  return s.write(Slice.make<byte>(3))
+}
+
+fn main() {
+  let it = Impl { total: 10 }
+  let _ = use_it(&it)
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn generic_empty_varargs_call_without_type_arg_errors() {
+    infer(
+        r#"
+fn f<T>(xs: VarArgs<T>) {}
+
+fn main() {
+  f()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
+}
+
+#[test]
+fn generic_varargs_call_with_args_infers_type() {
+    infer(
+        r#"
+fn f<T>(xs: VarArgs<T>) {}
+
+fn main() {
+  f(1, 2)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_varargs_call_with_explicit_type_arg_ok() {
+    infer(
+        r#"
+fn f<T>(xs: VarArgs<T>) {}
+
+fn main() {
+  f<int>()
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_leading_param_with_empty_varargs_ok() {
+    infer(
+        r#"
+fn f<T>(head: T, rest: VarArgs<T>) -> T { head }
+
+fn main() {
+  let x = f(1)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_empty_varargs_with_unresolved_return_type_errors() {
+    infer(
+        r#"
+fn f<T>(xs: VarArgs<T>) -> Option<T> { None }
+
+fn main() {
+  let r = f()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
+}
+
+#[test]
+fn generic_empty_varargs_with_type_resolved_by_later_use_ok() {
+    infer(
+        r#"
+fn f<T>(xs: VarArgs<T>) -> Option<T> { None }
+
+fn main() {
+  let r = f()
+  let x: int = r.unwrap_or(0)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_empty_varargs_with_type_resolved_by_annotation_ok() {
+    infer(
+        r#"
+fn f<T>(xs: VarArgs<T>) -> Option<T> { None }
+
+fn main() {
+  let r: Option<int> = f()
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_empty_varargs_method_call_without_type_arg_errors() {
+    infer(
+        r#"
+struct Box {}
+
+impl Box {
+  fn first<T>(self, xs: VarArgs<T>) -> Option<T> { None }
+}
+
+fn main() {
+  let b = Box {}
+  let r = b.first()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
+}
+
+#[test]
+fn generic_empty_varargs_method_call_with_annotation_ok() {
+    infer(
+        r#"
+struct Box {}
+
+impl Box {
+  fn first<T>(self, xs: VarArgs<T>) -> Option<T> { None }
+}
+
+fn main() {
+  let b = Box {}
+  let r: Option<int> = b.first()
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn varargs_param_is_a_slice_in_the_body() {
+    infer(
+        r#"
+fn test(xs: VarArgs<int>) -> int {
+  let ys: Slice<int> = xs
+  let mut n = xs.length() + xs[0]
+  for x in xs { n += x }
+  n + ys.length()
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn varargs_param_body_keeps_the_element_type() {
+    infer(
+        r#"
+fn test(xs: VarArgs<int>) -> Slice<string> {
+  xs
+}
+"#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn varargs_param_can_be_forwarded_with_spread() {
+    infer(
+        r#"
+fn inner(xs: VarArgs<int>) -> int { xs.length() }
+
+fn test(xs: VarArgs<int>) -> int {
+  inner(xs...)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn varargs_param_cannot_be_written_through() {
+    infer(
+        r#"
+fn test(xs: VarArgs<int>) {
+  xs[0] = 9
+}
+"#,
+    )
+    .assert_infer_code("write_through_read_only");
+}
+
+#[test]
+fn mut_varargs_param_can_be_written_through() {
+    infer(
+        r#"
+fn overwrite(xs: mut VarArgs<int>) {
+  xs[0] = 9
+}
+
+fn main() {
+  let mut a = [1, 2]
+  overwrite(a...)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn individual_args_to_mut_varargs_need_no_writable_binding() {
+    infer(
+        r#"
+fn overwrite(xs: mut VarArgs<int>) {
+  xs[0] = 9
+}
+
+fn main() {
+  let a = 1
+  let b = 2
+  overwrite(a, b)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn read_only_spread_to_mut_varargs_refused() {
+    infer(
+        r#"
+fn overwrite(xs: mut VarArgs<int>) {
+  xs[0] = 9
+}
+
+fn main() {
+  let a = [1, 2]
+  overwrite(a...)
+}
+"#,
+    )
+    .assert_infer_code("needs_writable");
+}
+
+#[test]
+fn generic_function_with_phantom_param_passed_as_argument_rejected() {
+    infer(
+        r#"
+fn bar(f: fn() -> ()) {}
+
+fn foo_f<T>() {}
+
+fn main() {
+  let _ = bar(foo_f)
+}
+"#,
+    )
+    .assert_infer_code_once("uninferable_generic_reference");
+}
+
+#[test]
+fn generic_function_with_phantom_param_bound_to_let_rejected() {
+    infer(
+        r#"
+fn foo_f<T>() {}
+
+fn main() {
+  let _f = foo_f
+}
+"#,
+    )
+    .assert_infer_code("uninferable_generic_reference");
+}
+
+#[test]
+fn generic_function_with_phantom_param_returned_rejected() {
+    infer(
+        r#"
+fn foo_f<T>() {}
+
+fn make() -> fn() -> () {
+  foo_f
+}
+"#,
+    )
+    .assert_infer_code("uninferable_generic_reference");
+}
+
+#[test]
+fn generic_function_with_partially_inferable_params_as_argument_rejected() {
+    infer(
+        r#"
+fn bar(f: fn(int) -> ()) {
+  f(1)
+}
+
+fn foo_f<T, U>(x: T) {}
+
+fn main() {
+  bar(foo_f)
+}
+"#,
+    )
+    .assert_infer_code("uninferable_generic_reference");
+}
+
+#[test]
+fn generic_function_reference_with_inferable_param_ok() {
+    infer(
+        r#"
+fn apply(f: fn(int) -> int) -> int {
+  f(1)
+}
+
+fn identity<T>(x: T) -> T {
+  x
+}
+
+fn main() {
+  let _ = apply(identity)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn imported_generic_function_reference_with_inferable_param_ok() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "util",
+        "util.lis",
+        r#"
+pub fn identity<T>(x: T) -> T {
+  x
+}
+"#,
+    );
+
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "util"
+
+fn apply(f: fn(int) -> int) -> int {
+  f(1)
+}
+
+fn main() {
+  let _ = apply(util.identity)
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn imported_generic_function_with_phantom_param_reference_rejected() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "util",
+        "util.lis",
+        r#"
+pub fn weird<T>() {}
+"#,
+    );
+
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "util"
+
+fn bar(f: fn() -> ()) {}
+
+fn main() {
+  let _ = bar(util.weird)
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_infer_code("uninferable_generic_reference");
+}
+
+#[test]
+fn bounded_function_reference_with_uninferable_bound_rejected() {
+    infer(
+        r#"
+interface Show { fn show() -> string; }
+fn foo_f<T: Show>(x: T) {}
+fn main() { let _f = foo_f }
+"#,
+    )
+    .assert_infer_code("cannot_infer_bounded_function_reference");
+}
+
+#[test]
+fn bounded_phantom_function_reference_rejected() {
+    infer(
+        r#"
+interface Show { fn show() -> string; }
+fn foo_f<T: Show>() {}
+fn main() { let _f = foo_f }
+"#,
+    )
+    .assert_infer_code("cannot_infer_bounded_function_reference");
+}
+
+#[test]
+fn bounded_function_reference_in_tuple_rejected() {
+    infer(
+        r#"
+interface Show { fn show() -> string; }
+fn foo_f<T: Show>() {}
+fn main() { let _t = (foo_f, 1) }
+"#,
+    )
+    .assert_infer_code("cannot_infer_bounded_function_reference");
+}
+
+#[test]
+fn bounded_function_reference_pinned_by_later_call_succeeds() {
+    infer(
+        r#"
+interface Show { fn show() -> string; }
+struct W {}
+impl W { fn show(self) -> string { "w" } }
+fn foo_f<T: Show>(x: T) {}
+fn main() {
+  let f = foo_f
+  f(W {})
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn empty_interface_bounded_function_reference_succeeds() {
+    infer(
+        r#"
+interface Empty {}
+fn foo_f<T: Empty>(x: T) { let _ = x }
+fn main() { let _f = foo_f }
+"#,
+    )
+    .assert_no_errors();
 }

@@ -1,10 +1,20 @@
 ---
 source: tests/spec/emit/patterns.rs
-description: "input: \nenum Color { Red, Green, Blue }\n\ntype Palette = Color\n\nfn describe(p: Palette) -> string {\n  match p {\n    Color.Red => \"r\",\n    Color.Green => \"g\",\n    Color.Blue => \"b\",\n  }\n}\n"
+description: |
+  
+  enum Color { Red, Green, Blue }
+  
+  type Palette = Color
+  
+  fn describe(p: Palette) -> string {
+    match p {
+      Color.Red => "r",
+      Color.Green => "g",
+      Color.Blue => "b",
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeColorRed() Color {
 	return Color{Tag: ColorRed}
@@ -18,7 +28,7 @@ func MakeColorBlue() Color {
 	return Color{Tag: ColorBlue}
 }
 
-type ColorTag int
+type ColorTag uint8
 
 const (
 	ColorRed ColorTag = iota
@@ -28,19 +38,6 @@ const (
 
 type Color struct {
 	Tag ColorTag
-}
-
-func (c Color) String() string {
-	switch c.Tag {
-	case ColorRed:
-		return "Color.Red"
-	case ColorGreen:
-		return "Color.Green"
-	case ColorBlue:
-		return "Color.Blue"
-	default:
-		return fmt.Sprintf("Color(%d)", c.Tag)
-	}
 }
 
 type Palette = Color

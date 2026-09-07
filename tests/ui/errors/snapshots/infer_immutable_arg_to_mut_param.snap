@@ -1,12 +1,12 @@
 ---
 source: tests/ui/errors/mod.rs
 ---
-  [error] Immutable argument passed to `mut` parameter
+  ✕ Immutable variable
    ╭─[test.lis:8:8]
  7 │   let data = [3, 1, 2];
  8 │   sort(data)
    ·        ──┬─
-   ·          ╰── expected mutable, found immutable
+   ·          ╰── `data` was declared without `mut`
  9 │ }
    ╰────
-  help: Bindings in Lisette are immutable by default. Use `let mut data = ...` to allow mutation, or make the parameter immutable by removing `mut` from the function signature · code: [infer.immutable_arg_to_mut_param]
+  help: `sort()` writes to `data`. Declare using `let mut data` to mark the variable mutable · code: [infer.immutable]

@@ -1,0 +1,394 @@
+use std::rc::Rc;
+
+use crate::Planner;
+use crate::control_flow::fallible;
+use crate::definitions::enum_layout::EnumLayout;
+use crate::names::go_name;
+use syntax::ast::{Generic, Pattern, RestPattern, StructFields};
+use syntax::go_names;
+use syntax::program::{Definition, DefinitionBody, interface_requirements};
+use syntax::types;
+use syntax::types::{Type, substitute};
+
+impl Planner<'_> {
+    pub(crate) fn go_name_for_binding(&self, pattern: &Pattern) -> Option<String> {
+        let name = match pattern {
+            Pattern::Identifier { identifier, .. } => identifier.as_str(),
+            Pattern::AsBinding { name, .. } => name.as_str(),
+            _ => return None,
+        };
+        if self.facts.is_unused_binding(pattern) {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    pub(crate) fn go_name_for_rest_binding(&self, rest: &RestPattern) -> Option<String> {
+        if let RestPattern::Bind { name, .. } = rest {
+            if self.facts.is_unused_rest_binding(rest) {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn field_is_embedded(&self, struct_ty: &Type, field_name: &str) -> bool {
+        let Some(resolved) = self.resolve_nominal(struct_ty) else {
+            return false;
+        };
+        matches!(
+            &resolved.definition.body,
+            DefinitionBody::Struct { fields, .. }
+                if fields
+                    .iter()
+                    .any(|f| f.name == field_name && f.is_embedded())
+        )
+    }
+
+    pub(crate) fn field_is_public(&self, struct_ty: &Type, field_name: &str) -> bool {
+        let Some(resolved) = self.resolve_nominal(struct_ty) else {
+            return false;
+        };
+        let id = resolved.id.as_str();
+
+        match &resolved.definition.body {
+            DefinitionBody::Struct { fields, .. } => {
+                if let Some(field) = fields.iter().find(|f| f.name == field_name) {
+                    return go_names::struct_field_is_exported(
+                        field,
+                        resolved.definition.is_serialized(),
+                    );
+                }
+                self.facts
+                    .method(id, field_name)
+                    .map(|method| method.visibility.is_public())
+                    .unwrap_or(false)
+            }
+            DefinitionBody::Enum { .. } => self
+                .facts
+                .method(id, field_name)
+                .map(|method| method.visibility.is_public())
+                .unwrap_or(false),
+            DefinitionBody::Interface { definition } => {
+                resolved.definition.visibility.is_public()
+                    && definition.methods.contains_key(field_name)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn method_needs_export(&self, method_name: &str) -> bool {
+        self.facts.has_global_exported_method_name(method_name)
+            || matches!(method_name, "string" | "goString" | "error")
+    }
+
+    pub(crate) fn type_uses_exported_members(&self, ty: &Type) -> bool {
+        let Type::Nominal { id, .. } = ty.strip_refs() else {
+            return false;
+        };
+        id.starts_with(go_name::PRELUDE_PREFIX)
+            || self
+                .facts
+                .package_for_qualified_name(id.as_str())
+                .is_some_and(|m| self.facts.is_foreign_package(m))
+    }
+
+    pub(crate) fn struct_field_is_exported(&self, ty: &Type, field: &str) -> bool {
+        self.field_is_public(ty, field) || self.type_uses_exported_members(ty)
+    }
+
+    pub(crate) fn type_has_equals(&self, ty: &Type, generics: &[Generic]) -> bool {
+        let peeled = self.facts.peel_alias(ty);
+        if let Type::Parameter(name) = &peeled {
+            return self.generic_param_has_equals_bound(generics, name.as_str());
+        }
+        let Some(id) = peeled.get_qualified_id() else {
+            return false;
+        };
+        self.facts.usable_equals_from(id)
+    }
+
+    fn generic_param_has_equals_bound(&self, generics: &[Generic], param_name: &str) -> bool {
+        let Some(generic) = generics.iter().find(|g| g.name.as_str() == param_name) else {
+            return false;
+        };
+        let Some(bounds) = generic.resolved_bounds() else {
+            return false;
+        };
+        bounds.into_iter().any(|bound| {
+            self.interface_bound_provides_equals(&self.facts.peel_alias(bound), param_name)
+        })
+    }
+
+    fn interface_bound_provides_equals(&self, bound: &Type, param_name: &str) -> bool {
+        interface_requirements(bound, |id| self.facts.definition(id))
+            .into_iter()
+            .any(|requirement| {
+                requirement.name == "equals" && requirement.ty.is_equals_bound_signature(param_name)
+            })
+    }
+
+    pub(crate) fn has_field(&self, struct_ty: &Type, field_name: &str) -> bool {
+        let Some(resolved) = self.resolve_nominal(struct_ty) else {
+            return false;
+        };
+        matches!(
+            &resolved.definition.body,
+            DefinitionBody::Struct { fields, .. }
+                if fields.iter().any(|f| f.name == field_name)
+        )
+    }
+
+    pub(crate) fn is_tuple_struct_type(&self, ty: &Type) -> bool {
+        self.resolve_nominal(ty).is_some_and(|resolved| {
+            matches!(
+                &resolved.definition.body,
+                DefinitionBody::Struct {
+                    fields: StructFields::Tuple(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    pub(crate) fn is_newtype_struct(&self, ty: &Type) -> bool {
+        let Type::Nominal { params, .. } = ty.strip_refs() else {
+            return false;
+        };
+        if !params.is_empty() {
+            return false;
+        }
+        self.resolve_nominal(ty)
+            .is_some_and(|resolved| resolved.definition.is_newtype())
+    }
+
+    pub(crate) fn get_newtype_underlying(&self, ty: &Type) -> Option<Type> {
+        let resolved = self.resolve_nominal(ty)?;
+        if let DefinitionBody::Struct {
+            fields: StructFields::Tuple(fields),
+            generics,
+            ..
+        } = &resolved.definition.body
+            && fields.len() == 1
+            && generics.is_empty()
+        {
+            return Some(fields[0].ty.clone());
+        }
+
+        None
+    }
+
+    pub(crate) fn peel_alias_id(&self, id: &str) -> String {
+        let nominal = Type::Nominal {
+            id: id.into(),
+            params: Vec::new(),
+            writable: false,
+        };
+        self.facts
+            .peel_alias(&nominal)
+            .get_qualified_id()
+            .unwrap_or(id)
+            .to_string()
+    }
+
+    pub(crate) fn as_enum(&self, ty: &Type) -> Option<String> {
+        let resolved = self.resolve_nominal(ty)?;
+        matches!(&resolved.definition.body, DefinitionBody::Enum { .. })
+            .then(|| resolved.id.to_string())
+    }
+
+    /// `Option<T>` where T is a concrete non-nilable Go value type, bridged
+    /// as `*T`. Excludes `Option<Unknown>`/`Option<any>` (`interface{}`).
+    pub(crate) fn is_non_nilable_option(&self, ty: &Type) -> bool {
+        if !ty.is_option() {
+            return false;
+        }
+        let inner = ty.ok_type();
+        if self.facts.contains_unknown(&inner) || inner.has_name("any") {
+            return false;
+        }
+        !self.facts.is_nilable_go_type(&inner)
+    }
+
+    /// Returns true if the Option wraps a Go interface type (not a pointer).
+    /// These need `IsNilInterface` instead of `!= nil` to catch typed nils.
+    pub(crate) fn is_interface_option(&self, ty: &Type) -> bool {
+        if !ty.is_option() {
+            return false;
+        }
+        let inner = ty.ok_type();
+        self.facts.is_interface(&inner)
+    }
+}
+
+impl Planner<'_> {
+    pub(crate) fn enum_layout(&self, enum_id: &str) -> Option<Rc<EnumLayout>> {
+        if let Some(layout) = self.namespace.enum_layouts.borrow().get(enum_id) {
+            return Some(layout.clone());
+        }
+        let layout = Rc::new(self.compute_enum_layout(enum_id)?);
+        self.namespace
+            .enum_layouts
+            .borrow_mut()
+            .insert(enum_id.to_string(), layout.clone());
+        Some(layout)
+    }
+
+    fn compute_enum_layout(&self, enum_id: &str) -> Option<EnumLayout> {
+        let Definition {
+            body:
+                DefinitionBody::Enum {
+                    generics,
+                    variants,
+                    default_variant,
+                    ..
+                },
+            ..
+        } = self.facts.definition(enum_id)?
+        else {
+            return None;
+        };
+
+        let name = types::unqualified_name(enum_id);
+        if matches!(name, "Option" | "Result" | "Partial") {
+            return None;
+        }
+
+        Some(EnumLayout::new(
+            self,
+            enum_id,
+            generics,
+            variants,
+            *default_variant,
+        ))
+    }
+
+    pub(crate) fn enum_struct_field_name(
+        &self,
+        enum_id: &str,
+        variant_name: &str,
+        field_name: &str,
+    ) -> Option<String> {
+        self.enum_layout(enum_id)?
+            .struct_field_name(variant_name, field_name)
+    }
+
+    fn enum_tuple_field_name(
+        &self,
+        enum_id: &str,
+        variant_name: &str,
+        field_index: usize,
+    ) -> Option<String> {
+        self.enum_layout(enum_id)?
+            .tuple_field_name(variant_name, field_index)
+    }
+
+    pub(crate) fn get_enum_tuple_field_name(
+        &self,
+        ty: &Type,
+        variant: &str,
+        index: usize,
+    ) -> String {
+        if ty.is_option() {
+            return match variant {
+                "Some" => fallible::OPTION_SOME_FIELD.to_string(),
+                _ => variant.to_string(),
+            };
+        }
+
+        if ty.is_result() {
+            return match (variant, index) {
+                ("Ok", 0) => fallible::RESULT_OK_FIELD.to_string(),
+                ("Err", 0) => fallible::RESULT_ERR_FIELD.to_string(),
+                _ => variant.to_string(),
+            };
+        }
+
+        if ty.is_partial() {
+            return match (variant, index) {
+                ("Ok", 0) => fallible::PARTIAL_OK_FIELD.to_string(),
+                ("Err", 0) => fallible::PARTIAL_ERR_FIELD.to_string(),
+                ("Both", 0) => fallible::PARTIAL_OK_FIELD.to_string(),
+                ("Both", 1) => fallible::PARTIAL_ERR_FIELD.to_string(),
+                _ => variant.to_string(),
+            };
+        }
+
+        if let Type::Nominal { id, .. } = ty
+            && let Some(name) = self.enum_tuple_field_name(id, variant, index)
+        {
+            return name;
+        }
+
+        if index == 0 {
+            variant.to_string()
+        } else {
+            format!("{}{}", variant, index)
+        }
+    }
+
+    pub(crate) fn is_enum_field_recursive(&self, ty: &Type, variant: &str, index: usize) -> bool {
+        if let Type::Nominal { id, .. } = ty
+            && let Some(layout) = self.enum_layout(id.as_ref())
+            && let Some(variant_layout) = layout.get_variant(variant)
+            && let Some(field) = variant_layout.fields.get(index)
+        {
+            return field.is_recursive();
+        }
+        false
+    }
+
+    pub(crate) fn is_enum_field_unit(&self, ty: &Type, variant: &str, index: usize) -> bool {
+        if let Type::Nominal {
+            id, params: args, ..
+        } = ty
+            && let Some(Definition {
+                body:
+                    DefinitionBody::Enum {
+                        generics, variants, ..
+                    },
+                ..
+            }) = self.facts.definition(id.as_str())
+        {
+            let sub_map: types::SubstitutionMap = generics
+                .iter()
+                .map(|g| g.name.clone())
+                .zip(args.iter().cloned())
+                .collect();
+            for v in variants {
+                if v.name == variant
+                    && let Some(field) = v.fields.iter().nth(index)
+                {
+                    let concrete = substitute(&field.ty, &sub_map);
+                    return concrete.is_unit() || concrete.is_never();
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn get_enum_struct_field_index(
+        &self,
+        ty: &Type,
+        variant: &str,
+        field_name: &str,
+    ) -> Option<usize> {
+        if let Type::Nominal { id, .. } = ty
+            && let Some(Definition {
+                body: DefinitionBody::Enum { variants, .. },
+                ..
+            }) = self.facts.definition(id.as_str())
+        {
+            for v in variants {
+                if v.name == variant {
+                    return v.fields.iter().position(|f| f.name == field_name);
+                }
+            }
+        }
+        None
+    }
+}

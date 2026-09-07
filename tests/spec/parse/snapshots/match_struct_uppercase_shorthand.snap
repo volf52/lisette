@@ -1,6 +1,12 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test(p: Point) {\n  match p {\n    Point { X } => X,\n  }\n}\n"
+description: |
+  
+  fn test(p: Point) {
+    match p {
+      Point { X } => X,
+    }
+  }
 ---
 [
     Function {
@@ -34,98 +40,97 @@ description: "input: \nfn test(p: Point) {\n  match p {\n    Point { X } => X,\n
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
         ],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Match {
-                    subject: Identifier {
-                        value: "p",
-                        ty: Variable(
-                            -1,
-                        ),
-                        span: Span {
-                            file_id: 0,
-                            byte_offset: 29,
-                            byte_length: 1,
+        body: Definition(
+            Block {
+                items: [
+                    Match {
+                        subject: Identifier {
+                            value: "p",
+                            ty: Var {
+                                id: uninferred,
+                            },
+                            span: Span {
+                                file_id: 0,
+                                byte_offset: 29,
+                                byte_length: 1,
+                            },
+                            resolution: Unresolved,
                         },
-                        binding_id: None,
-                        qualified: None,
-                    },
-                    arms: [
-                        MatchArm {
-                            pattern: Struct {
-                                identifier: "Point",
-                                fields: [
-                                    StructFieldPattern {
-                                        name: "X",
-                                        value: Identifier {
-                                            identifier: "X",
-                                            span: Span {
-                                                file_id: 0,
-                                                byte_offset: 45,
-                                                byte_length: 1,
+                        arms: [
+                            MatchArm {
+                                pattern: Struct {
+                                    identifier: "Point",
+                                    fields: [
+                                        StructFieldPattern {
+                                            name: "X",
+                                            value: Identifier {
+                                                identifier: "X",
+                                                span: Span {
+                                                    file_id: 0,
+                                                    byte_offset: 45,
+                                                    byte_length: 1,
+                                                },
                                             },
                                         },
+                                    ],
+                                    rest: false,
+                                    resolution: Unresolved,
+                                    ty: Var {
+                                        id: uninferred,
                                     },
-                                ],
-                                rest: false,
-                                ty: Variable(
-                                    -1,
-                                ),
-                                span: Span {
-                                    file_id: 0,
-                                    byte_offset: 37,
-                                    byte_length: 11,
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 37,
+                                        byte_length: 11,
+                                    },
+                                },
+                                expression: Identifier {
+                                    value: "X",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 52,
+                                        byte_length: 1,
+                                    },
+                                    resolution: Unresolved,
                                 },
                             },
-                            expression: Identifier {
-                                value: "X",
-                                ty: Variable(
-                                    -1,
-                                ),
-                                span: Span {
-                                    file_id: 0,
-                                    byte_offset: 52,
-                                    byte_length: 1,
-                                },
-                                binding_id: None,
-                                qualified: None,
-                            },
+                        ],
+                        ty: Var {
+                            id: uninferred,
                         },
-                    ],
-                    origin: Explicit,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 23,
-                        byte_length: 35,
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 23,
+                            byte_length: 35,
+                        },
                     },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 19,
-                byte_length: 41,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 19,
+                    byte_length: 41,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

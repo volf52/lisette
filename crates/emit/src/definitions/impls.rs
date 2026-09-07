@@ -1,7 +1,9 @@
-use crate::Emitter;
+use crate::Planner;
+use crate::expressions::top_items::emit_doc;
 use crate::names::go_name;
-use syntax::ast::{Expression, Generic, Pattern, Visibility};
-use syntax::types::Type;
+use syntax::EcoString;
+use syntax::ast::{Expression, FunctionDefinitionView, Generic, Pattern, Visibility};
+use syntax::types::{Type, build_substitution_map, substitute, type_args_match_params};
 
 struct ImplContext<'a> {
     receiver_name: &'a str,
@@ -10,7 +12,7 @@ struct ImplContext<'a> {
     qualified_type: String,
 }
 
-impl Emitter<'_> {
+impl Planner<'_> {
     pub(crate) fn emit_impl_block(
         &mut self,
         receiver_name: &str,
@@ -22,7 +24,7 @@ impl Emitter<'_> {
             receiver_name,
             ty,
             generics,
-            qualified_type: format!("{}.{}", self.current_module, receiver_name),
+            qualified_type: self.facts.qualified_current(receiver_name),
         };
 
         methods
@@ -32,9 +34,7 @@ impl Emitter<'_> {
             .join("\n\n")
     }
 
-    /// Emit one method of an `impl` block, producing either a receiver method
-    /// (`func (r Recv) m(...)`) or a free function (`func Recv_m(r Recv, ...)`)
-    /// depending on whether the method has `self` and whether it's UFCS-declared.
+    /// Emit one impl method as a receiver method or a UFCS free function.
     fn emit_impl_method(&mut self, method: &Expression, ctx: &ImplContext<'_>) -> Option<String> {
         let Expression::Function {
             doc,
@@ -45,49 +45,99 @@ impl Emitter<'_> {
         else {
             return None;
         };
-        if self.ctx.unused.is_unused_definition(name_span) {
+        if self.facts.is_unused_definition(name_span) {
             return None;
         }
+        let function = method.function_definition_view();
 
         self.scope.reset_for_top_level();
 
-        let function = method.to_function_definition();
         let is_public = matches!(visibility, Visibility::Public);
 
         let has_self = function.params.first().is_some_and(|p| {
             matches!(p.pattern, Pattern::Identifier { ref identifier, .. } if identifier == "self")
         });
         let is_ufcs = self
-            .ctx
-            .ufcs_methods
-            .contains(&(ctx.qualified_type.clone(), function.name.to_string()));
-        let should_export = is_public || self.method_needs_export(&function.name);
+            .facts
+            .is_ufcs_method(&ctx.qualified_type, function.name);
+        let should_export = is_public || self.method_needs_export(function.name);
         let is_free_function = !has_self || is_ufcs;
 
         let code = if is_free_function {
-            let mut free_function = function.clone();
             let method_name = if should_export {
-                go_name::capitalize_first(&function.name)
+                go_name::snake_to_camel(function.name)
             } else {
-                function.name.to_string()
+                go_name::snake_to_lower_camel(function.name)
             };
-            free_function.name = format!("{}_{}", ctx.receiver_name, method_name).into();
+            let free_name = format!("{}_{}", ctx.receiver_name, method_name).into();
             let mut combined_generics = ctx.generics.to_vec();
-            combined_generics.extend(free_function.generics.iter().cloned());
-            free_function.generics = combined_generics;
-            self.emit_function(&free_function, None, should_export)
+            combined_generics.extend(function.generics.iter().cloned());
+            let generic_bounds = self.free_function_generic_bounds(ctx, function.generics);
+            let free_function = FunctionDefinitionView {
+                name: &free_name,
+                generics: &combined_generics,
+                ..function
+            };
+            self.emit_function(free_function, None, false, generic_bounds.as_deref())
         } else {
             self.emit_function(
-                &function,
+                function,
                 Some((ctx.receiver_name.to_string(), ctx.ty.clone())),
                 should_export,
+                None,
             )
         };
 
         if code.is_empty() {
             return None;
         }
-        let method_doc_comment = self.emit_doc(doc);
+        let method_doc_comment = emit_doc(doc);
         Some(format!("{}{}", method_doc_comment, code))
+    }
+
+    fn free_function_generic_bounds(
+        &self,
+        ctx: &ImplContext<'_>,
+        method_generics: &[Generic],
+    ) -> Option<Vec<(EcoString, Vec<Type>)>> {
+        let receiver_generics = self
+            .facts
+            .definition(&ctx.qualified_type)?
+            .body
+            .generics()?;
+        if receiver_generics.len() != ctx.generics.len()
+            || !type_args_match_params(
+                ctx.ty.get_type_params().unwrap_or_default(),
+                ctx.generics.iter().map(|generic| &generic.name),
+            )
+        {
+            return None;
+        }
+
+        let substitution = build_substitution_map(
+            receiver_generics,
+            ctx.ty.get_type_params().unwrap_or_default(),
+        );
+        let mut generic_bounds = receiver_generics
+            .iter()
+            .zip(ctx.generics)
+            .map(|(receiver_generic, impl_generic)| {
+                let bounds = receiver_generic
+                    .resolved_bounds()
+                    .expect("generic bounds must be resolved before emission")
+                    .map(|bound| substitute(bound, &substitution))
+                    .collect();
+                (impl_generic.name.clone(), bounds)
+            })
+            .collect::<Vec<_>>();
+        generic_bounds.extend(method_generics.iter().map(|generic| {
+            let bounds = generic
+                .resolved_bounds()
+                .expect("generic bounds must be resolved before emission")
+                .cloned()
+                .collect();
+            (generic.name.clone(), bounds)
+        }));
+        Some(generic_bounds)
     }
 }

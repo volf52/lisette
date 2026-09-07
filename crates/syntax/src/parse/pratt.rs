@@ -3,10 +3,24 @@ use ecow::EcoString;
 use super::{ParseError, Parser};
 use crate::ast;
 use crate::lex::TokenKind::{self, *};
+use crate::program::DotAccessResolution;
 use crate::types::Type;
+use std::string;
 
 const RANGE_PREC: u8 = 6;
 const CAST_PREC: u8 = 9;
+
+#[derive(Clone, Copy)]
+pub(super) enum ExpressionContext {
+    Normal,
+    ControlFlowHeader,
+}
+
+impl ExpressionContext {
+    pub(super) fn is_control_flow_header(self) -> bool {
+        matches!(self, Self::ControlFlowHeader)
+    }
+}
 
 impl<'source> Parser<'source> {
     /// Parses by grouping together operations in expressions based on precedence.
@@ -18,40 +32,56 @@ impl<'source> Parser<'source> {
     /// 4. For postfix operators: Transform the current expression into a larger one.
     ///
     /// The `min_prec` param sets the minimum precedence level for this parsing context.
-    pub fn pratt_parse(&mut self, min_prec: u8) -> ast::Expression {
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            self.resync_on_error();
-            return ast::Expression::Unit {
-                ty: Type::uninferred(),
-                span,
-            };
+    pub(super) fn pratt_parse(
+        &mut self,
+        min_prec: u8,
+        context: ExpressionContext,
+    ) -> ast::Expression {
+        if let Some(result) =
+            self.with_recursion(|parser| parser.pratt_parse_inner(min_prec, context))
+        {
+            return result;
         }
+        let span = self.span_from_token(self.current_token());
+        self.resync_on_error();
+        ast::Expression::Unit {
+            ty: Type::uninferred(),
+            span,
+        }
+    }
 
+    fn pratt_parse_inner(&mut self, min_prec: u8, context: ExpressionContext) -> ast::Expression {
         let start = self.current_token();
-        let mut lhs = self.parse_left_hand_side();
-        let depth_before_loop = self.depth;
+        let mut lhs = self.parse_left_hand_side(context);
 
         while !self.at_eof() && !self.too_many_errors() {
             if self.check_go_channel_send() {
-                self.depth = depth_before_loop;
-                self.leave_recursion();
+                return lhs;
+            }
+
+            if self.check_increment_decrement(&lhs, start.byte_offset, context) {
                 return lhs;
             }
 
             if self.at_range() && RANGE_PREC > min_prec {
-                lhs = self.parse_range(Some(lhs.into()), start);
+                if !self.deepen() {
+                    break;
+                }
+                lhs = self.parse_range(Some(lhs.into()), start, context);
                 continue;
             }
 
             if self.current_token().kind == As && CAST_PREC > min_prec {
+                if !self.deepen() {
+                    break;
+                }
                 self.next();
                 let target_type = self.parse_annotation();
                 lhs = ast::Expression::Cast {
                     expression: lhs.into(),
                     target_type,
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 };
                 continue;
             }
@@ -66,20 +96,23 @@ impl<'source> Parser<'source> {
             if let Some(prec) = self.binary_operator_precedence(self.current_token().kind)
                 && prec > min_prec
             {
+                if !self.deepen() {
+                    break;
+                }
                 let operator = self.parse_binary_operator();
-                let rhs = self.pratt_parse(prec);
+                let rhs = self.pratt_parse(prec, context);
                 lhs = ast::Expression::Binary {
                     operator,
                     left: lhs.into(),
                     right: rhs.into(),
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 };
                 continue;
             }
 
-            if self.is_postfix_operator(&lhs) {
-                if !self.enter_recursion() {
+            if self.is_postfix_operator(&lhs, context) {
+                if !self.deepen() {
                     break;
                 }
                 if self.is_format_string(&lhs)
@@ -93,36 +126,15 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            if matches!(self.current_token().kind, Ampersand | Pipe | Caret)
-                && !self.newline_before_current()
-            {
-                let op_token = self.current_token();
-                let span = self.span_from_token(op_token);
-                let error = ParseError::new(
-                    "Unsupported operator",
-                    span,
-                    format!("`{}` is not a supported binary operator", op_token.text),
-                )
-                .with_help("Lisette does not support bitwise operators")
-                .with_parse_code("unsupported_operator");
-                self.errors.push(error);
-                self.next();
-                let _rhs = self.pratt_parse(min_prec);
-                continue;
-            }
-
             break;
         }
-
-        self.depth = depth_before_loop;
-        self.leave_recursion();
 
         lhs
     }
 
     fn prefix_operator_precedence(&self, kind: TokenKind) -> u8 {
         match kind {
-            Minus | Bang | Ampersand => 15,
+            Minus | Bang | Caret | Ampersand => 15,
             _ => {
                 debug_assert!(false, "unexpected prefix operator: {:?}", kind);
                 15
@@ -132,29 +144,29 @@ impl<'source> Parser<'source> {
 
     fn binary_operator_precedence(&self, kind: TokenKind) -> Option<u8> {
         match kind {
-            LeftAngleBracket if self.is_type_args_call() => None,
+            LeftAngleBracket if self.opens_type_args() => None,
             Pipeline => Some(1),
             PipeDouble if self.stream.peek_ahead(1).kind == Arrow => None,
             PipeDouble => Some(3),
             AmpersandDouble => Some(4),
             EqualDouble | NotEqual | LeftAngleBracket | RightAngleBracket | LessThanOrEqual
             | GreaterThanOrEqual => Some(5),
-            Plus | Minus => Some(7),
-            Star | Slash | Percent => Some(8),
+            Plus | Minus | Pipe | Caret => Some(7),
+            Star | Slash | Percent | ShiftLeft | ShiftRight | Ampersand | AndNot => Some(8),
             _ => None,
         }
     }
 
-    fn is_postfix_operator(&self, lhs: &ast::Expression) -> bool {
+    fn is_postfix_operator(&self, lhs: &ast::Expression, context: ExpressionContext) -> bool {
         match self.current_token().kind {
             LeftParen | LeftSquareBracket | QuestionMark | Dot => true,
             LeftCurlyBrace => match lhs {
                 ast::Expression::Identifier { .. } | ast::Expression::DotAccess { .. } => {
-                    self.is_struct_instantiation()
+                    self.is_struct_instantiation(context)
                 }
                 _ => false,
             },
-            LeftAngleBracket => self.is_type_args_call(),
+            LeftAngleBracket => self.opens_type_args(),
             Colon if self.stream.peek_ahead(1).kind == Colon => true,
             _ => false,
         }
@@ -170,26 +182,27 @@ impl<'source> Parser<'source> {
         )
     }
 
-    fn parse_left_hand_side(&mut self) -> ast::Expression {
+    fn parse_left_hand_side(&mut self, context: ExpressionContext) -> ast::Expression {
         let start = self.current_token();
 
         match start.kind {
-            Bang | Minus => {
+            Bang | Minus | Caret => {
                 self.next();
 
-                let operator = if start.kind == Bang {
-                    ast::UnaryOperator::Not
-                } else {
-                    ast::UnaryOperator::Negative
+                let operator = match start.kind {
+                    Bang => ast::UnaryOperator::Not,
+                    Minus => ast::UnaryOperator::Negative,
+                    Caret => ast::UnaryOperator::BitwiseNot,
+                    _ => unreachable!("guarded by match arm"),
                 };
 
                 let prec = self.prefix_operator_precedence(start.kind);
 
                 ast::Expression::Unary {
                     operator,
-                    expression: self.pratt_parse(prec).into(),
+                    expression: self.pratt_parse(prec, context).into(),
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
 
@@ -211,17 +224,17 @@ impl<'source> Parser<'source> {
                 }
                 let prec = self.prefix_operator_precedence(start.kind);
                 ast::Expression::Reference {
-                    expression: self.pratt_parse(prec).into(),
+                    expression: self.pratt_parse(prec, context).into(),
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
 
-            _ => self.parse_atomic_expression(),
+            _ => self.parse_atomic_expression(context),
         }
     }
 
-    pub fn include_in_larger_expression(&mut self, lhs: ast::Expression) -> ast::Expression {
+    fn include_in_larger_expression(&mut self, lhs: ast::Expression) -> ast::Expression {
         match self.current_token().kind {
             LeftParen => self.parse_function_call(lhs, vec![]),
             LeftSquareBracket => self.parse_index_expression(lhs),
@@ -277,13 +290,17 @@ impl<'source> Parser<'source> {
                         (last_span.byte_offset + last_span.byte_length)
                             .saturating_sub(first_span.byte_offset),
                     );
-                    let error = ParseError::new(title, span, "misplaced")
+                    let error = ParseError::new(title, span, format!("belongs on `{}`", method))
                         .with_parse_code("syntax_error")
                         .with_help(help);
                     self.errors.push(error);
 
                     let dot_access = self.parse_field_access(lhs);
                     return self.parse_function_call(dot_access, type_args);
+                }
+
+                if !self.is(LeftParen) {
+                    return self.recover_call_missing_parens(lhs, type_args);
                 }
 
                 self.parse_function_call(lhs, type_args)
@@ -293,13 +310,21 @@ impl<'source> Parser<'source> {
                 let lhs_name = match &lhs {
                     ast::Expression::Identifier { value, .. } => value.to_string(),
                     ast::Expression::DotAccess { member, .. } => member.to_string(),
-                    _ => std::string::String::new(),
+                    _ => string::String::new(),
                 };
                 let colon_token = self.current_token();
                 let span = ast::Span::new(self.file_id, colon_token.byte_offset, 2);
                 let after = self.stream.peek_ahead(2);
 
                 if after.kind == LeftAngleBracket {
+                    self.next(); // consume first `:`
+                    self.next(); // consume second `:`
+                    let type_args = self.parse_type_args();
+
+                    if self.at_turbofish_method() {
+                        return self.recover_turbofish_method(lhs, type_args, &lhs_name, span);
+                    }
+
                     let help = if !lhs_name.is_empty() {
                         format!(
                             "Lisette does not use turbofish syntax. Use `{}<T>(...)` instead",
@@ -310,9 +335,6 @@ impl<'source> Parser<'source> {
                             .to_string()
                     };
                     self.track_error_at(span, "invalid syntax", help);
-                    self.next(); // consume first `:`
-                    self.next(); // consume second `:`
-                    let type_args = self.parse_type_args();
                     self.parse_function_call(lhs, type_args)
                 } else {
                     let help = if !lhs_name.is_empty() && after.kind == Identifier {
@@ -324,17 +346,7 @@ impl<'source> Parser<'source> {
                         "Use `.` instead of `::` for enum variant access".to_string()
                     };
                     self.track_error_at(span, "invalid syntax", help);
-                    self.next(); // consume first `:`
-                    self.next(); // consume second `:`
-                    let field_start = self.current_token();
-                    let field: EcoString = self.current_token().text.into();
-                    self.ensure(Identifier);
-                    ast::Expression::DotAccess {
-                        ty: Type::uninferred(),
-                        expression: lhs.into(),
-                        member: field,
-                        span: self.span_from_tokens(field_start),
-                    }
+                    self.recover_double_colon_access(lhs)
                 }
             }
 
@@ -350,8 +362,55 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_range_end(&mut self) -> ast::Expression {
-        self.pratt_parse(RANGE_PREC)
+    fn at_turbofish_method(&self) -> bool {
+        self.is(Colon)
+            && self.stream.peek_ahead(1).kind == Colon
+            && self.stream.peek_ahead(2).kind == Identifier
+    }
+
+    fn recover_turbofish_method(
+        &mut self,
+        lhs: ast::Expression,
+        type_args: Vec<ast::Annotation>,
+        lhs_name: &str,
+        span: ast::Span,
+    ) -> ast::Expression {
+        let method = self.stream.peek_ahead(2).text;
+        let args = type_args
+            .iter()
+            .map(format_annotation)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let help = format!(
+            "Lisette does not use turbofish syntax. Use `{}.{}<{}>()` instead",
+            lhs_name, method, args
+        );
+        self.track_error_at(span, "invalid syntax", help);
+
+        let dot_access = self.recover_double_colon_access(lhs);
+
+        self.parse_function_call(dot_access, type_args)
+    }
+
+    fn recover_double_colon_access(&mut self, lhs: ast::Expression) -> ast::Expression {
+        self.next(); // consume first `:`
+        self.next(); // consume second `:`
+
+        let field_start = self.current_token();
+        let field: EcoString = self.current_token().text.into();
+        self.ensure(Identifier);
+
+        ast::Expression::DotAccess {
+            ty: Type::uninferred(),
+            expression: lhs.into(),
+            member: field,
+            span: self.span_from_offset(field_start.byte_offset),
+            resolution: DotAccessResolution::Unresolved,
+        }
+    }
+
+    pub(super) fn parse_range_end(&mut self, context: ExpressionContext) -> ast::Expression {
+        self.pratt_parse(RANGE_PREC, context)
     }
 
     fn check_go_channel_send(&mut self) -> bool {
@@ -380,12 +439,76 @@ impl<'source> Parser<'source> {
         self.resync_on_error();
         true
     }
+
+    fn check_increment_decrement(
+        &mut self,
+        lhs: &ast::Expression,
+        start_offset: u32,
+        context: ExpressionContext,
+    ) -> bool {
+        let current = self.current_token();
+        let kind = current.kind;
+        if kind != Plus && kind != Minus {
+            return false;
+        }
+        let next = self.stream.peek_ahead(1);
+        if next.kind != kind {
+            return false;
+        }
+        if current.byte_offset + current.byte_length != next.byte_offset {
+            return false;
+        }
+        if !self.is_valid_assignment_target(lhs) {
+            return false;
+        }
+
+        let mut ahead = 2;
+        while matches!(
+            self.stream.peek_ahead(ahead).kind,
+            Comment | DocComment | FileComment
+        ) {
+            ahead += 1;
+        }
+        let after = self.stream.peek_ahead(ahead);
+        let newline_after = {
+            let from = (next.byte_offset + next.byte_length) as usize;
+            let to = after.byte_offset as usize;
+            from <= to && to <= self.source.len() && self.source[from..to].contains('\n')
+        };
+        let ends_statement = newline_after
+            || matches!(
+                after.kind,
+                EOF | Semicolon | RightCurlyBrace | RightParen | RightSquareBracket | Comma
+            )
+            || (after.kind == LeftCurlyBrace && context.is_control_flow_header());
+        if !ends_statement {
+            return false;
+        }
+
+        let (operator, compound) = if kind == Plus {
+            ("++", "+= 1")
+        } else {
+            ("--", "-= 1")
+        };
+        let span = ast::Span::new(self.file_id, current.byte_offset, 2);
+        let target = self.source[start_offset as usize..current.byte_offset as usize].trim_end();
+        let help = format!("Use `{target} {compound}` instead");
+        self.track_error_at(span, format!("Lisette has no `{operator}` operator"), help);
+        self.next();
+        self.next();
+        true
+    }
 }
 
-fn format_annotation(ann: &ast::Annotation) -> std::string::String {
+fn format_annotation(ann: &ast::Annotation) -> string::String {
     match ann {
-        ast::Annotation::Constructor { name, params, .. } => {
-            if params.is_empty() {
+        ast::Annotation::Constructor {
+            name,
+            params,
+            writable,
+            ..
+        } => {
+            let rendered = if params.is_empty() {
                 name.to_string()
             } else {
                 format!(
@@ -397,6 +520,11 @@ fn format_annotation(ann: &ast::Annotation) -> std::string::String {
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
+            };
+            if *writable {
+                format!("mut {}", rendered)
+            } else {
+                rendered
             }
         }
         ast::Annotation::Tuple { elements, .. } => {
@@ -424,6 +552,54 @@ fn format_annotation(ann: &ast::Annotation) -> std::string::String {
                 format_annotation(return_type)
             )
         }
+        ast::Annotation::Constant { value, text, .. } => {
+            text.clone().unwrap_or_else(|| value.to_string())
+        }
         ast::Annotation::Unknown | ast::Annotation::Opaque { .. } => "_".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::Expression;
+    use crate::parse::{MAX_DEPTH, Parser};
+
+    fn depth(expression: &Expression) -> u32 {
+        1 + expression
+            .children()
+            .into_iter()
+            .map(depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn parse_bounded(source: &str) -> u32 {
+        let result = Parser::lex_and_parse_file(source, 0);
+        assert!(result.has_errors(), "expected a nesting error");
+        result.ast.iter().map(depth).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn long_pipeline_chain_stays_shallow() {
+        let source = format!("pub const x = a{}", " |> f".repeat(500));
+        assert!(parse_bounded(&source) <= MAX_DEPTH);
+    }
+
+    #[test]
+    fn long_binary_chain_stays_shallow() {
+        let source = format!("pub const x: int = 1{}", " + 1".repeat(500));
+        assert!(parse_bounded(&source) <= MAX_DEPTH);
+    }
+
+    #[test]
+    fn long_cast_chain_stays_shallow() {
+        let source = format!("pub const x = 1{}", " as int".repeat(500));
+        assert!(parse_bounded(&source) <= MAX_DEPTH);
+    }
+
+    #[test]
+    fn long_range_chain_stays_shallow() {
+        let source = format!("pub const x = 1{}", "..2".repeat(500));
+        assert!(parse_bounded(&source) <= MAX_DEPTH);
     }
 }

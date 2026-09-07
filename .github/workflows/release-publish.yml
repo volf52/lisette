@@ -1,0 +1,97 @@
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish prelude, bindgen, compiler
+    if: "${{ github.repository == 'ivov/lisette' && (github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore: release')) }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # ratchet:release-plz/action@v0.5
+        id: release
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - uses: taiki-e/install-action@1329c298aa20c3257846c9b2e0e55967df3e3c37 # ratchet:taiki-e/install-action@v2
+        if: steps.release.outputs.releases_created == 'true'
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Populate GitHub release notes from CHANGELOG.md
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          TAG=$(echo "$RELEASES" | jq -er '.[] | select(.package_name == "lisette") | .tag')
+          git fetch --tags origin
+          git-cliff --config cliff.toml --latest --strip all | sed -e '/^## \[/d' -e '/./,$!d' > /tmp/notes.md
+          if grep -qE '^- [a-z]+(\([^)]*\))?!:' /tmp/notes.md; then
+            printf 'This version contains breaking changes.\n\n%s\n' "$(cat /tmp/notes.md)" > /tmp/notes.md
+          fi
+          gh release edit "$TAG" --notes-file /tmp/notes.md
+          { grep -oE 'pull/[0-9]+' /tmp/notes.md || true; } | cut -d/ -f2 | sort -u > "/tmp/prs-${TAG}.txt"
+
+      # Tags are created via the GitHub REST API with GITHUB_TOKEN (not git push with the PAT)
+      # so they do not trigger the cargo-dist release workflow.
+      - name: Tag and publish Go modules
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMPILER_VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lisette") | .version')
+          COMMIT_SHA=$(git rev-parse HEAD)
+          for module in prelude bindgen; do
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/${module}/v${COMPILER_VERSION}" \
+              -f sha="${COMMIT_SHA}" || true
+          done
+          for module in prelude bindgen; do
+            curl -sf "https://proxy.golang.org/github.com/ivov/lisette/${module}/@v/v${COMPILER_VERSION}.info" > /dev/null || true
+          done
+
+      - name: Comment on released PRs and issues
+        if: steps.release.outputs.releases_created == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          TAG=$(echo "$RELEASES" | jq -r '.[] | select(.package_name == "lisette") | .tag')
+          RELEASE_LINK="[\`${TAG}\`](https://github.com/ivov/lisette/releases/tag/${TAG})"
+          declare -A COMMENTED_ISSUES
+          while IFS= read -r pr; do
+            [ -z "$pr" ] && continue
+            gh pr comment "$pr" --body "Released in ${RELEASE_LINK}" || true
+            for issue in $(gh pr view "$pr" --json closingIssuesReferences --jq '.closingIssuesReferences[].number' || true); do
+              if [[ -z "${COMMENTED_ISSUES[$issue]:-}" ]]; then
+                gh issue comment "$issue" --body "Addressed in ${RELEASE_LINK}" || true
+                COMMENTED_ISSUES[$issue]=1
+              fi
+            done
+          done < "/tmp/prs-${TAG}.txt"

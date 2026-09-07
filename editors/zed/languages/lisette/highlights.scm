@@ -1,11 +1,13 @@
 ; Keywords
 [
   "as"
+  "assert"
   "break"
   "const"
   "continue"
   "defer"
   "else"
+  "embed"
   "enum"
   "fn"
   "for"
@@ -45,15 +47,26 @@
   ">="
   "&&"
   "||"
+  "^"
+  "&^"
+  "<<"
+  ">>"
   "|>"
   "!"
   "&"
+  "|"
   "="
   "+="
   "-="
   "*="
   "/="
   "%="
+  "&="
+  "|="
+  "^="
+  "&^="
+  "<<="
+  ">>="
   ".."
   "..="
   "?"
@@ -120,9 +133,6 @@
 
 ; Enum definitions
 (enum_item
-  name: (type_identifier) @type.definition)
-
-(value_enum_item
   name: (type_identifier) @type.definition)
 
 ; Interface definitions
@@ -213,15 +223,13 @@
 (enum_variant
   name: (identifier) @constant)
 
-(value_enum_variant
-  name: (identifier) @constant)
-
 ; Match wildcards
 ((identifier) @variable
   (#eq? @variable "_"))
 
 ; Literals
 (string_literal) @string
+(raw_string_literal) @string
 (format_string) @string
 (char_literal) @character
 (boolean_literal) @boolean
@@ -238,6 +246,10 @@
 ; Comments
 (line_comment) @comment
 (doc_comment) @comment.documentation
+(file_comment) @comment.documentation
+
+; Shebang
+(shebang) @comment
 
 ; Visibility
 (visibility_modifier) @keyword.modifier

@@ -3,46 +3,79 @@
 // Go: 0.0.0
 // Lisette: 0.0.0
 
-/// Function with unnamed params - tests convertFunc unnamed param path
-pub fn Callback(arg0: int, arg1: string) -> bool
+/// Synthesized from a Go anonymous struct type.
+#[go(anon_struct)]
+pub struct AnonA {
+  pub A: int,
+}
 
+/// Synthesized from a Go anonymous struct type.
+#[go(anon_struct)]
+pub struct AnonB {
+  pub B: int,
+}
+
+/// Synthesized from a Go anonymous struct type.
+#[go(anon_struct)]
+pub struct AnonX {
+  pub X: int,
+}
+
+/// Function with unnamed params - tests convertFunc unnamed param path
+pub fn Callback(n: int, s: string) -> bool
+
+/// Comma-ok with pointer inner type - produces tuple to avoid
+/// ambiguity with single-pointer returns that also produce Option<Ref<T>>
 #[go(comma_ok)]
-pub fn FindNode(key: string) -> Option<Ref<Node>>
+pub fn FindNode(key: string) -> Option<mut Ref<Node>>
 
 /// Variadic function - tests convertFunc variadic path
 pub fn Printf(format: string, args: VarArgs<Unknown>)
 
 /// Function type with unsafe return in struct field
 pub struct BadFactory {
-  pub Create: fn() -> Unknown,
+  pub Create: Option<fn() -> Unknown>,
 }
 
 /// Function type with unsafe param in struct field - triggers signatureToLisette skip path
 pub struct BadHandler {
-  pub Process: fn(Unknown) -> int,
+  pub Process: Option<fn(Unknown) -> int>,
 }
 
-/// Function type returning skipped type with ok - tests analyzeReturns skip in Option path
-pub type BadOptionFn
+/// Function type returning an anonymous struct with ok - synthesized into the Option path
+pub struct BadOptionFn {
+  pub Check: Option<fn() -> Option<AnonX>>,
+}
 
-/// Function type returning skipped type with error - tests analyzeReturns skip in Result path
-pub type BadResultFn
+/// Function type returning an anonymous struct with error - synthesized into the Result path
+pub struct BadResultFn {
+  pub Run: Option<fn() -> Result<AnonX, error>>,
+}
+
+/// Function type params are writable
+pub struct Callbacks {
+  pub OnNode: Option<fn(mut Ref<Node>) -> ()>,
+  pub OnBytes: Option<fn(mut Slice<byte>) -> ()>,
+  pub OnLookup: Option<fn(mut Map<string, mut Slice<int>>) -> ()>,
+  pub OnValue: Option<fn(Node) -> ()>,
+  pub OnNodes: Option<fn(mut Ref<Node>, mut VarArgs<mut Ref<Node>>) -> ()>,
+}
 
 /// Function type with just error return - tests single error path
 pub struct ErrorOnly {
-  pub Try: fn() -> Result<(), error>,
+  pub Try: Option<fn() -> Result<(), error>>,
 }
 
 /// Function returning multiple values including error
 pub struct Fetcher {
-  pub Fetch: fn(string) -> Result<Slice<uint8>, error>,
+  pub Fetch: Option<fn(string) -> Result<Slice<byte>, error>>,
 }
 
 pub type Handler = fn(int) -> Result<(), error>
 
 /// Variadic function type
 pub struct Logger {
-  pub Log: fn(string, VarArgs<Unknown>) -> (),
+  pub Log: Option<fn(string, mut VarArgs<Unknown>) -> ()>,
 }
 
 pub type MultiReturn = fn() -> Result<int, error>
@@ -56,9 +89,11 @@ pub struct Node {
 
 pub type SimpleCallback = fn() -> ()
 
-/// Function type returning multiple skipped types - tests collectReturnTypes skip in tuple path
-pub type TupleSkip
+/// Function type returning two anonymous structs - synthesized into the tuple path
+pub struct TupleSkip {
+  pub GetPair: Option<fn() -> (AnonA, AnonB)>,
+}
 
-pub type Variadic = fn(string, VarArgs<int>) -> Result<(), error>
+pub type Variadic = fn(string, mut VarArgs<int>) -> Result<(), error>
 
 pub type WithArgs = fn(int, string) -> bool

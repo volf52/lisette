@@ -1,0 +1,43 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:example.com/arrays"
+  
+  fn main() {
+    let values: Array<Option<int>, 2> = [Some(1), None]
+    let container = arrays.Container { Values: values }
+    let roundtrip = container.Values
+    let _ = roundtrip
+  }
+---
+package main
+
+import (
+	"example.com/arrays"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func main() {
+	values := [2]lisette.Option[int]{lisette.MakeOptionSome(1), lisette.MakeOptionNone[int]()}
+	var unwrapped_1 [2]*int
+	for i_2, v_3 := range values {
+		if v_3.Tag == lisette.OptionSome {
+			unwrapped_1[i_2] = &v_3.SomeVal
+		} else {
+			unwrapped_1[i_2] = nil
+		}
+	}
+	container := arrays.Container{Values: unwrapped_1}
+	raw_4 := container.Values
+	var wrapped_5 [2]lisette.Option[int]
+	for i_6, v_7 := range raw_4 {
+		if v_7 != nil {
+			wrapped_5[i_6] = lisette.MakeOptionSome[int](*v_7)
+		} else {
+			wrapped_5[i_6] = lisette.MakeOptionNone[int]()
+		}
+	}
+	roundtrip := wrapped_5
+	_ = roundtrip
+}

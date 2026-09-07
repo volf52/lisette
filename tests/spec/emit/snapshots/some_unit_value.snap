@@ -1,11 +1,13 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn test() -> Option<()> {\n  Some(())\n}\n"
+description: |
+  
+  fn test() -> Option<()> {
+    Some(())
+  }
 ---
 package main
 
-import lisette "github.com/ivov/lisette/prelude"
-
-func test() lisette.Option[struct{}] {
-	return lisette.MakeOptionSome[struct{}](struct{}{})
+func test() (struct{}, bool) {
+	return struct{}{}, true
 }

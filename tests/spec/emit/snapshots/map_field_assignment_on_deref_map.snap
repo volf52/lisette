@@ -1,27 +1,27 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Box { x: int }\n\nfn main() {\n  let mut m = Map.from([(\"k\", Box { x: 0 })])\n  let r = &m\n  let mut entry = r.*[\"k\"]\n  entry.x = 1\n  r.*[\"k\"] = entry\n}\n"
+description: |
+  
+  struct Box { x: int }
+  
+  fn main() {
+    let mut m = Map.from([("k", Box { x: 0 })])
+    let mut r = &m
+    let mut entry = r.*["k"]
+    entry.x = 1
+    r.*["k"] = entry
+  }
 ---
 package main
-
-import (
-	"fmt"
-	lisette "github.com/ivov/lisette/prelude"
-)
 
 type Box struct {
 	x int
 }
 
-func (b Box) String() string {
-	return fmt.Sprintf("Box { x: %v }", b.x)
-}
-
 func main() {
-	m := lisette.MapFrom([]lisette.Tuple2[string, Box]{lisette.MakeTuple2("k", Box{x: 0})})
+	m := map[string]Box{"k": {x: 0}}
 	r := &m
 	entry := (*r)["k"]
 	entry.x = 1
-	base_1 := r
-	(*base_1)["k"] = entry
+	(*r)["k"] = entry
 }

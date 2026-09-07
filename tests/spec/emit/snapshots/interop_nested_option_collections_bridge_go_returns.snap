@@ -1,0 +1,49 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:example.com/nested"
+  
+  fn main() {
+    let values = nested.Values()
+    let maybe_values = nested.MaybeValues()
+    let _ = values
+    let _ = maybe_values
+  }
+---
+package main
+
+import (
+	"example.com/nested"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func main() {
+	src_1 := nested.Values()
+	wrapped_2 := make([]lisette.Option[int], len(src_1))
+	for i_3, v_4 := range src_1 {
+		if v_4 != nil {
+			wrapped_2[i_3] = lisette.MakeOptionSome[int](*v_4)
+		} else {
+			wrapped_2[i_3] = lisette.MakeOptionNone[int]()
+		}
+	}
+	values := wrapped_2
+	ret_5, ret_6 := nested.MaybeValues()
+	var maybe_values lisette.Option[[]lisette.Option[int]]
+	if ret_6 {
+		wrapped_7 := make([]lisette.Option[int], len(ret_5))
+		for i_8, v_9 := range ret_5 {
+			if v_9 != nil {
+				wrapped_7[i_8] = lisette.MakeOptionSome[int](*v_9)
+			} else {
+				wrapped_7[i_8] = lisette.MakeOptionNone[int]()
+			}
+		}
+		maybe_values = lisette.MakeOptionSome[[]lisette.Option[int]](wrapped_7)
+	} else {
+		maybe_values = lisette.MakeOptionNone[[]lisette.Option[int]]()
+	}
+	_ = values
+	_ = maybe_values
+}

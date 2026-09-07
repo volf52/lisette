@@ -1,9 +1,11 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nimport _ \"go:database/sql\"\n"
+description: |
+  
+  import _ "go:database/sql"
 ---
 [
-    ModuleImport {
+    PackageImport {
         name: "go:database/sql",
         name_span: Span {
             file_id: 0,

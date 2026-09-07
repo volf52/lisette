@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ivov/lisette/bindgen/internal/cli"
+	"github.com/ivov/lisette/bindgen/internal/config"
 )
 
 var update = flag.Bool("update", false, "update snapshot files")
@@ -84,7 +85,17 @@ func snapshotPathFor(fixturePath string) string {
 }
 
 func runBindgen(t *testing.T, pkgPath string) []byte {
-	result, err := cli.GeneratePkg("./"+pkgPath, "0.0.0", "0.0.0", nil)
+	var cfg *config.Config
+	cfgPath := filepath.Join(pkgPath, "bindgen.json")
+	if _, err := os.Stat(cfgPath); err == nil {
+		loaded, err := config.LoadConfig(cfgPath, nil)
+		if err != nil {
+			t.Fatalf("failed to load fixture config %s: %v", cfgPath, err)
+		}
+		cfg = &loaded
+	}
+
+	result, err := cli.GeneratePkg("./"+pkgPath, "0.0.0", "0.0.0", cfg, cli.Target{})
 	if err != nil {
 		t.Fatalf("bindgen failed: %v", err)
 	}
@@ -93,7 +104,7 @@ func runBindgen(t *testing.T, pkgPath string) []byte {
 }
 
 func TestGenerateError(t *testing.T) {
-	_, err := cli.GeneratePkg("/nonexistent/path/to/package", "0.0.0", "0.0.0", nil)
+	_, err := cli.GeneratePkg("/nonexistent/path/to/package", "0.0.0", "0.0.0", nil, cli.Target{})
 	if err == nil {
 		t.Error("expected error for nonexistent package, got nil")
 	}
@@ -133,6 +144,72 @@ func diffOutput(expected, actual []byte) string {
 	return diff.String()
 }
 
+func TestGeneratePkgs_FullEmit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	manifest := cli.GeneratePkgs([]string{"fmt", "os"}, "0.0.0", "0.0.0", nil, false, cli.Target{})
+
+	if len(manifest.Errors) != 0 {
+		t.Fatalf("expected no errors, got %v", manifest.Errors)
+	}
+	if len(manifest.Ok) != 2 {
+		t.Fatalf("expected 2 ok entries, got %d", len(manifest.Ok))
+	}
+	for _, ok := range manifest.Ok {
+		if ok.Stubbed {
+			t.Errorf("expected no stubs, package %q was stubbed", ok.Package)
+		}
+		if ok.Content == "" {
+			t.Errorf("expected content for %q, got empty", ok.Package)
+		}
+	}
+}
+
+func TestGeneratePkgs_HardFail(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	manifest := cli.GeneratePkgs([]string{"definitely/nonexistent/foo"}, "0.0.0", "0.0.0", nil, false, cli.Target{})
+
+	if len(manifest.Ok) != 0 {
+		t.Errorf("expected no ok entries, got %d", len(manifest.Ok))
+	}
+	if len(manifest.Errors) != 1 {
+		t.Fatalf("expected 1 error, got %d: %v", len(manifest.Errors), manifest.Errors)
+	}
+	if manifest.Errors[0].Package != "definitely/nonexistent/foo" {
+		t.Errorf("expected error package match, got %q", manifest.Errors[0].Package)
+	}
+}
+
+func TestGeneratePkgs_MixedBatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	manifest := cli.GeneratePkgs(
+		[]string{"fmt", "definitely/nonexistent/foo"},
+		"0.0.0", "0.0.0", nil, false, cli.Target{},
+	)
+
+	if len(manifest.Ok) != 1 {
+		t.Errorf("expected 1 ok entry, got %d (entries: %v)", len(manifest.Ok), manifest.Ok)
+	}
+	if len(manifest.Errors) != 1 {
+		t.Errorf("expected 1 error, got %d (entries: %v)", len(manifest.Errors), manifest.Errors)
+	}
+}
+
+func TestGeneratePkgs_Empty(t *testing.T) {
+	manifest := cli.GeneratePkgs(nil, "0.0.0", "0.0.0", nil, false, cli.Target{})
+	if len(manifest.Ok) != 0 || len(manifest.Errors) != 0 {
+		t.Errorf("expected empty manifest, got %v", manifest)
+	}
+}
+
 func TestGenerateStd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stdlib generation test in short mode")
@@ -144,7 +221,11 @@ func TestGenerateStd(t *testing.T) {
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	result, err := cli.GenerateStd(context.Background(), tmpDir, "0.0.0", "0.0.0", nil)
+	targets, err := cli.ParseTargets("darwin/arm64,linux/amd64")
+	if err != nil {
+		t.Fatalf("parse targets: %v", err)
+	}
+	result, err := cli.GenerateStd(context.Background(), tmpDir, "0.0.0", "0.0.0", nil, targets)
 	if err != nil {
 		t.Fatalf("GenerateStd failed: %v", err)
 	}
@@ -155,7 +236,6 @@ func TestGenerateStd(t *testing.T) {
 
 	expectedFiles := []string{
 		"fmt.d.lis",
-		"os.d.lis",
 		"net/http.d.lis",
 	}
 	for _, f := range expectedFiles {
@@ -163,5 +243,26 @@ func TestGenerateStd(t *testing.T) {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			t.Errorf("expected file %s not found", f)
 		}
+	}
+}
+
+func TestGenerateStdRejectsSingleTarget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stdlib generation test in short mode")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bindgen-stdlib-single-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	targets, err := cli.ParseTargets("darwin/arm64")
+	if err != nil {
+		t.Fatalf("parse targets: %v", err)
+	}
+	_, err = cli.GenerateStd(context.Background(), tmpDir, "0.0.0", "0.0.0", nil, targets)
+	if err == nil {
+		t.Fatal("expected GenerateStd to reject single-target invocation")
 	}
 }

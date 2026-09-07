@@ -1,0 +1,170 @@
+use crate::passes::walk::NodeCtx;
+use syntax::ast::{BindingId, Expression, IdentifierResolution, Pattern};
+
+pub fn check_unnecessary_range_loop(expression: &Expression, ctx: &NodeCtx) {
+    let Expression::For {
+        binding,
+        iterable,
+        body,
+        ..
+    } = expression
+    else {
+        return;
+    };
+    let binding_span = match &binding.pattern {
+        Pattern::Identifier { span, .. } => *span,
+        Pattern::AsBinding { name_span, .. } => *name_span,
+        _ => return,
+    };
+    let Some(index_id) = ctx.facts.binding_id_at(binding_span) else {
+        return;
+    };
+    let Expression::Range {
+        start: Some(start),
+        end: Some(end),
+        inclusive: false,
+        span,
+        ..
+    } = iterable.unwrap_parens()
+    else {
+        return;
+    };
+    if start.as_integer() != Some(0) {
+        return;
+    }
+    let Some((collection, collection_id)) = length_receiver(end) else {
+        return;
+    };
+
+    let mut walk = Walk {
+        index_id,
+        collection_id,
+        outcome: WalkOutcome::Searching,
+    };
+    walk.visit(body);
+
+    if walk.outcome == WalkOutcome::FoundIndexing {
+        ctx.sink
+            .push(diagnostics::lint::unnecessary_range_loop(span, collection));
+    }
+}
+
+fn length_receiver(expression: &Expression) -> Option<(&str, BindingId)> {
+    let Expression::Call {
+        expression: callee,
+        args,
+        ..
+    } = expression.unwrap_parens()
+    else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let Expression::DotAccess {
+        expression: receiver,
+        member,
+        ..
+    } = callee.unwrap_parens()
+    else {
+        return None;
+    };
+    if member != "length" {
+        return None;
+    }
+    let Expression::Identifier {
+        value,
+        resolution: IdentifierResolution::Binding(binding_id),
+        ..
+    } = receiver.unwrap_parens()
+    else {
+        return None;
+    };
+    if !receiver.get_type().is_slice() {
+        return None;
+    }
+    Some((value.as_str(), *binding_id))
+}
+
+struct Walk {
+    index_id: BindingId,
+    collection_id: BindingId,
+    outcome: WalkOutcome,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkOutcome {
+    Searching,
+    FoundIndexing,
+    Blocked,
+}
+
+impl Walk {
+    fn visit(&mut self, expression: &Expression) {
+        if self.outcome == WalkOutcome::Blocked {
+            return;
+        }
+        match expression {
+            Expression::Assignment { target, value, .. } => {
+                if touches_slice_place(target) {
+                    self.outcome = WalkOutcome::Blocked;
+                    return;
+                }
+                self.visit(target);
+                self.visit(value);
+            }
+            Expression::Reference {
+                expression: inner, ..
+            } => {
+                if touches_slice_place(inner) {
+                    self.outcome = WalkOutcome::Blocked;
+                    return;
+                }
+                self.visit(inner);
+            }
+            Expression::Call { .. }
+            | Expression::Function { .. }
+            | Expression::Lambda { .. }
+            | Expression::Task { .. }
+            | Expression::Defer { .. } => {
+                self.outcome = WalkOutcome::Blocked;
+            }
+            Expression::IndexedAccess {
+                expression: receiver,
+                index,
+                ..
+            } => {
+                if receiver.binding_id() == Some(self.collection_id)
+                    && index.binding_id() == Some(self.index_id)
+                {
+                    self.outcome = WalkOutcome::FoundIndexing;
+                    return;
+                }
+                self.visit(receiver);
+                self.visit(index);
+            }
+            other => {
+                if other.binding_id() == Some(self.index_id) {
+                    self.outcome = WalkOutcome::Blocked;
+                    return;
+                }
+                for child in other.children() {
+                    self.visit(child);
+                }
+            }
+        }
+    }
+}
+
+fn touches_slice_place(expression: &Expression) -> bool {
+    let expression = expression.unwrap_parens();
+    if expression.get_type().is_slice() {
+        return true;
+    }
+    match expression {
+        Expression::IndexedAccess { expression, .. } | Expression::DotAccess { expression, .. } => {
+            touches_slice_place(expression)
+        }
+        _ => false,
+    }
+}

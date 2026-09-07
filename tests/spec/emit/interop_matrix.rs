@@ -165,6 +165,21 @@ fn main() {
 }
 
 #[test]
+fn interop_comma_ok_match_subject_fuses() {
+    let input = r#"
+import "go:os"
+
+fn main() {
+  match os.LookupEnv("HOME") {
+    Some(v) => { let _ = v },
+    None => { let _ = "" },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn interop_comma_ok_let_call() {
     let input = r#"
 import "go:os"
@@ -220,6 +235,76 @@ fn main() {
 }
 "#;
     assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_sentinel_let_call() {
+    let input = r#"
+import "go:example.com/idx"
+
+fn main() {
+  let f = idx.Find
+  let r = f("hello", "ll")
+  match r {
+    Some(v) => { let _ = v },
+    None => { let _ = -2 },
+  }
+}
+"#;
+    let typedef = r#"
+#[go(sentinel_minus_one)]
+pub fn Find(s: string, substr: string) -> Option<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/idx", typedef)]);
+}
+
+#[test]
+fn interop_sentinel_call_arg() {
+    let input = r#"
+import "go:example.com/idx"
+
+fn apply(f: fn(string, string) -> Option<int>, s: string) -> int {
+  match f(s, "ll") {
+    Some(v) => v,
+    None => -2,
+  }
+}
+
+fn main() {
+  let r = apply(idx.Find, "hello")
+  let _ = r
+}
+"#;
+    let typedef = r#"
+#[go(sentinel_minus_one)]
+pub fn Find(s: string, substr: string) -> Option<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/idx", typedef)]);
+}
+
+#[test]
+fn interop_sentinel_return_pos() {
+    let input = r#"
+import "go:example.com/idx"
+
+fn make_finder() -> fn(string, string) -> Option<int> {
+  idx.Find
+}
+
+fn main() {
+  let f = make_finder()
+  let r = f("hello", "ll")
+  match r {
+    Some(v) => { let _ = v },
+    None => { let _ = -2 },
+  }
+}
+"#;
+    let typedef = r#"
+#[go(sentinel_minus_one)]
+pub fn Find(s: string, substr: string) -> Option<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/idx", typedef)]);
 }
 
 #[test]
@@ -297,35 +382,6 @@ fn main() {
 }
 
 #[test]
-fn interop_array_return_direct_call() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn main() {
-  let data = "hello" as Slice<uint8>
-  let hash = sha256.Sum256(data)
-  let _ = hash
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn interop_array_return_let_call() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn main() {
-  let f = sha256.Sum256
-  let data = "hello" as Slice<uint8>
-  let hash = f(data)
-  let _ = hash
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
 fn interop_tuple_direct_call() {
     let input = r#"
 import "go:path"
@@ -386,6 +442,98 @@ fn main() {
 }
 "#;
     assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_direct_prelude_map_arg() {
+    let input = r#"
+import "go:strings"
+
+fn main() {
+  let xs: Slice<string> = ["a"]
+  let ys = xs.map(strings.ToUpper)
+  let _ = ys
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_direct_prelude_filter_arg() {
+    let input = r#"
+import "go:unicode"
+
+fn main() {
+  let cs: Slice<rune> = ['a', '1']
+  let letters = cs.filter(unicode.IsLetter)
+  let _ = letters
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_direct_prelude_fold_arg() {
+    let input = r#"
+import "go:math"
+
+fn main() {
+  let xs: Slice<float64> = [1.0, 5.0]
+  let biggest = xs.fold(0.0, math.Max)
+  let _ = biggest
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_direct_option_map_arg() {
+    let input = r#"
+import "go:strings"
+
+fn main() {
+  let s: Option<string> = Some("a")
+  let upper = s.map(strings.ToUpper)
+  let _ = upper
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_sentinel_prelude_map_arg() {
+    let input = r#"
+import "go:example.com/idx"
+
+fn main() {
+  let xs: Slice<string> = ["hello"]
+  let ys = xs.map(idx.Find)
+  let _ = ys
+}
+"#;
+    let typedef = r#"
+#[go(sentinel_minus_one)]
+pub fn Find(s: string) -> Option<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/idx", typedef)]);
+}
+
+#[test]
+fn interop_comma_ok_slice_option_prelude_map_arg() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let keys: Slice<string> = ["k"]
+  let out = keys.map(aws.Fetch)
+  let _ = out
+}
+"#;
+    let typedef = r#"
+#[go(comma_ok)]
+pub fn Fetch(key: string) -> Option<Slice<Option<string>>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
 }
 
 #[test]
@@ -457,100 +605,6 @@ fn main() {
 }
 
 #[test]
-fn interop_array_return_explicit_return() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn get() -> fn(Slice<uint8>) -> Slice<uint8> {
-  return sha256.Sum256
-}
-
-fn main() {
-  let f = get()
-  let data: Slice<uint8> = []
-  let out = f(data)
-  let _ = out
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn interop_array_return_parenthesized_call() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn main() {
-  let data: Slice<uint8> = []
-  let out = (sha256.Sum256)(data)
-  let out2 = out.append(1)
-  let _ = out2
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn interop_array_return_if_assignment() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn main() {
-  let f: fn(Slice<uint8>) -> Slice<uint8> = if true {
-    sha256.Sum256
-  } else {
-    sha256.Sum224
-  }
-  let data: Slice<uint8> = []
-  let out = f(data)
-  let _ = out
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn interop_array_return_if_tail() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn get(cond: bool) -> fn(Slice<uint8>) -> Slice<uint8> {
-  if cond {
-    sha256.Sum256
-  } else {
-    sha256.Sum224
-  }
-}
-
-fn main() {
-  let f = get(true)
-  let data: Slice<uint8> = []
-  let out = f(data)
-  let _ = out
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn interop_array_return_call_arg() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn apply(f: fn(Slice<uint8>) -> Slice<uint8>, data: Slice<uint8>) -> Slice<uint8> {
-  f(data)
-}
-
-fn main() {
-  let data: Slice<uint8> = []
-  let out = apply(sha256.Sum256, data)
-  let _ = out
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
 fn interop_result_map_field_assignment() {
     let input = r#"
 import "go:strconv"
@@ -560,10 +614,12 @@ struct Holder { f: fn(string) -> Result<int, error> }
 fn main() {
   let mut m = Map.new<string, Holder>()
   m["a"] = Holder { f: strconv.Atoi }
-  let mut entry = m["a"]
+  let Some(found) = m.get("a") else { return; };
+  let mut entry = found
   entry.f = strconv.Atoi
   m["a"] = entry
-  let r = m["a"].f("1")
+  let Some(h) = m.get("a") else { return; };
+  let r = h.f("1")
   match r {
     Ok(v) => { let _ = v },
     Err(_) => { let _ = 0 },
@@ -622,6 +678,75 @@ fn main() {
       }
     },
     Err(_) => { let _ = 0 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_result_propagate_in_try_block() {
+    let input = r#"
+import "go:strconv"
+
+fn sum_parsed(a: string, b: string) -> Result<int, error> {
+  try {
+    let x = strconv.Atoi(a)?
+    let y = strconv.Atoi(b)?
+    x + y
+  }
+}
+
+fn main() {
+  match sum_parsed("3", "4") {
+    Ok(n) => { let _ = n },
+    Err(_) => { let _ = 0 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_result_propagate_in_try_block_discard_and_nil_guard() {
+    let input = r#"
+import "go:strconv"
+import "go:os"
+
+fn open_and_check(path: string, n: string) -> Result<int, error> {
+  try {
+    let f = os.Open(path)?
+    let _ = f.Stat()?
+    strconv.Atoi(n)?
+  }
+}
+
+fn main() {
+  match open_and_check("/tmp/x", "7") {
+    Ok(v) => { let _ = v },
+    Err(_) => { let _ = 0 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_comma_ok_propagate_in_try_block_fuses() {
+    let input = r#"
+import "go:os"
+
+fn lookup(k: string) -> Option<string> {
+  try {
+    let v = os.LookupEnv(k)?
+    v
+  }
+}
+
+fn main() {
+  match lookup("HOME") {
+    Some(v) => { let _ = v },
+    None => { let _ = 0 },
   }
 }
 "#;
@@ -714,31 +839,18 @@ fn main() {
 }
 
 #[test]
-fn interop_array_return_defer() {
+fn interop_flattened_result_tuple_tail_repackages_payload() {
     let input = r#"
-import "go:crypto/sha256"
+import "go:example.com/multi"
 
-fn main() {
-  let data: Slice<uint8> = [1, 2, 3]
-  defer sha256.Sum256(data)
-  let _ = 0
+fn load() -> Result<(string, int), error> {
+  multi.Load()
 }
 "#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn interop_array_return_statement_position() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn main() {
-  let data: Slice<uint8> = [1, 2, 3]
-  sha256.Sum256(data)
-  let _ = 0
-}
+    let typedef = r#"
+pub fn Load() -> Result<(string, int), error>
 "#;
-    assert_emit_snapshot!(input);
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/multi", typedef)]);
 }
 
 #[test]
@@ -802,12 +914,12 @@ fn main() {
 }
 
 #[test]
-fn interop_value_enum_aliased_import() {
+fn interop_package_const_aliased_import() {
     let input = r#"
 import t "go:time"
 
 fn main() {
-  let d = t.Duration.Second
+  let d = t.Second
   let _ = d
 }
 "#;
@@ -815,12 +927,25 @@ fn main() {
 }
 
 #[test]
-fn interop_value_enum_nested_module() {
+fn interop_package_const_in_call() {
+    let input = r#"
+import "go:time"
+import "go:fmt"
+
+fn function() {
+  fmt.Println("march", time.March)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_package_const_nested_package() {
     let input = r#"
 import "go:debug/dwarf"
 
 fn main() {
-  let t = dwarf.Tag.TagArrayType
+  let t = dwarf.TagArrayType
   let _ = t
 }
 "#;
@@ -828,14 +953,14 @@ fn main() {
 }
 
 #[test]
-fn interop_value_enum_match_arm_aliased() {
+fn interop_const_pattern_match_arm_aliased() {
     let input = r#"
 import t "go:time"
 
 fn describe(d: t.Duration) -> string {
   match d {
-    t.Duration.Second => "one second",
-    t.Duration.Minute => "one minute",
+    t.Second => "one second",
+    t.Minute => "one minute",
     _ => "other",
   }
 }
@@ -844,14 +969,30 @@ fn describe(d: t.Duration) -> string {
 }
 
 #[test]
-fn interop_value_enum_match_arm_nested_module() {
+fn interop_const_pattern_match_arm_screaming_snake_go_name() {
+    let input = r#"
+import "go:os"
+
+fn describe(flag: int) -> string {
+  match flag {
+    os.O_RDONLY => "readonly",
+    os.O_WRONLY => "writeonly",
+    _ => "other",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_const_pattern_match_arm_nested_package() {
     let input = r#"
 import "go:debug/dwarf"
 
 fn describe(a: dwarf.Attr) -> string {
   match a {
-    dwarf.Attr.AttrArtificial => "artificial",
-    dwarf.Attr.AttrByteSize   => "byte size",
+    dwarf.AttrArtificial => "artificial",
+    dwarf.AttrByteSize   => "byte size",
     _ => "other",
   }
 }
@@ -992,6 +1133,35 @@ fn main() {
 }
 
 #[test]
+fn fused_nullable_pointer_match_binds_destination() {
+    let input = r#"
+import "go:flag"
+
+fn main() {
+  let found = match flag.Lookup("verbose") {
+    Some(f) => f,
+    None => { return }
+  }
+  let _ = found.Name
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_nullable_pointer_let_else() {
+    let input = r#"
+import "go:flag"
+
+fn main() {
+  let Some(found) = flag.Lookup("verbose") else { return }
+  let _ = found.Name
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn interop_typed_nil_interface_result_return() {
     let input = r#"
 import "go:fmt"
@@ -1006,6 +1176,74 @@ fn main() {
 }
 "#;
     assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_result_error_ok_skips_nil_guard() {
+    let input = r#"
+import "go:example.com/legacy"
+
+fn main() {
+  match legacy.Close() {
+    Ok(stored) => { let _ = stored },
+    Err(_) => { let _ = 0 },
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Close() -> Result<error, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/legacy", typedef)]);
+}
+
+#[test]
+fn propagate_go_pointer_result_keeps_nil_guard() {
+    let input = r#"
+import "go:os"
+
+fn open_first(path: string) -> Result<int, error> {
+  let _ = os.Open(path)?
+  Ok(0)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_go_pointer_result_returns_value_fuses() {
+    let input = r#"
+import "go:os"
+
+fn open(path: string) -> Result<Ref<os.File>, error> {
+  let file = os.Open(path)?
+  Ok(file)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_parallel_error_tuple_return() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/migrate"
+
+fn main() {
+  let (src, db) = migrate.Close()
+  match src {
+    Some(e) => fmt.Println("source:", e),
+    None => {},
+  }
+  match db {
+    Some(e) => fmt.Println("db:", e),
+    None => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Close() -> (Option<error>, Option<error>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/migrate", typedef)]);
 }
 
 #[test]
@@ -1044,7 +1282,7 @@ import "go:io"
 import "go:os"
 
 fn main() {
-  let reader = bufio.NewReader(os.Stdin)
+  let mut reader = bufio.NewReader(os.Stdin)
   while true {
     let r = match reader.ReadRune() {
       Ok((r, _)) => r,
@@ -1138,4 +1376,1678 @@ pub type Msg = Event
 pub fn Peek() -> Option<Msg>
 "#;
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/evts", typedef)]);
+}
+
+#[test]
+fn interop_struct_literal_option_to_pointer_named_scalar() {
+    let input = r#"
+import "go:example.com/cb"
+
+fn main() {
+  let _ = cb.Options {
+    Direction: Some(cb.DirectionDefault),
+  }
+}
+"#;
+    let typedef = r#"
+pub type Direction = int
+
+pub const DirectionDefault: Direction = 0
+
+pub struct Options {
+  pub Direction: Option<Direction>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cb", typedef)]);
+}
+
+#[test]
+fn interop_struct_literal_option_to_pointer_struct() {
+    let input = r#"
+import "go:example.com/cb"
+
+fn main() {
+  let inner = cb.Inner { Tag: "x" }
+  let _ = cb.Outer {
+    Slot: Some(&inner),
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Inner {
+  pub Tag: string,
+}
+
+pub struct Outer {
+  pub Slot: Option<Ref<Inner>>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cb", typedef)]);
+}
+
+#[test]
+fn interop_struct_literal_option_none_to_pointer() {
+    let input = r#"
+import "go:example.com/cb"
+
+fn main() {
+  let _ = cb.Options {
+    Direction: None,
+  }
+}
+"#;
+    let typedef = r#"
+pub type Direction = int
+
+pub struct Options {
+  pub Direction: Option<Direction>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cb", typedef)]);
+}
+
+#[test]
+fn interop_pointer_scalar_param_some() {
+    let input = r#"
+import "go:example.com/cfg"
+
+fn main() {
+  cfg.Configure(Some("custom"))
+}
+"#;
+    let typedef = r#"
+pub fn Configure(name: Option<string>) -> ()
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cfg", typedef)]);
+}
+
+#[test]
+fn interop_pointer_scalar_param_none() {
+    let input = r#"
+import "go:example.com/cfg"
+
+fn main() {
+  cfg.Configure(None)
+}
+"#;
+    let typedef = r#"
+pub fn Configure(name: Option<string>) -> ()
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cfg", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_read_option_string_match() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let bucket = aws.Bucket { .. }
+  match bucket.Name {
+    Some(name) => { let _ = name },
+    None => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Bucket {
+  pub Name: Option<string>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_read_option_int32_let_binding() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let input = aws.ListInput { .. }
+  let n = input.MaxItems
+  let _ = n
+}
+"#;
+    let typedef = r#"
+pub struct ListInput {
+  pub MaxItems: Option<int32>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_read_option_string_in_loop() {
+    let input = r#"
+import "go:example.com/aws"
+import "go:fmt"
+
+fn main() {
+  let buckets: Slice<aws.Bucket> = []
+  for bucket in buckets {
+    match bucket.Name {
+      Some(name) => fmt.Println(name),
+      None => {},
+    }
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Bucket {
+  pub Name: Option<string>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_read_slice_option_string_iter() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let b = aws.Bucket { .. }
+  for tag in b.Tags {
+    match tag {
+      Some(v) => { let _ = v },
+      None => {},
+    }
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Bucket {
+  pub Tags: Slice<Option<string>>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_read_array_option_pointer_index() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let b = aws.Bucket { .. }
+  let slots = b.Slots
+  match slots[0] {
+    Some(v) => { let _ = v },
+    None => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Node {
+  pub Value: int,
+}
+
+pub struct Bucket {
+  pub Slots: Array<Option<Ref<Node>>, 2>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_assign_array_option_pointer() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let n = aws.Node { .. }
+  let mut b = aws.Bucket { .. }
+  b.Slots = [Some(&n), None]
+  let _ = b
+}
+"#;
+    let typedef = r#"
+pub struct Node {
+  pub Value: int,
+}
+
+pub struct Bucket {
+  pub Slots: Array<Option<Ref<Node>>, 2>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_read_map_option_string_index() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let b = aws.Bucket { .. }
+  match b.Annotations["k"] {
+    Some(v) => { let _ = v },
+    None => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Bucket {
+  pub Annotations: Map<string, Option<string>>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_assign_option_string() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let mut b = aws.Bucket { .. }
+  b.Name = Some("hi")
+}
+"#;
+    let typedef = r#"
+pub struct Bucket {
+  pub Name: Option<string>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_struct_field_assign_option_int32() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let mut b = aws.ListInput { .. }
+  b.MaxItems = Some(5)
+  b.MaxItems = None
+}
+"#;
+    let typedef = r#"
+pub struct ListInput {
+  pub MaxItems: Option<int32>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_nullable_field_read_through_go_struct_alias_wraps() {
+    let input = r#"
+import "go:flag"
+
+type MyFlag = flag.Flag
+
+fn main() {
+  let f: MyFlag = flag.Flag { .. }
+  let v = f.Value
+  match v {
+    Some(x) => { let _ = x },
+    None => { let _ = 0 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_nullable_field_assign_through_go_struct_alias_unwraps() {
+    let input = r#"
+import "go:flag"
+
+type MyFlag = flag.Flag
+
+fn main() {
+  let mut f: MyFlag = flag.Flag { .. }
+  f.Value = None
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_nullable_collection_field_read_through_go_struct_alias_wraps() {
+    let input = r#"
+import "go:crypto/x509"
+import "go:net/url"
+
+type Cert = x509.Certificate
+
+fn main() {
+  let u = url.URL {
+    Scheme: "https",
+    Host: "example.com",
+    ..,
+  }
+  let cert: Cert = x509.Certificate {
+    URIs: [Some(&u)],
+    PublicKey: 0,
+    ..,
+  }
+  let urls = cert.URIs
+  let first = urls[0]
+  match first {
+    Some(value) => { let _ = value },
+    None => { let _ = 0 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_nullable_collection_field_assign_through_go_struct_alias_unwraps() {
+    let input = r#"
+import "go:crypto/x509"
+import "go:net/url"
+
+type Cert = x509.Certificate
+
+fn main() {
+  let u = url.URL {
+    Scheme: "https",
+    Host: "example.com",
+    ..,
+  }
+  let mut cert: Cert = x509.Certificate {
+    PublicKey: 0,
+    ..,
+  }
+  let urls: Slice<Option<Ref<url.URL>>> = [Some(&u)]
+  cert.URIs = urls
+  let _ = cert
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_map_alias_value_unwrapped_at_go_struct_literal() {
+    let input = r#"
+import "go:go/ast"
+
+type Objects = mut Map<string, Option<mut Ref<ast.Object>>>
+
+fn main() {
+  let mut obj = ast.Object {
+    Kind: ast.Bad,
+    Name: "x",
+    Decl: None,
+    Data: None,
+    Type: None,
+  }
+  let mut objects: Objects = Map.new<string, Option<mut Ref<ast.Object>>>()
+  objects["present"] = Some(&obj)
+  objects["absent"] = None
+  let scope = ast.Scope {
+    Outer: None,
+    Objects: Some(objects),
+  }
+  let _ = scope
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_slice_alias_value_unwrapped_at_go_struct_literal() {
+    let input = r#"
+import "go:crypto/x509"
+import "go:net/url"
+
+type URLs = Slice<Option<Ref<url.URL>>>
+
+fn main() {
+  let u = url.URL {
+    Scheme: "https",
+    Host: "example.com",
+    ..,
+  }
+  let urls: URLs = [Some(&u), None]
+  let cert = x509.Certificate {
+    URIs: urls,
+    PublicKey: 0,
+    ..,
+  }
+  let _ = cert
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_nested_slice_of_option_unwrapped_at_go_field() {
+    let input = r#"
+import "go:example.com/cli"
+
+fn main() {
+  let f1 = &cli.Flag { Name: "a", .. }
+  let f2 = &cli.Flag { Name: "b", .. }
+  let g = cli.Group {
+    Flags: [[Some(f1), Some(f2)]],
+    ..,
+  }
+  let _ = g
+}
+"#;
+    let typedef = r#"
+pub struct Flag {
+  pub Name: string,
+}
+
+pub struct Group {
+  pub Flags: Slice<Slice<Option<Ref<Flag>>>>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cli", typedef)]);
+}
+
+#[test]
+fn interop_array_of_pointer_options_bridges_go_field_round_trip() {
+    let input = r#"
+import "go:example.com/arrays"
+
+fn main() {
+  let values: Array<Option<int>, 2> = [Some(1), None]
+  let container = arrays.Container { Values: values }
+  let roundtrip = container.Values
+  let _ = roundtrip
+}
+"#;
+    let typedef = r#"
+pub struct Container {
+  pub Values: Array<Option<int>, 2>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/arrays", typedef)]);
+}
+
+#[test]
+fn interop_map_with_pointer_option_keys_bridges_go_field_round_trip() {
+    let input = r#"
+import "go:example.com/maps"
+
+fn main() {
+  let mut values = Map.new<Option<int>, string>()
+  values[Some(1)] = "one"
+  values[None] = "none"
+  let container = maps.Container { Values: values }
+  let roundtrip = container.Values
+  let _ = roundtrip
+}
+"#;
+    let typedef = r#"
+pub struct Container {
+  pub Values: Map<Option<int>, string>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/maps", typedef)]);
+}
+
+#[test]
+fn interop_nested_option_collection_bridges_go_field_round_trip() {
+    let input = r#"
+import "go:example.com/nested"
+
+fn main() {
+  let values: Option<Slice<Option<int>>> = Some([Some(1), None])
+  let container = nested.Container { Values: values }
+  let roundtrip = container.Values
+  let _ = roundtrip
+}
+"#;
+    let typedef = r#"
+pub struct Container {
+  pub Values: Option<Slice<Option<int>>>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/nested", typedef)]);
+}
+
+#[test]
+fn interop_nested_option_collections_bridge_go_returns() {
+    let input = r#"
+import "go:example.com/nested"
+
+fn main() {
+  let values = nested.Values()
+  let maybe_values = nested.MaybeValues()
+  let _ = values
+  let _ = maybe_values
+}
+"#;
+    let typedef = r#"
+pub fn Values() -> Slice<Option<int>>
+pub fn MaybeValues() -> Option<Slice<Option<int>>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/nested", typedef)]);
+}
+
+#[test]
+fn interop_some_stores_result_fn_in_lowered_abi() {
+    let input = r#"
+import ext "go:example.com/ext"
+
+fn configure(conf: Ref<ext.Config>) {
+  let mut wrapped: Slice<Option<fn(ext.Config) -> Result<ext.Listener, error>>> = []
+  for listener in ext.WrapListeners(conf.Listeners) {
+    wrapped = wrapped.append(Some(listener))
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Config {
+  pub Listeners: Slice<fn(Config) -> Result<Listener, error>>,
+}
+
+pub interface Listener {}
+
+pub fn WrapListeners(listeners: Slice<fn(Config) -> Result<Listener, error>>) -> Slice<fn(Config) -> Result<Listener, error>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ext", typedef)]);
+}
+
+#[test]
+fn interop_channel_send_stores_result_fn_in_lowered_abi() {
+    let input = r#"
+import "go:example.com/ext"
+
+fn enqueue(ch: Channel<fn(int) -> Result<string, error>>) {
+  let _ = ch.send(ext.MakeParser())
+}
+"#;
+    let typedef = r#"
+pub fn MakeParser() -> fn(int) -> Result<string, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ext", typedef)]);
+}
+
+#[test]
+fn interop_unwrap_or_stores_result_fn_in_lowered_abi() {
+    let input = r#"
+import "go:example.com/ext"
+
+fn pick(opt: Option<fn(int) -> Result<string, error>>) {
+  let _ = opt.unwrap_or(ext.MakeParser())
+}
+"#;
+    let typedef = r#"
+pub fn MakeParser() -> fn(int) -> Result<string, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ext", typedef)]);
+}
+
+#[test]
+fn interop_slice_map_keeps_result_callback_tagged() {
+    let input = r#"
+import "go:example.com/ext"
+
+fn convert_all(xs: Slice<int>) {
+  let _ = xs.map(ext.Parse)
+}
+"#;
+    let typedef = r#"
+pub fn Parse(x: int) -> Result<string, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ext", typedef)]);
+}
+
+#[test]
+fn interop_aliased_native_receiver_wraps_result_callback() {
+    let input = r#"
+import "go:example.com/ext"
+
+type Ints = Slice<int>
+
+fn convert_all(xs: Ints) {
+  let _ = xs.map(ext.Parse)
+}
+"#;
+    let typedef = r#"
+pub fn Parse(x: int) -> Result<string, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ext", typedef)]);
+}
+
+#[test]
+fn interop_aliased_option_receiver_wraps_callback() {
+    let input = r#"
+import "go:example.com/ext"
+
+type MyOpt = Option<int>
+
+fn use_it(o: MyOpt) {
+  let _ = o.and_then(ext.Lookup)
+}
+"#;
+    let typedef = r#"
+pub fn Lookup(x: int) -> Option<string>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ext", typedef)]);
+}
+
+#[test]
+fn interop_collapsed_type_param_call_omits_turbofish() {
+    let input = r#"
+import "go:slices"
+import "go:fmt"
+
+fn main() {
+  let buffer = slices.Repeat([0 as byte], 1024)
+  let cloned = slices.Clone([1 as int32, 2])
+  let pinned = slices.Repeat<byte>([1], 4)
+  let largest = slices.Max([3 as byte, 1, 2])
+  fmt.Println(buffer.length(), cloned.length(), pinned.length(), largest)
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[]);
+}
+
+#[test]
+fn interop_collapsed_type_param_reconstructs_when_uninferrable() {
+    let input = r#"
+import "go:slices"
+import "go:fmt"
+
+fn apply(f: fn(Slice<byte>) -> Slice<byte>, xs: Slice<byte>) -> Slice<byte> {
+  f(xs)
+}
+
+fn main() {
+  let empty = slices.Concat<byte>()
+  let value: fn(Slice<byte>) -> Slice<byte> = slices.Clone
+  let out = apply(slices.Clone, empty)
+  fmt.Println(empty.length(), value(empty).length(), out.length())
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[]);
+}
+
+#[test]
+fn interop_collapsed_empty_varargs_reconstructs_type_arg() {
+    let input = r#"
+import "go:example.com/cat"
+
+fn main() {
+  let r: Slice<int> = cat.Cat(1)
+}
+"#;
+    let typedef = r#"
+#[go(collapsed_type_params, "T")]
+pub fn Cat<T>(n: int, xs: VarArgs<T>) -> Slice<T>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cat", typedef)]);
+}
+
+#[test]
+fn interop_collapsed_type_param_reconstructs_return_only_param() {
+    let input = r#"
+import "go:example.com/pick"
+import "go:fmt"
+
+fn main() {
+  let out = pick.Pick<byte, string>([1])
+  fmt.Println(out)
+}
+"#;
+    let typedef = r#"
+#[go(collapsed_type_params, "Slice<E>, E, R")]
+pub fn Pick<E, R>(s: Slice<E>) -> R
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/pick", typedef)]);
+}
+
+#[test]
+fn interop_collapsed_array_constraint_call_omits_turbofish() {
+    let input = r#"
+import "go:example.com/arr"
+import "go:fmt"
+
+fn main() {
+  let out = arr.Echo4([1, 2, 3, 4])
+  fmt.Println(out.length())
+}
+"#;
+    let typedef = r#"
+#[go(collapsed_type_params, "Array<E, 4>, E")]
+pub fn Echo4<E>(x: Array<E, 4>) -> Array<E, 4>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/arr", typedef)]);
+}
+
+#[test]
+fn interop_collapsed_array_constraint_reconstructs_when_uninferrable() {
+    let input = r#"
+import "go:example.com/arr"
+
+fn main() {
+  let out = arr.Make4<int>()
+  let _ = out
+}
+"#;
+    let typedef = r#"
+#[go(collapsed_type_params, "Array<E, 4>, E")]
+pub fn Make4<E>() -> Array<E, 4>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/arr", typedef)]);
+}
+
+#[test]
+fn interop_array_return() {
+    let input = r#"
+import "go:crypto/sha256"
+
+fn main() {
+  let data = "hi" as Slice<byte>
+  let hash = sha256.Sum256(data)
+  let _ = hash
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_array_return_to_slice() {
+    let input = r#"
+import "go:crypto/sha256"
+
+fn main() {
+  let data = "hi" as Slice<byte>
+  let bytes = sha256.Sum256(data).to_slice()
+  let _ = bytes
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+#[test]
+fn interop_fn_arg_slice_option_string() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Use([Some("hi"), None])
+}
+"#;
+    let typedef = r#"
+pub fn Use(xs: Slice<Option<string>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_arg_map_option_string() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let mut xs = Map.new<string, Option<string>>()
+  xs["k"] = Some("hi")
+  xs["gone"] = None
+  aws.Use(xs)
+}
+"#;
+    let typedef = r#"
+pub fn Use(xs: Map<string, Option<string>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_arg_variadic_option_pointer() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let n = aws.Node { .. }
+  aws.Use(Some(&n), None)
+}
+"#;
+    let typedef = r#"
+pub struct Node {
+  pub Value: int,
+}
+
+pub fn Use(xs: VarArgs<Option<Ref<Node>>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_arg_spread_variadic_option_pointer() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let n = aws.Node { .. }
+  let xs = [Some(&n), None]
+  aws.Use(xs...)
+}
+"#;
+    let typedef = r#"
+pub struct Node {
+  pub Value: int,
+}
+
+pub fn Use(xs: VarArgs<Option<Ref<Node>>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_return_slice_option_string() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  for x in aws.Make() {
+    match x {
+      Some(v) => { let _ = v },
+      None => {},
+    }
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<string>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_value_slice_option_return() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  let f = aws.Make
+  for x in f() {
+    match x {
+      Some(v) => fmt.Println(v),
+      None => fmt.Println("none"),
+    }
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<string>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_value_result_slice_option_return() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  let f = aws.Make
+  match f() {
+    Ok(xs) => {
+      for x in xs {
+        match x {
+          Some(v) => fmt.Println(v),
+          None => fmt.Println("none"),
+        }
+      }
+    },
+    Err(e) => { let _ = e },
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Result<Slice<Option<string>>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_result_slice_option_return() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  match aws.Make() {
+    Ok(xs) => {
+      for x in xs {
+        match x {
+          Some(v) => fmt.Println(v),
+          None => fmt.Println("none"),
+        }
+      }
+    },
+    Err(e) => { let _ = e },
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Result<Slice<Option<string>>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_propagate_slice_option_return() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn run() -> Result<(), error> {
+  let xs = aws.Make()?
+  for x in xs {
+    match x {
+      Some(v) => fmt.Println(v),
+      None => fmt.Println("none"),
+    }
+  }
+  Ok(())
+}
+
+fn main() {
+  let _ = run()
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Result<Slice<Option<string>>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_comma_ok_slice_option_return() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  match aws.Fetch() {
+    Some(xs) => {
+      for x in xs {
+        match x {
+          Some(v) => fmt.Println(v),
+          None => fmt.Println("none"),
+        }
+      }
+    },
+    None => fmt.Println("missing"),
+  }
+}
+"#;
+    let typedef = r#"
+#[go(comma_ok)]
+pub fn Fetch() -> Option<Slice<Option<string>>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_tuple_slice_option_slot() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  let (xs, n) = aws.Make()
+  fmt.Println(n)
+  for x in xs {
+    match x {
+      Some(v) => fmt.Println(v),
+      None => fmt.Println("none"),
+    }
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> (Slice<Option<string>>, int)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_value_result_let_call() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  let f = aws.Make
+  let r = f()
+  match r {
+    Ok(xs) => {
+      for x in xs {
+        match x {
+          Some(v) => fmt.Println(v),
+          None => fmt.Println("none"),
+        }
+      }
+    },
+    Err(e) => { let _ = e },
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Result<Slice<Option<string>>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_value_partial_slice_option() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  let f = aws.Read
+  match f() {
+    Ok(xs) => fmt.Println("ok", Slice.length(xs)),
+    Both(xs, e) => fmt.Println("both", Slice.length(xs), e),
+    Err(e) => fmt.Println("err", e),
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Read() -> Partial<Slice<Option<string>>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn fused_selective_partial_err_checks_nilable_value() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/aws"
+
+fn main() {
+  match aws.Read() {
+    Partial.Err(e) => fmt.Println("err", e),
+    _ => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Read() -> Partial<Slice<byte>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn selective_partial_err_sentinel_falls_back_to_tagged_match() {
+    let input = r#"
+import "go:example.com/aws"
+import "go:io"
+
+fn main() {
+  match aws.Read() {
+    Partial.Err(io.EOF) => panic("empty"),
+    _ => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Read() -> Partial<Slice<byte>, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn selective_partial_empty_interface_arms_do_not_import_prelude() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  if let Partial.Err(_) = aws.Read() {}
+}
+"#;
+    let typedef = r#"
+pub interface Item {}
+pub fn Read() -> Partial<Item, error>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_lisette_result_slice_option_let() {
+    let input = r#"
+import "go:fmt"
+
+fn make() -> Result<Slice<Option<string>>, error> {
+  Ok([Some("hi"), None])
+}
+
+fn main() {
+  let r = make()
+  match r {
+    Ok(xs) => {
+      for x in xs {
+        match x {
+          Some(v) => fmt.Println(v),
+          None => fmt.Println("none"),
+        }
+      }
+    },
+    Err(e) => { let _ = e },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_go_fn_into_go_callback_param() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Use(aws.Make)
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<string>>
+
+pub fn Use(f: fn() -> Slice<Option<string>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_go_fn_into_go_callback_param_result() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Use(aws.Make)
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Result<Slice<Option<string>>, error>
+
+pub fn Use(f: fn() -> Result<Slice<Option<string>>, error>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_lisette_fn_into_go_callback_param() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn make_it() -> Slice<Option<string>> {
+  [Some("hi"), None]
+}
+
+fn main() {
+  aws.Use(make_it)
+}
+"#;
+    let typedef = r#"
+pub fn Use(f: fn() -> Slice<Option<string>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_go_fn_into_lisette_fn_param() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn apply(f: fn() -> Slice<Option<string>>) -> Slice<Option<string>> {
+  f()
+}
+
+fn main() {
+  let xs = apply(aws.Make)
+  for x in xs {
+    match x {
+      Some(v) => { let _ = v },
+      None => {},
+    }
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<string>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_go_return_into_go_param() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Use(aws.Make())
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<int>>
+
+pub fn Use(xs: Slice<Option<int>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_go_return_spread_into_go_variadic() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Use(aws.Make()...)
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<int>>
+
+pub fn Use(xs: VarArgs<Option<int>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_fn_value_tuple_nested_option_slot() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn apply(f: fn() -> (Option<Slice<Option<string>>>, int)) -> (Option<Slice<Option<string>>>, int) {
+  f()
+}
+
+fn main() {
+  let (xs, n) = apply(aws.Make)
+  let _ = n
+  match xs {
+    Some(inner) => { for x in inner { let _ = x } },
+    None => {},
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> (Option<Slice<Option<string>>>, int)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_discarded_collection_return() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Make()
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Slice<Option<string>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_lisette_tuple_nested_option_slot() {
+    let input = r#"
+fn make() -> (Option<Slice<Option<string>>>, int) {
+  (Some([Some("hi"), None]), 7)
+}
+
+fn main() {
+  let t = make()
+  let (xs, n) = t
+  let _ = n
+  match xs {
+    Some(inner) => { for x in inner { let _ = x } },
+    None => {},
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_lisette_nested_option_return() {
+    let input = r#"
+fn make() -> Option<Slice<Option<string>>> {
+  Some([Some("hi"), None])
+}
+
+fn use_it(o: Option<Slice<Option<string>>>) {
+  match o {
+    Some(inner) => { for x in inner { let _ = x } },
+    None => {},
+  }
+}
+
+fn main() {
+  use_it(make())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_fn_arg_nested_option_slice() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  aws.Use(Some([Some("hi"), None]))
+  aws.Use(None)
+}
+"#;
+    let typedef = r#"
+pub fn Use(x: Option<Slice<Option<string>>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_ref_slice_option_return_and_arg() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  let xs = aws.Make()
+  aws.Use(xs)
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Ref<Slice<Option<string>>>
+
+pub fn Use(x: Ref<Slice<Option<string>>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_option_ref_slice_option() {
+    let input = r#"
+import "go:example.com/aws"
+
+fn main() {
+  match aws.Make() {
+    Some(xs) => aws.Use(Some(xs)),
+    None => aws.Use(None),
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Make() -> Option<Ref<Slice<Option<string>>>>
+
+pub fn Use(x: Option<Ref<Slice<Option<string>>>>)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/aws", typedef)]);
+}
+
+#[test]
+fn interop_generic_go_method_no_type_args() {
+    let input = r#"
+import "go:example.com/ttl"
+
+fn main() {
+  let cache = ttl.New<string, int>()
+  let _ = cache.Get("key")
+  cache.Set("key", 1, ttl.DefaultTTL)
+}
+"#;
+    let typedef = r#"
+pub type Duration = int64
+
+pub const DefaultTTL: Duration = 0
+
+pub type Cache<K: Comparable, V>
+
+pub fn New<K: Comparable, V>() -> Ref<Cache<K, V>>
+
+impl<K: Comparable, V> Cache<K, V> {
+  fn Get(self: Ref<Cache<K, V>>, key: K) -> V
+  fn Set(self: Ref<Cache<K, V>>, key: K, value: V, ttl: Duration)
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/ttl", typedef)]);
+}
+
+#[test]
+fn interop_nilable_map_return() {
+    let input = r#"
+import "go:example.com/reg"
+
+fn main() {
+  match reg.Registry(true) {
+    Some(m) => { let _ = m.length() },
+    None => { let _ = 0 },
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Registry(enabled: bool) -> Option<Map<string, int>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/reg", typedef)]);
+}
+
+#[test]
+fn interop_nilable_channel_return() {
+    let input = r#"
+import "go:example.com/reg"
+
+fn main() {
+  match reg.Events() {
+    Some(ch) => { let _ = ch.receive() },
+    None => { let _ = 0 },
+  }
+}
+"#;
+    let typedef = r#"
+pub fn Events() -> Option<Channel<int>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/reg", typedef)]);
+}
+
+#[test]
+fn interop_comma_ok_map_return_keeps_bool() {
+    let input = r#"
+import "go:example.com/reg"
+
+fn main() {
+  match reg.Lookup("a") {
+    Some(m) => { let _ = m.length() },
+    None => { let _ = 0 },
+  }
+}
+"#;
+    let typedef = r#"
+#[go(comma_ok)]
+pub fn Lookup(key: string) -> Option<Map<string, int>>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/reg", typedef)]);
+}
+
+#[test]
+fn interop_nilable_return_through_chained_newtypes() {
+    let input = r#"
+import "go:example.com/reg"
+
+fn main() {
+  match reg.Lookup() {
+    Some(idx) => { let _ = idx },
+    None => { let _ = 0 },
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Table(Map<string, int>)
+
+pub struct Index(Table)
+
+pub fn Lookup() -> Option<Index>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/reg", typedef)]);
+}
+
+#[test]
+fn interop_promoted_nullable_field_wraps_option() {
+    let input = r#"
+import "go:errors"
+import "go:example.com/promoted"
+
+fn handler(client: Ref<promoted.Client>) -> Result<promoted.Handler, error> {
+  client.Handler.ok_or_else(|| errors.New("handler is unavailable"))
+}
+
+fn group(client: Ref<promoted.Client>) -> Result<Ref<promoted.Group>, error> {
+  client.Group.ok_or_else(|| errors.New("group is unavailable"))
+}
+"#;
+    let typedef = r#"
+pub type Handler = fn()
+
+pub struct Group {}
+
+pub struct API {
+  pub Handler: Option<Handler>,
+  pub Group: Option<Ref<Group>>,
+}
+
+pub struct Client {
+  embed mut Ref<API>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/promoted", typedef)]);
+}
+
+#[test]
+fn interop_twice_promoted_nullable_field_wraps_option() {
+    let input = r#"
+import "go:errors"
+import "go:example.com/promoted"
+
+fn group(client: Ref<promoted.Client>) -> Result<Ref<promoted.Group>, error> {
+  client.Group.ok_or_else(|| errors.New("group is unavailable"))
+}
+"#;
+    let typedef = r#"
+pub struct Group {}
+
+pub struct API {
+  pub Group: Option<Ref<Group>>,
+}
+
+pub struct Base {
+  embed mut Ref<API>,
+}
+
+pub struct Client {
+  embed mut Base,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/promoted", typedef)]);
+}
+
+#[test]
+fn interop_promoted_nullable_field_write_unwraps_option() {
+    let input = r#"
+import "go:example.com/promoted"
+
+fn clear(client: mut Ref<promoted.Client>) {
+  client.Group = None
+}
+"#;
+    let typedef = r#"
+pub struct Group {}
+
+pub struct API {
+  pub Group: Option<mut Ref<Group>>,
+}
+
+pub struct Client {
+  embed mut Ref<API>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/promoted", typedef)]);
+}
+
+#[test]
+fn interop_promoted_nullable_field_round_trip() {
+    let input = r#"
+import "go:errors"
+import "go:fmt"
+import "go:text/template"
+import "go:text/template/parse"
+
+fn root(t: mut Ref<template.Template>) -> Result<mut Ref<parse.ListNode>, error> {
+  t.Root.ok_or_else(|| errors.New("root is unavailable"))
+}
+
+fn main() {
+  let mut t = template.New("greeting")
+  match t.Parse("hello {{.}}") {
+    Ok(parsed) => {
+      match root(parsed) {
+        Ok(_) => fmt.Println("root is available"),
+        Err(e) => fmt.Println("error", e),
+      }
+      parsed.Root = None
+      match root(parsed) {
+        Ok(_) => fmt.Println("root is available"),
+        Err(e) => fmt.Println("error", e),
+      }
+    },
+    Err(e) => fmt.Println("parse failed", e),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn interop_promoted_nullable_field_shadowed_by_direct_field() {
+    let input = r#"
+import "go:example.com/promoted"
+
+fn group(client: Ref<promoted.Client>) -> promoted.Group {
+  client.Group
+}
+"#;
+    let typedef = r#"
+pub struct Group {}
+
+pub struct API {
+  pub Group: Option<Ref<Group>>,
+}
+
+pub struct Client {
+  embed mut Ref<API>,
+  pub Group: Group,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/promoted", typedef)]);
+}
+
+#[test]
+fn interop_promoted_nullable_field_shadowed_by_method() {
+    let input = r#"
+import "go:example.com/promoted"
+
+fn group(client: Ref<promoted.Client>) -> Option<Ref<promoted.Group>> {
+  client.Group()
+}
+"#;
+    let typedef = r#"
+pub struct Group {}
+
+pub struct API {
+  pub Group: Option<Ref<Group>>,
+}
+
+pub struct Client {
+  embed mut Ref<API>,
+}
+
+impl Client {
+  fn Group(self: Ref<Client>) -> Option<Ref<Group>>
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/promoted", typedef)]);
 }

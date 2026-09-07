@@ -1,0 +1,366 @@
+use std::sync::Arc;
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use diagnostics::LisetteDiagnostic;
+use syntax::FileParseStatus;
+use syntax::ast::BindingId;
+use syntax::program::{EmitInput, MutationInfo, UnusedInfo, is_internal_package_id};
+
+use semantics::AnalyzeInput;
+use semantics::cache::{EmitStamp, save_package_cache};
+use semantics::facts::{BindingFact, Usage};
+use semantics::store::{ENTRY_FILE_ID, ENTRY_PACKAGE_ID};
+use semantics::{InferenceOutput, PARALLEL_THRESHOLD, run_inference};
+
+use crate::passes;
+use semantics::cache::CompiledPackage;
+use std::mem;
+use syntax::types;
+
+pub struct Analysis {
+    pub emit_input: EmitInput,
+    pub emit_stamps: Vec<EmitStamp>,
+    pub unreachable_packages: Vec<String>,
+    bindings: HashMap<BindingId, BindingFact>,
+    usages: HashSet<Usage>,
+    errors: Vec<LisetteDiagnostic>,
+    lints: Vec<LisetteDiagnostic>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Diagnostics<'a> {
+    errors: &'a [LisetteDiagnostic],
+    lints: &'a [LisetteDiagnostic],
+}
+
+impl<'a> Diagnostics<'a> {
+    pub fn iter(self) -> impl Iterator<Item = &'a LisetteDiagnostic> {
+        self.errors.iter().chain(self.lints)
+    }
+}
+
+impl Analysis {
+    pub fn diagnostics(&self) -> Diagnostics<'_> {
+        Diagnostics {
+            errors: &self.errors,
+            lints: &self.lints,
+        }
+    }
+
+    pub fn bindings(&self) -> &HashMap<BindingId, BindingFact> {
+        &self.bindings
+    }
+
+    pub fn usages(&self) -> &HashSet<Usage> {
+        &self.usages
+    }
+
+    pub fn errors(&self) -> &[LisetteDiagnostic] {
+        &self.errors
+    }
+
+    pub fn lints(&self) -> &[LisetteDiagnostic] {
+        &self.lints
+    }
+
+    pub fn push_error(&mut self, error: LisetteDiagnostic) {
+        assert!(error.is_error());
+        self.errors.push(error);
+    }
+
+    pub fn take_diagnostics(&mut self) -> Vec<LisetteDiagnostic> {
+        let mut diagnostics = mem::take(&mut self.errors);
+        diagnostics.append(&mut self.lints);
+        diagnostics
+    }
+
+    pub fn failed(&self) -> bool {
+        !self.errors().is_empty()
+    }
+
+    pub fn has_parse_errors(&self) -> bool {
+        self.parse_status(ENTRY_FILE_ID) != FileParseStatus::Clean
+    }
+
+    pub fn parse_status(&self, file_id: u32) -> FileParseStatus {
+        self.emit_input
+            .files
+            .get(&file_id)
+            .map(|file| file.parse_status)
+            .unwrap_or_default()
+    }
+
+    pub fn entry_parse_failed(&self) -> bool {
+        self.parse_status(ENTRY_FILE_ID) == FileParseStatus::Failed
+    }
+}
+
+pub fn analyze(input: AnalyzeInput) -> Analysis {
+    let target = input.locator.target();
+    let unused_item_reporting = if input.compile_phase.includes_tests() {
+        passes::UnusedItemReporting::Report
+    } else {
+        passes::UnusedItemReporting::Suppress
+    };
+    let InferenceOutput {
+        store,
+        facts,
+        sink,
+        has_pre_check_errors,
+        compiled_packages,
+        cached_packages,
+        cache_root,
+        unreachable_packages,
+        entry_parse_errors,
+    } = run_inference(input);
+    let entry_parse_status = store
+        .get_file(ENTRY_FILE_ID)
+        .map(|file| file.parse_status)
+        .unwrap_or_default();
+    let lint_mode = if entry_parse_status == FileParseStatus::Clean {
+        passes::LintMode::Run
+    } else {
+        passes::LintMode::Skip
+    };
+
+    let unused = if has_pre_check_errors {
+        UnusedInfo::default()
+    } else {
+        passes::run(&store, &facts, &sink, lint_mode, unused_item_reporting)
+    };
+    let mut mutations = MutationInfo::default();
+    for (&binding_id, b) in facts.bindings.iter() {
+        if let Some(mutation) = b.mutation {
+            mutations.record(binding_id, mutation);
+        }
+    }
+    let bindings = facts.bindings;
+    let usages = facts.usages;
+
+    // Canonicalize diagnostic order so the output is stable regardless of
+    // phase ordering, FxHashMap iteration, or parallel inference scheduling.
+    let mut all_diagnostics = sink.into_diagnostics();
+    all_diagnostics.sort_by(LisetteDiagnostic::sort_key);
+    all_diagnostics.splice(0..0, entry_parse_errors.into_iter().map(Into::into));
+
+    let has_permission_errors = all_diagnostics.iter().any(|diagnostic| {
+        diagnostic.is_error()
+            && matches!(
+                diagnostic.code_str(),
+                Some(
+                    "infer.write_through_read_only"
+                        | "infer.needs_writable"
+                        | "infer.immutable"
+                        | "infer.value_receiver_immutable"
+                        | "infer.aliased_writable_argument"
+                )
+            )
+    });
+    if has_permission_errors {
+        all_diagnostics.retain(|diagnostic| diagnostic.code_str() != Some("lint.unnecessary_mut"));
+    }
+
+    let emit_stamps: Vec<EmitStamp> = compiled_packages
+        .iter()
+        .map(|c| EmitStamp {
+            package_id: c.package_id.clone(),
+            artifact_hash: c.artifact_hash,
+        })
+        .collect();
+
+    if let Some(ref project_root) = cache_root {
+        let has_errors = all_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.is_error());
+        if !has_errors {
+            let save = |compiled: &CompiledPackage| {
+                let file_ids: HashSet<u32> = store
+                    .get_package(&compiled.package_id)
+                    .map(|m| m.file_ids().collect())
+                    .unwrap_or_default();
+
+                let has_package_lints = all_diagnostics.iter().any(|diagnostic| {
+                    !diagnostic.is_error()
+                        && diagnostic
+                            .file_id()
+                            .map(|fid| file_ids.contains(&fid))
+                            .unwrap_or(true)
+                });
+                if !has_package_lints
+                    && let Err(e) = save_package_cache(compiled, &store, project_root, target)
+                {
+                    eprintln!(
+                        "warning: failed to write cache for {}: {e}",
+                        compiled.package_id
+                    );
+                }
+            };
+            if compiled_packages.len() < PARALLEL_THRESHOLD {
+                compiled_packages.iter().for_each(save);
+            } else {
+                use rayon::prelude::*;
+                compiled_packages.par_iter().for_each(save);
+            }
+        }
+    }
+
+    let mut files = HashMap::default();
+    let mut definitions = HashMap::default();
+
+    let go_package_ids: HashSet<String> = store
+        .packages
+        .keys()
+        .filter(|id| id.starts_with(types::GO_IMPORT_PREFIX))
+        .cloned()
+        .collect();
+
+    for (_, package) in store.packages {
+        // Worker views are gone by now, so this unwraps without cloning.
+        let package = Arc::try_unwrap(package).unwrap_or_else(|shared| (*shared).clone());
+        let is_internal = is_internal_package_id(&package.id);
+        definitions.extend(package.definitions);
+
+        // Internal typedef files remain available so the LSP can map their IDs
+        // to URIs for go-to-definition. Source files identify their own package.
+        if is_internal {
+            files.extend(
+                package
+                    .files
+                    .into_iter()
+                    .filter(|(_, file)| file.is_d_lis()),
+            );
+            continue;
+        }
+
+        files.extend(package.files);
+    }
+
+    let (errors, lints) = classify_diagnostics(all_diagnostics);
+    Analysis {
+        emit_input: EmitInput {
+            files,
+            definitions,
+            entry_package_id: ENTRY_PACKAGE_ID.to_string(),
+            unused,
+            mutations,
+            cached_packages,
+            equality_index: store.equality_index,
+            test_index: store.test_index,
+            go_package_names: store.go_package_names,
+            go_package_ids,
+        },
+        emit_stamps,
+        unreachable_packages,
+        bindings,
+        usages,
+        errors,
+        lints,
+    }
+}
+
+fn classify_diagnostics(
+    diagnostics: Vec<LisetteDiagnostic>,
+) -> (Vec<LisetteDiagnostic>, Vec<LisetteDiagnostic>) {
+    diagnostics
+        .into_iter()
+        .partition(LisetteDiagnostic::is_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use semantics::loader::MemoryLoader;
+    use semantics::{AnalysisScope, CompilePhase, EntryFile, ProjectKind};
+
+    #[test]
+    fn analysis_classifies_diagnostics_by_severity() {
+        let (errors, lints) = classify_diagnostics(vec![
+            LisetteDiagnostic::warn("warning"),
+            LisetteDiagnostic::error("error"),
+            LisetteDiagnostic::info("info"),
+        ]);
+
+        let messages = errors
+            .iter()
+            .chain(&lints)
+            .map(LisetteDiagnostic::plain_message)
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["error", "warning", "info"]);
+    }
+
+    #[test]
+    fn analysis_retains_navigation_links() {
+        let source = "fn main() {\n  let value = 1\n  let _ = value\n}\n";
+        let mut loader = MemoryLoader::new();
+        loader.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+        let locator = Default::default();
+
+        let analysis = analyze(AnalyzeInput {
+            load_siblings: false,
+            scope: AnalysisScope::Script {
+                inside_project: false,
+            },
+            loader: &loader,
+            entry: Some(EntryFile::new(
+                source.to_string(),
+                "main.lis".to_string(),
+                "main.lis".to_string(),
+            )),
+            compile_phase: CompilePhase::Check,
+            project_kind: ProjectKind::Binary,
+            locator: &locator,
+            go_module: "",
+            disable_cache: true,
+            recover_target: semantics::RecoverTarget::None,
+        });
+
+        let value_span = analysis
+            .bindings()
+            .values()
+            .find(|binding| binding.name == "value")
+            .map(|binding| binding.span)
+            .expect("value binding should be retained");
+        assert!(
+            analysis
+                .usages()
+                .iter()
+                .any(|usage| usage.definition_span == value_span),
+            "value usage should link back to its retained binding"
+        );
+    }
+
+    #[test]
+    fn analysis_derives_recovered_entry_status_from_the_file() {
+        let source = "fn valid() {}\nfn broken(";
+        let loader = MemoryLoader::new();
+        let locator = Default::default();
+
+        let analysis = analyze(AnalyzeInput {
+            load_siblings: false,
+            scope: AnalysisScope::Script {
+                inside_project: false,
+            },
+            loader: &loader,
+            entry: Some(EntryFile::recovering(
+                source.to_string(),
+                "main.lis".to_string(),
+                "main.lis".to_string(),
+            )),
+            compile_phase: CompilePhase::Check,
+            project_kind: ProjectKind::Binary,
+            locator: &locator,
+            go_module: "",
+            disable_cache: true,
+            recover_target: semantics::RecoverTarget::None,
+        });
+
+        assert_eq!(
+            analysis.parse_status(ENTRY_FILE_ID),
+            FileParseStatus::Recovered
+        );
+        assert!(analysis.has_parse_errors());
+        assert!(!analysis.entry_parse_failed());
+    }
+}

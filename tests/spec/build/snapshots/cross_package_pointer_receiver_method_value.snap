@@ -1,0 +1,26 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === lib/lib.go ===
+package lib
+
+type Counter struct {
+	Count int
+}
+
+func (c *Counter) Increment() {
+	c.Count++
+}
+
+
+// === main.go ===
+package main
+
+import "github.com/user/myproject/lib"
+
+func main() {
+	c := lib.Counter{Count: 0}
+	f := (*lib.Counter).Increment
+	f(&c)
+	_ = c.Count
+}

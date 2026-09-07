@@ -1,0 +1,14 @@
+---
+source: tests/spec/format/mod.rs
+description: |-
+  struct Outer {
+    embed Base,
+    embed Ref<Other>,
+    extra: int,
+  }
+---
+struct Outer {
+  embed Base,
+  embed Ref<Other>,
+  extra: int,
+}

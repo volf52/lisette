@@ -1,6 +1,6 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: \"hello!@#$%^&*()_+{}|:<>?~`-=[]\\;',./\""
+description: "\"hello!@#$%^&*()_+{}|:<>?~`-=[]\\;',./\""
 ---
 LexResult {
     tokens: [
@@ -31,15 +31,11 @@ LexResult {
                 ),
             ],
             help: Some(
-                "Valid escapes are `\\a`, `\\b`, `\\f`, `\\n`, `\\r`, `\\t`, `\\v`, `\\\\`, `\\'`, `\\xHH` (hex), `\\ooo` (octal), and `\\u{HEX}` (unicode)",
+                "Valid escapes are `\\a`, `\\b`, `\\f`, `\\n`, `\\r`, `\\t`, `\\v`, `\\\\`, `\\\"`, `\\xHH` (hex), `\\ooo` (octal), and `\\u{HEX}` or `\\UHHHHHHHH` (unicode)",
             ),
             note: None,
             code: "lex.invalid_escape_sequence",
         },
     ],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

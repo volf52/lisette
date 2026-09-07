@@ -1,18 +1,24 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nstruct Point { x: int, y: int }\n\nimpl Point {\n  fn new(x: int, y: int) -> Point {\n    Point { x: x, y: y }\n  }\n\n  fn get_x(self: Point) -> int {\n    self.x\n  }\n}\n"
+description: |
+  
+  struct Point { x: int, y: int }
+  
+  impl Point {
+    fn new(x: int, y: int) -> Point {
+      Point { x: x, y: y }
+    }
+  
+    fn get_x(self: Point) -> int {
+      self.x
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 type Point struct {
 	x int
 	y int
-}
-
-func (p Point) String() string {
-	return fmt.Sprintf("Point { x: %v, y: %v }", p.x, p.y)
 }
 
 func Point_new(x, y int) Point {
@@ -22,6 +28,6 @@ func Point_new(x, y int) Point {
 	}
 }
 
-func (p Point) get_x() int {
+func (p Point) getX() int {
 	return p.x
 }

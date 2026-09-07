@@ -1,0 +1,41 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:fmt"
+  import "go:example.com/migrate"
+  
+  fn main() {
+    let (src, db) = migrate.Close()
+    match src {
+      Some(e) => fmt.Println("source:", e),
+      None => {},
+    }
+    match db {
+      Some(e) => fmt.Println("db:", e),
+      None => {},
+    }
+  }
+---
+package main
+
+import (
+	"example.com/migrate"
+	"fmt"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func main() {
+	ret_1, ret_2 := migrate.Close()
+	option_3 := lisette.OptionFromNilable[error](ret_1, lisette.IsNilInterface(ret_1))
+	option_4 := lisette.OptionFromNilable[error](ret_2, lisette.IsNilInterface(ret_2))
+	tup_5 := lisette.MakeTuple2(option_3, option_4)
+	src := tup_5.First
+	db := tup_5.Second
+	if src.Tag == lisette.OptionSome {
+		fmt.Println("source:", src.SomeVal)
+	}
+	if db.Tag == lisette.OptionSome {
+		fmt.Println("db:", db.SomeVal)
+	}
+}

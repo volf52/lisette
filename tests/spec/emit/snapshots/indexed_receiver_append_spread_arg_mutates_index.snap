@@ -1,0 +1,30 @@
+---
+source: tests/spec/emit/expressions.rs
+description: |
+  
+  fn bump_and_make(i: mut Ref<int>) -> Slice<int> {
+    i.* = 1
+    [99]
+  }
+  
+  fn test() -> int {
+    let xss = [[10], [20]]
+    let mut i = 0
+    let ys = xss[i].append(bump_and_make(&i)...)
+    ys[0]
+  }
+---
+package main
+
+func bumpAndMake(i *int) []int {
+	*i = 1
+	return []int{99}
+}
+
+func test() int {
+	xss := [][]int{{10}, {20}}
+	i := 0
+	recv_1 := xss[i]
+	ys := append(recv_1[:len(recv_1):len(recv_1)], bumpAndMake(&i)...)
+	return ys[0]
+}

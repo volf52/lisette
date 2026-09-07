@@ -1,10 +1,18 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum E {\n  Tag { x: int },\n  Other { x: int },\n}\n\nfn main() {\n  let e = E.Tag { x: 1 }\n  let _ = e\n}\n"
+description: |
+  
+  enum E {
+    Tag { x: int },
+    Other { x: int },
+  }
+  
+  fn main() {
+    let e = E.Tag { x: 1 }
+    let _ = e
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeETag(arg0 int) E {
 	return E{Tag: ETag_, X: arg0}
@@ -14,7 +22,7 @@ func MakeEOther(arg0 int) E {
 	return E{Tag: EOther, X: arg0}
 }
 
-type ETag int
+type ETag uint8
 
 const (
 	ETag_ ETag = iota
@@ -24,17 +32,6 @@ const (
 type E struct {
 	Tag ETag
 	X   int
-}
-
-func (e E) String() string {
-	switch e.Tag {
-	case ETag_:
-		return fmt.Sprintf("E.Tag { x: %v }", e.X)
-	case EOther:
-		return fmt.Sprintf("E.Other { x: %v }", e.X)
-	default:
-		return fmt.Sprintf("E(%d)", e.Tag)
-	}
 }
 
 func main() {

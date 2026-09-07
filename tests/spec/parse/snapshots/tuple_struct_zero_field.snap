@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Marker()\n"
+description: |
+  
+  struct Marker()
 ---
 [
     Struct {
@@ -13,8 +15,9 @@ description: "input: \nstruct Marker()\n"
             byte_length: 6,
         },
         generics: [],
-        fields: [],
-        kind: Tuple,
+        fields: Tuple(
+            [],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,

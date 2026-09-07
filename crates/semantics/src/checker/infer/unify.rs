@@ -1,36 +1,151 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use Type::{Constructor, Function, Variable};
+use crate::checker::EnvResolve;
+use Type::{Function, Nominal};
 use diagnostics::LisetteDiagnostic;
 use syntax::ast::Span;
-use syntax::types::{Bound, Type, TypeVariableState};
+use syntax::types::{Bound, CompoundKind, Type};
 
-use super::super::Checker;
+use crate::checker::infer::InferCtx;
+use crate::checker::infer::context::{Expectation, ExpectationRole};
+use syntax::types::FunctionParameter;
+use syntax::types::SimpleKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinBound {
+    Ordered,
+    Comparable,
+}
+
+impl BuiltinBound {
+    pub(crate) fn from_qualified_id(qualified: &str) -> Option<Self> {
+        match qualified {
+            "go:cmp.Ordered" | "prelude.Ordered" => Some(Self::Ordered),
+            "prelude.Comparable" => Some(Self::Comparable),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ordered => "cmp.Ordered",
+            Self::Comparable => "Comparable",
+        }
+    }
+
+    /// True when a parameter declared `T: self` satisfies a callee that
+    /// requires `T: target`. Encodes Go's `cmp.Ordered ⊂ Comparable`.
+    pub(crate) fn satisfies(self, target: Self) -> bool {
+        self == target || (self == Self::Ordered && target == Self::Comparable)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnifyError {
     TypeMismatch,
+    /// Equal apart from a qualifier difference that would grant permission.
+    QualifierMismatch,
     InfiniteType,
     ArityMismatch,
-    #[allow(clippy::box_collection)] // Intentional: shrinks Result<(), UnifyError> on hot path
+    #[expect(clippy::box_collection)] // Intentional: shrinks Result<(), UnifyError> on hot path
     Multiple(Box<Vec<UnifyError>>),
     AlreadyReported,
 }
 
-impl Checker<'_, '_> {
-    /// Make two types equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatched {
+    Handled,
+    Fallthrough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosureAdapter {
+    Widens,
+    Narrows,
+}
+
+/// A built-in container that holds values which can be widened into an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WideningContainer {
+    Slice,
+    Option,
+    Result,
+    Partial,
+    Map,
+}
+
+/// What a container has to widen, and how.
+#[derive(Debug, Clone, Copy)]
+enum Widening {
+    /// `map` over every element.
+    Elements,
+    /// `map` over the single held value.
+    Value,
+    /// `map_err` over the held error.
+    Error,
+    /// No method does it, so the entries are copied over by hand.
+    Entries,
+}
+
+impl WideningContainer {
+    fn of(ty: &Type) -> Option<Self> {
+        if ty.is_slice() {
+            Some(Self::Slice)
+        } else if ty.is_option() {
+            Some(Self::Option)
+        } else if ty.is_result() {
+            Some(Self::Result)
+        } else if ty.is_partial() {
+            Some(Self::Partial)
+        } else if ty.is_map() {
+            Some(Self::Map)
+        } else {
+            None
+        }
+    }
+
+    /// How the type argument at `position` is widened, if it can be.
+    fn widening(self, position: usize) -> Option<Widening> {
+        match self {
+            Self::Slice => Some(Widening::Elements),
+            Self::Option => Some(Widening::Value),
+            Self::Result | Self::Partial if position == 0 => Some(Widening::Value),
+            Self::Result | Self::Partial => Some(Widening::Error),
+            Self::Map if position == 1 => Some(Widening::Entries),
+            Self::Map => None,
+        }
+    }
+}
+
+impl InferCtx<'_> {
+    /// Make two types equal. Returns `false` when they do not match.
     ///
     /// - For two concrete types, verifies that they match.
     /// - For two variable types, records that the first equals the second.
     /// - For a concrete and a variable type, records that the variable equals the concrete.
-    pub(super) fn unify(&mut self, t1: &Type, t2: &Type, span: &Span) {
-        if let Err(unify_error) = self.try_unify(t1, t2, span) {
+    pub(super) fn unify(&mut self, t1: &Type, t2: &Type, span: &Span) -> bool {
+        match self.try_unify(t1, t2, span) {
+            Ok(()) => true,
+            Err(UnifyError::AlreadyReported) => false,
+            Err(unify_error) => {
+                let err = self.unification_diagnostic(t1, t2, span, &unify_error);
+                self.sink.push(err);
+                false
+            }
+        }
+    }
+
+    pub(super) fn unify_statement_loop(&mut self, expected_ty: &Type, span: &Span, keyword: &str) {
+        let unit_ty = self.type_unit();
+        if let Err(unify_error) = self.try_unify(expected_ty, &unit_ty, span) {
             if unify_error == UnifyError::AlreadyReported {
                 return;
             }
-            let err = self.unification_diagnostic(t1, t2, span, &unify_error);
-            self.sink.push(err);
+            let expected = expected_ty.resolve_in(&self.env);
+            let (types, _) = Type::remove_vars(&[&expected]);
+            self.sink.push(diagnostics::infer::loop_produces_no_value(
+                span,
+                keyword,
+                &types[0].to_string(),
+            ));
         }
     }
 
@@ -40,133 +155,245 @@ impl Checker<'_, '_> {
         t2: &Type,
         span: &Span,
     ) -> Result<(), UnifyError> {
-        let r1 = t1.shallow_resolve();
-        let r2 = t2.shallow_resolve();
+        let store = self.store;
+        let r1 = self.env.shallow_resolve(t1);
+        let r2 = self.env.shallow_resolve(t2);
+        let r1_is_unknown = r1.is_unknown();
+        let r2_is_unknown = r2.is_unknown();
 
-        match (t1, t2) {
-            _ if t1.is_ignored() || t2.is_ignored() => Ok(()),
-            _ if t1.is_receiver_placeholder() || t2.is_receiver_placeholder() => Ok(()),
-            _ if self.should_unify_refs(t1, t2, &r1, &r2) => self.unify_refs(t1, t2, span),
+        match (&r1, &r2) {
+            _ if r1.is_ignored() || r2.is_ignored() || r1.is_uninferred() || r2.is_uninferred() => {
+                Ok(())
+            }
+            _ if r1.is_receiver_placeholder() || r2.is_receiver_placeholder() => Ok(()),
+            _ if self.should_unify_refs(&r1, &r2) => self.unify_refs(&r1, &r2, span),
 
-            (Variable(v1), Variable(v2)) if Rc::ptr_eq(v1, v2) => Ok(()),
+            (Type::Var { id: i1, .. }, Type::Var { id: i2, .. }) if i1 == i2 => Ok(()),
 
-            _ if r1.is_unknown() => Ok(()),
-            _ if r2.is_unknown() && !t1.is_variable() => Err(UnifyError::TypeMismatch),
+            _ if r1_is_unknown && r2_is_unknown => {
+                self.check_qualifier(r1.is_writable(), r2.is_writable())?;
+                Ok(())
+            }
+
+            // Shallow resolution above leaves only unbound variables here.
+            (Type::Var { id, .. }, other) | (other, Type::Var { id, .. }) => {
+                if self.env.occurs(*id, other) {
+                    return Err(UnifyError::InfiniteType);
+                }
+                self.env.bind(*id, other.clone());
+                Ok(())
+            }
+
+            _ if r1_is_unknown && self.is_inside_invariant_position() => {
+                Err(UnifyError::TypeMismatch)
+            }
+            _ if r1_is_unknown => {
+                if r1.is_writable()
+                    && !matches!(r2, Type::Never | Type::Error)
+                    && !store.peel_alias(&r2).is_writable()
+                {
+                    Err(UnifyError::QualifierMismatch)
+                } else {
+                    Ok(())
+                }
+            }
+            _ if r2_is_unknown => Err(UnifyError::TypeMismatch),
 
             _ if matches!(r2, Type::Never) => Ok(()),
             _ if matches!(r1, Type::Never) => Err(UnifyError::TypeMismatch),
 
-            (Variable(type_var), other) => self.unify_type_variable(type_var, other, span, false),
-            (other, Variable(type_var)) => self.unify_type_variable(type_var, other, span, true),
-
-            // Error after Variable: variables absorb Error via linking above;
-            // non-variable vs Error succeeds silently
-            _ if matches!(r1, Type::Error) || matches!(r2, Type::Error) => Ok(()),
+            _ if matches!(r1, Type::Error) => {
+                self.collapse_vars_to_error(&r2);
+                Ok(())
+            }
+            _ if matches!(r2, Type::Error) => {
+                self.collapse_vars_to_error(&r1);
+                Ok(())
+            }
 
             (Type::Parameter(name1), Type::Parameter(name2)) if name1 == name2 => Ok(()),
 
-            (Constructor { .. }, Constructor { .. }) => self.unify_constructors(t1, t2, span),
+            (Type::ImportNamespace(m1), Type::ImportNamespace(m2)) if m1 == m2 => Ok(()),
 
-            (Function { .. }, Function { .. }) => self.unify_functions(t1, t2, span),
+            (Type::Simple(k1), Type::Simple(k2)) if k1 == k2 => Ok(()),
+
+            // Go-level aliases for scalar types: byte <-> uint8, rune <-> int32.
+            (Type::Simple(k1), Type::Simple(k2)) if simple_kinds_are_go_aliases(*k1, *k2) => Ok(()),
+
+            (Nominal { id, .. }, other)
+                if other.is_structural_alias_body()
+                    && let Some(u) = store.underlying_type(&r1) =>
+            {
+                if matches!(other, Type::Simple(_)) && store.is_nominal_defined_type(id.as_str()) {
+                    Err(UnifyError::TypeMismatch)
+                } else {
+                    self.try_unify(&u, &r2, span)
+                }
+            }
+
+            (other, Nominal { id, .. })
+                if other.is_structural_alias_body()
+                    && let Some(u) = store.underlying_type(&r2) =>
+            {
+                if matches!(other, Type::Simple(_)) && store.is_nominal_defined_type(id.as_str()) {
+                    Err(UnifyError::TypeMismatch)
+                } else {
+                    self.try_unify(&r1, &u, span)
+                }
+            }
+
+            (
+                Type::Compound {
+                    kind: k1,
+                    args: a1,
+                    writable: w1,
+                },
+                Type::Compound {
+                    kind: k2,
+                    args: a2,
+                    writable: w2,
+                },
+            ) if k1 == k2 && a1.len() == a2.len() => {
+                // Compound type arguments are invariant (same rule as generic
+                // user types). Track depth so that interface coercion is
+                // rejected inside generic positions.
+                let expected_writable = self.check_qualifier(*w1, *w2)?;
+                let a1 = a1.clone();
+                let a2 = a2.clone();
+                self.in_invariant_position(|this| {
+                    this.in_qualifier_invariant(expected_writable, |this| {
+                        this.unify_pairs(a1.iter().zip(a2.iter()), span)
+                    })
+                })
+            }
+
+            (Nominal { .. }, Nominal { .. }) => self.unify_constructors(&r1, &r2, span),
+
+            (Function(_), Function(_)) => self.unify_functions(&r1, &r2, span),
 
             (Type::Tuple(elems1), Type::Tuple(elems2)) => {
                 if elems1.len() != elems2.len() {
                     return Err(UnifyError::ArityMismatch);
                 }
-                self.unify_pairs(elems1.iter().zip(elems2), span)
+                let elems1 = elems1.clone();
+                let elems2 = elems2.clone();
+                self.unify_pairs(elems1.iter().zip(elems2.iter()), span)
             }
 
             (
-                Constructor {
-                    underlying_ty: Some(underlying),
-                    ..
+                Type::Array {
+                    length: length1,
+                    element: element1,
                 },
-                Function { .. },
-            ) => self.try_unify(underlying.as_ref(), t2, span),
+                Type::Array {
+                    length: length2,
+                    element: element2,
+                },
+            ) => {
+                if length1 != length2 {
+                    return Err(UnifyError::ArityMismatch);
+                }
+                let element1 = element1.as_ref().clone();
+                let element2 = element2.as_ref().clone();
+                self.try_unify(&element1, &element2, span)
+            }
+
+            // Bridge the size-erased `prelude.Array` method-host self-type to the
+            // real `Type::Array` by unifying the element and ignoring the size.
+            (Type::Array { element, .. }, Nominal { id, params, .. })
+            | (Nominal { id, params, .. }, Type::Array { element, .. })
+                if id.as_str() == "prelude.Array" =>
+            {
+                let element = element.as_ref().clone();
+                match params.first().cloned() {
+                    Some(nominal_elem) => self.try_unify(&element, &nominal_elem, span),
+                    None => Ok(()),
+                }
+            }
 
             (
-                Function { .. },
-                Constructor {
-                    underlying_ty: Some(underlying),
-                    ..
-                },
-            ) => self.try_unify(t1, underlying.as_ref(), span),
+                interface_ty @ Nominal { .. },
+                actual @ (Type::Simple(_) | Type::Compound { .. } | Type::Array { .. }),
+            ) => self.try_satisfy_interface(actual, interface_ty, span),
+
+            (Nominal { .. }, Function(_)) if let Some(u) = store.underlying_type(&r1) => {
+                self.try_unify(&u, &r2, span)
+            }
+
+            (Function(_), Nominal { .. }) if let Some(u) = store.underlying_type(&r2) => {
+                self.try_unify(&r1, &u, span)
+            }
 
             _ => Err(UnifyError::TypeMismatch),
         }
     }
 
-    fn should_unify_refs(&self, t1: &Type, t2: &Type, r1: &Type, r2: &Type) -> bool {
+    fn should_unify_refs(&self, t1: &Type, t2: &Type) -> bool {
         let either_is_ref = t1.is_ref() || t2.is_ref();
         let both_concrete = !t1.is_variable() && !t2.is_variable();
-        let neither_is_interface = !self.is_interface(t1) && !self.is_interface(t2);
-        let neither_is_unknown = !r1.is_unknown() && !r2.is_unknown();
+        let neither_is_interface = !self.store.is_interface(t1) && !self.store.is_interface(t2);
+        let neither_is_unknown = !t1.is_unknown() && !t2.is_unknown();
+        let neither_is_error = !t1.is_error() && !t2.is_error();
+        let neither_is_never = !t1.is_never() && !t2.is_never();
+        let neither_is_alias = !self.is_transparent_alias(t1) && !self.is_transparent_alias(t2);
 
-        either_is_ref && both_concrete && neither_is_interface && neither_is_unknown
+        either_is_ref
+            && both_concrete
+            && neither_is_interface
+            && neither_is_unknown
+            && neither_is_error
+            && neither_is_never
+            && neither_is_alias
     }
 
-    fn is_interface(&self, ty: &Type) -> bool {
-        if let Type::Constructor { id, .. } = ty {
-            self.store.get_interface(id).is_some()
-        } else {
-            false
-        }
+    fn is_transparent_alias(&self, ty: &Type) -> bool {
+        let Nominal { id, .. } = ty else {
+            return false;
+        };
+        self.store
+            .get_definition(id)
+            .is_some_and(|definition| definition.is_transparent_type_alias())
     }
 
     fn unify_refs(&mut self, t1: &Type, t2: &Type, span: &Span) -> Result<(), UnifyError> {
         match (t1.is_ref(), t2.is_ref()) {
-            (true, true) => self.try_unify(&t1.strip_refs(), &t2.strip_refs(), span),
+            (true, true) => {
+                let expected_writable = self.check_qualifier(t1.is_writable(), t2.is_writable())?;
+                // One `Ref` layer at a time, so every nested qualifier is compared.
+                let inner1 = t1.inner().unwrap_or(Type::Error);
+                let inner2 = t2.inner().unwrap_or(Type::Error);
+                self.in_qualifier_invariant(expected_writable, |this| {
+                    this.try_unify(&inner1, &inner2, span)
+                })
+            }
             (true, false) | (false, true) => Err(UnifyError::TypeMismatch),
             (false, false) => unreachable!("unify_refs called without refs"),
         }
     }
 
-    fn unify_type_variable(
-        &mut self,
-        type_var: &Rc<RefCell<TypeVariableState>>,
-        other_ty: &Type,
-        span: &Span,
-        var_on_right: bool,
-    ) -> Result<(), UnifyError> {
-        let state = type_var.borrow();
-        match &*state {
-            TypeVariableState::Link(ty) => {
-                let ty = ty.clone();
-                drop(state);
-                if var_on_right {
-                    self.try_unify(other_ty, &ty, span)
-                } else {
-                    self.try_unify(&ty, other_ty, span)
-                }
-            }
-            TypeVariableState::Unbound { id, hint } => {
-                let id = *id;
-                let hint = hint.clone();
-                drop(state);
-                if self.occurs_in(id, other_ty) {
-                    return Err(UnifyError::InfiniteType);
-                }
-
-                if let Some(log) = &mut self.inference.undo_log {
-                    log.push((Rc::clone(type_var), TypeVariableState::Unbound { id, hint }));
-                }
-                *type_var.borrow_mut() = TypeVariableState::Link(other_ty.clone());
-                Ok(())
+    fn collapse_vars_to_error(&mut self, ty: &Type) {
+        let resolved = self.env.shallow_resolve(ty);
+        if let Type::Var { id, .. } = resolved {
+            self.env.bind(id, Type::Error);
+        } else {
+            for child in resolved.children() {
+                self.collapse_vars_to_error(child);
             }
         }
     }
 
     fn unify_constructors(&mut self, t1: &Type, t2: &Type, span: &Span) -> Result<(), UnifyError> {
+        let store = self.store;
         let (
-            Constructor {
+            Nominal {
                 id: symbol1,
                 params: params1,
-                ..
+                writable: w1,
             },
-            Constructor {
+            Nominal {
                 id: symbol2,
                 params: params2,
-                ..
+                writable: w2,
             },
         ) = (t1, t2)
         else {
@@ -174,19 +401,17 @@ impl Checker<'_, '_> {
         };
 
         if symbol1 != symbol2 {
-            if let Constructor {
-                underlying_ty: Some(u),
-                ..
-            } = t1
-                && self.try_unify(u, t2, span).is_ok()
+            if store.get_interface(symbol2).is_none()
+                && !store.is_nominal_defined_type(symbol1.as_str())
+                && let Some(underlying) = store.underlying_type(t1)
+                && self.try_unify(&underlying, t2, span).is_ok()
             {
                 return Ok(());
             }
-            if let Constructor {
-                underlying_ty: Some(u),
-                ..
-            } = t2
-                && self.try_unify(t1, u, span).is_ok()
+            if store.get_interface(symbol1).is_none()
+                && !store.is_nominal_defined_type(symbol2.as_str())
+                && let Some(underlying) = store.underlying_type(t2)
+                && self.try_unify(t1, &underlying, span).is_ok()
             {
                 return Ok(());
             }
@@ -197,15 +422,47 @@ impl Checker<'_, '_> {
             return Err(UnifyError::TypeMismatch);
         }
 
-        // Generics are invariant — Box<Dog> is not Box<Animal>
+        let expected_writable = self.check_qualifier(*w1, *w2)?;
+
+        // Generics are invariant: Box<Dog> is not Box<Animal>
         // even if Dog satisfies Animal. Track depth so we reject
         // interface coercion inside generic type params. All generic types
         // are treated uniformly, including prelude types (Option, Result,
         // Slice, Map, Ref).
-        self.inference.type_param_depth += 1;
-        let result = self.unify_type_params(params1.iter().zip(params2), span);
-        self.inference.type_param_depth -= 1;
-        result
+        //
+        // Bail on the first error rather than collecting via `unify_pairs`:
+        // continuing past a failed pair would bind subsequent type variables
+        // and erase their original names from the diagnostic.
+        self.in_invariant_position(|this| {
+            this.in_qualifier_invariant(expected_writable, |this| {
+                let mut result = Ok(());
+                for (p1, p2) in params1.iter().zip(params2) {
+                    if let Err(e) = this.try_unify(p1, p2, span) {
+                        result = Err(e);
+                        break;
+                    }
+                }
+                result
+            })
+        })
+    }
+
+    fn check_qualifier(&self, w1: bool, w2: bool) -> Result<bool, UnifyError> {
+        let (expected, actual) = if self.is_qualifier_variance_flipped() {
+            (w2, w1)
+        } else {
+            (w1, w2)
+        };
+        let compatible = if self.is_qualifier_invariant() {
+            expected == actual
+        } else {
+            actual || !expected
+        };
+        if compatible {
+            Ok(expected)
+        } else {
+            Err(UnifyError::QualifierMismatch)
+        }
     }
 
     fn try_coerce_or_satisfy_interface(
@@ -214,13 +471,14 @@ impl Checker<'_, '_> {
         t2: &Type,
         span: &Span,
     ) -> Result<(), UnifyError> {
+        let store = self.store;
         let (
-            Constructor {
+            Nominal {
                 id: symbol1,
                 params: params1,
                 ..
             },
-            Constructor {
+            Nominal {
                 id: symbol2,
                 params: params2,
                 ..
@@ -234,7 +492,7 @@ impl Checker<'_, '_> {
             return Ok(());
         }
 
-        if self.inference.type_param_depth > 0 {
+        if self.is_inside_invariant_position() {
             return Err(UnifyError::TypeMismatch);
         }
 
@@ -243,107 +501,36 @@ impl Checker<'_, '_> {
         if symbol1 == "prelude.Option"
             && params1.len() == 1
             && symbol2.starts_with("go:")
-            && self.store.get_interface(symbol2).is_some()
+            && store.get_interface(symbol2).is_some()
         {
             return self.try_unify(&params1[0], t2, span);
         }
         if symbol2 == "prelude.Option"
             && params2.len() == 1
             && symbol1.starts_with("go:")
-            && self.store.get_interface(symbol1).is_some()
+            && store.get_interface(symbol1).is_some()
         {
-            return self.try_unify(&params2[0], t1, span);
+            return self.try_unify(t1, &params2[0], span);
         }
 
-        if let Some(interface) = self.store.get_interface(symbol1).cloned() {
-            return self
-                .satisfies_interface(t2, &interface, params1, span)
-                .and_then(|()| self.check_pointer_receivers(t2, &interface, span))
-                .map_err(|_| UnifyError::AlreadyReported);
-        }
-
-        if let Some(interface) = self.store.get_interface(symbol2).cloned() {
-            return self
-                .satisfies_interface(t1, &interface, params2, span)
-                .and_then(|()| self.check_pointer_receivers(t1, &interface, span))
-                .map_err(|_| UnifyError::AlreadyReported);
-        }
-
-        Err(UnifyError::TypeMismatch)
+        self.try_satisfy_interface(t2, t1, span)
     }
 
-    fn unify_type_params<'a>(
+    fn try_satisfy_interface(
         &mut self,
-        pairs: impl Iterator<Item = (&'a Type, &'a Type)>,
+        actual: &Type,
+        interface_ty: &Type,
         span: &Span,
     ) -> Result<(), UnifyError> {
-        for (t1, t2) in pairs {
-            let r1 = t1.shallow_resolve();
-            let r2 = t2.shallow_resolve();
-
-            match (t1, t2) {
-                _ if t1.is_ignored() || t2.is_ignored() => {}
-                _ if t1.is_receiver_placeholder() || t2.is_receiver_placeholder() => {}
-                (Variable(v1), Variable(v2)) if Rc::ptr_eq(v1, v2) => {}
-
-                _ if r1.is_unknown() => {}
-                _ if r2.is_unknown() && !t1.is_variable() => {
-                    return Err(UnifyError::TypeMismatch);
-                }
-
-                _ if matches!(r2, Type::Never) => {
-                    if let Variable(type_var) = t1
-                        && type_var.borrow().is_unbound()
-                    {
-                        self.unify_type_variable(type_var, &Type::Never, span, false)?;
-                    }
-                }
-                _ if matches!(r1, Type::Never) => {
-                    if let Variable(type_var) = t2
-                        && type_var.borrow().is_unbound()
-                    {
-                        self.unify_type_variable(type_var, &Type::Never, span, false)?;
-                    } else if !matches!(r2, Type::Never) && !r2.is_variable() {
-                        return Err(UnifyError::TypeMismatch);
-                    }
-                }
-
-                (Variable(type_var), other) | (other, Variable(type_var)) => {
-                    self.unify_type_variable(type_var, other, span, false)?;
-                }
-                (Type::Parameter(name1), Type::Parameter(name2)) if name1 == name2 => {}
-                (
-                    Constructor {
-                        id: id1,
-                        params: p1,
-                        ..
-                    },
-                    Constructor {
-                        id: id2,
-                        params: p2,
-                        ..
-                    },
-                ) if (id1 == id2 || are_go_type_aliases(id1, id2)) && p1.len() == p2.len() => {
-                    let is_user_defined = !id1.starts_with("prelude.");
-                    if is_user_defined {
-                        self.inference.type_param_depth += 1;
-                    }
-                    let r = self.unify_type_params(p1.iter().zip(p2), span);
-                    if is_user_defined {
-                        self.inference.type_param_depth -= 1;
-                    }
-                    r?;
-                }
-                (Function { .. }, Function { .. }) => {
-                    self.unify_functions(t1, t2, span)?;
-                }
-                (Type::Tuple(e1), Type::Tuple(e2)) if e1.len() == e2.len() => {
-                    self.unify_type_params(e1.iter().zip(e2), span)?;
-                }
-                _ => return Err(UnifyError::TypeMismatch),
-            }
+        if self.is_inside_invariant_position() {
+            return Err(UnifyError::TypeMismatch);
         }
-        Ok(())
+        if !self.store.is_interface(interface_ty) {
+            return Err(UnifyError::TypeMismatch);
+        }
+        self.satisfies_interface(actual, interface_ty, span)
+            .and_then(|()| self.check_pointer_receivers(actual, interface_ty, span))
+            .map_err(|_| UnifyError::AlreadyReported)
     }
 
     fn unify_pairs<'a>(
@@ -372,44 +559,36 @@ impl Checker<'_, '_> {
     }
 
     fn unify_functions(&mut self, t1: &Type, t2: &Type, span: &Span) -> Result<(), UnifyError> {
-        let (
-            Function {
-                params: params1,
-                return_type: return_type1,
-                bounds: bounds1,
-                param_mutability: mut1,
-                ..
-            },
-            Function {
-                params: params2,
-                return_type: return_type2,
-                bounds: bounds2,
-                param_mutability: mut2,
-                ..
-            },
-        ) = (t1, t2)
-        else {
+        let (Function(f1), Function(f2)) = (t1, t2) else {
             unreachable!("unify_functions called with non-Function types")
         };
 
-        if params1.len() != params2.len() {
+        if f1.params.len() != f2.params.len() {
             return Err(UnifyError::ArityMismatch);
         }
 
-        // A function with `mut` params cannot unify with one without (or vice versa),
-        // since that would let callers bypass the `let mut` requirement.
-        if mut1 != mut2 {
-            return Err(UnifyError::TypeMismatch);
+        let (params_result, return_type_result) = self.in_invariant_position(|this| {
+            let params_result = this.in_flipped_qualifier_variance(|this| {
+                this.unify_pairs(
+                    f1.params
+                        .iter()
+                        .zip(&f2.params)
+                        .map(|(left, right)| (&left.ty, &right.ty)),
+                    span,
+                )
+            });
+            let return_type_result = this.try_unify(&f1.return_type, &f2.return_type, span);
+            (params_result, return_type_result)
+        });
+
+        for bound in &f1.bounds {
+            self.check_function_bound(bound, &f1.params, span);
+        }
+        for bound in &f2.bounds {
+            self.check_function_bound(bound, &f2.params, span);
         }
 
-        let params_result = self.unify_pairs(params1.iter().zip(params2), span);
-        let return_type_result = self.try_unify(return_type1, return_type2, span);
-
-        for bound in bounds1.iter().chain(bounds2.iter()) {
-            self.check_function_bound(bound, span);
-        }
-
-        if !self.bounds_equivalent(bounds1, bounds2) {
+        if !self.bounds_equivalent(&f1.bounds, &f2.bounds) {
             return Err(UnifyError::TypeMismatch);
         }
 
@@ -425,8 +604,11 @@ impl Checker<'_, '_> {
         // When one side has no bounds (concrete function type) and the other
         // has bounds whose generics are all resolved to concrete types, the
         // bounds are satisfied by instantiation.
-        let all_resolved =
-            |bounds: &[Bound]| bounds.iter().all(|b| !b.generic.resolve().is_variable());
+        let all_resolved = |bounds: &[Bound]| {
+            bounds
+                .iter()
+                .all(|b| !b.generic.resolve_in(&self.env).is_variable())
+        };
 
         if bounds1.is_empty() && all_resolved(bounds2) {
             return true;
@@ -440,7 +622,8 @@ impl Checker<'_, '_> {
         }
 
         let matches = |a: &Bound, b: &Bound| {
-            a.generic.resolve() == b.generic.resolve() && a.ty.resolve() == b.ty.resolve()
+            a.generic.resolve_in(&self.env) == b.generic.resolve_in(&self.env)
+                && a.ty.resolve_in(&self.env) == b.ty.resolve_in(&self.env)
         };
 
         let all_in = |source: &[Bound], target: &[Bound]| {
@@ -450,46 +633,58 @@ impl Checker<'_, '_> {
         all_in(bounds1, bounds2) && all_in(bounds2, bounds1)
     }
 
-    fn check_function_bound(&mut self, bound: &Bound, span: &Span) {
-        let resolved_ty = bound.generic.resolve();
+    fn check_function_bound(
+        &mut self,
+        bound: &Bound,
+        signature_params: &[FunctionParameter],
+        span: &Span,
+    ) {
+        let store = self.store;
+        let resolved_ty = bound.generic.resolve_in(&self.env);
 
         if resolved_ty.is_variable() {
             return;
         }
 
-        let interface_ty = bound.ty.resolve();
-        let Type::Constructor { id, params, .. } = interface_ty else {
+        if self.dispatch_builtin_bound(bound, &resolved_ty, span) == Dispatched::Handled {
             return;
-        };
+        }
 
-        let Some(interface) = self.store.get_interface(&id).cloned() else {
+        let interface_ty = bound.ty.resolve_in(&self.env);
+        if !store.is_interface(&interface_ty) {
             return;
-        };
+        }
 
-        let _ = self.satisfies_interface(&resolved_ty, &interface, &params, span);
+        if self
+            .satisfies_interface(&resolved_ty, &interface_ty, span)
+            .is_ok()
+            && !self.generic_absorbed_via_ref_param(
+                &bound.generic,
+                signature_params.iter().map(|param| &param.ty),
+            )
+        {
+            let _ = self.check_pointer_receivers(&resolved_ty, &interface_ty, span);
+        }
     }
 
-    #[allow(clippy::only_used_in_recursion)]
-    fn occurs_in(&self, type_var_id: i32, ty: &Type) -> bool {
-        match ty {
-            Constructor { params, .. } => params.iter().any(|p| self.occurs_in(type_var_id, p)),
-            Variable(type_var) => match &*type_var.borrow() {
-                TypeVariableState::Unbound { id, .. } => *id == type_var_id,
-                TypeVariableState::Link(linked_ty) => self.occurs_in(type_var_id, linked_ty),
-            },
-            Function {
-                params,
-                return_type,
-                ..
-            } => {
-                params.iter().any(|p| self.occurs_in(type_var_id, p))
-                    || self.occurs_in(type_var_id, return_type)
-            }
-            Type::Forall { body, .. } => self.occurs_in(type_var_id, body),
-            Type::Tuple(elements) => elements.iter().any(|e| self.occurs_in(type_var_id, e)),
-            Type::Parameter(_) => false,
-            Type::Never | Type::Error => false,
-        }
+    /// Built-in bound recognition; falls through to the interface path on miss.
+    pub(super) fn dispatch_builtin_bound(
+        &mut self,
+        bound: &Bound,
+        resolved_generic: &Type,
+        span: &Span,
+    ) -> Dispatched {
+        let store = self.store;
+        let bound_ty = bound.ty.resolve_in(&self.env);
+        let Some(builtin) = bound_ty
+            .get_qualified_id()
+            .and_then(BuiltinBound::from_qualified_id)
+        else {
+            return Dispatched::Fallthrough;
+        };
+
+        self.check_builtin_bound_argument(store, resolved_generic, builtin, *span, None);
+        Dispatched::Handled
     }
 
     fn unification_diagnostic(
@@ -499,8 +694,8 @@ impl Checker<'_, '_> {
         span: &Span,
         error: &UnifyError,
     ) -> LisetteDiagnostic {
-        let t1_normalized = t1.resolve();
-        let t2_normalized = t2.resolve();
+        let t1_normalized = t1.resolve_in(&self.env);
+        let t2_normalized = t2.resolve_in(&self.env);
         let (types, _) = Type::remove_vars(&[&t1_normalized, &t2_normalized]);
         let expected = &types[0];
         let actual = &types[1];
@@ -511,6 +706,16 @@ impl Checker<'_, '_> {
                 .with_span_label(span, "infinite type detected here"),
 
             UnifyError::ArityMismatch => {
+                if let (Some(expected_len), Some(actual_len)) =
+                    (expected.array_len(), actual.array_len())
+                {
+                    return diagnostics::infer::array_length_mismatch(
+                        expected_len,
+                        actual_len,
+                        *span,
+                    );
+                }
+
                 if let (Some(expected_arity), Some(actual_arity)) =
                     (expected.tuple_arity(), actual.tuple_arity())
                 {
@@ -528,19 +733,85 @@ impl Checker<'_, '_> {
                         );
                 }
 
+                let (expected_name, actual_name) = Type::stringify_pair(expected, actual);
+
                 LisetteDiagnostic::error("Type mismatch")
                     .with_infer_code("type_mismatch")
-                    .with_span_label(span, format!("expected `{}`, found `{}`", expected, actual))
+                    .with_span_label(
+                        span,
+                        format!("expected `{}`, found `{}`", expected_name, actual_name),
+                    )
                     .with_help("The function types must have the same number of parameters")
             }
 
-            UnifyError::TypeMismatch | UnifyError::Multiple(_) => {
-                let help = self.help(expected, actual);
+            UnifyError::QualifierMismatch => {
+                let concrete_expected = overlay_qualifiers(expected, actual);
+                let (expected_name, actual_name) = Type::stringify_pair(&concrete_expected, actual);
+                if let Some(components) = self.read_only_constructions.get(span) {
+                    return diagnostics::infer::read_only_construction(
+                        &expected_name,
+                        &actual_name,
+                        &actual.strip_refs().to_string(),
+                        actual.is_ref(),
+                        components,
+                    );
+                }
+                let diagnostic = LisetteDiagnostic::error("Missing write permission")
+                    .with_infer_code("needs_writable")
+                    .with_span_label(
+                        span,
+                        format!("expected `{}`, found `{}`", expected_name, actual_name),
+                    );
+                if matches!(actual.unwrap_forall(), Function(_)) {
+                    diagnostic.with_help(format!(
+                        "A function value may demand less permission than its type \
+                         promises, never more. Match `mut` on each differing parameter, \
+                         or expect `{actual_name}` instead"
+                    ))
+                } else if concrete_expected.is_writable() == actual.is_writable() {
+                    diagnostic.with_help(format!(
+                        "`{expected_name}` and `{actual_name}` differ in a nested `mut`. \
+                         A container is invariant in its element, so the element \
+                         permission must match exactly"
+                    ))
+                } else {
+                    let context = self
+                        .expectation_at(span)
+                        .and_then(|expectation| expectation.value_context.clone());
+                    diagnostic.with_help(diagnostics::infer::needs_writable_help(
+                        &expected_name,
+                        &actual_name,
+                        context,
+                    ))
+                }
+            }
 
-                LisetteDiagnostic::error("Type mismatch")
+            UnifyError::TypeMismatch | UnifyError::Multiple(_) => {
+                let (expected_name, actual_name) = Type::stringify_pair(expected, actual);
+                let expectation = self.site_expectation(span, &t1_normalized);
+                let help = self.help(expected, actual, &expected_name, &actual_name, expectation);
+
+                let mut diagnostic = LisetteDiagnostic::error("Type mismatch")
                     .with_infer_code("type_mismatch")
-                    .with_span_label(span, format!("expected `{}`, found `{}`", expected, actual))
-                    .with_help(help)
+                    .with_span_label(
+                        span,
+                        format!("expected `{}`, found `{}`", expected_name, actual_name),
+                    )
+                    .with_help(help);
+                if let Some(Expectation {
+                    role:
+                        ExpectationRole::TailReturn {
+                            return_annotation_span,
+                            ..
+                        },
+                    ..
+                }) = expectation
+                {
+                    let return_annotation_span = *return_annotation_span;
+                    diagnostic = diagnostic
+                        .with_span_label(&return_annotation_span, "return type declared here");
+                }
+                diagnostic
             }
 
             UnifyError::AlreadyReported => {
@@ -549,18 +820,31 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn help(&self, expected: &Type, actual: &Type) -> String {
+    fn site_expectation(&self, span: &Span, expected_resolved: &Type) -> Option<&Expectation> {
+        self.expectation_at(span).filter(|expectation| {
+            expectation.expected_ty.resolve_in(&self.env) == *expected_resolved
+        })
+    }
+
+    fn help(
+        &self,
+        expected: &Type,
+        actual: &Type,
+        expected_name: &str,
+        actual_name: &str,
+        expectation: Option<&Expectation>,
+    ) -> String {
         if actual.is_unknown() {
             return format!(
                 "The `Unknown` type cannot be used directly. Use `assert_type` to narrow it down to a concrete type. Example: `let value = assert_type<{}>(...)?`",
-                expected
+                expected_name
             );
         }
 
         if expected.is_unknown() {
             return format!(
                 "The `Unknown` type cannot be used directly. Use `assert_type` to narrow it down to a concrete type.  Example: `let value = assert_type<{}>(...)?`",
-                actual
+                actual_name
             );
         }
 
@@ -584,8 +868,24 @@ impl Checker<'_, '_> {
             return "Wrap the value: `Ok(...)`".to_string();
         }
 
+        if result_error_help_applies(expected, actual) {
+            return "Wrap the value: `Err(...)`".to_string();
+        }
+
         if actual.wraps("Result", expected) {
             return "Unwrap the inner value with `?` or using `match`".to_string();
+        }
+
+        if array_to_slice_help_applies(expected, actual) {
+            return format!(
+                "Call `.to_slice()` to copy the elements into a new slice, or change the receiving type to `{actual_name}`"
+            );
+        }
+
+        if slice_to_array_help_applies(expected, actual) {
+            return format!(
+                "Copy the elements with `Array.from(...)`, which yields `Option<{expected_name}>`, or change the receiving type to `{actual_name}`"
+            );
         }
 
         if actual.wraps("Slice", expected) {
@@ -596,11 +896,215 @@ impl Checker<'_, '_> {
             return "Wrap the value in a slice literal".to_string();
         }
 
+        if self.store.contains_unknown(expected) && !self.store.contains_unknown(actual) {
+            use syntax::types::CompoundKind::{Map, Slice};
+            return match expected.as_compound() {
+                Some((Map, [key, value])) if self.store.resolves_to_unknown(value) => {
+                    format!(
+                        "Build the map at `Map<{0}, {1}>`, e.g. `Map.from<{0}, {1}>([(k, v)])`",
+                        key.stringify(),
+                        value.stringify()
+                    )
+                }
+                Some((Slice, args))
+                    if args
+                        .first()
+                        .is_some_and(|ty| self.store.resolves_to_unknown(ty)) =>
+                {
+                    format!("Annotate the slice literal: `let xs: {} = [v1, v2, ...]`", expected_name)
+                }
+                _ if self.store.resolve_to_function_type(expected).is_some()
+                    && self.store.resolve_to_function_type(actual).is_some() =>
+                {
+                    "Function types must match exactly, and `Unknown` matches only `Unknown`. Declare the function with the expected signature and narrow with `assert_type` inside, or wrap it in a closure that narrows at the call site".to_string()
+                }
+                _ => format!(
+                    "`Unknown` matches only `Unknown`, never a concrete type. Build `{expected_name}` from a value already annotated as `Unknown`, e.g. `let value: Unknown = ...`, or change the expected type to `{actual_name}`"
+                ),
+            };
+        }
+
+        if self.store.is_interface(actual) && !self.store.is_interface(expected) {
+            return format!(
+                "An interface value does not carry its concrete type. Narrow it with `assert_type`, e.g. `let value = assert_type<{}>(value)?`",
+                expected_name
+            );
+        }
+
+        if self.store.is_numeric_compatible_with(expected, actual) {
+            return format!("Cast with `as`, e.g. `value as {}`", expected_name);
+        }
+
+        if let Some(Function(function)) = self.store.resolve_to_function_type(expected)
+            && function.return_type.as_ref() == actual
+        {
+            return "Remove the `()` so that the type matches".to_string();
+        }
+
+        match self.closure_adapter(expected, actual) {
+            Some(ClosureAdapter::Widens) => {
+                return "Function types must match exactly. Wrap the value in a closure to convert at the call site, e.g. `|value| callee(value)`".to_string();
+            }
+            Some(ClosureAdapter::Narrows) => {
+                return "Function types must match exactly. Wrap the value in a closure that narrows the interface value with `assert_type`, or change the signature to match".to_string();
+            }
+            None => {}
+        }
+
+        if let Some(widening) = self.container_widening_help(expected, actual, expected_name) {
+            return widening;
+        }
+
+        if let Some(expectation) = expectation {
+            return expectation.help(expected_name, actual_name);
+        }
+
         format!(
             "Change the type annotation to `{}` or convert the value to `{}`",
-            actual, expected
+            actual_name, expected_name
         )
     }
+
+    fn container_widening_help(
+        &self,
+        expected: &Type,
+        actual: &Type,
+        expected_name: &str,
+    ) -> Option<String> {
+        let container = WideningContainer::of(expected)?;
+        if WideningContainer::of(actual) != Some(container) {
+            return None;
+        }
+
+        let (expected_args, actual_args) = (expected.get_type_params()?, actual.get_type_params()?);
+        if expected_args.len() != actual_args.len() {
+            return None;
+        }
+
+        let mut differing = expected_args
+            .iter()
+            .zip(actual_args)
+            .enumerate()
+            .filter(|(_, (expected_arg, actual_arg))| expected_arg != actual_arg);
+        let (position, (expected_element, actual_element)) = differing.next()?;
+        if differing.next().is_some() {
+            return None;
+        }
+
+        if !self.store.is_interface(expected_element) || !self.widens_into_interface(actual_element)
+        {
+            return None;
+        }
+
+        let cast = format!("|value| value as {expected_element}");
+        Some(match container.widening(position)? {
+            Widening::Elements => format!("Use `.map({cast})` to widen each element"),
+            Widening::Value => format!("Use `.map({cast})` to widen the value"),
+            Widening::Error => format!("Use `.map_err({cast})` to widen the error"),
+            Widening::Entries => format!(
+                "Copy the entries into a new `{expected_name}`, widening each value: `widened[key] = value as {expected_element}`"
+            ),
+        })
+    }
+
+    fn widens_into_interface(&self, ty: &Type) -> bool {
+        !matches!(ty, Type::Parameter(_))
+            && !self.store.is_interface(ty)
+            && !self.store.resolves_to_unknown(ty)
+    }
+
+    fn closure_adapter(&self, expected: &Type, actual: &Type) -> Option<ClosureAdapter> {
+        if !matches!((expected, actual), (Function(_), Function(_))) {
+            return None;
+        }
+
+        let (expected_positions, actual_positions) = (expected.children(), actual.children());
+        if expected_positions.len() != actual_positions.len() {
+            return None;
+        }
+        let return_index = expected_positions.len().checked_sub(1)?;
+
+        let mut adapter = None;
+        for (index, (left, right)) in expected_positions.iter().zip(&actual_positions).enumerate() {
+            if left == right {
+                continue;
+            }
+            if !self.store.is_interface(left) && !self.store.is_interface(right) {
+                return None;
+            }
+            let narrows = if index == return_index {
+                self.store.is_interface(right)
+            } else {
+                self.store.is_interface(left)
+            };
+            if narrows {
+                adapter = Some(ClosureAdapter::Narrows);
+            } else if adapter.is_none() {
+                adapter = Some(ClosureAdapter::Widens);
+            }
+        }
+        adapter
+    }
+
+    /// Whether the emitter absorbs this bounded generic into a pointer type argument
+    /// via a top-level `Ref<T>` param (`with_absorbed_ref_generics`), so the pointer
+    /// satisfies the interface. Decided from params alone, like the emitter.
+    pub(super) fn generic_absorbed_via_ref_param<'a>(
+        &self,
+        generic: &Type,
+        params: impl IntoIterator<Item = &'a Type>,
+    ) -> bool {
+        let is_absorbed_param = |param: &Type| matches!(param.as_compound(), Some((CompoundKind::Ref, [inner, ..])) if inner == generic);
+
+        let Type::Var { id, .. } = generic else {
+            return params.into_iter().any(is_absorbed_param);
+        };
+
+        let mut absorbed = false;
+        for param in params {
+            if is_absorbed_param(param) {
+                absorbed = true;
+            } else if self.env.occurs(*id, param) {
+                return false;
+            }
+        }
+        absorbed
+    }
+}
+
+fn result_error_help_applies(expected: &Type, actual: &Type) -> bool {
+    expected.get_name().is_some_and(|name| name == "Result")
+        && expected
+            .get_type_params()
+            .and_then(|params| params.get(1))
+            .is_some_and(|error_type| error_type == actual)
+}
+
+fn array_to_slice_help_applies(expected: &Type, actual: &Type) -> bool {
+    if !expected.is_slice() {
+        return false;
+    }
+    let Type::Array { element, .. } = actual else {
+        return false;
+    };
+    let Some(expected_element) = expected.get_type_params().and_then(|params| params.first())
+    else {
+        return false;
+    };
+    expected_element == element.as_ref()
+}
+
+fn slice_to_array_help_applies(expected: &Type, actual: &Type) -> bool {
+    let Type::Array { element, .. } = expected else {
+        return false;
+    };
+    if !actual.is_slice() {
+        return false;
+    }
+    actual
+        .get_type_params()
+        .and_then(|params| params.first())
+        .is_some_and(|actual_element| actual_element == element.as_ref())
 }
 
 fn are_go_type_aliases(a: &str, b: &str) -> bool {
@@ -610,5 +1114,80 @@ fn are_go_type_aliases(a: &str, b: &str) -> bool {
             | ("prelude.uint8", "prelude.byte")
             | ("prelude.rune", "prelude.int32")
             | ("prelude.int32", "prelude.rune")
+    )
+}
+
+/// The actual type's concrete content carrying the expected type's write
+/// qualifiers, so messages show the caller's arguments instead of `K, V`.
+fn overlay_qualifiers(expected: &Type, actual: &Type) -> Type {
+    match (expected, actual) {
+        (Type::Parameter(_), _) => actual.clone(),
+        (
+            Type::Compound {
+                kind: expected_kind,
+                args: expected_args,
+                writable,
+            },
+            Type::Compound {
+                kind: actual_kind,
+                args: actual_args,
+                ..
+            },
+        ) if expected_kind == actual_kind && expected_args.len() == actual_args.len() => {
+            Type::Compound {
+                kind: *expected_kind,
+                args: expected_args
+                    .iter()
+                    .zip(actual_args)
+                    .map(|(e, a)| overlay_qualifiers(e, a))
+                    .collect(),
+                writable: *writable,
+            }
+        }
+        (
+            Nominal {
+                id,
+                params: expected_params,
+                writable,
+            },
+            Nominal {
+                id: actual_id,
+                params: actual_params,
+                ..
+            },
+        ) if id == actual_id && expected_params.len() == actual_params.len() => Nominal {
+            id: id.clone(),
+            params: expected_params
+                .iter()
+                .zip(actual_params)
+                .map(|(e, a)| overlay_qualifiers(e, a))
+                .collect(),
+            writable: *writable,
+        },
+        (Type::Tuple(expected_items), Type::Tuple(actual_items))
+            if expected_items.len() == actual_items.len() =>
+        {
+            Type::Tuple(
+                expected_items
+                    .iter()
+                    .zip(actual_items)
+                    .map(|(e, a)| overlay_qualifiers(e, a))
+                    .collect(),
+            )
+        }
+        _ => expected.clone(),
+    }
+}
+
+/// Go-level aliases between scalar builtins: `byte` is an alias for `uint8`,
+/// and `rune` is an alias for `int32`.
+fn simple_kinds_are_go_aliases(a: SimpleKind, b: SimpleKind) -> bool {
+    use SimpleKind;
+    matches!(
+        (a, b),
+        (SimpleKind::Byte, SimpleKind::Uint8)
+            | (SimpleKind::Uint8, SimpleKind::Byte)
+            | (SimpleKind::Rune, SimpleKind::Int32)
+            | (SimpleKind::Int32, SimpleKind::Rune)
     )
 }

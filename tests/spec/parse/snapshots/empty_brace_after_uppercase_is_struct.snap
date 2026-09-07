@@ -1,6 +1,11 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Foo {}\nfn test() {\n  let result = Foo {};\n}\n"
+description: |
+  
+  struct Foo {}
+  fn test() {
+    let result = Foo {};
+  }
 ---
 [
     Struct {
@@ -13,8 +18,9 @@ description: "input: \nstruct Foo {}\nfn test() {\n  let result = Foo {};\n}\n"
             byte_length: 3,
         },
         generics: [],
-        fields: [],
-        kind: Record,
+        fields: Record(
+            [],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,
@@ -34,68 +40,65 @@ description: "input: \nstruct Foo {}\nfn test() {\n  let result = Foo {};\n}\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Let {
-                    binding: Binding {
-                        pattern: Identifier {
-                            identifier: "result",
+        body: Definition(
+            Block {
+                items: [
+                    Let {
+                        binding: Binding {
+                            pattern: Identifier {
+                                identifier: "result",
+                                span: Span {
+                                    file_id: 0,
+                                    byte_offset: 33,
+                                    byte_length: 6,
+                                },
+                            },
+                            annotation: None,
+                            ty: Var {
+                                id: uninferred,
+                            },
+                        },
+                        value: StructCall {
+                            name: "Foo",
+                            field_assignments: [],
+                            spread: None,
+                            ty: Var {
+                                id: uninferred,
+                            },
                             span: Span {
                                 file_id: 0,
-                                byte_offset: 33,
+                                byte_offset: 42,
                                 byte_length: 6,
                             },
                         },
-                        annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
-                    },
-                    value: StructCall {
-                        name: "Foo",
-                        field_assignments: [],
-                        spread: None,
-                        ty: Variable(
-                            -1,
-                        ),
+                        mode: Plain,
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 42,
-                            byte_length: 6,
+                            byte_offset: 29,
+                            byte_length: 19,
                         },
                     },
-                    mutable: false,
-                    mut_span: None,
-                    else_block: None,
-                    else_span: None,
-                    typed_pattern: None,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 29,
-                        byte_length: 19,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 25,
-                byte_length: 26,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 25,
+                    byte_length: 26,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 15,

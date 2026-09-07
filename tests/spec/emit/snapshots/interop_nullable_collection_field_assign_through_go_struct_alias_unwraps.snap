@@ -1,0 +1,50 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:crypto/x509"
+  import "go:net/url"
+  
+  type Cert = x509.Certificate
+  
+  fn main() {
+    let u = url.URL {
+      Scheme: "https",
+      Host: "example.com",
+      ..,
+    }
+    let mut cert: Cert = x509.Certificate {
+      PublicKey: 0,
+      ..,
+    }
+    let urls: Slice<Option<Ref<url.URL>>> = [Some(&u)]
+    cert.URIs = urls
+    let _ = cert
+  }
+---
+package main
+
+import (
+	"crypto/x509"
+	lisette "github.com/ivov/lisette/prelude"
+	"net/url"
+)
+
+type Cert = x509.Certificate
+
+func main() {
+	u := url.URL{
+		Scheme: "https",
+		Host:   "example.com",
+	}
+	cert := x509.Certificate{PublicKey: 0}
+	urls := []lisette.Option[*url.URL]{lisette.MakeOptionSome(&u)}
+	unwrapped_1 := make([]*url.URL, len(urls))
+	for i_2, v_3 := range urls {
+		if v_3.Tag == lisette.OptionSome {
+			unwrapped_1[i_2] = v_3.SomeVal
+		}
+	}
+	cert.URIs = unwrapped_1
+	_ = cert
+}

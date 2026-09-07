@@ -1,0 +1,368 @@
+use semantics::store::Store;
+use syntax::ast::{BinaryOperator, Expression, IdentifierResolution, UnaryOperator};
+use syntax::types::SimpleKind;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Bound {
+    pub(crate) value: i128,
+    pub(crate) inclusive: bool,
+}
+
+impl Bound {
+    pub(crate) fn new(value: i128, inclusive: bool) -> Self {
+        Self { value, inclusive }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaskOp {
+    And,
+    Or,
+}
+
+/// A masked integer comparison, `operator` flipped so the masked side is left.
+pub(crate) struct MaskComparison {
+    pub(crate) mask_op: MaskOp,
+    pub(crate) mask: i128,
+    pub(crate) operator: BinaryOperator,
+    pub(crate) constant: i128,
+    pub(crate) kind: SimpleKind,
+}
+
+/// Decomposes a masked integer comparison; `None` unless `m` and `c` are in-range
+/// integer literals and `m != 0` (zero masks belong to `redundant_operation`).
+/// A negative `m` is valid only for the equality reasoning.
+pub(crate) fn mask_comparison(expression: &Expression, store: &Store) -> Option<MaskComparison> {
+    use BinaryOperator::*;
+    let Expression::Binary { operator, .. } = expression else {
+        return None;
+    };
+    if !matches!(
+        operator,
+        Equal | NotEqual | LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual
+    ) {
+        return None;
+    }
+
+    let (mask_expr, operator, constant) = integer_literal_comparison(expression)?;
+
+    let Expression::Binary {
+        operator: bit_operator,
+        left: bit_left,
+        right: bit_right,
+        ..
+    } = mask_expr
+    else {
+        return None;
+    };
+    let mask_op = match bit_operator {
+        BitwiseAnd => MaskOp::And,
+        BitwiseOr => MaskOp::Or,
+        _ => return None,
+    };
+    let bit_left = bit_left.unwrap_parens();
+    let bit_right = bit_right.unwrap_parens();
+    let mask = match (
+        signed_integer_literal(bit_left),
+        signed_integer_literal(bit_right),
+    ) {
+        (None, Some(mask)) | (Some(mask), None) => mask,
+        _ => return None,
+    };
+
+    let kind = store.underlying_simple_kind(&mask_expr.get_type())?;
+    if !kind.is_ordered() {
+        return None;
+    }
+    let (min, max) = kind.integer_range()?;
+    if mask == 0 || mask < min || mask > max || constant < min || constant > max {
+        return None;
+    }
+
+    Some(MaskComparison {
+        mask_op,
+        mask,
+        operator,
+        constant,
+        kind,
+    })
+}
+
+pub(crate) fn in_scope_comparison(a: &Expression, b: &Expression) -> bool {
+    match (signed_integer_literal(a), signed_integer_literal(b)) {
+        (None, Some(value)) => integer_operand_fits(a, value),
+        (Some(value), None) => integer_operand_fits(b, value),
+        (None, None) => same_ordered_numeric(a, b),
+        (Some(_), Some(_)) => false,
+    }
+}
+
+fn integer_literal_comparison(
+    expression: &Expression,
+) -> Option<(&Expression, BinaryOperator, i128)> {
+    let Expression::Binary {
+        operator,
+        left,
+        right,
+        ..
+    } = expression.unwrap_parens()
+    else {
+        return None;
+    };
+    let left = left.unwrap_parens();
+    let right = right.unwrap_parens();
+    match (signed_integer_literal(left), signed_integer_literal(right)) {
+        (None, Some(bound)) => Some((left, *operator, bound)),
+        (Some(bound), None) => Some((right, flip_comparison(*operator), bound)),
+        _ => None,
+    }
+}
+
+pub(crate) fn in_scope_integer_literal_comparison(
+    expression: &Expression,
+) -> Option<(&Expression, BinaryOperator, i128)> {
+    let (operand, operator, bound) = integer_literal_comparison(expression)?;
+    integer_operand_fits(operand, bound).then_some((operand, operator, bound))
+}
+
+fn integer_operand_fits(operand: &Expression, value: i128) -> bool {
+    match operand.get_type().as_simple() {
+        Some(kind) if kind.is_ordered() => match kind.integer_range() {
+            Some((min, max)) => min <= value && value <= max,
+            None => kind.is_float(),
+        },
+        _ => false,
+    }
+}
+
+fn same_ordered_numeric(a: &Expression, b: &Expression) -> bool {
+    if is_literal(a) || is_literal(b) {
+        return false;
+    }
+    match (a.get_type().as_simple(), b.get_type().as_simple()) {
+        (Some(ka), Some(kb)) => ka == kb && ka.is_ordered(),
+        _ => false,
+    }
+}
+
+fn is_literal(expression: &Expression) -> bool {
+    match expression.unwrap_parens() {
+        Expression::Literal { .. } => true,
+        Expression::Unary {
+            operator: UnaryOperator::Negative,
+            expression,
+            ..
+        } => matches!(expression.unwrap_parens(), Expression::Literal { .. }),
+        _ => false,
+    }
+}
+
+pub(crate) fn signed_integer_literal(expression: &Expression) -> Option<i128> {
+    if let Some(value) = expression.as_integer() {
+        return Some(value as i128);
+    }
+    if let Expression::Unary {
+        operator: UnaryOperator::Negative,
+        expression,
+        ..
+    } = expression
+    {
+        return expression.as_integer().map(|value| -(value as i128));
+    }
+    None
+}
+
+pub(crate) fn flip_comparison(operator: BinaryOperator) -> BinaryOperator {
+    use BinaryOperator::*;
+    match operator {
+        LessThan => GreaterThan,
+        GreaterThan => LessThan,
+        LessThanOrEqual => GreaterThanOrEqual,
+        GreaterThanOrEqual => LessThanOrEqual,
+        other => other,
+    }
+}
+
+pub(crate) fn negate_comparison(operator: BinaryOperator) -> Option<&'static str> {
+    use BinaryOperator::*;
+    Some(match operator {
+        Equal => "!=",
+        NotEqual => "==",
+        LessThan => ">=",
+        LessThanOrEqual => ">",
+        GreaterThan => "<=",
+        GreaterThanOrEqual => "<",
+        _ => return None,
+    })
+}
+
+/// A value-stable boolean (identifier, field read, literal, or `!` of one),
+/// safe to carry a constraint run across in a `&&`/`||` chain.
+pub(crate) fn is_skippable_boolean(expression: &Expression) -> bool {
+    if !expression.get_type().is_boolean() {
+        return false;
+    }
+    match expression.unwrap_parens() {
+        Expression::Identifier { .. }
+        | Expression::DotAccess { .. }
+        | Expression::Literal { .. } => true,
+        Expression::Unary {
+            operator: UnaryOperator::Not,
+            expression: inner,
+            ..
+        } => is_skippable_boolean(inner),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_side_effect_free(expression: &Expression) -> bool {
+    match expression.unwrap_parens() {
+        Expression::Identifier { .. } | Expression::Literal { .. } => true,
+        Expression::Unary {
+            expression: inner, ..
+        } => is_side_effect_free(inner),
+        Expression::Binary { left, right, .. } => {
+            is_side_effect_free(left) && is_side_effect_free(right)
+        }
+        Expression::DotAccess {
+            expression: inner, ..
+        } => is_side_effect_free(inner),
+        _ => false,
+    }
+}
+
+pub(crate) fn expressions_equivalent(a: &Expression, b: &Expression) -> bool {
+    let a = a.unwrap_parens();
+    let b = b.unwrap_parens();
+    match (a, b) {
+        (Expression::Identifier { value: av, .. }, Expression::Identifier { value: bv, .. }) => {
+            av == bv
+        }
+        (Expression::Literal { literal: al, .. }, Expression::Literal { literal: bl, .. }) => {
+            al == bl
+        }
+        (
+            Expression::Unary {
+                operator: ao,
+                expression: ae,
+                ..
+            },
+            Expression::Unary {
+                operator: bo,
+                expression: be,
+                ..
+            },
+        ) => ao == bo && expressions_equivalent(ae, be),
+        (
+            Expression::Binary {
+                operator: ao,
+                left: al,
+                right: ar,
+                ..
+            },
+            Expression::Binary {
+                operator: bo,
+                left: bl,
+                right: br,
+                ..
+            },
+        ) => ao == bo && expressions_equivalent(al, bl) && expressions_equivalent(ar, br),
+        (
+            Expression::DotAccess {
+                expression: ae,
+                member: am,
+                ..
+            },
+            Expression::DotAccess {
+                expression: be,
+                member: bm,
+                ..
+            },
+        ) => am == bm && expressions_equivalent(ae, be),
+        (Expression::Block { items: ai, .. }, Expression::Block { items: bi, .. }) => {
+            ai.len() == bi.len() && ai.iter().zip(bi).all(|(x, y)| expressions_equivalent(x, y))
+        }
+        (
+            Expression::Call {
+                expression: ac,
+                args: aa,
+                ..
+            },
+            Expression::Call {
+                expression: bc,
+                args: ba,
+                ..
+            },
+        ) => {
+            expressions_equivalent(ac, bc)
+                && aa.len() == ba.len()
+                && aa.iter().zip(ba).all(|(x, y)| expressions_equivalent(x, y))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MinMaxOp {
+    Min,
+    Max,
+}
+
+pub(crate) struct MinMaxCall<'a> {
+    pub(crate) op: MinMaxOp,
+    pub(crate) left: &'a Expression,
+    pub(crate) right: &'a Expression,
+}
+
+pub(crate) fn prelude_min_max(expression: &Expression) -> Option<MinMaxCall<'_>> {
+    let Expression::Call {
+        expression: callee,
+        args,
+        spread,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    if spread.is_some() || args.len() != 2 {
+        return None;
+    }
+    let Expression::Identifier {
+        resolution: IdentifierResolution::Definition(qualified),
+        ..
+    } = callee.unwrap_parens()
+    else {
+        return None;
+    };
+    let op = match qualified.as_str() {
+        "prelude.min" => MinMaxOp::Min,
+        "prelude.max" => MinMaxOp::Max,
+        _ => return None,
+    };
+    Some(MinMaxCall {
+        op,
+        left: &args[0],
+        right: &args[1],
+    })
+}
+
+/// The more restrictive of two bounds; `first_wins(a, b)` is true when `a`'s
+/// value is tighter. At equal values the bound stays inclusive only if both were.
+pub(crate) fn tighter(
+    a: Option<Bound>,
+    b: Option<Bound>,
+    first_wins: impl Fn(i128, i128) -> bool,
+) -> Option<Bound> {
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => {
+            if a.value == b.value {
+                Some(Bound::new(a.value, a.inclusive && b.inclusive))
+            } else if first_wins(a.value, b.value) {
+                Some(a)
+            } else {
+                Some(b)
+            }
+        }
+    }
+}

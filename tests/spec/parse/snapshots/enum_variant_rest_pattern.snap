@@ -1,6 +1,14 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn test(s: Shape) {\n  match s {\n    Shape.Triangle(..) => print(\"triangle\"),\n    Shape.Circle(..) => print(\"circle\"),\n  }\n}\n"
+description: |
+  
+  enum Shape { Triangle(int, int, int), Circle(float) }
+  fn test(s: Shape) {
+    match s {
+      Shape.Triangle(..) => print("triangle"),
+      Shape.Circle(..) => print("circle"),
+    }
+  }
 ---
 [
     Enum {
@@ -16,6 +24,7 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
         variants: [
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Triangle",
                 name_span: Span {
                     file_id: 0,
@@ -27,7 +36,7 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                         EnumFieldDefinition {
                             name: "field0",
                             name_span: Span {
-                                file_id: 0,
+                                file_id: 4294967295,
                                 byte_offset: 0,
                                 byte_length: 0,
                             },
@@ -40,14 +49,14 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                                     byte_length: 3,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                         EnumFieldDefinition {
                             name: "field1",
                             name_span: Span {
-                                file_id: 0,
+                                file_id: 4294967295,
                                 byte_offset: 0,
                                 byte_length: 0,
                             },
@@ -60,14 +69,14 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                                     byte_length: 3,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                         EnumFieldDefinition {
                             name: "field2",
                             name_span: Span {
-                                file_id: 0,
+                                file_id: 4294967295,
                                 byte_offset: 0,
                                 byte_length: 0,
                             },
@@ -80,15 +89,16 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                                     byte_length: 3,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                     ],
                 ),
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Circle",
                 name_span: Span {
                     file_id: 0,
@@ -100,7 +110,7 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                         EnumFieldDefinition {
                             name: "field0",
                             name_span: Span {
-                                file_id: 0,
+                                file_id: 4294967295,
                                 byte_offset: 0,
                                 byte_length: 0,
                             },
@@ -113,9 +123,9 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                                     byte_length: 5,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                     ],
                 ),
@@ -159,168 +169,171 @@ description: "input: \nenum Shape { Triangle(int, int, int), Circle(float) }\nfn
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
         ],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Match {
-                    subject: Identifier {
-                        value: "s",
-                        ty: Variable(
-                            -1,
-                        ),
-                        span: Span {
-                            file_id: 0,
-                            byte_offset: 83,
-                            byte_length: 1,
-                        },
-                        binding_id: None,
-                        qualified: None,
-                    },
-                    arms: [
-                        MatchArm {
-                            pattern: EnumVariant {
-                                identifier: "Shape.Triangle",
-                                fields: [],
-                                rest: true,
-                                ty: Variable(
-                                    -1,
-                                ),
-                                span: Span {
-                                    file_id: 0,
-                                    byte_offset: 91,
-                                    byte_length: 18,
-                                },
+        body: Definition(
+            Block {
+                items: [
+                    Match {
+                        subject: Identifier {
+                            value: "s",
+                            ty: Var {
+                                id: uninferred,
                             },
-                            expression: Call {
-                                expression: Identifier {
-                                    value: "print",
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                            span: Span {
+                                file_id: 0,
+                                byte_offset: 83,
+                                byte_length: 1,
+                            },
+                            resolution: Unresolved,
+                        },
+                        arms: [
+                            MatchArm {
+                                pattern: EnumVariant {
+                                    identifier: "Shape.Triangle",
+                                    fields: [],
+                                    rest: true,
+                                    resolution: Unresolved,
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 91,
+                                        byte_length: 18,
+                                    },
+                                },
+                                expression: Call {
+                                    expression: Identifier {
+                                        value: "print",
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
+                                        span: Span {
+                                            file_id: 0,
+                                            byte_offset: 113,
+                                            byte_length: 5,
+                                        },
+                                        resolution: Unresolved,
+                                    },
+                                    args: [
+                                        Literal {
+                                            literal: String {
+                                                value: "triangle",
+                                                raw: false,
+                                            },
+                                            ty: Var {
+                                                id: uninferred,
+                                            },
+                                            span: Span {
+                                                file_id: 0,
+                                                byte_offset: 119,
+                                                byte_length: 10,
+                                            },
+                                        },
+                                    ],
+                                    spread: None,
+                                    type_arguments: None,
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 113,
-                                        byte_length: 5,
+                                        byte_length: 17,
                                     },
-                                    binding_id: None,
-                                    qualified: None,
+                                    call_kind: Unresolved,
                                 },
-                                args: [
-                                    Literal {
-                                        literal: String(
-                                            "triangle",
-                                        ),
-                                        ty: Variable(
-                                            -1,
-                                        ),
+                            },
+                            MatchArm {
+                                pattern: EnumVariant {
+                                    identifier: "Shape.Circle",
+                                    fields: [],
+                                    rest: true,
+                                    resolution: Unresolved,
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 136,
+                                        byte_length: 16,
+                                    },
+                                },
+                                expression: Call {
+                                    expression: Identifier {
+                                        value: "print",
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
                                         span: Span {
                                             file_id: 0,
-                                            byte_offset: 119,
-                                            byte_length: 10,
+                                            byte_offset: 156,
+                                            byte_length: 5,
                                         },
+                                        resolution: Unresolved,
                                     },
-                                ],
-                                spread: None,
-                                type_args: [],
-                                ty: Variable(
-                                    -1,
-                                ),
-                                span: Span {
-                                    file_id: 0,
-                                    byte_offset: 113,
-                                    byte_length: 17,
-                                },
-                            },
-                        },
-                        MatchArm {
-                            pattern: EnumVariant {
-                                identifier: "Shape.Circle",
-                                fields: [],
-                                rest: true,
-                                ty: Variable(
-                                    -1,
-                                ),
-                                span: Span {
-                                    file_id: 0,
-                                    byte_offset: 136,
-                                    byte_length: 16,
-                                },
-                            },
-                            expression: Call {
-                                expression: Identifier {
-                                    value: "print",
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                                    args: [
+                                        Literal {
+                                            literal: String {
+                                                value: "circle",
+                                                raw: false,
+                                            },
+                                            ty: Var {
+                                                id: uninferred,
+                                            },
+                                            span: Span {
+                                                file_id: 0,
+                                                byte_offset: 162,
+                                                byte_length: 8,
+                                            },
+                                        },
+                                    ],
+                                    spread: None,
+                                    type_arguments: None,
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 156,
-                                        byte_length: 5,
+                                        byte_length: 15,
                                     },
-                                    binding_id: None,
-                                    qualified: None,
-                                },
-                                args: [
-                                    Literal {
-                                        literal: String(
-                                            "circle",
-                                        ),
-                                        ty: Variable(
-                                            -1,
-                                        ),
-                                        span: Span {
-                                            file_id: 0,
-                                            byte_offset: 162,
-                                            byte_length: 8,
-                                        },
-                                    },
-                                ],
-                                spread: None,
-                                type_args: [],
-                                ty: Variable(
-                                    -1,
-                                ),
-                                span: Span {
-                                    file_id: 0,
-                                    byte_offset: 156,
-                                    byte_length: 15,
+                                    call_kind: Unresolved,
                                 },
                             },
+                        ],
+                        ty: Var {
+                            id: uninferred,
                         },
-                    ],
-                    origin: Explicit,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 77,
-                        byte_length: 99,
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 77,
+                            byte_length: 99,
+                        },
                     },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 73,
-                byte_length: 105,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 73,
+                    byte_length: 105,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 55,

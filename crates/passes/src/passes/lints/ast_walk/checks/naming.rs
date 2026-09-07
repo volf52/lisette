@@ -1,0 +1,240 @@
+use diagnostics::LocalSink;
+use syntax::ast::{Binding, Expression, Generic, Pattern, RestPattern, Span, Visibility};
+
+use crate::passes::lints::ast_walk::casing::{is_snake_case, to_pascal_case, to_snake_case};
+use crate::passes::walk::{FunctionRole, NodeCtx, PatternRole};
+
+use super::helpers::first_param_is_self;
+
+pub fn check_expression_naming<'a>(
+    expression: &Expression,
+    ctx: &NodeCtx<'a>,
+    role: FunctionRole<'a>,
+) {
+    let sink = ctx.sink;
+    let is_d_lis = ctx.is_d_lis();
+    match expression {
+        Expression::Struct {
+            name,
+            name_span,
+            generics,
+            fields,
+            visibility,
+            ..
+        } => {
+            if !visibility.is_public() {
+                check_pascal_case(name, name_span, "non_pascal_case_type", sink);
+            }
+
+            for generic in generics {
+                check_type_parameter(generic, sink);
+            }
+
+            if !is_d_lis {
+                for field in fields.iter().filter(|f| !f.is_embedded()) {
+                    check_snake_case(
+                        &field.name,
+                        &field.name_span,
+                        "non_snake_case_struct_field",
+                        sink,
+                    );
+                }
+            }
+        }
+
+        Expression::Enum {
+            name,
+            name_span,
+            generics,
+            variants,
+            visibility,
+            ..
+        } => {
+            if !visibility.is_public() {
+                check_pascal_case(name, name_span, "non_pascal_case_type", sink);
+            }
+
+            for generic in generics {
+                check_type_parameter(generic, sink);
+            }
+
+            for variant in variants {
+                check_pascal_case(
+                    &variant.name,
+                    &variant.name_span,
+                    "non_pascal_case_enum_variant",
+                    sink,
+                );
+
+                if !is_d_lis && variant.fields.is_struct() {
+                    for field in variant.fields.iter() {
+                        check_snake_case(
+                            &field.name,
+                            &field.name_span,
+                            "non_snake_case_enum_field",
+                            sink,
+                        );
+                    }
+                }
+            }
+        }
+
+        Expression::TypeAlias {
+            name,
+            name_span,
+            generics,
+            visibility,
+            ..
+        } => {
+            if !visibility.is_public() {
+                check_pascal_case(name, name_span, "non_pascal_case_type", sink);
+            }
+
+            for generic in generics {
+                check_type_parameter(generic, sink);
+            }
+        }
+
+        Expression::Interface {
+            name,
+            name_span,
+            generics,
+            visibility,
+            ..
+        } => {
+            if !visibility.is_public() {
+                check_pascal_case(name, name_span, "non_pascal_case_type", sink);
+            }
+
+            for generic in generics {
+                check_type_parameter(generic, sink);
+            }
+        }
+
+        Expression::Function {
+            name,
+            name_span,
+            generics,
+            params,
+            visibility,
+            ..
+        } => {
+            let exempt = go_method_name_exempt(ctx, role, params, *visibility, name);
+            if !is_d_lis && !exempt {
+                check_snake_case(name, name_span, "non_snake_case_function", sink);
+            }
+
+            for generic in generics {
+                check_type_parameter(generic, sink);
+            }
+        }
+
+        Expression::ImplBlock { generics, .. } => {
+            for generic in generics {
+                check_type_parameter(generic, sink);
+            }
+        }
+
+        _ => {}
+    }
+}
+
+pub fn check_pattern_naming(pattern: &Pattern, ctx: &NodeCtx, role: PatternRole) {
+    if ctx.is_d_lis() {
+        return;
+    }
+    let (name, span) = match pattern {
+        Pattern::Identifier { identifier, span } => (identifier, span),
+        Pattern::AsBinding {
+            name, name_span, ..
+        } => (name, name_span),
+        Pattern::Slice {
+            rest: RestPattern::Bind { name, span },
+            ..
+        } => (name, span),
+        _ => return,
+    };
+    let code = match role {
+        PatternRole::Parameter => "non_snake_case_parameter",
+        PatternRole::Binding => "non_snake_case_variable",
+    };
+    check_snake_case(name, span, code, ctx.sink);
+}
+
+/// Whether a method is exempt from the snake_case lint because a rename would change
+/// its exported Go name or break interface conformance (matched by source name).
+fn go_method_name_exempt(
+    ctx: &NodeCtx,
+    role: FunctionRole<'_>,
+    params: &[Binding],
+    visibility: Visibility,
+    name: &str,
+) -> bool {
+    let (is_method, public, impl_type) = match role {
+        FunctionRole::InterfaceMethod { public } => (true, public, None),
+        FunctionRole::ImplMethod { type_name } => (
+            first_param_is_self(params),
+            visibility.is_public(),
+            Some(type_name),
+        ),
+        FunctionRole::Free => (false, false, None),
+    };
+    if !is_method {
+        return false;
+    }
+    if is_builtin_interface_method(name) {
+        return true;
+    }
+    if let Some(type_name) = impl_type
+        && ctx
+            .facts
+            .method_spelling_pinned_by_interface(ctx.package_id(), name, type_name)
+    {
+        return true;
+    }
+    if public {
+        to_pascal_case(&to_snake_case(name)) != to_pascal_case(name)
+    } else {
+        name.chars().next().is_some_and(char::is_uppercase)
+    }
+}
+
+fn is_builtin_interface_method(name: &str) -> bool {
+    name == "Error"
+}
+
+fn check_type_parameter(generic: &Generic, sink: &LocalSink) {
+    check_pascal_case(
+        &generic.name,
+        &generic.span,
+        "non_pascal_case_type_parameter",
+        sink,
+    );
+}
+
+fn check_pascal_case(name: &str, span: &Span, code: &str, sink: &LocalSink) {
+    if name.starts_with('_') {
+        return;
+    }
+
+    let first_char = name.chars().next().unwrap_or('A');
+    if !first_char.is_uppercase() {
+        sink.push(diagnostics::lint::miscased_pascal(
+            span,
+            code,
+            &to_pascal_case(name),
+        ));
+    }
+}
+
+fn check_snake_case(name: &str, span: &Span, code: &str, sink: &LocalSink) {
+    if name.starts_with('_') || is_snake_case(name) {
+        return;
+    }
+
+    sink.push(diagnostics::lint::miscased_snake(
+        span,
+        code,
+        &to_snake_case(name),
+    ));
+}

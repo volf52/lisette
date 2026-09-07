@@ -1,18 +1,24 @@
 ---
 source: tests/spec/emit/recover.rs
-description: "input: \nfn may_panic() -> int { 42 }\n\nfn test() {\n  let result = recover { may_panic() };\n}\n"
+description: |
+  
+  fn may_panic() -> int { 42 }
+  
+  fn test() {
+    let result = recover { may_panic() };
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func may_panic() int {
+func mayPanic() int {
 	return 42
 }
 
 func test() {
 	recoverResult_1 := lisette.RecoverBlock(func() int {
-		return may_panic()
+		return mayPanic()
 	})
 	_ = recoverResult_1
 }

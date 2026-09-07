@@ -1,454 +1,585 @@
-mod bindings;
+mod abi;
+mod analyze;
 pub(crate) mod calls;
-mod collectors;
+pub(crate) mod context;
 pub(crate) mod control_flow;
 pub(crate) mod definitions;
 pub(crate) mod expressions;
-mod imports;
 pub(crate) mod names;
 mod output;
 pub(crate) mod patterns;
-pub(crate) mod queries;
+mod plan;
+mod render;
+mod state;
 pub(crate) mod statements;
 pub(crate) mod types;
 mod utils;
 
-pub(crate) use bindings::Bindings;
-pub(crate) use calls::go_interop::GoCallStrategy;
+pub(crate) use analyze::facts::EmitFacts;
+pub(crate) use context::lowering::{LineIndex, ReturnContext};
 pub(crate) use definitions::enum_layout::EnumLayout;
 pub(crate) use names::go_name;
 pub(crate) use names::go_name::escape_reserved;
 pub(crate) use output::OutputCollector;
-pub(crate) use types::emitter::{ArmPosition, EmitFlags, LineIndex, LoopContext, Position};
+pub(crate) use render::Renderer;
 pub(crate) use types::prelude::PreludeType;
 pub(crate) use utils::is_order_sensitive;
 pub(crate) use utils::write_line;
 
 pub use names::go_name::PRELUDE_IMPORT_PATH;
+pub use names::go_name::go_test_function_name;
 pub use output::OutputFile;
+pub use output::imports;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::sync::Arc;
 
-use ecow::EcoString;
-use imports::ImportBuilder;
-use syntax::ast::{Generic, Span};
+use abi::callable::{CallableReturnAbi, OptionReturnAbi, PayloadLayout};
+use abi::catalog::GoAbiCatalog;
+use analyze::facts::{EmitFactsConfig, is_nullable_option};
+use diagnostics::LisetteDiagnostic;
+use names::go_name::GeneratedPackage;
+use names::packages::{PackageRequirements, PackageUse};
+use plan::PackagePlan;
+use plan::bodies::{LoopId, LoweredBlock, LoweredStatement};
+use state::adapter_registry::AdapterRegistry;
+use state::file_namespace::FileNamespace;
+use state::package_state::{FunctionEmissionContext, PackageState};
+use state::scope::ScopeState;
+use syntax::ast::{Expression, Span};
+use syntax::program;
 use syntax::program::{
-    CoercionInfo, Definition, EmitInput, File, ModuleId, MutationInfo, ResolutionInfo, UnusedInfo,
+    Definition, DefinitionBody, EmitInput, EqualityIndex, File, MutationInfo, TestIndex, UnusedInfo,
 };
-use syntax::types::Type;
+use syntax::types::{Symbol, Type};
+use types::go_type::GoType;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EmitOptions {
-    pub debug: bool,
+    pub sourcemap: bool,
+    pub emit_tests: bool,
 }
 
-pub struct TestEmitConfig<'a> {
-    pub definitions: &'a HashMap<EcoString, Definition>,
-    pub module_id: &'a str,
-    pub go_module: &'a str,
-    pub unused: &'a UnusedInfo,
-    pub mutations: &'a MutationInfo,
-    pub coercions: &'a CoercionInfo,
-    pub resolutions: &'a ResolutionInfo,
-    pub ufcs_methods: &'a HashSet<(String, String)>,
-    pub go_package_names: &'a HashMap<String, String>,
+/// A library root's Go package name, from its package path (`example.com/lib/v2` -> `lib`).
+pub fn root_package_name(go_module: &str) -> String {
+    go_name::sanitize_package_name(program::go_import_default_name(go_module)).into_owned()
 }
 
-struct EmitContext<'a> {
-    definitions: &'a HashMap<EcoString, Definition>,
-    unused: &'a UnusedInfo,
-    mutations: &'a MutationInfo,
-    coercions: &'a CoercionInfo,
-    resolutions: &'a ResolutionInfo,
-    ufcs_methods: &'a HashSet<(String, String)>,
-    go_package_names: &'a HashMap<String, String>,
-    entry_module: ModuleId,
-    go_module: String,
-    options: EmitOptions,
-    /// file_id -> byte offset to line lookup.
-    line_indexes: Arc<HashMap<u32, LineIndex>>,
-}
-
-struct ModuleData {
-    make_functions: HashMap<String, String>,
-    enum_layouts: HashMap<String, EnumLayout>,
-    /// Fields that were exported due to serialization tags (e.g. `#[json]`).
-    /// Key is "TypeId.field_name". Checked during field access to match
-    /// the capitalization used in the struct definition.
-    tag_exported_fields: HashSet<String>,
-    /// Method names that appear in any pub interface.
-    /// These must be capitalized in Go to satisfy the interface,
-    /// regardless of the concrete method's own visibility.
+#[derive(Default)]
+pub(crate) struct GlobalEmitData {
+    go_abi_catalog: GoAbiCatalog,
     exported_method_names: HashSet<String>,
-    /// Bounds from constrained impl blocks, keyed by receiver name.
-    /// Go requires type parameter constraints on the type definition itself,
-    /// so we pre-scan impl blocks and merge their bounds into struct generics.
-    impl_bounds: HashMap<String, Vec<Generic>>,
-    /// Types that have unconstrained impl blocks (impl<T> Type<T> with no bounds).
-    /// Used to detect when a type has both constrained and unconstrained impl blocks.
-    unconstrained_impl_receivers: HashSet<String>,
-    /// Maps module IDs to their import aliases (e.g., "lib" → "L", "models/user" → "user").
-    /// Used when emitting cross-module references to use the correct alias.
-    module_aliases: HashMap<String, String>,
-    /// Reverse of `module_aliases`: maps alias → module_id (e.g., "L" → "lib").
-    /// Used for O(1) lookup when resolving an alias back to a module name.
-    reverse_module_aliases: HashMap<String, String>,
-    /// Generic type parameters whose Ref has been absorbed into the Go type parameter.
-    /// When a function has `item: Ref<T>` where T has interface bounds, Go requires
-    /// T itself (not *T) to satisfy the interface. So we emit `item T` and let Go
-    /// infer T = *ConcreteType. Ref<T> for these params should emit as just T.
-    absorbed_ref_generics: HashSet<String>,
-    /// Pre-computed wrapping strategy per Go function.
-    go_call_strategies: HashMap<String, GoCallStrategy>,
 }
 
-struct ScopeState {
-    next_var: usize,
-    bindings: Bindings,
-    /// Stack of Go variable names declared at each scope level.
-    declared: Vec<HashSet<String>>,
-    /// Current Go block scope depth (0 = function level).
-    scope_depth: usize,
-    /// Stack of loop contexts (result var + optional label) per nesting level.
-    loop_stack: Vec<LoopContext>,
-    /// Go variable names currently used as block-to-var assign targets.
-    assign_targets: HashSet<String>,
-}
+impl GlobalEmitData {
+    fn compute(definitions: &HashMap<Symbol, Definition>) -> Self {
+        let mut globals = GlobalEmitData {
+            go_abi_catalog: GoAbiCatalog::from_definitions(definitions),
+            exported_method_names: HashSet::default(),
+        };
 
-impl ScopeState {
-    fn reset_for_top_level(&mut self) {
-        self.next_var = 0;
-        self.bindings.reset();
-        self.declared.clear();
-        self.declared.push(HashSet::default());
+        for (key, definition) in definitions.iter() {
+            globals.register_exported_methods(key, definition);
+        }
+
+        globals
+    }
+
+    fn register_exported_methods(&mut self, key: &Symbol, definition: &Definition) {
+        let is_user_definition =
+            !go_name::is_go_import(key) && !key.starts_with(go_name::PRELUDE_PREFIX);
+        match &definition.body {
+            DefinitionBody::Interface {
+                definition: iface, ..
+            } if definition.visibility.is_public() => {
+                for method_name in iface.methods.keys() {
+                    self.exported_method_names.insert(method_name.to_string());
+                }
+            }
+            DefinitionBody::Value { .. }
+                if definition.visibility.is_public()
+                    && is_user_definition
+                    && key.split('.').nth(2).is_some() =>
+            {
+                let method_name = go_name::unqualified_name(key);
+                self.exported_method_names.insert(method_name.to_string());
+            }
+            _ => {}
+        }
+
+        if is_user_definition && let Some(methods) = definition.methods() {
+            for method in methods
+                .values()
+                .filter(|method| method.visibility.is_public())
+            {
+                self.exported_method_names
+                    .insert(method.source_name.to_string());
+            }
+        }
+
+        if definition.visibility.is_public() && definition.is_display() {
+            self.exported_method_names.insert("to_string".to_string());
+        }
     }
 }
 
-pub struct Emitter<'a> {
-    ctx: EmitContext<'a>,
-    module: ModuleData,
-    scope: ScopeState,
-
-    current_module: ModuleId,
-
-    synthesized_adapter_types: HashMap<(EcoString, EcoString), String>,
-    pending_adapter_types: Vec<String>,
-
-    // Per-file accumulated state (reset between files)
-    flags: EmitFlags,
-    ensure_imported: HashSet<ModuleId>,
-
-    // Temporary emission context (saved/restored per-expression).
-    // These are implicit arguments — ideally parameters, but
-    // plumbing through deep call chains is impractical.
-    position: Position,
-    current_return_context: Option<Type>,
-    /// Target type for Option/Result assignment (interface coercion).
-    assign_target_ty: Option<Type>,
-    /// Generic function identifiers should NOT add type args when used as callees
-    /// (the call site handles instantiation), only when used as values.
-    emitting_call_callee: bool,
-    /// Set while emitting expressions that will appear in Go `if`/`for`/`switch`
-    /// conditions. Generic composite literals (`Type[Args]{...}`) need inner parens
-    /// in these contexts because gofmt strips outer condition parens for generics.
-    in_condition: bool,
-    /// When true, `emit_regular_call` skips array return wrapping (`arr := call; arr[:]`)
-    /// and returns the raw call string. Set by `emit_go_call_discarded` for discarded calls
-    /// where the array-to-slice conversion is unnecessary.
-    skip_array_return_wrap: bool,
-    /// Declared slot type during tuple staging; recovers Go alias type args that
-    /// call-site inference loses in assign-position match arms.
-    current_slot_expected_ty: Option<Type>,
+pub(crate) fn classify_go_return_type(
+    definitions: &HashMap<Symbol, Definition>,
+    return_ty: &Type,
+    go_hints: &[String],
+) -> Option<CallableReturnAbi> {
+    let payload = || {
+        if return_ty
+            .ok_type()
+            .tuple_arity()
+            .is_some_and(|arity| arity >= 2)
+        {
+            PayloadLayout::Flattened
+        } else {
+            PayloadLayout::Packed
+        }
+    };
+    if return_ty.is_partial() {
+        return Some(CallableReturnAbi::Partial { payload: payload() });
+    }
+    if return_ty.is_result() {
+        return Some(if return_ty.ok_type().is_unit() {
+            CallableReturnAbi::BareError
+        } else {
+            CallableReturnAbi::Result { payload: payload() }
+        });
+    }
+    if return_ty.is_option() {
+        if let Some(value) = sentinel_hint(go_hints) {
+            return Some(CallableReturnAbi::Option(OptionReturnAbi::Sentinel(value)));
+        }
+        if !is_nullable_option(definitions, return_ty) {
+            return Some(CallableReturnAbi::Option(OptionReturnAbi::CommaOk {
+                payload: payload(),
+            }));
+        }
+        if go_hints.iter().any(|s| s == "comma_ok") {
+            return Some(CallableReturnAbi::Option(OptionReturnAbi::CommaOk {
+                payload: payload(),
+            }));
+        }
+        return Some(CallableReturnAbi::Option(OptionReturnAbi::Nullable));
+    }
+    if let Some(arity) = return_ty.tuple_arity()
+        && arity >= 2
+    {
+        return Some(CallableReturnAbi::Tuple { arity });
+    }
+    None
 }
 
-impl<'a> Emitter<'a> {
-    pub fn emit(analysis: &'a EmitInput, go_module: &str, options: EmitOptions) -> Vec<OutputFile> {
-        let mut output = vec![];
+fn sentinel_hint(hints: &[String]) -> Option<i64> {
+    hints
+        .iter()
+        .any(|h| h == "sentinel_minus_one")
+        .then_some(-1)
+}
 
-        let line_indexes: Arc<HashMap<u32, LineIndex>> = Arc::new(if options.debug {
+pub struct TestEmitConfig<'a> {
+    pub definitions: &'a HashMap<Symbol, Definition>,
+    pub package_id: &'a str,
+    pub go_module: &'a str,
+    pub unused: &'a UnusedInfo,
+    pub mutations: &'a MutationInfo,
+    pub equality_index: &'a EqualityIndex,
+    pub test_index: &'a TestIndex,
+    pub go_package_names: &'a HashMap<String, String>,
+    pub go_package_ids: &'a HashSet<String>,
+}
+
+pub struct Planner<'a> {
+    facts: EmitFacts<'a>,
+    package: PackageState,
+    function_contexts: Vec<FunctionEmissionContext>,
+    scope: ScopeState,
+    adapter_registry: AdapterRegistry,
+    namespace: FileNamespace,
+}
+
+impl Planner<'_> {
+    fn require_stdlib(&mut self) {
+        self.require_generated_package(GeneratedPackage::Prelude);
+    }
+
+    fn require_fmt(&mut self) {
+        self.require_generated_package(GeneratedPackage::Fmt);
+    }
+
+    fn require_errors(&mut self) {
+        self.require_generated_package(GeneratedPackage::Errors);
+    }
+
+    fn require_slices(&mut self) {
+        self.require_generated_package(GeneratedPackage::Slices);
+    }
+
+    fn require_strings(&mut self) {
+        self.require_generated_package(GeneratedPackage::Strings);
+    }
+
+    fn require_maps(&mut self) {
+        self.require_generated_package(GeneratedPackage::Maps);
+    }
+
+    fn require_json(&mut self) {
+        self.require_generated_package(GeneratedPackage::Json);
+    }
+
+    fn require_cmp(&mut self) {
+        self.require_generated_package(GeneratedPackage::Cmp);
+    }
+
+    fn require_testkit(&mut self) {
+        self.require_generated_package(GeneratedPackage::TestKit);
+    }
+
+    fn require_testing(&mut self) {
+        self.require_generated_package(GeneratedPackage::Testing);
+    }
+
+    fn require_generated_package(&mut self, package: GeneratedPackage) {
+        self.namespace.require(PackageUse::generated(package));
+    }
+
+    fn use_go_type(&mut self, ty: &Type) -> String {
+        self.use_rendered_go_type(self.go_type(ty))
+    }
+
+    fn use_rendered_go_type(&mut self, go_type: GoType) -> String {
+        self.namespace.absorb(go_type.requirements());
+        go_type.code
+    }
+
+    fn require_packages(&mut self, requirements: &PackageRequirements) {
+        self.namespace.absorb(requirements);
+    }
+}
+
+impl<'a> Planner<'a> {
+    fn return_context_for_type(&self, return_ty: Type) -> ReturnContext {
+        let return_ty = self.facts.peel_alias(&return_ty);
+        match self.classify_direct_emission(&return_ty) {
+            Some(shape) => ReturnContext::Lowered { return_ty, shape },
+            None => ReturnContext::Tagged(return_ty),
+        }
+    }
+
+    /// Append this file's newly-synthesized adapter declarations to `source`.
+    fn drain_file_emission_into(&mut self, source: &mut OutputCollector) {
+        for adapter_declaration in self.adapter_registry.drain_declarations() {
+            source.collect_with_blank(adapter_declaration);
+        }
+    }
+}
+
+impl<'a> Planner<'a> {
+    pub fn emit(
+        analysis: &'a EmitInput,
+        go_module: &str,
+        entry_package_name: &'a str,
+        options: EmitOptions,
+    ) -> Result<Vec<OutputFile>, Vec<LisetteDiagnostic>> {
+        let line_indexes = options.sourcemap.then(|| {
             analysis
                 .files
                 .iter()
                 .map(|(file_id, file)| {
-                    let path = if file.module_id == analysis.entry_module_id {
-                        format!("src/{}", file.name)
-                    } else {
-                        format!("{}/{}", file.module_id, file.name)
-                    };
-                    (*file_id, LineIndex::from_source(path, &file.source))
+                    (
+                        *file_id,
+                        LineIndex::from_source(file.display_path.clone(), &file.source),
+                    )
                 })
                 .collect()
-        } else {
-            HashMap::default()
         });
 
-        for (module_id, module_info) in &analysis.modules {
-            if analysis.cached_modules.contains(module_id) {
-                continue;
-            }
+        let shared = SharedEmitContext {
+            emit_tests: options.emit_tests,
+            line_indexes,
+            globals: GlobalEmitData::compute(&analysis.definitions),
+        };
 
-            let ctx = EmitContext {
-                definitions: &analysis.definitions,
-                unused: &analysis.unused,
-                mutations: &analysis.mutations,
-                coercions: &analysis.coercions,
-                resolutions: &analysis.resolutions,
-                ufcs_methods: &analysis.ufcs_methods,
-                go_package_names: &analysis.go_package_names,
-                entry_module: analysis.entry_module_id.to_string(),
-                go_module: go_module.to_string(),
-                options: options.clone(),
-                line_indexes: line_indexes.clone(),
+        let mut files_by_package: HashMap<&str, Vec<&File>> = HashMap::default();
+        for file in analysis.files.values().filter(|file| !file.is_d_lis()) {
+            if !analysis.cached_packages.contains(&file.package_id) {
+                files_by_package
+                    .entry(file.package_id.as_str())
+                    .or_default()
+                    .push(file);
+            }
+        }
+        for files in files_by_package.values_mut() {
+            files.sort_unstable_by_key(|file| file.id);
+        }
+        let mut work: Vec<_> = files_by_package.into_iter().collect();
+        work.sort_unstable_by_key(|(package_id, _)| *package_id);
+
+        const PARALLEL_THRESHOLD: usize = 4;
+
+        let emit_one = |(package_id, files): &(&str, Vec<&File>)| {
+            emit_package(
+                analysis,
+                go_module,
+                entry_package_name,
+                &shared,
+                package_id,
+                files,
+            )
+        };
+
+        let package_outputs: Vec<Result<Vec<OutputFile>, Vec<LisetteDiagnostic>>> =
+            if work.len() < PARALLEL_THRESHOLD {
+                work.iter().map(emit_one).collect()
+            } else {
+                use rayon::prelude::*;
+                work.par_iter().map(emit_one).collect()
             };
-            let mut emitter = Self::new(ctx, module_id);
 
-            let files: Vec<_> = module_info
-                .file_ids
-                .iter()
-                .filter_map(|fid| analysis.files.get(fid))
-                .collect();
-
-            let mut module_output = emitter.emit_files(&files, module_id);
-
-            if module_id != &analysis.entry_module_id {
-                for file in &mut module_output {
-                    file.name = format!("{}/{}", module_info.path, file.name);
-                }
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        for package_output in package_outputs {
+            match package_output {
+                Ok(mut files) => output.append(&mut files),
+                Err(mut errors) => diagnostics.append(&mut errors),
             }
-
-            output.extend(module_output);
         }
 
-        output
+        if diagnostics.is_empty() {
+            output.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(output)
+        } else {
+            diagnostics.sort_by(LisetteDiagnostic::sort_key);
+            Err(diagnostics)
+        }
     }
 
-    pub fn new_for_tests(config: &TestEmitConfig<'a>, source: Option<&str>) -> Self {
-        let (debug, line_indexes) = match source {
-            Some(src) => (
-                true,
-                Arc::new(HashMap::from_iter([(
-                    0u32,
-                    LineIndex::from_source("src/test.lis".to_string(), src),
-                )])),
-            ),
-            None => (false, Arc::new(HashMap::default())),
-        };
-        let ctx = EmitContext {
+    pub fn emit_files_for_tests(
+        config: &TestEmitConfig<'a>,
+        source: Option<&str>,
+        files: &[&File],
+    ) -> Result<Vec<OutputFile>, Vec<LisetteDiagnostic>> {
+        let line_indexes = source.map(|src| {
+            HashMap::from_iter([(
+                0u32,
+                LineIndex::from_source("src/test.lis".to_string(), src),
+            )])
+        });
+        let globals = GlobalEmitData::compute(config.definitions);
+        let facts = EmitFacts::new(EmitFactsConfig {
             definitions: config.definitions,
             unused: config.unused,
             mutations: config.mutations,
-            coercions: config.coercions,
-            resolutions: config.resolutions,
-            ufcs_methods: config.ufcs_methods,
+            equality_index: config.equality_index,
+            test_index: config.test_index,
             go_package_names: config.go_package_names,
-            entry_module: config.module_id.to_string(),
+            go_package_ids: config.go_package_ids,
+            entry_package: config.package_id.to_string().into(),
+            entry_package_name: "main",
             go_module: config.go_module.to_string(),
-            options: EmitOptions { debug },
-            line_indexes,
-        };
-        Self::new(ctx, config.module_id)
-    }
-
-    fn new(ctx: EmitContext<'a>, current_module: &str) -> Self {
-        Self {
-            ctx,
-            module: ModuleData {
-                make_functions: HashMap::default(),
-                enum_layouts: HashMap::default(),
-                tag_exported_fields: HashSet::default(),
-                exported_method_names: HashSet::default(),
-                impl_bounds: HashMap::default(),
-                unconstrained_impl_receivers: HashSet::default(),
-                module_aliases: HashMap::default(),
-                reverse_module_aliases: HashMap::default(),
-                absorbed_ref_generics: HashSet::default(),
-                go_call_strategies: HashMap::default(),
-            },
-            scope: ScopeState {
-                next_var: 0,
-                bindings: Bindings::new(),
-                declared: vec![HashSet::default()],
-                scope_depth: 0,
-                loop_stack: Vec::new(),
-                assign_targets: HashSet::default(),
-            },
-            current_module: current_module.to_string(),
-            synthesized_adapter_types: HashMap::default(),
-            pending_adapter_types: Vec::new(),
-            flags: EmitFlags::default(),
-            ensure_imported: HashSet::default(),
-            position: Position::Expression,
-            current_return_context: None,
-            assign_target_ty: None,
-            emitting_call_callee: false,
-            in_condition: false,
-            skip_array_return_wrap: false,
-            current_slot_expected_ty: None,
-        }
-    }
-
-    pub(crate) fn emit_condition_operand(
-        &mut self,
-        output: &mut String,
-        expression: &syntax::ast::Expression,
-    ) -> String {
-        let prev = self.in_condition;
-        self.in_condition = true;
-        let result = self.emit_operand(output, expression);
-        self.in_condition = prev;
-        result
-    }
-
-    pub(crate) fn push_loop(&mut self, result_var: impl Into<String>) {
-        self.scope.loop_stack.push(LoopContext {
-            result_var: result_var.into(),
-            label: None,
+            emit_tests: false,
+            line_indexes: line_indexes.as_ref(),
+            globals: &globals,
+            current_package: config.package_id.to_string().into(),
         });
+        Planner::emit_files_with_facts(facts, files)
     }
 
-    pub(crate) fn pop_loop(&mut self) {
-        self.scope.loop_stack.pop();
+    fn new(facts: EmitFacts<'a>, first_file: &File) -> Self {
+        let namespace = FileNamespace::build(
+            first_file,
+            facts.go_module(),
+            facts.unused_imports_for_current_package(),
+            facts.go_package_names(),
+        );
+        Self {
+            facts,
+            package: PackageState::default(),
+            function_contexts: Vec::new(),
+            scope: ScopeState::new(),
+            adapter_registry: AdapterRegistry::default(),
+            namespace,
+        }
     }
 
-    pub(crate) fn current_loop_result_var(&self) -> Option<&str> {
-        self.scope
-            .loop_stack
-            .last()
-            .map(|ctx| ctx.result_var.as_str())
-    }
-
-    pub(crate) fn current_loop_label(&self) -> Option<&str> {
-        self.scope
-            .loop_stack
-            .last()
-            .and_then(|ctx| ctx.label.as_deref())
-    }
-
-    pub(crate) fn with_position<F, R>(&mut self, position: Position, f: F) -> R
-    where
-        F: FnOnce(&mut Self) -> R,
-    {
-        let saved = std::mem::replace(&mut self.position, position);
+    fn with_loop<R>(&mut self, result_var: impl Into<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scope.push_loop(result_var.into());
         let result = f(self);
-        self.position = saved;
+        self.scope.pop_loop();
         result
     }
 
-    pub(crate) fn wrap_value(&self, value: &str) -> String {
-        if value.is_empty() {
-            return String::new();
-        }
-        match &self.position {
-            Position::Tail => format!("return {}\n", value),
-            Position::Statement => format!("{}\n", value),
-            Position::Expression => value.to_string(),
-            Position::Assign(var) => format!("{} = {}\n", var, value),
+    fn current_loop_result_var(&self) -> Option<&str> {
+        self.scope.current_loop_result_var()
+    }
+
+    fn current_loop_id(&self) -> Option<LoopId> {
+        self.scope.current_loop_id()
+    }
+
+    /// Push the enclosing function/lambda/try/recover return context. This
+    /// scope stack is the single source of truth for return-context lowering;
+    /// all readers consult it via [`Planner::return_ctx`].
+    fn with_return_context<R>(&mut self, ctx: ReturnContext, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scope.push_return_ctx(ctx);
+        let result = f(self);
+        self.scope.pop_return_ctx();
+        result
+    }
+
+    fn with_test_handle<R>(&mut self, name: Option<String>, f: impl FnOnce(&mut Self) -> R) -> R {
+        if let Some(name) = name {
+            self.scope.push_test_handle(name);
+            let result = f(self);
+            self.scope.pop_test_handle();
+            result
+        } else {
+            f(self)
         }
     }
 
-    pub(crate) fn emit_unreachable_if_needed(&self, output: &mut String, has_catchall: bool) {
-        if self.position.is_tail() && !has_catchall {
-            output.push_str("panic(\"unreachable\")\n");
-        }
+    fn current_test_handle(&self) -> Option<String> {
+        self.scope.current_test_handle().map(str::to_string)
     }
 
-    /// Computes the position for match arms based on the current position and result type.
-    ///
-    /// For control flow constructs that need to produce values (match, if-else), this
-    /// determines whether we need a temporary result variable and what position the
-    /// inner branches should use.
-    ///
-    /// If `output` is provided, declares the result variable when needed.
-    pub(crate) fn compute_arm_position(
+    /// The enclosing function/lambda/try/recover return context, maintained on
+    /// the scope stack and shared cheaply via `Rc`. Defaults to
+    /// `ReturnContext::None` outside any function body (e.g. package-level
+    /// collection). This is the single source of truth for return-context
+    /// lowering.
+    fn return_ctx(&self) -> ReturnContext {
+        self.scope.current_return_ctx()
+    }
+
+    /// `true` if this is a new declaration in the current block (use `:=`),
+    /// `false` if the name is already declared (use `=`).
+    fn try_declare(&mut self, go_name: &str) -> bool {
+        self.scope.try_declare_go_name(go_name)
+    }
+
+    fn is_declared(&self, go_name: &str) -> bool {
+        self.scope.is_go_name_declared(go_name)
+    }
+
+    /// Whether an enclosing branch already tested this exact condition.
+    fn is_condition_established(&self, condition: &str) -> bool {
+        self.scope.is_condition_established(condition)
+    }
+
+    /// Unconditionally marks `go_name` as declared in the current block.
+    fn declare(&mut self, go_name: &str) {
+        self.scope.declare_go_name(go_name);
+    }
+
+    /// Allocate a fresh Go temp, register it as declared, and emit
+    /// `tmp := value` into `output`.
+    fn hoist_tmp_value(&mut self, output: &mut String, hint: &str, value: &str) -> String {
+        let tmp = self.fresh_var(Some(hint));
+        self.declare(&tmp);
+        write_line!(output, "{} := {}", tmp, value);
+        tmp
+    }
+
+    /// Bind `value` to a name that can be read more than once.
+    fn stable_source(
         &mut self,
-        output: Option<&mut String>,
-        ty: &Type,
-    ) -> ArmPosition {
-        if self.position.is_tail() {
-            return ArmPosition::from_position(Position::Tail);
+        statements: &mut Vec<LoweredStatement>,
+        hint: &str,
+        value: &str,
+    ) -> String {
+        if go_name::is_plain_identifier(value) {
+            return value.to_string();
         }
+        self.hoist_tmp_value_statement(statements, hint, value)
+    }
 
-        if let Some(var) = self.position.assign_target() {
-            return ArmPosition::from_position(Position::Assign(var.to_string()));
+    /// Structured counterpart of `hoist_tmp_value`: push a `TempBind` leaf.
+    fn hoist_tmp_value_statement(
+        &mut self,
+        setup: &mut Vec<LoweredStatement>,
+        hint: &str,
+        value: &str,
+    ) -> String {
+        let tmp = self.fresh_var(Some(hint));
+        self.declare(&tmp);
+        setup.push(LoweredStatement::TempBind {
+            name: tmp.clone(),
+            value: value.to_string(),
+        });
+        tmp
+    }
+
+    /// Run `f` inside a fresh scope to build a `LoweredBlock`, returning `None`
+    /// when its IR emits no output.
+    fn capture_scoped_block<F>(&mut self, f: F) -> Option<LoweredBlock>
+    where
+        F: FnOnce(&mut Self) -> LoweredBlock,
+    {
+        let block = self.with_scope(f);
+        (!block.renders_empty()).then_some(block)
+    }
+
+    fn enter_scope(&mut self) {
+        self.scope.enter_block();
+    }
+
+    fn exit_scope(&mut self) {
+        self.scope.exit_block();
+    }
+
+    fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.enter_scope();
+        let result = f(self);
+        self.exit_scope();
+        result
+    }
+
+    fn with_binding_frame<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scope.push_binding_frame();
+        let result = f(self);
+        self.scope.pop_binding_frame();
+        result
+    }
+
+    fn with_isolated_function<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scope.enter_isolated_function();
+        let result = f(self);
+        self.scope.exit_isolated_function();
+        result
+    }
+
+    fn with_assign_target<R>(&mut self, target: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+        let newly_active = self.scope.activate_assign_target(target);
+        let result = f(self);
+        if newly_active {
+            self.scope.deactivate_assign_target(target);
         }
-
-        if self.position.is_expression() && !ty.is_unit() {
-            let var = self.fresh_var(Some("result"));
-            if let Some(out) = output {
-                let go_ty = self.go_type_as_string(ty);
-                write_line!(out, "var {} {}", var, go_ty);
-            }
-            return ArmPosition::with_result_var(var);
-        }
-
-        ArmPosition::from_position(Position::Statement)
+        result
     }
 
-    /// Checks if a Go variable name has been declared in the current scope.
-    /// Tracks declarations at each scope level so variable shadowing works correctly.
-    /// Returns true if this is a new declaration (use :=), false if already declared (use =).
-    pub(crate) fn try_declare(&mut self, go_name: &str) -> bool {
-        if let Some(current_scope) = self.scope.declared.last_mut() {
-            if current_scope.contains(go_name) {
-                false
-            } else {
-                current_scope.insert(go_name.to_string());
-                true
-            }
-        } else {
-            true
-        }
+    fn capture_go_uses<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> (R, HashSet<String>) {
+        self.scope.enter_use_region();
+        let result = f(self);
+        let uses = self.scope.exit_use_region();
+        (result, uses)
     }
 
-    pub(crate) fn is_declared(&self, go_name: &str) -> bool {
-        self.scope
-            .declared
-            .iter()
-            .any(|scope| scope.contains(go_name))
+    fn fresh_var(&mut self, hint: Option<&str>) -> String {
+        self.scope.fresh_go_name(hint)
     }
 
-    /// Unconditionally marks a Go variable name as declared in the current scope.
-    /// Use this for parameters, which are always "declared" at function entry.
-    pub(crate) fn declare(&mut self, go_name: &str) {
-        if let Some(current_scope) = self.scope.declared.last_mut() {
-            current_scope.insert(go_name.to_string());
-        }
+    fn current_function_context(&self) -> Option<&FunctionEmissionContext> {
+        self.function_contexts.last()
     }
 
-    pub(crate) fn enter_scope(&mut self) {
-        self.scope.scope_depth += 1;
-        self.scope.bindings.save();
-        self.scope.declared.push(HashSet::default());
-    }
-
-    pub(crate) fn exit_scope(&mut self) {
-        self.scope.scope_depth = self.scope.scope_depth.saturating_sub(1);
-        self.scope.bindings.restore();
-        if self.scope.declared.len() > 1 {
-            self.scope.declared.pop();
-        }
-    }
-
-    pub(crate) fn current_module(&self) -> &str {
-        &self.current_module
-    }
-
-    pub(crate) fn module_alias_for_type(&self, ty: &Type) -> Option<String> {
-        if let Type::Constructor { id, .. } = ty {
-            let module = names::go_name::module_of_type_id(id);
-            self.module.module_aliases.get(module).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn maybe_line_directive(&self, span: &Span) -> String {
-        if !self.ctx.options.debug || span.is_dummy() {
+    fn maybe_line_directive(&self, span: &Span) -> String {
+        if span.is_dummy() {
             return String::new();
         }
 
-        let Some(source) = self.ctx.line_indexes.get(&span.file_id) else {
+        let Some(source) = self.facts.line_index(span.file_id) else {
             return String::new();
         };
 
@@ -458,138 +589,128 @@ impl<'a> Emitter<'a> {
         format!("//line {}:{}:{}\n", source.path, line, col)
     }
 
-    fn unused_imports_for_current_module<'u>(
-        unused: &'u UnusedInfo,
-        current_module: &str,
-    ) -> &'u HashSet<EcoString> {
-        static EMPTY: std::sync::LazyLock<HashSet<EcoString>> =
-            std::sync::LazyLock::new(HashSet::default);
-        unused
-            .imports_by_module
-            .get(current_module)
-            .unwrap_or(&EMPTY)
+    fn emit_files_with_facts(
+        facts: EmitFacts<'a>,
+        files: &[&File],
+    ) -> Result<Vec<OutputFile>, Vec<LisetteDiagnostic>> {
+        let Some(first_file) = files.first() else {
+            return Ok(Vec::new());
+        };
+        Self::new(facts, first_file).emit_files(files)
     }
 
-    pub fn emit_files(&mut self, files: &[&File], module_id: &str) -> Vec<OutputFile> {
-        self.current_module = module_id.to_string();
-        self.collect_module_aliases(files);
-        self.collect_go_call_strategies();
-        self.collect_exported_method_names(files);
-        self.collect_impl_bounds(files);
-        self.collect_enum_layouts();
-        let make_functions = self.collect_make_functions();
+    fn emit_files(mut self, files: &[&File]) -> Result<Vec<OutputFile>, Vec<LisetteDiagnostic>> {
+        let plan = self.build_package_plan(files);
+        self.render_package_plan(files, plan)
+    }
 
+    fn render_package_plan(
+        mut self,
+        files: &[&File],
+        plan: PackagePlan,
+    ) -> Result<Vec<OutputFile>, Vec<LisetteDiagnostic>> {
+        let PackagePlan {
+            package_name,
+            collision_diagnostics,
+        } = plan;
         let mut output_files = Vec::new();
-        let should_create_bootstrap = files.len() > 1 && !make_functions.is_empty();
-
-        let package_name = if module_id == self.ctx.entry_module {
-            "main".to_string()
-        } else {
-            let raw = module_id.rsplit('/').next().unwrap_or(module_id);
-            go_name::sanitize_package_name(raw).into_owned()
-        };
-
-        if should_create_bootstrap {
-            let mut bootstrap_source = OutputCollector::new();
-            for function in &make_functions {
-                bootstrap_source.collect_with_blank(function.clone());
-            }
-
-            let bootstrap_source_str = bootstrap_source.render();
-
-            let unused_imports =
-                Self::unused_imports_for_current_module(self.ctx.unused, &self.current_module);
-            let mut import_builder = ImportBuilder::new(
-                &self.ctx.go_module,
-                unused_imports,
-                self.ctx.go_package_names,
-            );
-
-            // Collect imports from all files in the module to get aliased imports
-            for file in files {
-                import_builder.collect_from_file(file);
-            }
-
-            import_builder.extend_with_modules(&self.ensure_imported);
-            if self.flags.needs_stdlib {
-                import_builder.require_stdlib();
-            }
-            import_builder.filter_unreferenced(&bootstrap_source_str);
-
-            output_files.push(OutputFile {
-                name: "bootstrap.go".to_string(),
-                imports: import_builder.build(),
-                source: bootstrap_source_str,
-                package_name: package_name.clone(),
-            });
-        }
+        let mut all_diagnostics = collision_diagnostics;
 
         for file in files {
-            let mut source = OutputCollector::new();
-
-            if !should_create_bootstrap {
-                for function in &make_functions {
-                    source.collect_with_blank(function.clone());
-                }
-            }
-
-            self.pending_adapter_types.clear();
-
-            for expression in &file.items {
-                self.scope.reset_for_top_level();
-                let code = self.emit_top_item(expression);
-                if !code.is_empty() {
-                    source.collect_with_blank(code);
-                }
-            }
-
-            for adapter_decl in std::mem::take(&mut self.pending_adapter_types) {
-                source.collect_with_blank(adapter_decl);
-            }
-
-            let unused_imports =
-                Self::unused_imports_for_current_module(self.ctx.unused, &self.current_module);
-            let mut import_builder = ImportBuilder::new(
-                &self.ctx.go_module,
-                unused_imports,
-                self.ctx.go_package_names,
+            self.namespace = FileNamespace::build(
+                file,
+                self.facts.go_module(),
+                self.facts.unused_imports_for_current_package(),
+                self.facts.go_package_names(),
             );
-            import_builder.collect_from_file(file);
-
-            let ensure_imported = std::mem::take(&mut self.ensure_imported);
-            import_builder.extend_with_modules(&ensure_imported);
-
-            let flags = std::mem::take(&mut self.flags);
-            if flags.needs_fmt {
-                import_builder.require_fmt();
-            }
-            if flags.needs_stdlib {
-                import_builder.require_stdlib();
-            }
-            if flags.needs_errors {
-                import_builder.require_errors();
-            }
-            if flags.needs_slices {
-                import_builder.require_slices();
-            }
-            if flags.needs_strings {
-                import_builder.require_strings();
-            }
-            if flags.needs_maps {
-                import_builder.require_maps();
-            }
-
-            let rendered_source = source.render();
-            import_builder.filter_unreferenced(&rendered_source);
-
+            let source = self.render_file_source(file);
+            let (imports, mut diagnostics) = self
+                .namespace
+                .finish(self.facts.go_package_names(), self.facts.go_package_ids());
+            all_diagnostics.append(&mut diagnostics);
             output_files.push(OutputFile {
                 name: file.go_filename(),
-                imports: import_builder.build(),
-                source: rendered_source,
+                imports,
+                source,
                 package_name: package_name.clone(),
+                file_comment: file.file_comment.clone(),
             });
         }
 
-        output_files
+        if all_diagnostics.is_empty() {
+            Ok(output_files)
+        } else {
+            all_diagnostics.sort_by(LisetteDiagnostic::sort_key);
+            Err(all_diagnostics)
+        }
     }
+
+    fn render_file_source(&mut self, file: &File) -> String {
+        let mut source = OutputCollector::new();
+
+        for expression in &file.items {
+            let Expression::Enum { name, variants, .. } = expression else {
+                continue;
+            };
+            if PreludeType::from_name(name).is_some() {
+                continue;
+            }
+            let enum_id = self.facts.qualified_current(name);
+            for variant in variants {
+                source.collect_with_blank(self.create_make_function_code(&enum_id, &variant.name));
+            }
+        }
+
+        for expression in &file.items {
+            self.scope.reset_for_top_level();
+            let code = self.emit_top_item(expression);
+            if !code.is_empty() {
+                source.collect_with_blank(code);
+            }
+        }
+
+        self.drain_file_emission_into(&mut source);
+        source.render()
+    }
+}
+
+/// Emit state built once in [`Planner::emit`] and shared by every package worker.
+struct SharedEmitContext {
+    emit_tests: bool,
+    line_indexes: Option<HashMap<u32, LineIndex>>,
+    globals: GlobalEmitData,
+}
+
+fn emit_package<'a>(
+    analysis: &'a EmitInput,
+    go_module: &str,
+    entry_package_name: &'a str,
+    shared_emit_ctx: &SharedEmitContext,
+    package_id: &str,
+    files: &[&'a File],
+) -> Result<Vec<OutputFile>, Vec<LisetteDiagnostic>> {
+    let facts = EmitFacts::new(EmitFactsConfig {
+        definitions: &analysis.definitions,
+        unused: &analysis.unused,
+        mutations: &analysis.mutations,
+        equality_index: &analysis.equality_index,
+        test_index: &analysis.test_index,
+        go_package_names: &analysis.go_package_names,
+        go_package_ids: &analysis.go_package_ids,
+        entry_package: analysis.entry_package_id.to_string().into(),
+        entry_package_name,
+        go_module: go_module.to_string(),
+        emit_tests: shared_emit_ctx.emit_tests,
+        line_indexes: shared_emit_ctx.line_indexes.as_ref(),
+        globals: &shared_emit_ctx.globals,
+        current_package: package_id.to_string().into(),
+    });
+    Planner::emit_files_with_facts(facts, files).map(|mut package_output| {
+        if package_id != analysis.entry_package_id.as_str() {
+            for file in &mut package_output {
+                file.name = format!("{}/{}", package_id, file.name);
+            }
+        }
+        package_output
+    })
 }

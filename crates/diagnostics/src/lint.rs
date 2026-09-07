@@ -1,9 +1,11 @@
 use crate::LisetteDiagnostic;
 use syntax::ast::{DeadCodeCause, Span};
+use syntax::types::SimpleKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueKind {
     RedundantLetElse,
+    RedundantLetAssert,
     RedundantIfLet,
     UnreachableIfLetElse,
     RedundantIfLetElse,
@@ -16,6 +18,8 @@ pub enum UnusedExpressionKind {
     Option,
     Partial,
     Value,
+    SliceGrow,
+    SliceReserve,
 }
 
 impl UnusedExpressionKind {
@@ -25,7 +29,7 @@ impl UnusedExpressionKind {
             Self::Result => "unused_result",
             Self::Option => "unused_option",
             Self::Partial => "unused_partial",
-            Self::Value => "unused_value",
+            Self::Value | Self::SliceGrow | Self::SliceReserve => "unused_value",
         }
     }
 }
@@ -74,6 +78,30 @@ pub fn written_but_not_read(span: &Span, name: &str) -> LisetteDiagnostic {
         )
 }
 
+pub fn shadowed_capture(
+    span: &Span,
+    outer_span: &Span,
+    name: &str,
+    is_parameter: bool,
+    is_struct_field: bool,
+) -> LisetteDiagnostic {
+    let rename = if is_struct_field {
+        format!("Rename this binding to `{}: <new name>`", name)
+    } else if is_parameter {
+        "Rename this parameter".to_string()
+    } else {
+        "Rename this binding".to_string()
+    };
+    LisetteDiagnostic::warn("Shadowed capture")
+        .with_lint_code("shadowed_capture")
+        .with_span_primary_label(span, "shadows a binding this lambda could capture")
+        .with_span_label(outer_span, "outer binding declared here")
+        .with_help(format!(
+            "{} so the outer `{}` stays readable inside the lambda",
+            rename, name
+        ))
+}
+
 pub fn dead_code(span: &Span, cause: DeadCodeCause) -> LisetteDiagnostic {
     let (code, msg) = match cause {
         DeadCodeCause::Return => ("dead_code_after_return", "Unreachable code after return"),
@@ -113,6 +141,12 @@ pub fn pattern_issue(span: &Span, kind: IssueKind) -> LisetteDiagnostic {
             "always matches",
             "Remove the `else` block since the pattern cannot fail",
         ),
+        IssueKind::RedundantLetAssert => (
+            "redundant_let_assert",
+            "Redundant `assert` in `let assert`",
+            "always matches",
+            "Use a plain `let` since the pattern cannot fail",
+        ),
         IssueKind::RedundantIfLet => (
             "redundant_if_let",
             "Redundant `if let` pattern",
@@ -133,40 +167,10 @@ pub fn pattern_issue(span: &Span, kind: IssueKind) -> LisetteDiagnostic {
         ),
     };
 
-    LisetteDiagnostic::warn(message)
+    LisetteDiagnostic::info(message)
         .with_lint_code(code)
         .with_span_label(span, label)
         .with_help(help)
-}
-
-pub fn discarded_result_in_tail(span: &Span, return_type: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("`Result` is silently discarded")
-        .with_lint_code("unused_result")
-        .with_span_label(span, "failure will go unnoticed")
-        .with_help(format!(
-            "Handle this `Result` with `?` or `match`, explicitly discard it with `let _ = ...`, or return it by adding `-> {}` to the function signature",
-            return_type
-        ))
-}
-
-pub fn discarded_option_in_tail(span: &Span, return_type: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Unused Option")
-        .with_lint_code("unused_option")
-        .with_span_label(span, "this `Option` is discarded")
-        .with_help(format!(
-            "Handle this `Option`, explicitly discard it with `let _ = ...`, or return it by adding `-> {}` to the function signature",
-            return_type
-        ))
-}
-
-pub fn discarded_partial_in_tail(span: &Span, return_type: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("`Partial` is silently discarded")
-        .with_lint_code("unused_partial")
-        .with_span_label(span, "partial result will go unnoticed")
-        .with_help(format!(
-            "Handle this `Partial` with `match`, explicitly discard it with `let _ = ...`, or return it by adding `-> {}` to the function signature",
-            return_type
-        ))
 }
 
 pub fn unused_expression(span: &Span, kind: UnusedExpressionKind) -> LisetteDiagnostic {
@@ -185,9 +189,9 @@ pub fn unused_expression(span: &Span, kind: UnusedExpressionKind) -> LisetteDiag
         ),
         UnusedExpressionKind::Option => (
             "unused_option",
-            "Unused Option",
-            "this `Option` is discarded",
-            "Handle this `Option`, or explicitly discard it with `let _ = ...`",
+            "`Option` is silently discarded",
+            "absence will go unnoticed",
+            "Handle this `Option` with `?` or `match`, or explicitly discard it with `let _ = ...`",
         ),
         UnusedExpressionKind::Partial => (
             "unused_partial",
@@ -200,6 +204,18 @@ pub fn unused_expression(span: &Span, kind: UnusedExpressionKind) -> LisetteDiag
             "Unused expression value",
             "this value is discarded",
             "Use the value, or ignore with `let _ = ...`",
+        ),
+        UnusedExpressionKind::SliceGrow => (
+            "unused_value",
+            "Unused `append()` output",
+            "output is discarded",
+            "`append()` outputs a new slice, leaving the original slice intact. Assign the output back to grow it `let s = s.append(...)` or discard the output with `let _ = s.append(...)`",
+        ),
+        UnusedExpressionKind::SliceReserve => (
+            "unused_value",
+            "Unused `reserve()` output",
+            "output is discarded",
+            "`reserve()` outputs a new slice, leaving the original slice intact. Assign the output back `let s = s.reserve(...)` or discard the output with `let _ = s.reserve(...)`",
         ),
     };
     LisetteDiagnostic::warn(msg)
@@ -219,7 +235,7 @@ pub fn unnecessary_reference(span: &Span, name: Option<&str>) -> LisetteDiagnost
             "Remove the `&` operator".to_string(),
         ),
     };
-    LisetteDiagnostic::warn("Unnecessary `&`")
+    LisetteDiagnostic::info("Unnecessary `&`")
         .with_lint_code("unnecessary_reference")
         .with_span_label(span, label)
         .with_help(help)
@@ -249,17 +265,84 @@ pub fn ineffective_try_block(span: &Span) -> LisetteDiagnostic {
         .with_help("A `try` block is effective only if the expression may succeed or fail")
 }
 
+pub fn append_to_zero_filled(
+    make_span: &Span,
+    append_span: &Span,
+    length: Option<u64>,
+    element: &str,
+) -> LisetteDiagnostic {
+    let append_label = match length {
+        Some(n) => format!("`append` adds element {} here", n + 1),
+        None => "`append` adds elements after the zeros here".to_string(),
+    };
+    let help = match length {
+        Some(n) => format!(
+            "For an empty slice with room for {n}, use `Slice.new<{element}>().reserve({n})`"
+        ),
+        None => format!(
+            "For an empty slice with reserved room, use `Slice.new<{element}>().reserve(n)`"
+        ),
+    };
+    LisetteDiagnostic::warn("Appending to a zero-filled slice")
+        .with_lint_code("append_to_zero_filled")
+        .with_span_label(make_span, "already all zeros")
+        .with_span_label(append_span, append_label)
+        .with_help(help)
+}
+
+pub fn replaceable_with_autofill(span: &Span, kept: &str, struct_name: &str) -> LisetteDiagnostic {
+    let example = if kept.is_empty() {
+        format!("`{} {{ .. }}`", struct_name)
+    } else {
+        format!("`{} {{ {}, .. }}`", struct_name, kept)
+    };
+    LisetteDiagnostic::info("Replaceable with autofill spread")
+        .with_lint_code("replaceable_with_autofill")
+        .with_span_label(span, "has zero-valued fields")
+        .with_help(format!(
+            "Replace zero-valued fields with autofill spread: {}",
+            example
+        ))
+}
+
+pub fn redundant_field_names(span: &Span, name: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant field name")
+        .with_lint_code("redundant_field_names")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace `{name}: {name}` with `{name}`"))
+}
+
+pub fn needless_update(span: &Span, base: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Needless struct update")
+        .with_lint_code("needless_update")
+        .with_span_label(span, "has no effect")
+        .with_help(format!("Remove `..{base}`"))
+}
+
 pub fn double_negation(span: &Span, is_bool: bool) -> LisetteDiagnostic {
     let (code, msg) = if is_bool {
-        ("double_bool_negation", "double boolean negation")
+        ("double_bool_negation", "Double boolean negation")
     } else {
-        ("double_int_negation", "double numeric negation")
+        ("double_int_negation", "Double numeric negation")
     };
 
     LisetteDiagnostic::warn(msg)
         .with_lint_code(code)
-        .with_span_label(span, "mistaken double negation")
+        .with_span_label(span, "accidental double negation")
         .with_help("Remove one of the negation operators")
+}
+
+pub fn negated_equality(span: &Span, is_equal: bool) -> LisetteDiagnostic {
+    let (from, to) = if is_equal {
+        ("!(a == b)", "a != b")
+    } else {
+        ("!(a != b)", "a == b")
+    };
+
+    LisetteDiagnostic::info("Negated equality comparison")
+        .with_lint_code("negated_equality")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Rewrite `{from}` as `{to}`"))
 }
 
 pub fn tautological_comparison(span: &Span, always_true: bool) -> LisetteDiagnostic {
@@ -269,8 +352,190 @@ pub fn tautological_comparison(span: &Span, always_true: bool) -> LisetteDiagnos
         .with_lint_code("self_comparison")
         .with_span_label(span, "comparing to itself")
         .with_help(format!(
-            "This condition is always {}. Did you mean to compare different values?",
+            "This condition is always `{}`. Did you mean to compare different values?",
             result
+        ))
+}
+
+pub fn unsigned_comparison(span: &Span, always_true: bool) -> LisetteDiagnostic {
+    let result = if always_true { "true" } else { "false" };
+
+    LisetteDiagnostic::warn(format!("Comparison is always {result}"))
+        .with_lint_code("unsigned_comparison")
+        .with_span_label(span, "an unsigned integer is never negative")
+        .with_help(
+            "An unsigned integer is never negative, so this comparison always has the same result. Did you mean to compare to a different value?",
+        )
+}
+
+pub fn type_limit_comparison(span: &Span, always_true: bool) -> LisetteDiagnostic {
+    let result = if always_true { "true" } else { "false" };
+
+    LisetteDiagnostic::warn(format!("Comparison is always {result}"))
+        .with_lint_code("type_limit_comparison")
+        .with_span_label(span, "compares against the limit of the value's type")
+        .with_help(format!(
+            "This compares against the limit of the value's type, so this comparison is always `{result}`. Did you mean to compare to a different value?"
+        ))
+}
+
+pub fn redundant_comparison(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant comparison")
+        .with_lint_code("redundant_comparison")
+        .with_span_label(span, "already implied by the other comparison")
+        .with_help(
+            "Drop this comparison, since the expression is equivalent to the other side alone",
+        )
+}
+
+pub fn double_comparison(span: &Span, combined: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Comparisons can be combined")
+        .with_lint_code("double_comparison")
+        .with_span_label(span, format!("simplify to `{combined}`"))
+        .with_help(format!(
+            "These two comparisons cover the same operands, so they are equivalent to a single `{combined}`."
+        ))
+}
+
+pub fn bad_bit_mask(span: &Span, always_true: bool) -> LisetteDiagnostic {
+    let (result, clause) = if always_true {
+        ("true", "always satisfy")
+    } else {
+        ("false", "unable to satisfy")
+    };
+
+    LisetteDiagnostic::warn("Incompatible bit mask")
+        .with_lint_code("bad_bit_mask")
+        .with_span_label(span, format!("always `{result}`"))
+        .with_help(format!(
+            "The mask makes this value {clause} the comparison, so it is always `{result}`. Check the mask or the constant."
+        ))
+}
+
+pub fn ineffective_bit_mask(
+    span: &Span,
+    mask_operator: &str,
+    mask: i128,
+    constant: i128,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Ineffective bit mask")
+        .with_lint_code("ineffective_bit_mask")
+        .with_span_label(span, "mask has no effect")
+        .with_help(format!(
+            "`{mask_operator} {mask}` does not change the result of comparing with `{constant}`, so the mask can be removed."
+        ))
+}
+
+pub fn equal_operands(span: &Span, note: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Equal operands")
+        .with_lint_code("equal_operands")
+        .with_span_label(span, "identical operands")
+        .with_help(format!(
+            "Both operands are identical so the result {note}. Did you mean to use different operands?"
+        ))
+}
+
+pub fn float_cmp(span: &Span, is_equal: bool) -> LisetteDiagnostic {
+    let operator = if is_equal { "==" } else { "!=" };
+
+    LisetteDiagnostic::warn("Exact float comparison")
+        .with_lint_code("float_cmp")
+        .with_span_label(span, format!("floats compared with `{operator}`"))
+        .with_help(
+            "Floating-point results are rarely bit-exact, so `==` and `!=` may not behave as intended. Compare within a tolerance instead, e.g. `math.Abs(a - b) < c`.",
+        )
+}
+
+pub fn float_equality_without_abs(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Float equality without `abs`")
+        .with_lint_code("float_equality_without_abs")
+        .with_span_label(span, "difference is not wrapped in `math.Abs`")
+        .with_help(
+            "Because `a - b` is signed, this is also `true` whenever `a` is far below `b`, not only when `a` and `b` are close, so it wrongly accepts values that are nowhere near equal. Compare the magnitude instead: `math.Abs(a - b) < c`.",
+        )
+}
+
+pub fn non_negative_comparison(span: &Span, always_true: bool) -> LisetteDiagnostic {
+    let result = if always_true { "true" } else { "false" };
+
+    LisetteDiagnostic::warn(format!("Comparison is always {result}"))
+        .with_lint_code("non_negative_comparison")
+        .with_span_label(span, "a length is never negative")
+        .with_help(
+            "A length is never negative, so this comparison always has the same result. Did you mean to compare to a different value?",
+        )
+}
+
+pub fn goos_goarch_comparison(
+    span: &Span,
+    always_true: bool,
+    const_name: &str,
+    kind: &str,
+    examples: &str,
+) -> LisetteDiagnostic {
+    let result = if always_true { "true" } else { "false" };
+
+    LisetteDiagnostic::warn(format!("Comparison is always {result}"))
+        .with_lint_code("goos_goarch_comparison")
+        .with_span_label(span, format!("`runtime.{const_name}` never holds this value"))
+        .with_help(format!(
+            "`runtime.{const_name}` only ever holds a known {kind}, and this is not one. Did you mean a valid value such as {examples}?"
+        ))
+}
+
+pub fn redundant_operation(span: &Span, always: Option<&str>) -> LisetteDiagnostic {
+    match always {
+        Some(value) => LisetteDiagnostic::info(format!("Operation always evaluates to `{value}`"))
+            .with_lint_code("redundant_operation")
+            .with_span_label(span, "the other operand cannot change the result")
+            .with_help(format!("Simplify this operation to `{value}`")),
+        None => LisetteDiagnostic::info("Operation has no effect")
+            .with_lint_code("redundant_operation")
+            .with_span_label(span, "one operand leaves the other unchanged")
+            .with_help("Simplify this operation to its other operand"),
+    }
+}
+
+pub fn unnecessary_min_or_max(span: &Span, op: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Unnecessary `{op}` call"))
+        .with_lint_code("unnecessary_min_or_max")
+        .with_span_label(span, "always returns the same operand")
+        .with_help(format!(
+            "This `{op}` always evaluates to one of its operands, so it has no effect. Simplify it to that operand."
+        ))
+}
+
+pub fn manual_min_max(span: &Span, op: &str, extreme: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Manual `{op}()`"))
+        .with_lint_code("manual_min_max")
+        .with_span_label(span, format!("can use `{op}()`"))
+        .with_help(format!(
+            "This `if` returns the {extreme} of its two operands, same as `{op}()`"
+        ))
+}
+
+pub fn integer_division_to_zero(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Integer division is always `0`")
+        .with_lint_code("integer_division_to_zero")
+        .with_span_label(span, "the numerator is smaller in magnitude")
+        .with_help(
+            "Dividing these integer literals truncates to `0` because the numerator is smaller in magnitude than the denominator. Did you mean floating-point division?",
+        )
+}
+
+pub fn verbose_failure_propagation(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Verbose failure propagation")
+        .with_lint_code("verbose_failure_propagation")
+        .with_span_label(span, "re-returns the failure by hand")
+        .with_help("Use `?` to propagate the failure concisely")
+}
+
+pub fn almost_swapped(span: &Span, first: &str, second: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Variables are not swapped")
+        .with_lint_code("almost_swapped")
+        .with_span_label(span, "does not swap values")
+        .with_help(format!(
+            "`{first} = {second}` overwrites `{first}`, so `{second} = {first}` writes `{second}`'s own value back and the original `{first}` is lost. Save one value in a temporary variable first"
         ))
 }
 
@@ -281,6 +546,447 @@ pub fn self_assignment(span: &Span) -> LisetteDiagnostic {
         .with_help("Correct this assignment")
 }
 
+pub fn manual_compound_assignment(span: &Span, symbol: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual compound assignment")
+        .with_lint_code("manual_compound_assignment")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Use the `{symbol}` compound assignment operator"))
+}
+
+pub fn misrefactored_assign_op(
+    span: &Span,
+    target: &str,
+    compound: &str,
+    other: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn(format!("Compound assignment repeats `{target}`"))
+        .with_lint_code("misrefactored_assign_op")
+        .with_span_label(span, format!("uses `{target}` twice"))
+        .with_help(format!(
+            "The `{compound}` operator already includes `{target}`, so naming `{target}` again on the right applies it twice. To apply `{other}` once, write `{target} {compound} {other}`."
+        ))
+}
+
+pub fn neg_multiply(span: &Span, operand: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Multiplication by `-1`")
+        .with_lint_code("neg_multiply")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Use the negation `-{operand}` instead"))
+}
+
+pub fn regexp_in_loop(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Regexp recompiled on every iteration")
+        .with_lint_code("regexp_in_loop")
+        .with_span_label(span, "recompiled")
+        .with_help(
+            "Compile the pattern once outside the loop and reuse it: `regexp.MustCompile`, or `regexp.Compile` to keep the error",
+        )
+}
+
+pub fn manual_is_empty(span: &Span, replacement: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Length comparison can use `is_empty()`")
+        .with_lint_code("manual_is_empty")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Simplify to `{replacement}`"))
+}
+
+pub fn manual_find(span: &Span, receiver: &str, predicate: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Filtered slice thrown away")
+        .with_lint_code("manual_find")
+        .with_span_label(span, "can use `find`")
+        .with_help(format!(
+            "`filter(...).get(0)` builds the whole filtered slice. Use `{receiver}.find({predicate})` to return the first match directly"
+        ))
+}
+
+pub fn manual_extend(span: &Span, replacement: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Element-by-element append")
+        .with_lint_code("manual_extend")
+        .with_span_label(span, "can be one append")
+        .with_help(format!(
+            "This loop appends one element per iteration, growing the slice each time. Spread the iterated slice to append all of it at once: `{replacement}`"
+        ))
+}
+
+pub fn manual_contains(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `contains`")
+        .with_lint_code("manual_contains")
+        .with_span_label(span, "can be simpler")
+        .with_help("Replace `.any(|x| x == value)` with `.contains(value)`")
+}
+
+pub fn unnecessary_first_then_check(span: &Span, replacement: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("First-element check can use `is_empty()`")
+        .with_lint_code("unnecessary_first_then_check")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Simplify to `{replacement}`"))
+}
+
+pub fn redundant_slice_bounds(span: &Span, replacement: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant slice bounds")
+        .with_lint_code("redundant_slice_bounds")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Simplify to `{replacement}`"))
+}
+
+pub fn duplicate_logical_operand(span: &Span, operand_text: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Duplicate logical operand")
+        .with_lint_code("duplicate_logical_operand")
+        .with_span_label(span, "accidental repetition")
+        .with_help(format!("Simplify to `{operand_text}`"))
+}
+
+pub fn negated_logical_operand(span: &Span, always_true: bool) -> LisetteDiagnostic {
+    let (message, label, result, reason) = if always_true {
+        (
+            "Tautological logical operands",
+            "always `true`",
+            "true",
+            "an operand or its negation always holds",
+        )
+    } else {
+        (
+            "Contradictory logical operands",
+            "always `false`",
+            "false",
+            "an operand and its negation cannot both hold",
+        )
+    };
+
+    LisetteDiagnostic::warn(message)
+        .with_lint_code("negated_logical_operand")
+        .with_span_label(span, label)
+        .with_help(format!("Replace with `{result}`, since {reason}"))
+}
+
+pub fn bool_literal_comparison(span: &Span, replacement: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant comparison to boolean literal")
+        .with_lint_code("bool_literal_comparison")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Simplify to `{replacement}`"))
+}
+
+pub fn loop_runs_once(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Loop runs at most once")
+        .with_lint_code("loop_runs_once")
+        .with_span_label(span, "the body always exits before looping back")
+        .with_help(
+            "The body always exits on the first iteration, so the loop never repeats. Make the exit conditional, or remove the loop.",
+        )
+}
+
+pub fn needless_continue(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Needless `continue`")
+        .with_lint_code("needless_continue")
+        .with_span_label(span, "redundant")
+        .with_help("Remove the `continue`. The loop already continues once its body ends")
+}
+
+pub fn unconditional_recursion(span: &Span, name: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Unconditional recursion")
+        .with_lint_code("unconditional_recursion")
+        .with_span_label(span, "recurses on every path")
+        .with_help(format!(
+            "`{name}` always calls itself, so it overflows the stack instead of returning. Add a base case that returns without recursing"
+        ))
+}
+
+pub fn unnecessary_return(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Unnecessary `return`")
+        .with_lint_code("unnecessary_return")
+        .with_span_label(span, "redundant in tail position")
+        .with_help("The final expression of a function is its return value. Drop `return` and keep the value")
+}
+
+pub fn identical_if_branches(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Identical if-else branches")
+        .with_lint_code("identical_if_branches")
+        .with_span_label(span, "both branches are equivalent")
+        .with_help("Remove the `if` and keep a single copy of the branch body")
+}
+
+pub fn collapsible_if(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Collapsible `if`")
+        .with_lint_code("collapsible_if")
+        .with_span_label(span, "can be merged into the outer `if`")
+        .with_help("Merge this nested `if` into the outer condition with `&&`")
+}
+
+pub fn collapsible_match(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Collapsible `match`")
+        .with_lint_code("collapsible_match")
+        .with_span_label(span, "can be merged into the outer arm")
+        .with_help(
+            "Move the inner pattern into the outer arm's pattern to remove a level of nesting",
+        )
+}
+
+pub fn collapsible_else_if(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Collapsible `else if`")
+        .with_lint_code("collapsible_else_if")
+        .with_span_label(span, "can join the `else`")
+        .with_help("Remove the braces around this `if` and write it as `else if`")
+}
+
+pub fn redundant_else(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant `else`")
+        .with_lint_code("redundant_else")
+        .with_span_label(span, "unnecessary")
+        .with_help(
+            "The `if` branch always exits, so the `else` only adds nesting. Drop `else` and move its body to follow the `if`",
+        )
+}
+
+pub fn needless_bool_assign(
+    span: &Span,
+    target: &str,
+    condition: &str,
+    negate: bool,
+) -> LisetteDiagnostic {
+    let help = if negate {
+        format!("Replace the `if` with `{target} = !({condition})`")
+    } else {
+        format!("Replace the `if` with `{target} = {condition}`")
+    };
+    LisetteDiagnostic::info("Needless boolean assignment")
+        .with_lint_code("needless_bool_assign")
+        .with_span_label(span, "can be simpler")
+        .with_help(help)
+}
+
+pub fn redundant_closure_call(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant closure call")
+        .with_lint_code("redundant_closure_call")
+        .with_span_label(span, "called immediately")
+        .with_help("Drop the `(|| ...)()` wrapper and use its body directly")
+}
+
+pub fn single_element_loop(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Loop over a single element")
+        .with_lint_code("single_element_loop")
+        .with_span_label(span, "only one element")
+        .with_help("The loop body runs once. Bind the element with `let` and remove the loop")
+}
+
+pub fn while_let_loop(span: &Span, pattern: &str, subject: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `while let`")
+        .with_lint_code("while_let_loop")
+        .with_span_label(span, "can be a `while let`")
+        .with_help(format!(
+            "Replace the `loop` and `match` with `while let {pattern} = {subject}`"
+        ))
+}
+
+pub fn identical_match_arms(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Identical match arms")
+        .with_lint_code("identical_match_arms")
+        .with_span_label(span, "every arm is identical")
+        .with_help(
+            "All `match` arms resolve to the same value. Did you mean for the arms to differ?",
+        )
+}
+
+pub fn match_same_arms(span: &Span, earlier: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Duplicate match arm")
+        .with_lint_code("match_same_arms")
+        .with_span_label(span, "same body as an earlier arm")
+        .with_help(format!("Merge this arm into the `{earlier}` arm with `|`"))
+}
+
+pub fn redundant_guards(span: &Span, binding: &str, literal: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant guard")
+        .with_lint_code("redundant_guards")
+        .with_span_label(span, "the pattern can test this directly")
+        .with_help(format!(
+            "Replace `{binding}` with `{literal}` in the pattern and drop the guard"
+        ))
+}
+
+pub fn wildcard_in_or_patterns(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Wildcard in or-pattern")
+        .with_lint_code("wildcard_in_or_patterns")
+        .with_span_label(span, "can be just `_`")
+        .with_help(
+            "The `_` alternative already matches everything. Replace the whole pattern with `_`",
+        )
+}
+
+pub fn unnecessary_bool(span: &Span, consequence_is_true: bool) -> LisetteDiagnostic {
+    let help = if consequence_is_true {
+        "Replace this `if... else` with the condition itself"
+    } else {
+        "Replace this `if... else` with the negated condition"
+    };
+
+    LisetteDiagnostic::info("Unnecessary boolean if-else")
+        .with_lint_code("unnecessary_bool")
+        .with_span_label(span, "can be simpler")
+        .with_help(help)
+}
+
+pub fn redundant_pattern_matching(span: &Span, predicate: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant pattern matching")
+        .with_lint_code("redundant_pattern_matching")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace this `match` with `.{predicate}()`"))
+}
+
+pub fn manual_map(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual map")
+        .with_lint_code("manual_map")
+        .with_span_label(span, "can be simpler")
+        .with_help("Replace this `match` with `.map(...)`")
+}
+
+pub fn manual_unwrap_or(span: &Span, lazy_default: bool) -> LisetteDiagnostic {
+    let method = if lazy_default {
+        "unwrap_or_else"
+    } else {
+        "unwrap_or"
+    };
+    LisetteDiagnostic::info("Manual `unwrap_or`")
+        .with_lint_code("manual_unwrap_or")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace this `match` with `.{method}(...)`"))
+}
+
+pub fn manual_map_or(span: &Span, lazy_default: bool) -> LisetteDiagnostic {
+    let replacement = if lazy_default {
+        ".map_or_else(...)"
+    } else {
+        ".map_or(...)"
+    };
+    LisetteDiagnostic::info("Manual `map_or`")
+        .with_lint_code("manual_map_or")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace this `match` with `{replacement}`"))
+}
+
+pub fn manual_filter(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `filter`")
+        .with_lint_code("manual_filter")
+        .with_span_label(span, "can be simpler")
+        .with_help("Replace this `match` with `.filter(...)`")
+}
+
+pub fn manual_ok_or(span: &Span, lazy: bool) -> LisetteDiagnostic {
+    let method = if lazy { "ok_or_else" } else { "ok_or" };
+    LisetteDiagnostic::info("Manual `ok_or`")
+        .with_lint_code("manual_ok_or")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace this `match` with `.{method}(...)`"))
+}
+
+pub fn manual_ok_err(span: &Span, method: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Manual `{method}`"))
+        .with_lint_code("manual_ok_err")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace this `match` with `.{method}()`"))
+}
+
+pub fn needless_match(span: &Span, subject: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Needless `match`")
+        .with_lint_code("needless_match")
+        .with_span_label(span, "unnecessary")
+        .with_help(format!(
+            "Every arm rebuilds the subject unchanged. Replace this `match` with `{subject}`"
+        ))
+}
+
+pub fn map_unwrap_or(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `map_or`")
+        .with_lint_code("map_unwrap_or")
+        .with_span_label(span, "can be simpler")
+        .with_help("Replace `.map(f).unwrap_or(d)` with `.map_or(d, f)`")
+}
+
+pub fn bind_instead_of_map(span: &Span, wrapper: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `map`")
+        .with_lint_code("bind_instead_of_map")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!(
+            "Replace `.and_then(|x| {wrapper}(y))` with `.map(|x| y)`"
+        ))
+}
+
+pub fn map_flatten(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `and_then`")
+        .with_lint_code("map_flatten")
+        .with_span_label(span, "can be simpler")
+        .with_help("Replace `.map(f).flatten()` with `.and_then(f)`")
+}
+
+pub fn map_identity(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant `map`")
+        .with_lint_code("map_identity")
+        .with_span_label(span, "does nothing")
+        .with_help("Remove `.map(|x| x)`, which returns its input unchanged")
+}
+
+pub fn unnecessary_map_on_constructor(
+    span: &Span,
+    variant: &str,
+    method: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Unnecessary `{method}`"))
+        .with_lint_code("unnecessary_map_on_constructor")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!(
+            "Replace `{variant}(x).{method}(f)` with `{variant}(f(x))`"
+        ))
+}
+
+pub fn map_or_none(span: &Span, replacement: &str) -> LisetteDiagnostic {
+    let help = if replacement == "ok" {
+        "Replace `.map_or(None, Some)` with `.ok()`".to_string()
+    } else {
+        format!("Replace `.map_or(None, f)` with `.{replacement}(f)`")
+    };
+    LisetteDiagnostic::info(format!("Manual `{replacement}`"))
+        .with_lint_code("map_or_none")
+        .with_span_label(span, "can be simpler")
+        .with_help(help)
+}
+
+pub fn manual_option_zip(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `zip`")
+        .with_lint_code("manual_option_zip")
+        .with_span_label(span, "can be simpler")
+        .with_help("Replace `a.and_then(|x| b.map(|y| (x, y)))` with `a.zip(b)`")
+}
+
+pub fn unnecessary_lazy_evaluations(span: &Span, lazy: &str, eager: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Unnecessary lazy evaluation")
+        .with_lint_code("unnecessary_lazy_evaluations")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!(
+            "Replace `.{lazy}(...)` with `.{eager}(...)` to pass the value directly"
+        ))
+}
+
+pub fn or_fn_call(span: &Span, eager: &str, lazy: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Unnecessary eager evaluation")
+        .with_lint_code("or_fn_call")
+        .with_span_label(span, "always evaluated")
+        .with_help(format!(
+            "Replace `.{eager}(...)` with `.{lazy}(...)` so the fallback runs only when needed"
+        ))
+}
+
+pub fn needless_question_mark(span: &Span, wrapper: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Needless `?` in `{wrapper}`"))
+        .with_lint_code("needless_question_mark")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace `{wrapper}(x?)` with `x`"))
+}
+
+pub fn redundant_closure(span: &Span, callee: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant closure")
+        .with_lint_code("redundant_closure")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!("Replace this closure with `{callee}`"))
+}
+
 pub fn empty_match_arm(span: &Span) -> LisetteDiagnostic {
     LisetteDiagnostic::warn("Empty match arm")
         .with_lint_code("empty_match_arm")
@@ -289,7 +995,7 @@ pub fn empty_match_arm(span: &Span) -> LisetteDiagnostic {
 }
 
 pub fn unnecessary_parens(span: &Span, keyword: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Unnecessary parens")
+    LisetteDiagnostic::info("Unnecessary parens")
         .with_lint_code("excess_parens_on_condition")
         .with_span_label(span, "remove parens")
         .with_help(format!(
@@ -307,33 +1013,152 @@ pub fn match_on_literal(span: &Span) -> LisetteDiagnostic {
         )
 }
 
-pub fn single_arm_match(span: &Span, pattern_suggestion: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Ineffective match")
-        .with_lint_code("single_arm_match")
-        .with_span_label(span, "should be `if let`")
+pub fn match_as_if_let(span: &Span, pattern_suggestion: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("`match` reducible to `if let`")
+        .with_lint_code("match_as_if_let")
+        .with_span_label(span, "can be simpler")
         .with_help(format!(
-            "A match with a single meaningful arm is ineffective. Use `if let {} = value {{ ... }}` instead.",
+            "Replace this `match` with `if let {} = value {{ ... }}`",
             pattern_suggestion
         ))
 }
 
+pub fn equatable_if_let(span: &Span, pattern: &str, subject: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("`if let` used as an equality check")
+        .with_lint_code("equatable_if_let")
+        .with_span_label(span, "can be `==`")
+        .with_help(format!(
+            "The pattern binds nothing, so replace `if let {pattern} = {subject}` with `{subject} == {pattern}`",
+        ))
+}
+
+pub fn single_arm_select(span: &Span, receive: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Single-arm `select`")
+        .with_lint_code("single_arm_select")
+        .with_span_label(span, "waits on a single operation")
+        .with_help(format!(
+            "A `select` with one arm makes no choice between channel operations. Use `match {receive} {{ ... }}` directly"
+        ))
+}
+
+pub fn match_on_bool(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Match on boolean")
+        .with_lint_code("match_on_bool")
+        .with_span_label(span, "should be `if`")
+        .with_help("A `match` on a boolean is better written as an `if` expression")
+}
+
+pub fn match_single_binding(span: &Span, binding: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Ineffective match")
+        .with_lint_code("match_single_binding")
+        .with_span_label(span, "should be `let`")
+        .with_help(format!(
+            "A match with a single binding is ineffective. Use `let {} = value` instead.",
+            binding
+        ))
+}
+
+pub fn let_and_return(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant binding before return")
+        .with_lint_code("let_and_return")
+        .with_span_label(span, "bound and immediately returned")
+        .with_help("Return the value directly instead of binding it first")
+}
+
+pub fn redundant_rebinding(span: &Span, name: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant rebinding")
+        .with_lint_code("redundant_rebinding")
+        .with_span_label(span, format!("rebinds `{name}` to itself"))
+        .with_help(format!(
+            "Remove `let {name} = {name}`. The existing `{name}` already refers to this value, so rebinding it does nothing."
+        ))
+}
+
+pub fn discarded_unit_binding(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Discard binds an expression with no value")
+        .with_lint_code("discarded_unit_binding")
+        .with_span_label(span, "this expression produces no value to discard")
+        .with_help(
+            "Remove `let _ = ` and keep the expression as a statement. A `let _ = ` discard is only meaningful when the expression produces a value.",
+        )
+}
+
 pub fn uninterpolated_fstring(span: &Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Uninterpolated f-string")
+    LisetteDiagnostic::info("Uninterpolated f-string")
         .with_lint_code("uninterpolated_fstring")
         .with_span_label(span, "zero interpolations")
         .with_help("Remove the `f` prefix. A string without interpolations does not need to be a format string")
 }
 
+pub fn unprefixed_fstring(span: &Span, name: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Unprefixed f-string")
+        .with_lint_code("unprefixed_fstring")
+        .with_span_label(span, format!("`{name}` will not be interpolated"))
+        .with_help(format!(
+            "Add the `f` prefix to interpolate `{name}`. Without it the braces stay literal text"
+        ))
+}
+
+pub fn nested_fstring(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Nested f-string")
+        .with_lint_code("nested_fstring")
+        .with_span_label(span, "already inside an f-string")
+        .with_help(
+            "Move the inner f-string's text and interpolations into the surrounding f-string",
+        )
+}
+
+pub fn redundant_fstring_conversion(span: &Span, method: &str, value: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Redundant `{method}`"))
+        .with_lint_code("redundant_fstring_conversion")
+        .with_span_label(span, "converts to a string")
+        .with_help(format!(
+            "Interpolate `{value}` directly. The f-string already formats it as a string"
+        ))
+}
+
+pub fn unnecessary_raw_string(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Unnecessary raw string")
+        .with_lint_code("unnecessary_raw_string")
+        .with_span_label(span, "no backslashes")
+        .with_help("Remove the `r` prefix. A string without backslashes does not need to be raw")
+}
+
+pub fn invisible_in_string(
+    span: &Span,
+    codepoint: u32,
+    name: &str,
+    is_bidi: bool,
+) -> LisetteDiagnostic {
+    let (title, code, help) = if is_bidi {
+        (
+            "Bidirectional character in string",
+            "bidi_in_string",
+            "Bidirectional control characters can reorder surrounding text and enable source-spoofing attacks. If intentional, write it as a `\\u` escape so it is visible in source. Otherwise remove it.",
+        )
+    } else {
+        (
+            "Invisible character in string",
+            "invisible_in_string",
+            "Invisible characters in strings can hide bugs and silently shift meaning. Remove the character, or replace it with the visible character you meant.",
+        )
+    };
+    LisetteDiagnostic::warn(title)
+        .with_lint_code(code)
+        .with_span_label(span, format!("contains U+{codepoint:04X} ({name})"))
+        .with_help(help)
+}
+
 pub fn expression_only_fstring(span: &Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Expression-only f-string")
+    LisetteDiagnostic::info("Expression-only f-string")
         .with_lint_code("expression_only_fstring")
         .with_span_label(span, "the entire f-string is an expression")
         .with_help("Use the expression directly. Wrapping it in an f-string adds no value")
 }
 
-pub fn rest_only_slice_pattern(span: &Span, help: impl Into<String>) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Ineffective pattern")
-        .with_lint_code("rest_only_slice_pattern")
+pub fn rest_only_pattern(span: &Span, help: impl Into<String>) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Ineffective pattern")
+        .with_lint_code("rest_only_pattern")
         .with_span_label(span, "always matches")
         .with_help(help)
 }
@@ -353,10 +1178,39 @@ pub fn miscased_snake(span: &Span, code: &str, suggested_name: &str) -> LisetteD
 }
 
 pub fn miscased_screaming_snake(span: &Span, suggested_name: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Miscased name")
-        .with_lint_code("constant_not_screaming_snake_case")
+    LisetteDiagnostic::error("Miscased name")
+        .with_infer_code("constant_not_screaming_snake_case")
         .with_span_label(span, "expected SCREAMING_SNAKE_CASE")
         .with_help(format!("Rename to `{}`", suggested_name))
+}
+
+pub fn enum_variant_names(
+    span: &Span,
+    enum_name: &str,
+    is_prefix: bool,
+    example_old: &str,
+    example_new: &str,
+) -> LisetteDiagnostic {
+    let affix = if is_prefix { "prefix" } else { "suffix" };
+    LisetteDiagnostic::info("Variant names repeat the enum name")
+        .with_lint_code("enum_variant_names")
+        .with_span_label(span, "each variant repeats this name")
+        .with_help(format!(
+            "Drop the `{enum_name}` {affix} from each variant (`{example_old}` to `{example_new}`). A variant is already written as `{enum_name}.{example_new}`, so the {affix} repeats the enum name."
+        ))
+}
+
+pub fn self_named_constructors(
+    span: &Span,
+    type_name: &str,
+    method_name: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Constructor named after its type")
+        .with_lint_code("self_named_constructors")
+        .with_span_label(span, "repeats the type name")
+        .with_help(format!(
+            "Calling this as `{type_name}.{method_name}()` repeats the type name. Rename it to `new`, the conventional constructor name."
+        ))
 }
 
 pub fn unused_field(span: &Span) -> LisetteDiagnostic {
@@ -378,6 +1232,13 @@ pub fn unused_import(span: &Span) -> LisetteDiagnostic {
         .with_lint_code("unused_import")
         .with_span_label(span, "never used")
         .with_help("Use or remove this import")
+}
+
+pub fn redundant_import_alias(span: &Span, path: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant import alias")
+        .with_lint_code("redundant_import_alias")
+        .with_span_label(span, "alias matches package name exactly")
+        .with_help(format!("Remove the alias: `import \"{path}\"`"))
 }
 
 pub fn unused_type(span: &Span) -> LisetteDiagnostic {
@@ -417,55 +1278,28 @@ pub fn private_type_in_public_api(
     ));
 
     if let Some(s) = span {
-        diagnostic = diagnostic.with_span_label(s, "private");
+        diagnostic = diagnostic.with_span_label(s, format!("exposed by `{}`", public_definition));
     }
 
     diagnostic
 }
 
-pub fn unknown_attribute(span: &Span, name: &str) -> LisetteDiagnostic {
+pub fn unknown_attribute(span: &Span, name: &str, known: &[&str]) -> LisetteDiagnostic {
+    let known_list = known
+        .iter()
+        .map(|attribute| format!("`#[{attribute}]`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     LisetteDiagnostic::warn("Unknown attribute")
         .with_lint_code("unknown_attribute")
         .with_span_label(span, "not recognized")
         .with_help(format!(
-            "`{}` is not a recognized attribute. Known attributes: `#[json]`, `#[xml]`, `#[yaml]`, `#[toml]`, `#[db]`, `#[bson]`, `#[msgpack]`, `#[mapstructure]`, `#[tag]`",
-            name
+            "`{name}` is not a recognized attribute. Known attributes: {known_list}"
         ))
-}
-
-pub fn field_attribute_without_struct_attribute(
-    field_span: &Span,
-    attribute_name: &str,
-) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Orphan field attribute")
-        .with_lint_code("orphan_field_attribute")
-        .with_span_label(field_span, "field has attribute but struct does not")
-        .with_help(format!(
-            "Add `#[{}]` atop the struct definition to enable field-level attributes",
-            attribute_name
-        ))
-}
-
-pub fn duplicate_tag_key(span: &Span, key: &str, first_span: &Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Duplicate tag")
-        .with_lint_code("duplicate_tag")
-        .with_span_label(span, "duplicate")
-        .with_span_label(first_span, "first occurrence")
-        .with_help(format!(
-            "Remove one of the `{}` attributes - each tag key may appear only once per field",
-            key
-        ))
-}
-
-pub fn conflicting_case_transforms(span: &Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Conflicting case transforms")
-        .with_lint_code("conflicting_case_transforms")
-        .with_span_label(span, "conflicting")
-        .with_help("Choose either `snake_case` or `camel_case`, not both")
 }
 
 pub fn tag_has_alias(span: &Span, key: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Prefer predefined tag alias")
+    LisetteDiagnostic::info("Prefer predefined tag alias")
         .with_lint_code("tag_has_alias")
         .with_span_label(span, "use alias instead")
         .with_help(format!(
@@ -479,7 +1313,562 @@ pub fn unknown_tag_option(span: &Span, option: &str) -> LisetteDiagnostic {
         .with_lint_code("unknown_tag_option")
         .with_span_label(span, "not recognized")
         .with_help(format!(
-            "`{}` is not a recognized tag option. Known options: `snake_case`, `camel_case`, `omitempty`, `!omitempty`, `skip`, `string`",
+            "`{}` is not a recognized tag option. Known options: `snake_case`, `camel_case`, `omitempty`, `!omitempty`, `omitzero`, `!omitzero`, `skip`, `string`",
             option
         ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeverEmptyType {
+    Struct,
+    Enum,
+    Tuple,
+    Array,
+}
+
+impl NeverEmptyType {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Struct => "a struct",
+            Self::Enum => "an enum",
+            Self::Tuple => "a tuple",
+            Self::Array => "a fixed-size array",
+        }
+    }
+
+    fn advice(self) -> &'static str {
+        match self {
+            Self::Enum => {
+                "Remove `omitempty`, or use `omitzero` to omit the first variant when its fields are all zero"
+            }
+            _ => "Use `omitzero` to omit the zero value",
+        }
+    }
+}
+
+pub fn ineffective_omitempty(
+    span: &Span,
+    never_empty: NeverEmptyType,
+    set_by: Option<&Span>,
+) -> LisetteDiagnostic {
+    let diagnostic =
+        LisetteDiagnostic::warn("Ineffective `omitempty`").with_lint_code("ineffective_omitempty");
+    let diagnostic = match set_by {
+        None => diagnostic.with_span_label(span, "has no effect"),
+        Some(set_by) => diagnostic
+            .with_span_label(span, "always serialized")
+            .with_span_label(set_by, "`omitempty` set here"),
+    };
+    diagnostic.with_help(format!(
+        "Go omits an `omitempty` field only when it is empty, and {} never is. {}",
+        never_empty.description(),
+        never_empty.advice()
+    ))
+}
+
+pub fn trim_charset_misuse(span: &Span, function: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn(format!("Misuse of `{function}`"))
+        .with_lint_code("trim_charset_misuse")
+        .with_span_label(span, "treated as charset")
+        .with_help(format!(
+            "`strings.{function}` removes a set of characters, not a substring. Did you mean `strings.TrimPrefix` or `strings.TrimSuffix`?"
+        ))
+}
+
+pub fn duplicate_arguments(span: &Span, package: &str, function: &str) -> LisetteDiagnostic {
+    let display_package = package.strip_prefix("go:").unwrap_or(package);
+    LisetteDiagnostic::warn("Duplicate arguments")
+        .with_lint_code("duplicate_arguments")
+        .with_span_label(span, "identical arguments")
+        .with_help(format!(
+            "Passing the same value twice to `{display_package}.{function}` makes this call a no-op. Did you mean to pass different values?"
+        ))
+}
+
+pub fn manual_equal_fold(
+    span: &Span,
+    negated: bool,
+    namespace: &str,
+    left_arg: &str,
+    right_arg: &str,
+) -> LisetteDiagnostic {
+    let prefix = if negated { "!" } else { "" };
+    LisetteDiagnostic::info("Inefficient string comparison")
+        .with_lint_code("manual_equal_fold")
+        .with_span_label(span, "can use `strings.EqualFold`")
+        .with_help(format!(
+            "Use `{prefix}{namespace}.EqualFold({left_arg}, {right_arg})` to compare case-insensitively in one call"
+        ))
+}
+
+pub fn manual_bytes_equal(
+    span: &Span,
+    negated: bool,
+    namespace: &str,
+    left_arg: &str,
+    right_arg: &str,
+) -> LisetteDiagnostic {
+    let prefix = if negated { "!" } else { "" };
+    LisetteDiagnostic::info("Manual `bytes.Equal`")
+        .with_lint_code("manual_bytes_equal")
+        .with_span_label(span, "can use `bytes.Equal`")
+        .with_help(format!(
+            "Use `{prefix}{namespace}.Equal({left_arg}, {right_arg})` to compare byte slices directly"
+        ))
+}
+
+pub fn redundant_sprintf(span: &Span, namespace: &str, value: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant `Sprintf`")
+        .with_lint_code("redundant_sprintf")
+        .with_span_label(span, "returns its argument unchanged")
+        .with_help(format!(
+            "`{namespace}.Sprintf(\"%s\", {value})` formats a string as itself. Use `{value}` directly"
+        ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintfOperand {
+    Verb(char),
+    StarWidth,
+    StarPrecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintfClass {
+    Integer,
+    Float,
+    Complex,
+    Boolean,
+    String,
+}
+
+impl PrintfClass {
+    pub fn of(kind: SimpleKind) -> Option<PrintfClass> {
+        Some(match kind {
+            SimpleKind::Int
+            | SimpleKind::Int8
+            | SimpleKind::Int16
+            | SimpleKind::Int32
+            | SimpleKind::Int64
+            | SimpleKind::Uint
+            | SimpleKind::Uint8
+            | SimpleKind::Uint16
+            | SimpleKind::Uint32
+            | SimpleKind::Uint64
+            | SimpleKind::Uintptr
+            | SimpleKind::Byte
+            | SimpleKind::Rune => PrintfClass::Integer,
+            SimpleKind::Float32 | SimpleKind::Float64 => PrintfClass::Float,
+            SimpleKind::Complex64 | SimpleKind::Complex128 => PrintfClass::Complex,
+            SimpleKind::Bool => PrintfClass::Boolean,
+            SimpleKind::String => PrintfClass::String,
+            SimpleKind::Unit => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            PrintfClass::Integer => "an integer",
+            PrintfClass::Float => "a float",
+            PrintfClass::Complex => "a complex number",
+            PrintfClass::Boolean => "a boolean",
+            PrintfClass::String => "a string",
+        }
+    }
+
+    fn suggested_verb(self) -> char {
+        match self {
+            PrintfClass::Integer => 'd',
+            PrintfClass::Float | PrintfClass::Complex => 'f',
+            PrintfClass::Boolean => 't',
+            PrintfClass::String => 's',
+        }
+    }
+}
+
+fn printf_classes_phrase(accepted: &[PrintfClass]) -> String {
+    match accepted {
+        [] => "a pointer".to_string(),
+        [only] => only.name().to_string(),
+        [first, second] => format!("{} or {}", first.name(), second.name()),
+        [leading @ .., last] => {
+            let listed: Vec<&str> = leading.iter().map(|class| class.name()).collect();
+            format!("{}, or {}", listed.join(", "), last.name())
+        }
+    }
+}
+
+pub fn printf_verb_type_mismatch(
+    span: &Span,
+    package: &str,
+    function: &str,
+    verb: char,
+    accepted: &[PrintfClass],
+    argument: SimpleKind,
+) -> LisetteDiagnostic {
+    let display_package = package.strip_prefix("go:").unwrap_or(package);
+    let type_name = argument.leaf_name();
+    let needs = printf_classes_phrase(accepted);
+    let suggestion = PrintfClass::of(argument).map_or('v', PrintfClass::suggested_verb);
+
+    LisetteDiagnostic::warn("Format verb mismatch")
+        .with_lint_code("printf_verb_mismatch")
+        .with_span_label(span, format!("`{type_name}` argument for `%{verb}`"))
+        .with_help(format!(
+            "`{display_package}.{function}` formats `%{verb}`, which needs {needs}, but the argument has type `{type_name}`. Use `%{suggestion}`, or convert the argument"
+        ))
+}
+
+pub fn printf_star_type_mismatch(
+    span: &Span,
+    package: &str,
+    function: &str,
+    precision: bool,
+    argument: SimpleKind,
+) -> LisetteDiagnostic {
+    let display_package = package.strip_prefix("go:").unwrap_or(package);
+    let type_name = argument.leaf_name();
+    let part = if precision { "precision" } else { "width" };
+
+    LisetteDiagnostic::warn(format!("Format {part} mismatch"))
+        .with_lint_code("printf_verb_mismatch")
+        .with_span_label(span, format!("`{type_name}` argument for the `*` {part}"))
+        .with_help(format!(
+            "`{display_package}.{function}` takes the `*` {part} from an argument of type `{type_name}`, but a {part} must be an integer. Use a fixed {part}, or convert the argument"
+        ))
+}
+
+pub fn printf_verb_mismatch(
+    span: &Span,
+    package: &str,
+    function: &str,
+    operands: &[PrintfOperand],
+    supplied: usize,
+) -> LisetteDiagnostic {
+    let display_package = package.strip_prefix("go:").unwrap_or(package);
+    let only_verbs = operands
+        .iter()
+        .all(|operand| matches!(operand, PrintfOperand::Verb(_)));
+    let operand_word = match (only_verbs, operands.len()) {
+        (true, 1) => "verb",
+        (true, _) => "verbs",
+        (false, 1) => "operand",
+        (false, _) => "operands",
+    };
+    let argument_word = if supplied == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    let counts = format!(
+        "{} {operand_word} but {supplied} {argument_word}",
+        operands.len()
+    );
+    let label = format!(
+        "{} {operand_word}, {supplied} {argument_word}",
+        operands.len()
+    );
+
+    match operands.get(supplied) {
+        Some(unmatched) => {
+            let (corruption, repair) = match unmatched {
+                // A raw control character would break the help across lines.
+                PrintfOperand::Verb(verb) if verb.is_control() => {
+                    let escaped = verb.escape_default();
+                    (
+                        format!("`%{escaped}` prints as `%!{escaped}(MISSING)`"),
+                        "Add the missing argument, remove the verb, or write `%%` for a literal percent sign",
+                    )
+                }
+                PrintfOperand::Verb(verb) => (
+                    format!("`%{verb}` prints as `%!{verb}(MISSING)`"),
+                    "Add the missing argument, remove the verb, or write `%%` for a literal percent sign",
+                ),
+                PrintfOperand::StarWidth => (
+                    "the `*` width prints as `%!(BADWIDTH)`".to_string(),
+                    "Add the missing width argument or write a fixed width",
+                ),
+                PrintfOperand::StarPrecision => (
+                    "the `*` precision prints as `%!(BADPREC)`".to_string(),
+                    "Add the missing precision argument or write a fixed precision",
+                ),
+            };
+            LisetteDiagnostic::warn("Missing format arguments")
+                .with_lint_code("printf_verb_mismatch")
+                .with_span_label(span, label)
+                .with_help(format!(
+                    "`{display_package}.{function}` has {counts}, so {corruption}. {repair}"
+                ))
+        }
+        None => {
+            let (extras, repair) = if supplied == operands.len() + 1 {
+                (
+                    "the extra argument prints",
+                    "Add a verb for it or remove it",
+                )
+            } else {
+                (
+                    "the extra arguments print",
+                    "Add verbs for them or remove them",
+                )
+            };
+            LisetteDiagnostic::warn("Extra format arguments")
+                .with_lint_code("printf_verb_mismatch")
+                .with_span_label(span, label)
+                .with_help(format!(
+                    "`{display_package}.{function}` has {counts}, so {extras} as `%!(EXTRA ...)` at the end of the output. {repair}"
+                ))
+        }
+    }
+}
+
+pub fn manual_replace_all(
+    span: &Span,
+    namespace: &str,
+    s: &str,
+    old: &str,
+    new: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `strings.ReplaceAll`")
+        .with_lint_code("manual_replace_all")
+        .with_span_label(span, "can use `strings.ReplaceAll`")
+        .with_help(format!(
+            "`{namespace}.Replace({s}, {old}, {new}, -1)` replaces every occurrence. Use `{namespace}.ReplaceAll({s}, {old}, {new})`"
+        ))
+}
+
+pub fn redundant_trim_guard(
+    span: &Span,
+    namespace: &str,
+    prefix: bool,
+    replacement: &str,
+) -> LisetteDiagnostic {
+    let (guard, trim, affix) = if prefix {
+        ("HasPrefix", "TrimPrefix", "prefix")
+    } else {
+        ("HasSuffix", "TrimSuffix", "suffix")
+    };
+    LisetteDiagnostic::info(format!("Redundant `{namespace}.{guard}` guard"))
+        .with_lint_code("redundant_trim_guard")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!(
+            "`{namespace}.{trim}` already returns the string unchanged when the {affix} is absent. Replace the `if` with `{replacement}`"
+        ))
+}
+
+pub fn replace_count_zero(
+    span: &Span,
+    namespace: &str,
+    s: &str,
+    old: &str,
+    new: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Zero replacement count")
+        .with_lint_code("replace_count_zero")
+        .with_span_label(span, "replaces nothing")
+        .with_help(format!(
+            "`{namespace}.Replace` with a count of `0` replaces nothing and returns `{s}` unchanged. Use `{namespace}.ReplaceAll({s}, {old}, {new})` to replace every occurrence, or a positive count to replace that many"
+        ))
+}
+
+pub fn needless_splitn(
+    span: &Span,
+    member: &str,
+    original: &str,
+    replacement: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::info(format!("Needless `{member}`"))
+        .with_lint_code("needless_splitn")
+        .with_span_label(span, "splits with no limit")
+        .with_help(format!(
+            "`{original}` splits with no limit. Use `{replacement}`"
+        ))
+}
+
+pub fn eager_split_in_loop(span: &Span, original: &str, replacement: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Needless slice")
+        .with_lint_code("eager_split_in_loop")
+        .with_span_label(span, "only this loop reads it")
+        .with_help(format!(
+            "`{original}` allocates a slice that only this loop reads. Use `{replacement}`, which returns the same parts one at a time"
+        ))
+}
+
+pub fn manual_rotate(span: &Span, width: u64) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `bits.RotateLeft`")
+        .with_lint_code("manual_rotate")
+        .with_span_label(span, "can use `bits.RotateLeft`")
+        .with_help(format!(
+            "Use `bits.RotateLeft{width}` after `import \"go:math/bits\"`"
+        ))
+}
+
+pub fn manual_time_since(span: &Span, namespace: &str, arg: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `time.Since`")
+        .with_lint_code("manual_time_since")
+        .with_span_label(span, "can use `time.Since`")
+        .with_help(format!(
+            "`{namespace}.Since({arg})` is shorthand for `{namespace}.Now().Sub({arg})`"
+        ))
+}
+
+pub fn manual_time_until(span: &Span, namespace: &str, receiver: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `time.Until`")
+        .with_lint_code("manual_time_until")
+        .with_span_label(span, "can use `time.Until`")
+        .with_help(format!(
+            "`{namespace}.Until({receiver})` is shorthand for `{receiver}.Sub({namespace}.Now())`"
+        ))
+}
+
+pub fn lost_query_mutation(span: &Span, method: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Lost query mutation")
+        .with_lint_code("lost_query_mutation")
+        .with_span_label(span, "mutates a discarded copy")
+        .with_help(format!(
+            "`URL.Query` returns a fresh copy, so this `{method}` has no effect. Bind it, mutate it, then assign `values.Encode()` to `RawQuery`"
+        ))
+}
+
+/// The direction of an `encoding/json` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonDirection {
+    /// `Marshal` and `MarshalIndent`.
+    Reads,
+    /// `Unmarshal`.
+    Fills,
+}
+
+/// `fields` pairs each skipped field's name with the span of its declaration.
+pub fn json_skipped_field(
+    span: &Span,
+    owner: &str,
+    fields: &[(&str, Span)],
+    direction: JsonDirection,
+) -> LisetteDiagnostic {
+    let names = quoted_names(fields);
+    let one = fields.len() == 1;
+    let title = if one {
+        "Field skipped by JSON"
+    } else {
+        "Fields skipped by JSON"
+    };
+    let label = match (direction, one) {
+        (JsonDirection::Reads, _) => format!("{names} will not be serialized"),
+        (JsonDirection::Fills, true) => format!("{names} will keep its current value"),
+        (JsonDirection::Fills, false) => format!("{names} will keep their current values"),
+    };
+    let rule = match direction {
+        JsonDirection::Reads => "Only `pub` fields are written to JSON",
+        JsonDirection::Fills => "Only `pub` fields are filled from JSON",
+    };
+    // The call anchors the diagnostic, so its label goes first.
+    let mut diagnostic = LisetteDiagnostic::warn(title)
+        .with_lint_code("json_skipped_field")
+        .with_span_label(span, label)
+        .with_help(format!(
+            "{rule}. Add `#[json]` to `{owner}`, or mark {names} as `pub`"
+        ));
+    for (_, declared_at) in fields {
+        diagnostic = diagnostic.with_span_label(declared_at, "declared without `pub`");
+    }
+    diagnostic
+}
+
+fn quoted_names(fields: &[(&str, Span)]) -> String {
+    let quoted: Vec<String> = fields.iter().map(|(name, _)| format!("`{name}`")).collect();
+    match quoted.as_slice() {
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [] => String::new(),
+    }
+}
+
+pub fn waitgroup_add_in_task(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("`WaitGroup.Add` inside a `task`")
+        .with_lint_code("waitgroup_add_in_task")
+        .with_span_label(span, "may run after `Wait`")
+        .with_help(
+            "Prefer `wg.Go(|| ...)`, which counts the task and starts it in one step and runs `Done` for you, or move `Add` before the `task`",
+        )
+}
+
+pub fn manual_waitgroup_go(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Manual `WaitGroup.Go`")
+        .with_lint_code("manual_waitgroup_go")
+        .with_span_label(span, "counts the next `task`")
+        .with_help(
+            "Prefer `wg.Go(|| ...)`, which counts the task and starts it in one step and runs `Done` for you",
+        )
+}
+
+pub fn task_argument_call(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Call evaluated before the `task` starts")
+        .with_lint_code("task_argument_call")
+        .with_span_label(span, "runs on the caller")
+        .with_help(
+            "Move the work into a `task { ... }` block to run it in the task, or bind it with `let` first to make the order visible",
+        )
+}
+
+pub fn deprecated_api(span: &Span, message: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Use of deprecated API")
+        .with_lint_code("deprecated")
+        .with_span_label(span, "not intended for new code")
+        .with_help(message)
+}
+
+pub fn superseded_api(span: &Span, successor: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Superseded API")
+        .with_lint_code("superseded_api")
+        .with_span_label(span, "no longer modern Go")
+        .with_help(format!("Use `{successor}` instead"))
+}
+
+pub fn lost_cancel(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Context leaking")
+        .with_lint_code("lost_cancel")
+        .with_span_label(span, "never called")
+        .with_help(
+            "Call this cancel function (usually `defer cancel()`) to release the context, or it leaks until the parent is canceled",
+        )
+}
+
+pub fn exit_after_defer(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("`os.Exit` skips `defer`")
+        .with_lint_code("exit_after_defer")
+        .with_span_label(span, "exits before `defer` can run")
+        .with_help(
+            "`os.Exit` will terminate the process without running deferred calls. Run the cleanup before exiting instead of deferring it",
+        )
+}
+
+pub fn unnecessary_range_loop(span: &Span, collection: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Unnecessary range loop")
+        .with_lint_code("unnecessary_range_loop")
+        .with_span_label(span, "can be simpler")
+        .with_help(format!(
+            "This loop exposes the index only to access elements of `{collection}`. Iterate directly over the elements with `for value in {collection}`"
+        ))
+}
+
+pub fn out_of_domain_value(
+    span: &Span,
+    type_display: &str,
+    valid_display: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Out-of-domain value")
+        .with_lint_code("out_of_domain_value")
+        .with_span_label(span, "out of domain")
+        .with_help(format!(
+            "`{type_display}` has a closed domain (`{valid_display}`) that excludes this value"
+        ))
+}
+
+pub fn infallible_assertion(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::warn("Infallible assertion")
+        .with_lint_code("infallible_assertion")
+        .with_span_label(span, "never fails")
+        .with_help("This assertion cannot catch a regression. Write a useful assertion")
 }

@@ -1,6 +1,11 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
+description: |
+  
+  enum Result<T, E> {
+    Ok(T),
+    Err(E),
+  }
 ---
 LexResult {
     tokens: [
@@ -132,9 +137,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

@@ -1,4 +1,4 @@
-use crate::assert_emit_snapshot;
+use crate::{assert_emit_snapshot, assert_emit_snapshot_with_go_typedefs};
 
 #[test]
 fn binary_addition() {
@@ -142,6 +142,49 @@ fn test() -> bool {
 }
 
 #[test]
+fn binary_logical_and_short_circuits_rhs_with_setup() {
+    let input = r#"
+fn track(flag: mut Ref<bool>) -> Result<int, error> {
+  flag.* = true
+  Ok(1)
+}
+
+fn test() {
+  let mut ran = false
+  if false && track(&ran).is_ok() {
+    panic("body should not run")
+  }
+  if ran {
+    panic("rhs evaluated despite short-circuit")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn binary_logical_or_short_circuits_rhs_with_setup() {
+    let input = r#"
+fn track(flag: mut Ref<bool>) -> Result<int, error> {
+  flag.* = true
+  Ok(1)
+}
+
+fn test() {
+  let mut ran = false
+  if true || track(&ran).is_ok() {
+    if ran {
+      panic("rhs evaluated despite short-circuit")
+    }
+    return
+  }
+  panic("if-body should run")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn unary_negation() {
     let input = r#"
 fn test() -> int {
@@ -152,10 +195,84 @@ fn test() -> int {
 }
 
 #[test]
+fn unary_double_negation_cannot_lex_as_decrement() {
+    let input = r#"
+fn test(x: int) -> int {
+  - -x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn unary_logical_not() {
     let input = r#"
 fn test() -> bool {
   !true
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn negated_float_comparison_keeps_not() {
+    let input = r#"
+type Score = float64
+
+fn test(a: float64, b: float64, c: Score, d: Score) -> bool {
+  !(a < b) && !(c <= d)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn negated_generic_comparison_keeps_not() {
+    let input = r#"
+fn test<T: Ordered>(a: T, b: T) -> bool {
+  !(a > b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn negated_int_comparison_flips() {
+    let input = r#"
+fn test(a: int, b: int, s: string, t: string) -> bool {
+  !(a < b) && !(s < t)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn negated_float_equality_flips() {
+    let input = r#"
+fn test(a: float64, b: float64) -> bool {
+  !(a == b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unary_not_skips_operator_text_inside_string_literal() {
+    let input = r#"
+fn test(s: string) -> bool {
+  !("x == y" == s)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unary_not_does_not_flip_comparison_inside_call_argument() {
+    let input = r#"
+fn always_false(b: bool) -> bool { false }
+
+fn test(x: int, y: int) -> bool {
+  !always_false(x == y)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -194,12 +311,76 @@ fn test(p: Point) {
 }
 
 #[test]
+fn struct_autofill_lisette_primitives() {
+    let input = r#"
+struct Conf { name: string, count: int, on: bool }
+
+fn test() -> Conf {
+  Conf { name: "x", .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_autofill_lisette_option_emits_none() {
+    let input = r#"
+struct Conf { name: string, opt: Option<int> }
+
+fn test() -> Conf {
+  Conf { name: "x", .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_autofill_nested_user_struct_recurses() {
+    let input = r#"
+struct Inner { opt: Option<int>, items: Slice<int> }
+struct Outer { inner: Inner }
+
+fn test() -> Outer {
+  Outer { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_autofill_lisette_slice_omitted_map_non_nil() {
+    let input = r#"
+struct Conf { items: Slice<int>, lookup: Map<string, int> }
+
+fn test() -> Conf {
+  Conf { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_autofill_enum_struct_variant() {
+    let input = r#"
+enum Action {
+  Move { x: int, y: int, dist: int },
+  Stop,
+}
+
+fn test() -> Action {
+  Action.Move { x: 5, .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn deref_field_access() {
     let input = r#"
 struct Counter { value: int }
 
 impl Counter {
-  fn increment(self: Ref<Counter>) {
+  fn increment(self: mut Ref<Counter>) {
     self.*.value = self.*.value + 1
   }
 
@@ -228,6 +409,30 @@ fn tuple_access_both_elements() {
 fn test() -> int {
   let tuple = (42, "hello");
   tuple.0 + 1
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_field_access_through_alias() {
+    let input = r#"
+import "go:fmt"
+
+struct Flag(bool)
+struct Ticket(int)
+type FlagAlias = Flag
+type TicketAlias = Ticket
+type Deep = TicketAlias
+
+fn read(x: FlagAlias) -> bool { x.0 }
+fn deep(t: Deep) -> int { t.0 }
+
+fn main() {
+  let f: FlagAlias = Flag(true)
+  let t: TicketAlias = Ticket(3)
+  let o: Option<FlagAlias> = Some(Flag(false))
+  fmt.Println(f.0, t.0, read(f), deep(t), o.unwrap_or(Flag(true)).0)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -296,6 +501,140 @@ fn test() -> Result<int, string> {
 }
 
 #[test]
+fn propagate_in_struct_literal_field() {
+    let input = r#"
+struct User {
+  id: int,
+  name: string,
+}
+
+fn get_id() -> Result<int, string> { Ok(1) }
+fn get_name() -> Result<string, string> { Ok("Ada") }
+
+fn make_user() -> Result<User, string> {
+  Ok(User {
+    id: get_id()?,
+    name: get_name()?,
+  })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_struct_literal_spread_base() {
+    let input = r#"
+struct User {
+  id: int,
+  name: string,
+}
+
+fn get_base() -> Result<User, string> {
+  Ok(User { id: 1, name: "a" })
+}
+
+fn override_id() -> Result<User, string> {
+  Ok(User { id: 2, ..get_base()? })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_match_subject() {
+    let input = r#"
+fn g() -> Result<int, string> { Ok(1) }
+
+fn f() -> Result<int, string> {
+  match g()? {
+    0 => Ok(10),
+    x => Ok(x),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_range_start() {
+    let input = r#"
+fn g() -> Result<int, string> { Ok(0) }
+
+fn f() -> Result<int, string> {
+  let mut s = 0
+  for i in g()?..5 { s = s + i }
+  Ok(s)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_range_end() {
+    let input = r#"
+fn g() -> Result<int, string> { Ok(5) }
+
+fn f() -> Result<int, string> {
+  let mut s = 0
+  for i in 0..g()? { s = s + i }
+  Ok(s)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_for_iterable() {
+    let input = r#"
+fn g() -> Result<Slice<int>, string> { Ok([1, 2, 3]) }
+
+fn f() -> Result<int, string> {
+  let mut s = 0
+  for i in g()? { s = s + i }
+  Ok(s)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_loop_break_value() {
+    let input = r#"
+fn g() -> Result<int, string> { Ok(5) }
+
+fn f() -> Result<int, string> {
+  let x = loop { break g()? }
+  Ok(x)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_in_if_let_subject() {
+    let input = r#"
+fn g() -> Result<Option<int>, string> { Ok(Some(1)) }
+
+fn f() -> Result<int, string> {
+  if let Some(n) = g()? { Ok(n) } else { Ok(0) }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_chained_double() {
+    let input = r#"
+fn h() -> Result<Result<int, string>, string> { Ok(Ok(1)) }
+
+fn f() -> Result<int, string> {
+  Ok(h()??)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn const_simple() {
     let input = r#"
 const MAX_SIZE = 100
@@ -345,14 +684,116 @@ fn main() {
 }
 
 #[test]
-fn const_go_keyword_name() {
+fn const_reference_to_const_stays_const() {
     let input = r#"
 import "go:fmt"
 
-const range: int = 42
+const X = 10
+const Y = X + 5
 
 fn main() {
-  fmt.Println(range)
+  fmt.Println(Y)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn const_bitwise_not_stays_const() {
+    let input = r#"
+const MASK = ^1
+
+fn main() {
+  let _ = MASK
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn const_imported_constant_stays_const() {
+    let input = r#"
+import "go:fmt"
+import "go:time"
+
+const DELAY = time.Second / 12
+
+fn main() {
+  fmt.Println(DELAY)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn const_imported_nonliteral_constant_stays_const() {
+    let typedef = "pub const SHIFT: int = 60 + 8\n";
+    let input = r#"
+import "go:example.com/consts"
+
+const DELAY = consts.SHIFT / 12
+
+fn main() {
+  let _ = DELAY
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/consts", typedef)]);
+}
+
+#[test]
+fn shift_by_imported_nonliteral_constant_not_pinned() {
+    let typedef = "pub const SHIFT: int = 60 + 8\n";
+    let input = r#"
+import "go:example.com/consts"
+
+fn main() {
+  let _ = (1 << consts.SHIFT) as float64
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/consts", typedef)]);
+}
+
+#[test]
+fn const_eligibility_does_not_leak_out_of_block() {
+    let input = r#"
+import "go:fmt"
+
+fn make() -> int {
+  2
+}
+
+fn main() {
+  {
+    const X = 1
+    fmt.Println(X)
+  }
+  let x = make()
+  const Y = x
+  fmt.Println(Y)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn const_eligibility_does_not_leak_across_functions() {
+    let input = r#"
+import "go:fmt"
+
+fn make() -> int {
+  2
+}
+
+fn a() {
+  const X = 1
+  fmt.Println(X)
+}
+
+fn main() {
+  a()
+  let x = make()
+  const Y = x
+  fmt.Println(Y)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -380,6 +821,19 @@ fn test() {
   let x = 10;
   let y = 20;
   fmt.Print(f"x = {x}, y = {y}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_escaped_quote_before_interp() {
+    let input = r#"
+import "go:fmt"
+
+fn test() {
+  let x = 7;
+  fmt.Println(f"prefix \", {x}")
 }
 "#;
     assert_emit_snapshot!(input);
@@ -435,6 +889,52 @@ fn test() {
 }
 
 #[test]
+fn format_string_solo_rune() {
+    let input = r#"
+import "go:fmt"
+
+fn test() {
+  let c = 'A';
+  fmt.Print(f"{c}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_rune_alias() {
+    let input = r#"
+import "go:fmt"
+
+type Ch = rune
+
+fn test() {
+  let c: Ch = 'A';
+  fmt.Print(f"{c}")
+  fmt.Print(f"char: {c}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_display_rune_newtype_keeps_stringer() {
+    let input = r#"
+import "go:fmt"
+
+#[display]
+struct Grade(rune)
+
+fn test() {
+  let g = Grade('B');
+  fmt.Print(f"{g}")
+  fmt.Print(f"grade: {g}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn compound_assignment() {
     let input = r#"
 fn test() -> int {
@@ -453,7 +953,7 @@ fn test() -> int {
 #[test]
 fn deref_assignment() {
     let input = r#"
-fn mutate(r: Ref<int>) {
+fn mutate(r: mut Ref<int>) {
   r.* = 99
 }
 
@@ -484,10 +984,10 @@ impl Foo {
 #[test]
 fn deref_assignment_target_captured_before_rhs() {
     let input = r#"
-struct H { ptr: Ref<int> }
+struct H { ptr: mut Ref<int> }
 
 impl H {
-  fn repoint(self: Ref<H>, q: Ref<int>) -> int {
+  fn repoint(self: mut Ref<H>, q: mut Ref<int>) -> int {
     self.ptr = q
     9
   }
@@ -510,10 +1010,10 @@ fn main() {
 #[test]
 fn compound_deref_assignment_target_captured() {
     let input = r#"
-struct H { ptr: Ref<int> }
+struct H { ptr: mut Ref<int> }
 
 impl H {
-  fn repoint(self: Ref<H>, q: Ref<int>) -> int {
+  fn repoint(self: mut Ref<H>, q: mut Ref<int>) -> int {
     self.ptr = q
     9
   }
@@ -535,10 +1035,10 @@ fn main() {
 fn dot_field_through_ref_assignment_captured() {
     let input = r#"
 struct P { x: int }
-struct H { ptr: Ref<P> }
+struct H { ptr: mut Ref<P> }
 
 impl H {
-  fn repoint(self: Ref<H>, q: Ref<P>) -> int {
+  fn repoint(self: mut Ref<H>, q: mut Ref<P>) -> int {
     self.ptr = q
     9
   }
@@ -559,7 +1059,7 @@ fn main() {
 #[test]
 fn binary_left_hoisted_when_right_is_call() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -576,7 +1076,7 @@ fn main() {
 #[test]
 fn call_args_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -595,7 +1095,7 @@ fn main() {
 #[test]
 fn tuple_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -614,7 +1114,7 @@ fn struct_literal_field_eval_order_captured() {
     let input = r#"
 struct Pair { a: int, b: int }
 
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -631,7 +1131,7 @@ fn main() {
 #[test]
 fn format_string_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -648,7 +1148,7 @@ fn main() {
 #[test]
 fn slice_literal_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -665,7 +1165,7 @@ fn main() {
 #[test]
 fn range_value_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -685,7 +1185,7 @@ fn regular_call_callee_eval_order_captured() {
 fn f0(x: int) -> int { x + 10 }
 fn f1(x: int) -> int { x + 20 }
 
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   0
 }
@@ -701,9 +1201,119 @@ fn main() {
 }
 
 #[test]
+fn chained_callee_call_arg_stays_inline() {
+    let input = r#"
+struct O {}
+
+impl O {
+  fn a(self, num: int) -> O { self }
+  fn b(self, num: int) -> O { self }
+  fn c(self) {}
+}
+
+fn one() -> int { 1 }
+
+fn main() {
+  let o = O {}
+  o.a(1).b(one()).c()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn chained_callee_constructor_args_stay_inline() {
+    let input = r#"
+struct O {}
+struct P(int)
+
+enum Color {
+  Red(int),
+  Blue,
+}
+
+impl O {
+  fn p(self, p: P) -> O { self }
+  fn col(self, c: Color) -> O { self }
+  fn c(self) {}
+}
+
+fn main() {
+  let o = O {}
+  o.p(P(2)).col(Color.Red(3)).col(Color.Blue).c()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn errors_new_format_string_collapses_to_errorf() {
+    let input = r#"
+import "go:errors"
+
+fn fail(line: string) -> error {
+  errors.New(f"malformed line: {line}")
+}
+
+fn percent(rate: int) -> error {
+  errors.New(f"{rate}% failed")
+}
+
+fn main() {
+  let _ = fail("x")
+  let _ = percent(3)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn errors_new_non_sprintf_args_stay() {
+    let input = r#"
+import "go:errors"
+
+fn plain() -> error {
+  errors.New("plain message")
+}
+
+fn no_interpolation() -> error {
+  errors.New(f"nothing to fill in")
+}
+
+fn solo(msg: string) -> error {
+  errors.New(f"{msg}")
+}
+
+fn main() {
+  let _ = plain()
+  let _ = no_interpolation()
+  let _ = solo("y")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_callee_pure_constructor_arg_not_captured() {
+    let input = r#"
+struct P(int)
+fn f0(p: P) -> int { 0 }
+fn f1(p: P) -> int { 1 }
+
+fn main() {
+  let fs = [f0, f1]
+  let i = 0
+  let r = fs[i](P(2))
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn index_access_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -721,7 +1331,7 @@ fn main() {
 #[test]
 fn slice_range_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -747,7 +1357,7 @@ impl Adder {
   }
 }
 
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -771,7 +1381,7 @@ impl Counter {
   fn get(self) -> int { self.n }
 }
 
-fn bump_and_get(c: Ref<Counter>) -> int {
+fn bump_and_get(c: mut Ref<Counter>) -> int {
   c.*.n = c.*.n + 1
   c.*.n
 }
@@ -790,7 +1400,7 @@ fn main() {
 #[test]
 fn native_method_dot_access_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -808,7 +1418,7 @@ fn main() {
 #[test]
 fn native_method_identifier_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> string {
+fn bump(i: mut Ref<int>) -> string {
   i.* = 1
   ","
 }
@@ -828,7 +1438,7 @@ fn tuple_struct_call_eval_order_captured() {
     let input = r#"
 struct Pair(int, int)
 
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -845,7 +1455,7 @@ fn main() {
 #[test]
 fn append_args_eval_order_captured() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   10
 }
@@ -853,7 +1463,7 @@ fn bump(i: Ref<int>) -> int {
 fn main() {
   let mut i = 0
   let mut items: Slice<int> = []
-  items.append(i, bump(&i))
+  items = items.append(i, bump(&i))
   let _ = items
 }
 "#;
@@ -863,7 +1473,7 @@ fn main() {
 #[test]
 fn call_args_prebound_ref_eval_order() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = 1
   9
 }
@@ -873,7 +1483,7 @@ fn first(a: int, _b: int) -> int { a }
 fn main() {
   let mut i = 0
   let m = [[10], [20]]
-  let ip = &i
+  let mut ip = &i
   let x = first(m[i][0], [bump(ip)][0])
   let _ = x
 }
@@ -884,9 +1494,9 @@ fn main() {
 #[test]
 fn call_args_carrier_struct_ref_eval_order() {
     let input = r#"
-struct Carrier { p: Ref<int> }
+struct Carrier { p: mut Ref<int> }
 
-fn bump(c: Carrier) -> int {
+fn bump(c: mut Carrier) -> int {
   c.p.* = 1
   9
 }
@@ -896,7 +1506,7 @@ fn first(a: int, _b: int) -> int { a }
 fn main() {
   let mut i = 0
   let m = [[10], [20]]
-  let c = Carrier { p: &i }
+  let mut c = Carrier { p: &i }
   let x = first(m[i][0], [bump(c)][0])
   let _ = x
 }
@@ -907,9 +1517,9 @@ fn main() {
 #[test]
 fn assignment_deref_target_frozen_prebound_ref() {
     let input = r#"
-struct Holder { p: Ref<int> }
+struct Holder { p: mut Ref<int> }
 
-fn retarget(h: Ref<Holder>, np: Ref<int>) -> int {
+fn retarget(h: mut Ref<Holder>, np: mut Ref<int>) -> int {
   h.p = np
   9
 }
@@ -918,8 +1528,8 @@ fn main() {
   let mut a = 1
   let mut b = 2
   let mut h = Holder { p: &a }
-  let hp = &h
-  let np = &b
+  let mut hp = &h
+  let mut np = &b
   h.p.* = retarget(hp, np)
   let _ = a
 }
@@ -930,10 +1540,10 @@ fn main() {
 #[test]
 fn assignment_deref_target_frozen_carrier_ref() {
     let input = r#"
-struct Holder { p: Ref<int> }
-struct Carrier { h: Ref<Holder>, np: Ref<int> }
+struct Holder { p: mut Ref<int> }
+struct Carrier { h: mut Ref<Holder>, np: mut Ref<int> }
 
-fn retarget(mut c: Carrier) -> int {
+fn retarget(c: mut Carrier) -> int {
   c.h.p = c.np
   9
 }
@@ -954,10 +1564,10 @@ fn main() {
 fn call_args_carrier_enum_ref_eval_order() {
     let input = r#"
 enum Carrier {
-  C { p: Ref<int> },
+  C { p: mut Ref<int> },
 }
 
-fn bump(c: Carrier) -> int {
+fn bump(c: mut Carrier) -> int {
   match c {
     Carrier.C { p } => {
       p.* = 1
@@ -971,7 +1581,7 @@ fn first(a: int, _b: int) -> int { a }
 fn main() {
   let mut i = 0
   let m = [[10], [20]]
-  let c = Carrier.C { p: &i }
+  let mut c = Carrier.C { p: &i }
   let x = first(m[i][0], [bump(c)][0])
   let _ = x
 }
@@ -982,10 +1592,10 @@ fn main() {
 #[test]
 fn assignment_deref_target_frozen_match_hidden_ref() {
     let input = r#"
-struct Holder { p: Ref<int> }
-struct Carrier { h: Ref<Holder>, np: Ref<int> }
+struct Holder { p: mut Ref<int> }
+struct Carrier { h: mut Ref<Holder>, np: mut Ref<int> }
 
-fn retarget(c: Carrier) -> int {
+fn retarget(c: mut Carrier) -> int {
   c.h.*.p = c.np
   9
 }
@@ -994,7 +1604,7 @@ fn main() {
   let mut a = 1
   let mut b = 2
   let mut h = Holder { p: &a }
-  let c = Carrier { h: &h, np: &b }
+  let mut c = Carrier { h: &h, np: &b }
   h.p.* = match 0 {
     0 => retarget(c),
     _ => 0,
@@ -1082,6 +1692,27 @@ fn let_binding_shadows_go_builtin() {
 fn test(items: Slice<int>) -> int {
   let len = items.length();
   len
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn shadowing_let_keeps_its_annotated_type() {
+    let input = r#"
+fn take(v: int64) -> int64 {
+  v
+}
+
+fn test() {
+  let x = 1
+  if x != 1 {
+    panic("outer binding was clobbered")
+  }
+  let x: int64 = 5
+  if take(x) != 5 {
+    panic("shadowing binding lost its annotated type")
+  }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1182,7 +1813,7 @@ fn make_counter(start: int) -> fn() -> int {
 fn map_index_assign_closure_type_propagation() {
     let input = r#"
 fn test() {
-  let mut m: Map<string, fn(int) -> int> = Map.new()
+  let mut m: mut Map<string, fn(int) -> int> = Map.new()
   m["square"] = |x| x * x
 }
 "#;
@@ -1215,13 +1846,14 @@ fn deref_map_value_method_call() {
 struct Counter { count: int }
 
 impl Counter {
-  fn increment(self: Ref<Counter>) {
+  fn increment(self: mut Ref<Counter>) {
     self.*.count += 1
   }
 }
 
-fn test(m: Map<string, Ref<Counter>>) {
-  m["a"].*.increment()
+fn test(m: mut Map<string, mut Ref<Counter>>) {
+  let Some(c) = m.get("a") else { return; };
+  c.*.increment()
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1269,7 +1901,7 @@ fn auto_address_function_call_receiver() {
 struct Foo { value: int }
 
 impl Foo {
-  fn increment(self: Ref<Foo>) {
+  fn increment(self: mut Ref<Foo>) {
     self.value = self.value + 1
   }
 }
@@ -1291,7 +1923,7 @@ fn auto_address_parenthesized_function_call_receiver() {
 struct Foo { value: int }
 
 impl Foo {
-  fn increment(self: Ref<Foo>) {
+  fn increment(self: mut Ref<Foo>) {
     self.value = self.value + 1
   }
 }
@@ -1313,7 +1945,7 @@ fn auto_address_struct_literal_receiver() {
 struct Foo { value: int }
 
 impl Foo {
-  fn increment(self: Ref<Foo>) {
+  fn increment(self: mut Ref<Foo>) {
     self.value = self.value + 1
   }
 }
@@ -1331,7 +1963,7 @@ fn auto_address_parenthesized_struct_literal_receiver() {
 struct Foo { value: int }
 
 impl Foo {
-  fn increment(self: Ref<Foo>) {
+  fn increment(self: mut Ref<Foo>) {
     self.value = self.value + 1
   }
 }
@@ -1362,7 +1994,7 @@ fn test() {
 #[test]
 fn deref_map_index_assignment() {
     let input = r#"
-fn update(m: Ref<Map<string, int>>, key: string, val: int) {
+fn update(m: mut Ref<mut Map<string, int>>, key: string, val: int) {
   m.*[key] = val
 }
 "#;
@@ -1594,6 +2226,29 @@ fn main() {
 }
 
 #[test]
+fn slice_range_value_eval_order() {
+    let input = r#"
+import "go:fmt"
+
+fn make_items() -> Slice<int> {
+  fmt.Println("receiver")
+  [10, 20, 30, 40]
+}
+
+fn make_range() -> Range<int> {
+  fmt.Println("range")
+  1..3
+}
+
+fn main() {
+  let xs = make_items()[make_range()]
+  fmt.Println(xs.length())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn map_field_assignment_expression_position() {
     let input = r#"
 import "go:fmt"
@@ -1603,7 +2258,7 @@ struct Config {
 }
 
 fn main() {
-  let mut m: Map<string, Config> = Map.new()
+  let mut m: mut Map<string, Config> = Map.new()
   m["a"] = Config { value: 1 }
   let _ = {
     let mut entry = m["a"]
@@ -1634,11 +2289,11 @@ fn emit_or_capture_no_collision_with_user_vars() {
 import "go:fmt"
 
 fn main() {
-  let _bound_0 = 10
+  let bound_0 = 10
   for i in 0..(1 + 2) {
     fmt.Println(i)
   }
-  fmt.Println(_bound_0)
+  fmt.Println(bound_0)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1668,7 +2323,7 @@ import "go:fmt"
 struct Key { k: string }
 struct Box { x: int }
 
-fn make_key(counter: Ref<int>) -> Key {
+fn make_key(counter: mut Ref<int>) -> Key {
   counter.* = counter.* + 1
   Key { k: "a" }
 }
@@ -1699,7 +2354,7 @@ fn make_key() -> string {
 }
 
 fn main() {
-  let mut m: Map<string, C> = Map.new()
+  let mut m: mut Map<string, C> = Map.new()
   m["a"] = C { value: 1 }
   let key = make_key()
   let mut entry = m[key]
@@ -1757,7 +2412,7 @@ struct Box { x: int }
 
 fn main() {
   let mut m = Map.from([("k", Box { x: 0 })])
-  let r = &m
+  let mut r = &m
   let mut entry = r.*["k"]
   entry.x = 1
   r.*["k"] = entry
@@ -1779,10 +2434,9 @@ fn make_i() -> int {
 }
 
 fn main() {
-  let mut maps: Map<int, Map<string, Box>> = Map.new()
   let mut inner = Map.new<string, Box>()
   inner["k"] = Box { x: 0 }
-  maps[0] = inner
+  let mut maps: mut Slice<mut Map<string, Box>> = [inner]
   let i = make_i()
   let mut entry = maps[i]["k"]
   entry.x = 1
@@ -1831,7 +2485,7 @@ fn map_field_assignment_newtype() {
 struct New(int)
 
 fn main() {
-  let mut m: Map<string, New> = Map.new()
+  let mut m: mut Map<string, New> = Map.new()
   m["a"] = New(0)
   m["a"] = New(5)
 }
@@ -1884,9 +2538,26 @@ struct Box {
 fn main() {
   let mut m = Map.new<string, Box>()
   m["a"] = Box { items: [] }
-  let mut entry = m["a"]
+  let mut entry = Box { items: m["a"].items.clone() }
   entry.items = entry.items.append(1)
   m["a"] = entry
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_field_append_value_position() {
+    let input = r#"
+struct Box {
+  items: Slice<int>,
+}
+
+fn main() {
+  let mut m = Map.new<string, Box>()
+  m["a"] = Box { items: [1] }
+  let xs = m["a"].items.append(2)
+  let _ = xs
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1898,7 +2569,7 @@ fn map_entry_slice_append_tuple_field() {
 fn main() {
   let mut m = Map.new<string, (Slice<int>, int)>()
   m["a"] = ([1], 2)
-  let mut entry = m["a"]
+  let mut entry = (m["a"].0.clone(), m["a"].1)
   entry.0 = entry.0.append(3)
   m["a"] = entry
 }
@@ -1914,7 +2585,7 @@ struct Wrap(Slice<int>, int)
 fn main() {
   let mut m = Map.new<string, Wrap>()
   m["a"] = Wrap([], 0)
-  let mut entry = m["a"]
+  let mut entry = Wrap(m["a"].0.clone(), m["a"].1)
   entry.0 = entry.0.append(2)
   m["a"] = entry
 }
@@ -1947,7 +2618,7 @@ struct Wrap(Inner)
 fn main() {
   let mut m = Map.new<string, Wrap>()
   m["a"] = Wrap(Inner { items: [] })
-  let mut inner = m["a"].0
+  let mut inner = Inner { items: m["a"].0.items.clone() }
   inner.items = inner.items.append(1)
   m["a"] = Wrap(inner)
 }
@@ -1962,7 +2633,7 @@ struct Box {
   items: Slice<int>,
 }
 
-fn get_map(m: Map<string, Box>) -> Map<string, Box> {
+fn get_map(m: mut Map<string, Box>) -> mut Map<string, Box> {
   m
 }
 
@@ -1970,7 +2641,7 @@ fn main() {
   let mut m = Map.new<string, Box>()
   m["a"] = Box { items: [] }
   let mut map = get_map(m)
-  let mut entry = map["a"]
+  let mut entry = Box { items: map["a"].items.clone() }
   entry.items = entry.items.append(1)
   map["a"] = entry
 }
@@ -1988,8 +2659,8 @@ struct Box {
 fn main() {
   let mut m = Map.new<string, Box>()
   m["a"] = Box { items: [] }
-  let r = &m
-  let mut entry = r.*["a"]
+  let mut r = &m
+  let mut entry = Box { items: r.*["a"].items.clone() }
   entry.items = entry.items.append(1)
   r.*["a"] = entry
 }
@@ -2027,6 +2698,117 @@ fn make_i() -> int {
 fn main() {
   let mut items = [(0, 0)]
   items[make_i()].0 = if true { 1 } else { 2 }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_field_assignment_no_temp_for_trivial_rhs() {
+    let input = r#"
+struct Pos { x: int, y: int }
+
+struct Snake {
+  parts: mut Slice<Pos>,
+  head:  int
+}
+
+impl Snake {
+  fn set_head(self: mut Ref<Snake>, x: int, y: int) {
+    self.parts[self.head].x = x
+    self.parts[self.head].y = y
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn compound_indexed_field_assignment_no_temp_for_trivial_rhs() {
+    let input = r#"
+struct Pos { x: int, y: int }
+
+struct Snake {
+  parts: mut Slice<Pos>,
+  head:  int
+}
+
+impl Snake {
+  fn grow(self: mut Ref<Snake>) {
+    self.parts[self.head].x += 1
+    self.parts[self.head].y -= 2
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_lvalue_pins_base_before_call_index() {
+    let input = r#"
+fn main() {
+  let mut xss = [[10, 11], [20, 21]]
+  let mut i = 0
+  let bump = || -> int { i += 1; i }
+  xss[i][bump()] = 9
+  let _ = xss
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_lvalue_pins_call_base_before_index() {
+    let input = r#"
+fn main() {
+  let mut xs = [10, 20]
+  let mut i = 0
+  let make = || -> mut Slice<int> { i += 1; xs }
+  make()[i] = 99
+  let _ = xs
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_index_captured_before_rhs_setup() {
+    let input = r#"
+fn main() {
+  let mut m = Map.new<string, int>()
+  m["0"] = 100
+  let mut i = 0
+  m[f"{i}"] = if true { i += 1; 7 } else { 0 }
+  let _ = m
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_lvalue_pins_call_base_before_format_string_index() {
+    let input = r#"
+fn main() {
+  let mut m = Map.new<string, int>()
+  m["0"] = 100
+  let mut i = 0
+  let make = || -> mut Map<string, int> { i += 1; m }
+  make()[f"{i}"] = 99
+  let _ = m
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn expr_position_indexed_assign_pins_base_before_call_rhs() {
+    let input = r#"
+fn main() {
+  let mut xss = [[10, 11], [20, 21]]
+  let mut i = 0
+  let bump = || -> int { i += 1; i }
+  let _ = if true { xss[i][0] = bump() } else {}
+  let _ = xss
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2114,7 +2896,7 @@ fn auto_address_receiver_ref_temp_var_no_collision() {
 struct Box { x: int }
 
 impl Box {
-  fn inc(self: Ref<Box>) -> int {
+  fn inc(self: mut Ref<Box>) -> int {
     self.*.x = self.*.x + 1
     self.*.x
   }
@@ -2160,9 +2942,41 @@ fn main() {
   for i in 0..make_bound() {
     sum = sum + i;
   }
-  let _bound_1 = 7;
+  let bound_1 = 7;
   let _ = sum;
-  let _ = _bound_1;
+  let _ = bound_1;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn loop_variable_named_like_bound_temp_no_collision() {
+    let input = r#"
+fn make_bound() -> int { 3 }
+
+fn main() {
+  let mut sum = 0;
+  for bound_1 in 0..=make_bound() {
+    sum = sum + bound_1;
+  }
+  let _ = sum;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn loop_variable_named_like_range_temp_no_collision() {
+    let input = r#"
+fn make_range() -> Range<int> { 0..3 }
+
+fn main() {
+  let mut sum = 0;
+  for range_1 in make_range() {
+    sum = sum + range_1;
+  }
+  let _ = sum;
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2227,6 +3041,23 @@ fn make_box() -> Box { Box { x: 1 } }
 fn main() {
   let v = Box.add(make_box(), 1);
   let _ = v;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn ufcs_call_to_public_snake_case_receiver_method() {
+    let input = r#"
+pub struct Service {}
+
+impl Service {
+  pub fn get_session(self) -> int { 42 }
+}
+
+fn main() {
+  let s = Service {};
+  let _ = Service.get_session(s);
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2336,6 +3167,67 @@ impl Box {
 fn main() {
   let f = Box.new
   let _ = f(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn promoted_method_expression_value_receiver() {
+    let input = r#"
+struct Base { pub id: int }
+
+impl Base {
+  pub fn describe(self) -> string { "base" }
+}
+
+struct Mid { embed Base }
+struct Top { embed Mid }
+
+fn main() {
+  let f = Top.describe
+  let _ = f(Top { Mid: Mid { Base: Base { id: 1 } } })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn promoted_method_expression_on_predeclared_type_name() {
+    let input = r#"
+import "go:fmt"
+
+struct Base { pub v: int }
+
+impl Base {
+  pub fn value(self) -> int { self.v }
+}
+
+struct len { embed Base }
+
+fn main() {
+  let f = len.value
+  fmt.Println(f(len { Base: Base { v: 3 } }))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn promoted_method_expression_pointer_receiver() {
+    let input = r#"
+struct Base { pub id: int }
+
+impl Base {
+  pub fn bump(self: mut Ref<Base>) { self.id += 1 }
+}
+
+struct Outer { embed Base }
+
+fn main() {
+  let g = Outer.bump
+  let mut o = Outer { Base: Base { id: 1 } }
+  g(&o)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2474,12 +3366,12 @@ fn reference_nested_parens_no_hoist() {
 struct S { x: int }
 
 impl S {
-  fn inc(self: Ref<S>) { self.x = self.x + 1 }
+  fn inc(self: mut Ref<S>) { self.x = self.x + 1 }
 }
 
 fn main() {
   let mut s = S { x: 1 }
-  let r = &((s))
+  let mut r = &((s))
   r.inc()
 }
 "#;
@@ -2505,15 +3397,34 @@ fn ufcs_address_of_receiver_parens() {
 struct Counter { x: int }
 
 impl Counter {
-  fn inc(self: Ref<Counter>) -> int {
+  fn inc(self: mut Ref<Counter>) -> int {
     self.x = self.x + 1
     self.x
   }
 }
 
 fn main() {
-  let c = Counter { x: 0 }
+  let mut c = Counter { x: 0 }
   let _ = Counter.inc(&c)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn ufcs_address_of_struct_literal_receiver() {
+    let input = r#"
+struct Counter { x: int }
+
+impl Counter {
+  fn inc(self: mut Ref<Counter>) -> int {
+    self.x = self.x + 1
+    self.x
+  }
+}
+
+fn main() {
+  let _ = Counter.inc(&Counter { x: 0 })
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2523,7 +3434,7 @@ fn main() {
 fn private_field_not_capitalized_by_method_export() {
     let input = r#"
 pub interface IFoo {
-  fn foo(self) -> int
+  fn foo() -> int
 }
 
 struct S {
@@ -2569,7 +3480,7 @@ fn ref_slice_append_statement_rewrite() {
     let input = r#"
 fn main() {
   let mut s = [1]
-  let r: Ref<Slice<int>> = &s
+  let mut r: mut Ref<mut Slice<int>> = &s
   r.* = r.*.append(2)
   let _ = s
 }
@@ -2614,7 +3525,7 @@ struct Item { x: int }
 
 fn main() {
   let mut v = Item { x: 0 }
-  let r = &v
+  let mut r = &v
   r.*.x = 1
   let _ = v.x
 }
@@ -2628,7 +3539,7 @@ fn newtype_nested_field_assign_eval_order() {
 struct Inner { x: int }
 struct Wrap(Inner)
 
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = i.* + 1
   i.*
 }
@@ -2685,7 +3596,7 @@ struct Wrap(int)
 
 fn main() {
   let mut w = Wrap(0)
-  let r = &w
+  let mut r = &w
   let _ = { r.* = Wrap(1) }
   let _ = w.0
 }
@@ -2708,11 +3619,23 @@ fn main() {
 }
 
 #[test]
+fn bare_append_discards_without_writeback() {
+    let input = r#"
+fn main() {
+  let items: Slice<int> = []
+  items.append(1)
+  let _ = items
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn ref_call_field_assignment() {
     let input = r#"
 struct Item { x: int }
 
-fn get() -> Ref<Item> { &Item { x: 0 } }
+fn get() -> mut Ref<Item> { &Item { x: 0 } }
 
 fn main() {
   get().x = 1
@@ -2729,7 +3652,7 @@ struct Wrap(Pair)
 
 fn main() {
   let mut w = Wrap(Pair([1], 0))
-  let mut p = w.0
+  let mut p = Pair(w.0.0.clone(), w.0.1)
   p.0 = p.0.append(2)
   w = Wrap(p)
   let _ = w
@@ -2743,7 +3666,7 @@ fn map_field_assign_captures_key() {
     let input = r#"
 struct Pair { x: int }
 
-fn set_key(k: Ref<string>) -> int {
+fn set_key(k: mut Ref<string>) -> int {
   k.* = "b"
   1
 }
@@ -2769,7 +3692,7 @@ struct Wrap(Slice<int>)
 
 fn main() {
   let mut w = Wrap([1])
-  let r = &w
+  let mut r = &w
   r.* = Wrap(r.0.append(2))
   let _ = w
 }
@@ -2780,13 +3703,14 @@ fn main() {
 #[test]
 fn map_field_ref_slice_append() {
     let input = r#"
-struct Outer { items: Ref<Slice<int>> }
+struct Outer { items: mut Ref<Slice<int>> }
 
 fn main() {
   let mut items = [1]
-  let mut m = Map.new<string, Outer>()
+  let mut m = Map.new<string, mut Outer>()
   m["a"] = Outer { items: &items }
-  m["a"].items.* = m["a"].items.*.append(2)
+  let Some(o) = m.get("a") else { return; };
+  o.items.* = o.items.*.append(2)
   let _ = items
 }
 "#;
@@ -2800,9 +3724,10 @@ struct Wrap(int)
 
 fn main() {
   let mut w = Wrap(1)
-  let mut m = Map.new<string, Ref<Wrap>>()
+  let mut m = Map.new<string, mut Ref<Wrap>>()
   m["a"] = &w
-  m["a"].* = Wrap(2)
+  let Some(r) = m.get("a") else { return; };
+  r.* = Wrap(2)
   let _ = w
 }
 "#;
@@ -2817,11 +3742,12 @@ struct Wrap(Inner)
 
 fn main() {
   let mut w = Wrap(Inner { x: 0 })
-  let mut m = Map.new<string, Ref<Wrap>>()
+  let mut m = Map.new<string, mut Ref<Wrap>>()
   m["a"] = &w
-  let mut inner = m["a"].0
+  let Some(r) = m.get("a") else { return; };
+  let mut inner = r.0
   inner.x = 1
-  m["a"].* = Wrap(inner)
+  r.* = Wrap(inner)
   let _ = w
 }
 "#;
@@ -2835,9 +3761,10 @@ struct Wrap(Slice<int>)
 
 fn main() {
   let mut w = Wrap([1])
-  let mut m = Map.new<string, Ref<Wrap>>()
+  let mut m = Map.new<string, mut Ref<Wrap>>()
   m["a"] = &w
-  m["a"].* = Wrap(m["a"].0.append(2))
+  let Some(r) = m.get("a") else { return; };
+  r.* = Wrap(r.0.append(2))
   let _ = w
 }
 "#;
@@ -2852,11 +3779,12 @@ struct Wrap(Inner)
 
 fn main() {
   let mut w = Wrap(Inner { items: [1] })
-  let mut m = Map.new<string, Ref<Wrap>>()
+  let mut m = Map.new<string, mut Ref<Wrap>>()
   m["a"] = &w
-  let mut inner = m["a"].0
+  let Some(r) = m.get("a") else { return; };
+  let mut inner = Inner { items: r.0.items.clone() }
   inner.items = inner.items.append(2)
-  m["a"].* = Wrap(inner)
+  r.* = Wrap(inner)
   let _ = w
 }
 "#;
@@ -2872,7 +3800,8 @@ fn main() {
   let mut items = [1]
   let mut m = Map.new<string, Outer>()
   m["a"] = Outer { items: &items }
-  let _ = { m["a"].items.*.append(2) }
+  let Some(o) = m.get("a") else { return; };
+  let _ = { o.items.*.append(2) }
   let _ = items
 }
 "#;
@@ -2884,15 +3813,16 @@ fn map_ref_newtype_mid_chain_field_assign() {
     let input = r#"
 struct Inner { x: int }
 struct Wrap(Inner)
-struct Outer { w: Ref<Wrap> }
+struct Outer { w: mut Ref<Wrap> }
 
 fn main() {
   let mut w = Wrap(Inner { x: 0 })
-  let mut m = Map.new<string, Outer>()
+  let mut m = Map.new<string, mut Outer>()
   m["a"] = Outer { w: &w }
-  let mut inner = m["a"].w.0
+  let Some(o) = m.get("a") else { return; };
+  let mut inner = o.w.0
   inner.x = 2
-  m["a"].w.* = Wrap(inner)
+  o.w.* = Wrap(inner)
   let _ = w
 }
 "#;
@@ -2904,15 +3834,16 @@ fn map_ref_newtype_mid_chain_field_append() {
     let input = r#"
 struct Inner { items: Slice<int> }
 struct Wrap(Inner)
-struct Outer { w: Ref<Wrap> }
+struct Outer { w: mut Ref<Wrap> }
 
 fn main() {
   let mut w = Wrap(Inner { items: [1] })
-  let mut m = Map.new<string, Outer>()
+  let mut m = Map.new<string, mut Outer>()
   m["a"] = Outer { w: &w }
-  let mut inner = m["a"].w.0
+  let Some(o) = m.get("a") else { return; };
+  let mut inner = Inner { items: o.w.0.items.clone() }
   inner.items = inner.items.append(2)
-  m["a"].w.* = Wrap(inner)
+  o.w.* = Wrap(inner)
   let _ = w
 }
 "#;
@@ -2982,14 +3913,14 @@ import "go:fmt"
 struct Inner { x: int }
 struct Wrap(Inner)
 
-fn get() -> Ref<Wrap> {
+fn get() -> mut Ref<Wrap> {
   let _ = fmt.Println("get")
   let mut w = Wrap(Inner { x: 1 })
   &w
 }
 
 fn main() {
-  let r = get()
+  let mut r = get()
   let mut inner = r.0
   inner.x = 2
   r.* = Wrap(inner)
@@ -3005,7 +3936,7 @@ import "go:fmt"
 
 struct S { x: int }
 
-fn get() -> Ref<S> {
+fn get() -> mut Ref<S> {
   let _ = fmt.Println("get")
   let mut s = S { x: 1 }
   &s
@@ -3053,6 +3984,18 @@ fn main() {
 }
 
 #[test]
+fn cast_to_func_type_parenthesizes() {
+    let input = r#"
+type Handler = fn(int) -> ()
+
+fn test(h: Handler) -> fn(int) -> () {
+  h as fn(int) -> ()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn newtype_over_ref_pointer_cast() {
     let input = r#"
 struct Wrap(Ref<int>)
@@ -3078,7 +4021,7 @@ fn main() {
   let mut m = Map.new<string, Outer>()
   m["a"] = Outer{ items: [1] }
   let k = key()
-  let mut entry = m[k]
+  let mut entry = Outer { items: m[k].items.clone() }
   entry.items = entry.items.append(2)
   m[k] = entry
 }
@@ -3213,20 +4156,6 @@ fn main() {
 }
 
 #[test]
-fn ref_newtype_extend_expr_position() {
-    let input = r#"
-struct Wrap(Slice<int>)
-
-fn main() {
-  let mut w = Wrap([1])
-  let r = &w
-  let _ = r.0.extend([2])
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
 fn unit_call_in_slice_append() {
     let input = r#"
 fn noop() {}
@@ -3298,8 +4227,18 @@ fn unit_call_in_assert_type() {
 fn noop() {}
 
 fn main() {
-  let x = assert_type<()>(noop())
+  let x = assert_type<int>(noop())
   let _ = x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn assert_type_boundary_return_fuses() {
+    let input = r#"
+fn test(value: Unknown) -> Option<int> {
+  assert_type<int>(value)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -3399,7 +4338,7 @@ fn parenthesized_call_base_field_assignment() {
     let input = r#"
 struct S { x: int }
 
-fn get(r: Ref<S>) -> Ref<S> { r }
+fn get(r: mut Ref<S>) -> mut Ref<S> { r }
 
 fn main() {
   let mut s = S { x: 0 }
@@ -3475,34 +4414,6 @@ fn new() -> Channel<int> {
 
 fn test() -> Channel<int> {
   new()
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn user_function_imaginary_not_hijacked() {
-    let input = r#"
-fn imaginary(x: int) -> int {
-  x * 2
-}
-
-fn test() -> int {
-  imaginary(5)
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn user_function_assert_type_not_hijacked() {
-    let input = r#"
-fn assert_type(x: int) -> Option<int> {
-  Some(x)
-}
-
-fn test() -> Option<int> {
-  assert_type(42)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -3654,6 +4565,907 @@ fn make_int() -> int { 2 }
 
 fn test() -> int {
   takes_two(1, &make_int())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_does_not_collapse_multi_arg_sprint() {
+    let input = r#"
+import "go:fmt"
+
+fn test() {
+  fmt.Println(fmt.Sprint("a", "b"))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_still_collapses_single_arg_sprint() {
+    let input = r#"
+import "go:fmt"
+
+fn test(x: int) {
+  fmt.Println(fmt.Sprint(x))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_still_collapses_explicit_sprintf() {
+    let input = r#"
+import "go:fmt"
+
+fn test(x: int) {
+  fmt.Println(fmt.Sprintf("%d", x))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_does_not_collapse_concatenated_format_strings() {
+    let input = r#"
+import "go:fmt"
+
+fn test(a: int, b: int) {
+  fmt.Println(f"a={a}" + f" b={b}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_does_not_collapse_sprintf_plus_call() {
+    let input = r#"
+import "go:fmt"
+
+fn suffix() -> string {
+  "tail"
+}
+
+fn test() {
+  fmt.Println(fmt.Sprintf("%d", 1) + suffix())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_return_from_underlying_variable_casts() {
+    let input = r#"
+struct UserId(int)
+
+fn make(i: int) -> UserId {
+  i as UserId
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_typed_let_from_underlying_call_casts() {
+    let input = r#"
+struct UserId(int)
+
+fn raw() -> int { 1 }
+
+fn take(u: UserId) {
+  let _ = u
+}
+
+fn test() {
+  let id: UserId = raw() as UserId
+  take(id)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_assignment_from_underlying_value_casts() {
+    let input = r#"
+struct UserId(int)
+
+fn raw() -> int { 1 }
+
+fn take(u: UserId) {
+  let _ = u
+}
+
+fn test() {
+  let mut id = UserId(0)
+  id = raw() as UserId
+  take(id)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_struct_field_from_underlying_value_casts() {
+    let input = r#"
+struct UserId(int)
+struct Box { v: UserId }
+
+fn test(i: int) -> Box {
+  Box { v: i as UserId }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unit_block_as_tuple_element_emits_struct_empty() {
+    let input = r#"
+import "go:fmt"
+
+fn side() {
+  fmt.Println("side")
+}
+
+fn test() -> int {
+  let t = ({ side() }, 1)
+  t.1
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn typed_function_alias_from_named_function_declares_alias_type() {
+    let input = r#"
+type Handler = fn() -> int
+
+fn make_handler() -> int { 1 }
+
+fn use_ref(r: Ref<Handler>) -> int {
+  r.*()
+}
+
+fn test() -> int {
+  let h: Handler = make_handler
+  use_ref(&h)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emitted_expr_call_before_setup_arg_capture() {
+    let input = r#"
+fn side() -> int { 1 }
+
+fn get_y() -> Result<int, error> { Ok(2) }
+
+fn add(_a: int, _b: int) -> int { 0 }
+
+fn run() -> Result<int, error> {
+  Ok(add(side(), get_y()?))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emitted_expr_literal_args_skip_capture() {
+    let input = r#"
+fn add3(_a: int, _b: int, _c: int) -> int { 0 }
+
+fn run() -> int {
+  add3(1, 2, 3)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emitted_expr_call_after_setup_arg_no_capture() {
+    let input = r#"
+fn side() -> int { 1 }
+
+fn get_x() -> Result<int, error> { Ok(2) }
+
+fn add(_a: int, _b: int) -> int { 0 }
+
+fn run() -> Result<int, error> {
+  Ok(add(get_x()?, side()))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_range_capped_callable_bounds_eval_order() {
+    let input = r#"
+fn start() -> int { 1 }
+fn end() -> int { 3 }
+
+fn test() -> int {
+  let xs = [10, 20, 30, 40]
+  let ys = xs[start()..end()]
+  ys.length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_range_capped_open_base_evaluated_once() {
+    let input = r#"
+fn make_items() -> Slice<int> { [10, 20, 30] }
+
+fn test() -> int {
+  let ys = make_items()[1..]
+  ys.length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_receiver_append_arg_mutates_index() {
+    let input = r#"
+fn bump(i: mut Ref<int>) -> int {
+  i.* = 1
+  99
+}
+
+fn test() -> int {
+  let xss = [[10], [20]]
+  let mut i = 0
+  let ys = xss[i].append(bump(&i))
+  ys[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn indexed_receiver_append_spread_arg_mutates_index() {
+    let input = r#"
+fn bump_and_make(i: mut Ref<int>) -> Slice<int> {
+  i.* = 1
+  [99]
+}
+
+fn test() -> int {
+  let xss = [[10], [20]]
+  let mut i = 0
+  let ys = xss[i].append(bump_and_make(&i)...)
+  ys[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn call_callee_eval_order_propagate_arg() {
+    let input = r#"
+fn make_f(i: Ref<int>) -> fn(int) -> int {
+  |x: int| -> int { x }
+}
+
+fn get(i: mut Ref<int>) -> Result<int, string> {
+  i.* = 1
+  Ok(7)
+}
+
+fn run() -> Result<int, string> {
+  let mut i = 0
+  let y = make_f(&i)(get(&i)?)
+  Ok(y)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn compound_index_target_frozen_before_rhs() {
+    let input = r#"
+fn run() -> Result<(), string> {
+  let mut xs = [10, 20]
+  let mut i = 0
+  let bump = || -> Result<int, string> {
+    i = 1
+    Ok(5)
+  }
+  xs[i] += bump()?
+  Ok(())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pointer_deref_target_frozen_before_rhs() {
+    let input = r#"
+fn run() -> Result<(), string> {
+  let mut a = 10
+  let mut b = 20
+  let mut p = &a
+  let bump = || -> Result<int, string> {
+    p = &b
+    Ok(5)
+  }
+  p.* = bump()?
+  Ok(())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pointer_deref_field_target_frozen_before_rhs() {
+    let input = r#"
+struct Box { value: int }
+
+fn run() -> Result<(), string> {
+  let mut a = Box { value: 10 }
+  let mut b = Box { value: 20 }
+  let mut p = &a
+  let bump = || -> Result<int, string> {
+    p = &b
+    Ok(5)
+  }
+  p.*.value = bump()?
+  Ok(())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pointer_implicit_field_target_frozen_before_rhs() {
+    let input = r#"
+struct Box { value: int }
+
+fn run() -> Result<(), string> {
+  let mut a = Box { value: 10 }
+  let mut b = Box { value: 20 }
+  let mut p = &a
+  let bump = || -> Result<int, string> {
+    p = &b
+    Ok(5)
+  }
+  p.value = bump()?
+  Ok(())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn compound_index_target_frozen_before_call_rhs() {
+    let input = r#"
+fn run() -> int {
+  let mut xs = [10, 20]
+  let mut i = 0
+  let bump = || -> int { i = 1; 5 }
+  xs[i] += bump()
+  xs[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pointer_deref_target_frozen_before_call_rhs() {
+    let input = r#"
+fn run() -> int {
+  let mut a = 10
+  let mut b = 20
+  let mut p = &a
+  let repoint = || -> int { p = &b; 5 }
+  p.* = repoint()
+  a
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn compound_identifier_target_reads_before_call_rhs() {
+    let input = r#"
+fn run() -> int {
+  let mut x = 1
+  let bump = || -> int { x = 100; 5 }
+  x += bump()
+  x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn inline_call_pins_when_later_operand_pins() {
+    let input = r#"
+fn run() -> int {
+  let mut x = 1
+  let setx = || -> int { x = 50; 100 }
+  let bump = |v: int| -> int { x += 7; v }
+  let r = [setx(), x, bump(5)]
+  r[0] + r[1] + r[2]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn alias_free_target_keeps_compound_assign_with_call_rhs() {
+    let input = r#"
+fn pure_add(a: int) -> int { a + 100 }
+
+fn run() -> int {
+  let mut x = 5
+  x += pure_add(1)
+  x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn alias_free_base_not_pinned_before_call_rhs() {
+    let input = r#"
+fn pure_add(a: int) -> int { a + 100 }
+
+fn run() -> int {
+  let mut ws = [1, 2, 3]
+  ws[0] = pure_add(7)
+  ws[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn alias_free_operand_not_pinned_before_call() {
+    let input = r#"
+fn bump(a: int) -> int { a + 1 }
+
+fn run() -> int {
+  let mut items: Slice<int> = []
+  let mut i = 0
+  let ibump = || -> int { i = 1; 10 }
+  items = items.append(i, ibump())
+  items[0] + items[1]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pure_constructor_does_not_force_sibling_pins() {
+    let input = r#"
+struct Wrap(int)
+
+fn run() -> int {
+  let pair = (Wrap(9), Wrap(8))
+  pair.0.0 + pair.1.0
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pure_constructor_with_mutable_read_pins_when_later_operand_pins() {
+    let input = r#"
+fn run() -> int {
+  let mut x = 1
+  let bump = || -> int { x = 20; 2 }
+  let elems = [Some(x), Some(x + bump()), Some(x)]
+  elems[0].unwrap_or(-1) + elems[1].unwrap_or(-1) + elems[2].unwrap_or(-1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn setup_bearing_call_pins_when_later_operand_pins() {
+    let input = r#"
+fn foo(a: int, b: int) -> int { a + b }
+
+fn run() -> int {
+  let mut x = 1
+  let setx = || -> int { x = 50; 100 }
+  let bump = |v: int| -> int { x += 7; v }
+  let r = [foo(x, setx()), x, bump(5)]
+  r[0] + r[1] + r[2]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn constructor_lowered_to_conversion_pins_before_call() {
+    let input = r#"
+struct Box(int)
+
+fn run() -> int {
+  let mut x = 1
+  let bump = |v: int| -> int { x = 50; v }
+  let r = (Box(x), bump(5))
+  r.0.0 + r.1
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn top_level_reference_not_pinned_before_call() {
+    let input = r#"
+const BASE = 10
+
+fn eff(x: mut Ref<int>) -> int {
+  x.* = 1
+  2
+}
+
+fn run() -> int {
+  let mut i = 0
+  let r = [BASE, eff(&i)]
+  r[0] + r[1]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn compound_binary_rhs_keeps_grouping_when_left_pinned() {
+    let input = r#"
+fn run() -> int {
+  let mut x = 2
+  let mut y = 3
+  let bump = || -> int { y = 10; 4 }
+  x *= y + bump()
+  x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn index_assignment_base_frozen_before_call_rhs() {
+    let input = r#"
+fn run() -> int {
+  let mut xs = [1, 2, 3]
+  let swap = || -> int { xs = [7, 8, 9]; 42 }
+  xs[0] = swap()
+  xs[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn range_variable_slice_base_call_evaluated_once() {
+    let input = r#"
+fn make() -> Slice<int> { [1, 2, 3] }
+
+fn run() -> int {
+  let r = 1..
+  let s = make()[r]
+  s.length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn selector_callee_eval_order_captured() {
+    let input = r#"
+fn f0(x: int) -> int { x + 10 }
+fn f1(x: int) -> int { x + 20 }
+struct Handler { f: fn(int) -> int }
+
+fn run() -> Result<int, string> {
+  let hs = [Handler { f: f0 }, Handler { f: f1 }]
+  let mut i = 0
+  let get = || -> Result<int, string> { i = 1; Ok(7) }
+  let y = hs[i].f(get()?)
+  Ok(y)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn selector_receiver_append_arg_mutates_index() {
+    let input = r#"
+struct Holder { slc: Slice<int> }
+fn bump(i: mut Ref<int>) -> int { i.* = 1; 99 }
+
+fn run() -> int {
+  let hs = [Holder { slc: [10] }, Holder { slc: [20] }]
+  let mut i = 0
+  let ys = hs[i].slc.append(bump(&i))
+  ys[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn index_target_constructor_rhs_not_frozen() {
+    let input = r#"
+struct Wrap(int)
+
+fn run() -> int {
+  let mut xs = [Wrap(0), Wrap(0)]
+  let i = 0
+  xs[i] = Wrap(5)
+  xs[0].0
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_literal_arg_callee_eval_order() {
+    let input = r#"
+struct Box { v: int }
+fn f0(b: Box) -> int { b.v }
+fn f1(b: Box) -> int { b.v }
+
+fn run() -> int {
+  let fs = [f0, f1]
+  let mut i = 0
+  let bump = || -> int { i = 1; 7 }
+  let y = fs[i](Box { v: bump() })
+  y
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_literal_rhs_index_target_frozen() {
+    let input = r#"
+fn run() -> int {
+  let mut xs = [[0], [0]]
+  let mut i = 0
+  let bump = || -> int { i = 1; 5 }
+  xs[i] = [bump()]
+  xs[0][0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn field_receiver_append_arg_mutates_field() {
+    let input = r#"
+struct Holder { slc: Slice<int> }
+
+fn run() -> int {
+  let mut h = Holder { slc: [10] }
+  let bump = || -> int { h.slc = [99]; 7 }
+  let ys = h.slc.append(bump())
+  ys[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn range_rhs_index_target_frozen() {
+    let input = r#"
+fn lo() -> int { 0 }
+
+fn run() -> int {
+  let mut rs = [0..0, 0..0]
+  let mut i = 0
+  let bump = || -> int { i = 1; 5 }
+  rs[i] = lo()..bump()
+  rs[0].end
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn identifier_native_receiver_arg_mutates_index() {
+    let input = r#"
+fn bump(i: mut Ref<int>) -> int { i.* = 1; 99 }
+
+fn run() -> int {
+  let xss = [[10], [20]]
+  let mut i = 0
+  let ys = Slice.append(xss[i], bump(&i))
+  ys[0]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_string_operands_concatenate() {
+    let input = r#"
+fn greet(first: string, last: string) -> string {
+  f"Hello, {first} {last}!"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_adjacent_string_operands_concatenate() {
+    let input = r#"
+fn join(a: string, b: string) -> string {
+  f"{a}{b}"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_solo_string_operand_is_the_operand() {
+    let input = r#"
+fn same(name: string) -> string {
+  f"{name}"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_concatenation_keeps_text_escapes() {
+    let input = r#"
+fn wrap(a: string, b: string) -> string {
+  f"{{{a}}} 100% \"{b}\"\n"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_string_alias_operand_concatenates() {
+    let input = r#"
+type Name = string
+
+fn greet(n: Name) -> string {
+  f"hi {n}"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_newtype_over_string_keeps_sprintf() {
+    let input = r#"
+#[display]
+struct Id(string)
+
+fn show(id: Id) -> string {
+  f"id {id}"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_mixed_operands_keep_sprintf() {
+    let input = r#"
+fn count(name: string, n: int) -> string {
+  f"{name} has {n}"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_concatenation_as_byte_at_receiver_is_parenthesized() {
+    let input = r#"
+fn first(b: string) -> byte {
+  f"x{b}".byte_at(0)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_concatenation_as_length_receiver() {
+    let input = r#"
+fn size(b: string) -> int {
+  f"x{b}".length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_concatenation_operands_keep_evaluation_order() {
+    let input = r#"
+import "go:fmt"
+
+fn first() -> string { fmt.Println("first"); "a" }
+fn second() -> string { fmt.Println("second"); "b" }
+
+fn main() {
+  fmt.Println(f"{first()} and {second()}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn errors_new_string_only_format_string_stays_errors_new() {
+    let input = r#"
+import "go:errors"
+
+fn fail(path: string) -> error {
+  errors.New(f"cannot open {path}")
+}
+
+fn main() {
+  let _ = fail("x")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_string_only_format_string_prints_concatenation() {
+    let input = r#"
+import "go:fmt"
+
+fn main() {
+  let name = "Ada"
+  fmt.Println(f"Hello {name}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_concatenation_is_captured_before_later_argument_setup() {
+    let input = r#"
+import "go:fmt"
+
+fn next(s: string) -> Result<string, error> { fmt.Println(s); Ok(s) }
+fn log(s: string) -> string { fmt.Println(s); s }
+fn show(a: string, b: string) -> string { a + b }
+
+fn run() -> Result<string, error> {
+  Ok(show(f"{next("one")?}{log("two")}", next("three")?))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fmt_println_does_not_collapse_concatenation_that_starts_with_sprintf() {
+    let input = r#"
+import "go:fmt"
+
+fn b() -> string { "b" }
+
+fn main() {
+  fmt.Println(f"{fmt.Sprintf("%02d", 1)}{b()}")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn byte_at_on_ref_receiver_is_parenthesized() {
+    let input = r#"
+fn first(r: Ref<string>) -> byte {
+  r.byte_at(0)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_solo_deref_operand_as_byte_at_receiver_is_parenthesized() {
+    let input = r#"
+fn first(r: Ref<string>) -> byte {
+  f"{r.*}".byte_at(0)
 }
 "#;
     assert_emit_snapshot!(input);

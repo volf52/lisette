@@ -1,10 +1,16 @@
 use crate::cli_error;
 use crate::output::{format_backticks, use_color};
 use diagnostics::infer::levenshtein_distance;
-use semantics::cache::go_stdlib::{GoModuleCache, try_load_go_stdlib_cache};
-use semantics::cache::types::CachedDefinition;
-use stdlib::{get_go_stdlib_packages, get_go_stdlib_typedef};
-use syntax::ast::{Annotation, Binding, Expression, Generic, Pattern, StructKind, VariantFields};
+use semantics::cache::go_stdlib::{GoPackageCache, try_load_go_stdlib_cache};
+use std::mem;
+use stdlib::{
+    Target, format_targets, get_go_stdlib_package_targets, get_go_stdlib_packages,
+    get_go_stdlib_typedef,
+};
+use syntax::ast::EnumVariant;
+use syntax::ast::{Annotation, Binding, Expression, Generic, Pattern, StructFields, VariantFields};
+use syntax::doc::{dedent, drop_callout_lines, split_example};
+use syntax::program::DefinitionBody;
 
 #[derive(Debug, Clone, Copy)]
 enum TypeKind {
@@ -67,8 +73,13 @@ struct GoPackageIndex {
 
 fn annotation_to_string(ann: &Annotation) -> String {
     match ann {
-        Annotation::Constructor { name, params, .. } => {
-            if params.is_empty() {
+        Annotation::Constructor {
+            name,
+            params,
+            writable,
+            ..
+        } => {
+            let rendered = if params.is_empty() {
                 name.to_string()
             } else {
                 format!(
@@ -80,6 +91,11 @@ fn annotation_to_string(ann: &Annotation) -> String {
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
+            };
+            if *writable {
+                format!("mut {}", rendered)
+            } else {
+                rendered
             }
         }
         Annotation::Function {
@@ -93,7 +109,7 @@ fn annotation_to_string(ann: &Annotation) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let ret = annotation_to_string(return_type);
-            if ret == "Unit" {
+            if ret == "Unit" || ret == "()" {
                 format!("fn({})", params_str)
             } else {
                 format!("fn({}) -> {}", params_str, ret)
@@ -106,6 +122,9 @@ fn annotation_to_string(ann: &Annotation) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("({})", inner)
+        }
+        Annotation::Constant { value, text, .. } => {
+            text.clone().unwrap_or_else(|| value.to_string())
         }
         Annotation::Unknown => "Unknown".to_string(),
         Annotation::Opaque { .. } => String::new(),
@@ -120,7 +139,20 @@ fn generics_to_string(generics: &[Generic]) -> String {
             "<{}>",
             generics
                 .iter()
-                .map(|g| g.name.to_string())
+                .map(|g| {
+                    if g.bound_count() == 0 {
+                        g.name.to_string()
+                    } else {
+                        format!(
+                            "{}: {}",
+                            g.name,
+                            g.bounds()
+                                .map(annotation_to_string)
+                                .collect::<Vec<_>>()
+                                .join(" + ")
+                        )
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -162,25 +194,29 @@ fn function_signature(
         .collect::<Vec<_>>()
         .join(", ");
     let ret = match return_annotation {
-        Annotation::Unknown => "Unit".to_string(),
+        Annotation::Unknown => String::new(),
         other => annotation_to_string(other),
     };
-    format!("fn {}{}({}) -> {}", name, generics_str, params_str, ret)
+    if ret.is_empty() || ret == "Unit" || ret == "()" {
+        format!("fn {}{}({})", name, generics_str, params_str)
+    } else {
+        format!("fn {}{}({}) -> {}", name, generics_str, params_str, ret)
+    }
 }
 
-fn struct_definition(
-    name: &str,
-    gen_str: &str,
-    fields: &[syntax::ast::StructFieldDefinition],
-    kind: &StructKind,
-    show_pub: bool,
-) -> String {
-    match kind {
-        StructKind::Record => {
-            if fields.is_empty() {
+fn struct_definition(name: &str, gen_str: &str, fields: &StructFields, show_pub: bool) -> String {
+    match fields {
+        StructFields::Record(fields) => {
+            let visible: Vec<_> = if show_pub {
+                fields.iter().collect()
+            } else {
+                fields.iter().filter(|f| f.visibility.is_public()).collect()
+            };
+            let hidden = fields.len() - visible.len();
+            if visible.is_empty() && hidden == 0 {
                 format!("struct {}{} {{}}", name, gen_str)
             } else {
-                let field_strs: Vec<String> = fields
+                let mut field_strs: Vec<String> = visible
                     .iter()
                     .map(|f| {
                         let vis = if show_pub && f.visibility.is_public() {
@@ -191,10 +227,13 @@ fn struct_definition(
                         format!("{}{}: {}", vis, f.name, annotation_to_string(&f.annotation))
                     })
                     .collect();
+                if hidden > 0 {
+                    field_strs.push("..".to_string());
+                }
                 format!("struct {}{} {{ {} }}", name, gen_str, field_strs.join(", "))
             }
         }
-        StructKind::Tuple => {
+        StructFields::Tuple(fields) => {
             let field_strs: Vec<String> = fields
                 .iter()
                 .map(|f| annotation_to_string(&f.annotation))
@@ -204,7 +243,7 @@ fn struct_definition(
     }
 }
 
-fn enum_definition(name: &str, gen_str: &str, variants: &[syntax::ast::EnumVariant]) -> String {
+fn enum_definition(name: &str, gen_str: &str, variants: &[EnumVariant]) -> String {
     let is_compact = variants.len() <= 3
         && variants.iter().all(|v| {
             matches!(&v.fields, VariantFields::Unit)
@@ -295,184 +334,45 @@ fn interface_definition(name: &str, gen_str: &str, method_signatures: &[Expressi
     )
 }
 
-fn build_prelude_index() -> PreludeIndex {
-    let source = stdlib::LIS_PRELUDE_SOURCE;
-    let parse_result = syntax::parse::Parser::lex_and_parse_file(source, 0);
-
-    let mut types: Vec<TypeInfo> = Vec::new();
-    let mut functions: Vec<FunctionInfo> = Vec::new();
-
-    for expression in &parse_result.ast {
-        match expression {
-            Expression::TypeAlias {
-                doc,
-                name,
-                generics,
-                ..
-            } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = format!("type {}{}", name, gen_str);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
-                    definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Primitive,
-                });
-            }
-
-            Expression::Struct {
-                doc,
-                name,
-                generics,
-                fields,
-                kind,
-                ..
-            } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = struct_definition(name, &gen_str, fields, kind, true);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
-                    definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Struct,
-                });
-            }
-
-            Expression::Enum {
-                doc,
-                name,
-                generics,
-                variants,
-                ..
-            } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = enum_definition(name, &gen_str, variants);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
-                    definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Enum,
-                });
-            }
-
-            Expression::Interface {
-                doc,
-                name,
-                generics,
-                method_signatures,
-                ..
-            } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = interface_definition(name, &gen_str, method_signatures);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
-                    definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Interface,
-                });
-            }
-
-            Expression::ImplBlock {
-                receiver_name,
-                methods,
-                generics,
-                annotation,
-                ..
-            } => {
-                let base_name = annotation
-                    .get_name()
-                    .unwrap_or_else(|| receiver_name.to_string());
-
-                let impl_annotation_str = annotation_to_string(annotation);
-
-                let is_specialized =
-                    impl_annotation_str != base_name && !impl_annotation_str.is_empty() && {
-                        match annotation {
-                            Annotation::Constructor { params, .. } => {
-                                params.len() != generics.len()
-                                    || params.iter().zip(generics.iter()).any(|(p, g)| {
-                                        p.get_name().map(|n| n != g.name.as_str()).unwrap_or(true)
-                                    })
-                            }
-                            _ => false,
-                        }
-                    };
-
-                let suffix = if is_specialized {
-                    format!(" (on {})", impl_annotation_str)
-                } else {
-                    String::new()
-                };
-
-                for method in methods {
-                    if let Expression::Function {
-                        doc,
-                        name,
-                        generics: mgen,
-                        params,
-                        return_annotation,
-                        ..
-                    } = method
-                    {
-                        let sig = function_signature(name, mgen, params, return_annotation);
-                        if let Some(type_info) = types.iter_mut().find(|t| t.name == base_name) {
-                            type_info.methods.push(MethodInfo {
-                                name: name.to_string(),
-                                signature: sig,
-                                doc: doc.clone(),
-                            });
-                            if !suffix.is_empty()
-                                && let Some(last) = type_info.methods.last_mut()
-                            {
-                                last.signature = format!("{}{}", last.signature, suffix);
-                            }
-                        }
-                    }
-                }
-            }
-
-            Expression::Function {
-                doc,
-                name,
-                generics,
-                params,
-                return_annotation,
-                ..
-            } => {
-                let sig = function_signature(name, generics, params, return_annotation);
-                functions.push(FunctionInfo {
-                    name: name.to_string(),
-                    signature: sig,
-                    doc: doc.clone(),
-                });
-            }
-
-            _ => {}
-        }
-    }
-
-    PreludeIndex { types, functions }
+#[derive(Clone, Copy, PartialEq)]
+enum IndexStyle {
+    Prelude,
+    GoPackage,
 }
 
-fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
+struct SourceIndex {
+    types: Vec<TypeInfo>,
+    functions: Vec<FunctionInfo>,
+    constants: Vec<ConstInfo>,
+    variables: Vec<VarInfo>,
+}
+
+fn type_entry(
+    name: &str,
+    generics: &[Generic],
+    doc: &Option<String>,
+    definition: String,
+    kind: TypeKind,
+) -> TypeInfo {
+    TypeInfo {
+        name: name.to_string(),
+        generics: generics.iter().map(|g| g.name.to_string()).collect(),
+        definition,
+        doc: doc.clone(),
+        methods: Vec::new(),
+        kind,
+    }
+}
+
+fn index_source(source: &str, style: IndexStyle) -> SourceIndex {
     let parse_result = syntax::parse::Parser::lex_and_parse_file(source, 0);
 
-    let mut types: Vec<TypeInfo> = Vec::new();
-    let mut functions: Vec<FunctionInfo> = Vec::new();
-    let mut constants: Vec<ConstInfo> = Vec::new();
-    let mut variables: Vec<VarInfo> = Vec::new();
+    let mut index = SourceIndex {
+        types: Vec::new(),
+        functions: Vec::new(),
+        constants: Vec::new(),
+        variables: Vec::new(),
+    };
 
     for expression in &parse_result.ast {
         match expression {
@@ -483,26 +383,26 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 annotation,
                 ..
             } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
                 let gen_str = generics_to_string(generics);
-                let definition = if let Annotation::Opaque { .. } = annotation {
-                    format!("type {}{}", name, gen_str)
-                } else {
+                let shows_underlying = style == IndexStyle::GoPackage
+                    && !matches!(annotation, Annotation::Opaque { .. });
+                let definition = if shows_underlying {
                     format!(
                         "type {}{} = {}",
                         name,
                         gen_str,
                         annotation_to_string(annotation)
                     )
+                } else {
+                    format!("type {}{}", name, gen_str)
                 };
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
+                index.types.push(type_entry(
+                    name,
+                    generics,
+                    doc,
                     definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Primitive,
-                });
+                    TypeKind::Primitive,
+                ));
             }
 
             Expression::Struct {
@@ -510,20 +410,22 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 name,
                 generics,
                 fields,
-                kind,
                 ..
             } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = struct_definition(name, &gen_str, fields, kind, false);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
+                let show_private_fields = style == IndexStyle::Prelude;
+                let definition = struct_definition(
+                    name,
+                    &generics_to_string(generics),
+                    fields,
+                    show_private_fields,
+                );
+                index.types.push(type_entry(
+                    name,
+                    generics,
+                    doc,
                     definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Struct,
-                });
+                    TypeKind::Struct,
+                ));
             }
 
             Expression::Enum {
@@ -533,17 +435,10 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 variants,
                 ..
             } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = enum_definition(name, &gen_str, variants);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
-                    definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Enum,
-                });
+                let definition = enum_definition(name, &generics_to_string(generics), variants);
+                index
+                    .types
+                    .push(type_entry(name, generics, doc, definition, TypeKind::Enum));
             }
 
             Expression::Interface {
@@ -553,17 +448,15 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 method_signatures,
                 ..
             } => {
-                let gen_names: Vec<String> = generics.iter().map(|g| g.name.to_string()).collect();
-                let gen_str = generics_to_string(generics);
-                let definition = interface_definition(name, &gen_str, method_signatures);
-                types.push(TypeInfo {
-                    name: name.to_string(),
-                    generics: gen_names,
+                let definition =
+                    interface_definition(name, &generics_to_string(generics), method_signatures);
+                index.types.push(type_entry(
+                    name,
+                    generics,
+                    doc,
                     definition,
-                    doc: doc.clone(),
-                    methods: Vec::new(),
-                    kind: TypeKind::Interface,
-                });
+                    TypeKind::Interface,
+                ));
             }
 
             Expression::Function {
@@ -574,10 +467,9 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 return_annotation,
                 ..
             } => {
-                let sig = function_signature(name, generics, params, return_annotation);
-                functions.push(FunctionInfo {
+                index.functions.push(FunctionInfo {
                     name: name.to_string(),
-                    signature: sig,
+                    signature: function_signature(name, generics, params, return_annotation),
                     doc: doc.clone(),
                 });
             }
@@ -587,15 +479,16 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 identifier,
                 annotation,
                 ..
-            } => {
-                let sig = if let Some(ann) = annotation {
-                    format!("const {}: {}", identifier, annotation_to_string(ann))
-                } else {
-                    format!("const {}", identifier)
+            } if style == IndexStyle::GoPackage => {
+                let signature = match annotation {
+                    Some(annotation) => {
+                        format!("const {}: {}", identifier, annotation_to_string(annotation))
+                    }
+                    None => format!("const {}", identifier),
                 };
-                constants.push(ConstInfo {
+                index.constants.push(ConstInfo {
                     name: identifier.to_string(),
-                    signature: sig,
+                    signature,
                     doc: doc.clone(),
                 });
             }
@@ -605,11 +498,10 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
                 name,
                 annotation,
                 ..
-            } => {
-                let sig = format!("var {}: {}", name, annotation_to_string(annotation));
-                variables.push(VarInfo {
+            } if style == IndexStyle::GoPackage => {
+                index.variables.push(VarInfo {
                     name: name.to_string(),
-                    signature: sig,
+                    signature: format!("var {}: {}", name, annotation_to_string(annotation)),
                     doc: doc.clone(),
                 });
             }
@@ -617,139 +509,227 @@ fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
             Expression::ImplBlock {
                 receiver_name,
                 methods,
-                annotation,
                 generics,
+                annotation,
                 ..
             } => {
-                let base_name = annotation
-                    .get_name()
-                    .unwrap_or_else(|| receiver_name.to_string());
-
-                let impl_annotation_str = annotation_to_string(annotation);
-
-                let is_specialized =
-                    impl_annotation_str != base_name && !impl_annotation_str.is_empty() && {
-                        match annotation {
-                            Annotation::Constructor { params, .. } => {
-                                params.len() != generics.len()
-                                    || params.iter().zip(generics.iter()).any(|(p, g)| {
-                                        p.get_name().map(|n| n != g.name.as_str()).unwrap_or(true)
-                                    })
-                            }
-                            _ => false,
-                        }
-                    };
-
-                let suffix = if is_specialized {
-                    format!(" (on {})", impl_annotation_str)
-                } else {
-                    String::new()
-                };
-
-                for method in methods {
-                    if let Expression::Function {
-                        doc,
-                        name,
-                        generics: mgen,
-                        params,
-                        return_annotation,
-                        ..
-                    } = method
-                    {
-                        let sig = function_signature(name, mgen, params, return_annotation);
-                        if let Some(type_info) = types.iter_mut().find(|t| t.name == base_name) {
-                            type_info.methods.push(MethodInfo {
-                                name: name.to_string(),
-                                signature: sig,
-                                doc: doc.clone(),
-                            });
-                            if !suffix.is_empty()
-                                && let Some(last) = type_info.methods.last_mut()
-                            {
-                                last.signature = format!("{}{}", last.signature, suffix);
-                            }
-                        }
-                    }
-                }
+                attach_impl_methods(
+                    &mut index.types,
+                    receiver_name,
+                    methods,
+                    generics,
+                    annotation,
+                );
             }
 
             _ => {}
         }
     }
 
+    index
+}
+
+fn attach_impl_methods(
+    types: &mut [TypeInfo],
+    receiver_name: &str,
+    methods: &[Expression],
+    generics: &[Generic],
+    annotation: &Annotation,
+) {
+    let base_name = annotation
+        .get_name()
+        .unwrap_or_else(|| receiver_name.to_string());
+
+    let impl_annotation_str = annotation_to_string(annotation);
+
+    let is_specialized = impl_annotation_str != base_name && !impl_annotation_str.is_empty() && {
+        match annotation {
+            Annotation::Constructor { params, .. } => {
+                params.len() != generics.len()
+                    || params
+                        .iter()
+                        .zip(generics.iter())
+                        .any(|(p, g)| p.get_name().map(|n| n != g.name.as_str()).unwrap_or(true))
+            }
+            _ => false,
+        }
+    };
+
+    let suffix = if is_specialized {
+        format!(" (on {})", impl_annotation_str)
+    } else {
+        String::new()
+    };
+
+    let Some(type_info) = types.iter_mut().find(|t| t.name == base_name) else {
+        return;
+    };
+
+    for method in methods {
+        if let Expression::Function {
+            doc,
+            name,
+            generics: method_generics,
+            params,
+            return_annotation,
+            ..
+        } = method
+        {
+            let signature = function_signature(name, method_generics, params, return_annotation);
+            type_info.methods.push(MethodInfo {
+                name: name.to_string(),
+                signature: format!("{}{}", signature, suffix),
+                doc: doc.clone(),
+            });
+        }
+    }
+}
+
+fn build_index_from_source(source: &str) -> PreludeIndex {
+    let index = index_source(source, IndexStyle::Prelude);
+    PreludeIndex {
+        types: index.types,
+        functions: index.functions,
+    }
+}
+
+fn build_prelude_index() -> PreludeIndex {
+    let mut index = build_index_from_source(stdlib::LIS_PRELUDE_SOURCE);
+    if let Some(array) = index.types.iter_mut().find(|t| t.name == "Array") {
+        array.generics.push("N".to_string());
+        array.definition = "type Array<T, N>".to_string();
+        // `site/scripts/build-prelude.mjs` mirrors these two. Update both.
+        array.methods.splice(
+            0..0,
+            [
+                MethodInfo {
+                    name: "new".to_string(),
+                    signature: "fn new() -> Array<T, N>".to_string(),
+                    doc: Some(
+                        "Creates an array of `N` zero values.\n\
+                         \n\
+                         Example:\n  \
+                         // !callout-right `[0, 0, 0]`\n  \
+                         let scores = Array.new<int, 3>()"
+                            .to_string(),
+                    ),
+                },
+                MethodInfo {
+                    name: "from".to_string(),
+                    signature: "fn from(slice: Slice<T>) -> Option<Array<T, N>>".to_string(),
+                    doc: Some(
+                        "Copies a `Slice` into a new `Array`, or returns `None` when the \
+                         `Slice` does not hold exactly `N` elements.\n\
+                         \n\
+                         Example:\n  \
+                         let parts = [1, 2, 3]\n  \
+                         // !callout-right `Some([1, 2, 3])`\n  \
+                         let fixed = Array.from<int, 3>(parts)"
+                            .to_string(),
+                    ),
+                },
+            ],
+        );
+    }
+    index.types.push(TypeInfo {
+        name: "Unit".to_string(),
+        generics: Vec::new(),
+        definition: "type Unit".to_string(),
+        doc: Some(
+            "The type of `()`, returned when there is no meaningful value to produce.".to_string(),
+        ),
+        methods: Vec::new(),
+        kind: TypeKind::Primitive,
+    });
+    index
+}
+
+fn build_test_prelude_index() -> PreludeIndex {
+    build_index_from_source(stdlib::LIS_TEST_PRELUDE_SOURCE)
+}
+
+fn build_go_package_index(source: &str, package: &str) -> GoPackageIndex {
+    let index = index_source(source, IndexStyle::GoPackage);
     GoPackageIndex {
         package: package.to_string(),
-        types,
-        functions,
-        constants,
-        variables,
+        types: index.types,
+        functions: index.functions,
+        constants: index.constants,
+        variables: index.variables,
     }
 }
 
 fn format_method_name(s: &str) -> String {
-    if use_color() {
-        use owo_colors::OwoColorize;
-        s.bright_magenta().to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-fn colorize_definition(definition: &str) -> String {
     if !use_color() {
-        return definition.to_string();
+        return s.to_string();
     }
     use owo_colors::OwoColorize;
-
-    let mut result = String::new();
-    let chars: Vec<char> = definition.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let ch = chars[i];
-        if ch.is_alphabetic() || ch == '_' {
-            let start = i;
-            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                i += 1;
+    let mut out = String::new();
+    let mut buf = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '<' {
+            if !buf.is_empty() {
+                out.push_str(&buf.bright_magenta().to_string());
+                buf.clear();
             }
-            let word: String = chars[start..i].iter().collect();
-            match word.as_str() {
-                "enum" | "struct" | "type" | "interface" | "fn" | "pub" => {
-                    result.push_str(&word.blue().to_string());
+            let mut inner = String::from("<");
+            for ic in chars.by_ref() {
+                inner.push(ic);
+                if ic == '>' {
+                    break;
                 }
-                "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16"
-                | "uint32" | "uint64" | "uintptr" | "byte" | "bool" | "string" | "rune"
-                | "float32" | "float64" | "complex64" | "complex128" | "Unit" | "Unknown"
-                | "Never" => {
-                    result.push_str(&word.bright_cyan().to_string());
-                }
-                _ if word.starts_with(char::is_uppercase) => {
-                    result.push_str(&word.bright_cyan().to_string());
-                }
-                _ => result.push_str(&word),
             }
+            out.push_str(&inner.green().to_string());
         } else {
-            result.push(ch);
-            i += 1;
+            buf.push(c);
         }
     }
-
-    result
+    if !buf.is_empty() {
+        out.push_str(&buf.bright_magenta().to_string());
+    }
+    out
 }
 
-fn colorize_signature(sig: &str) -> String {
+fn is_primitive_word(word: &str) -> bool {
+    matches!(
+        word,
+        "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "byte"
+            | "bool"
+            | "string"
+            | "rune"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "Unit"
+            | "Unknown"
+            | "Never"
+    )
+}
+
+fn colorize_code(code: &str) -> String {
     if !use_color() {
-        return sig.to_string();
+        return code.to_string();
     }
     use owo_colors::OwoColorize;
 
     let mut result = String::new();
-    let chars: Vec<char> = sig.chars().collect();
+    let chars: Vec<char> = code.chars().collect();
     let len = chars.len();
     let mut i = 0;
     let mut after_fn_keyword = false;
-    let mut fn_name_done = false;
 
     while i < len {
         let ch = chars[i];
@@ -759,17 +739,21 @@ fn colorize_signature(sig: &str) -> String {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
+            let names_a_function = after_fn_keyword;
+            after_fn_keyword = false;
             match word.as_str() {
+                "enum" | "struct" | "type" | "interface" | "pub" => {
+                    result.push_str(&word.blue().to_string());
+                }
                 "fn" => {
                     result.push_str(&word.blue().to_string());
                     after_fn_keyword = true;
                 }
-                "self" => {
-                    result.push_str(&word);
-                }
-                _ if after_fn_keyword && !fn_name_done => {
+                _ if names_a_function => {
                     result.push_str(&word.bright_magenta().to_string());
-                    fn_name_done = true;
+                }
+                _ if is_primitive_word(&word) => {
+                    result.push_str(&word.bright_cyan().to_string());
                 }
                 _ if word.starts_with(char::is_uppercase) => {
                     result.push_str(&word.bright_cyan().to_string());
@@ -777,10 +761,8 @@ fn colorize_signature(sig: &str) -> String {
                 _ => result.push_str(&word),
             }
         } else {
-            if after_fn_keyword && !fn_name_done && ch == ' ' {
-                result.push(ch);
-                i += 1;
-                continue;
+            if ch != ' ' {
+                after_fn_keyword = false;
             }
             result.push(ch);
             i += 1;
@@ -800,16 +782,195 @@ fn format_type_with_generics_plain(name: &str, generics: &[String]) -> String {
 
 fn print_all(index: &PreludeIndex) {
     println!();
+    println!("  Browse documentation on a symbol from the prelude or from the Go stdlib");
+
+    println!();
+    println!("  Examples:");
+    let examples = [
+        ("Slice", "Docs on Lisette's `Slice` type"),
+        (
+            "Slice.map",
+            "Docs on `map` method on Lisette's `Slice` type",
+        ),
+        ("prelude", "List all Lisette prelude symbols"),
+        ("test", "How to write and run tests"),
+        ("go:", "List all Go stdlib packages"),
+        ("go:os", "Docs on Go stdlib `os` package contents"),
+        (
+            "go:os.File",
+            "Docs on `File` type in Go stdlib `os` package",
+        ),
+        ("-s append", "Search docs for `append`"),
+    ];
+    let arg_width = examples.iter().map(|(arg, _)| arg.len()).max().unwrap_or(0) + 4;
+    for (arg, description) in examples {
+        let padding = " ".repeat(arg_width - arg.len());
+        let description = format_backticks(description, use_color());
+        if use_color() {
+            use owo_colors::OwoColorize;
+            println!(
+                "    {} {}{}{}",
+                "lis doc".bright_magenta(),
+                format_doc_arg(arg),
+                padding,
+                description
+            );
+        } else {
+            println!("    lis doc {arg}{padding}{description}");
+        }
+    }
+
+    let label_width = print_prelude_section(index);
+
+    println!();
+    println!("  Go stdlib:");
+    print_go_stdlib_section(label_width);
+}
+
+fn print_prelude_section(index: &PreludeIndex) -> usize {
+    let categories = prelude_categories(index);
+    let label_width = categories
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0)
+        + 3;
+    println!();
+    println!("  Prelude:");
+    for (label, leaves) in &categories {
+        print_prelude_category(label, label_width, leaves);
+    }
+    label_width
+}
+
+fn print_prelude(index: &PreludeIndex) {
+    println!();
+    println!("  Lisette's prelude");
+    println!();
     println!(
-        "  Prelude types and functions. Use {} to learn more.",
-        format_method_name("lis doc <type[.method]>")
+        "  Run {} to view a symbol",
+        format_method_name("lis doc <symbol>")
     );
-    println!(
-        "  For Go stdlib packages, try e.g. {} or {}",
-        format_method_name("lis doc go:os"),
-        format_method_name("lis doc go:net/http")
+    println!();
+
+    let categories = prelude_categories(index);
+    let label_width = categories
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0)
+        + 3;
+    for (label, leaves) in &categories {
+        print_prelude_category(label, label_width, leaves);
+    }
+}
+
+fn print_test_code(code: &str) {
+    let lines: Vec<&str> = code.lines().collect();
+    let min_indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    println!();
+    for line in lines {
+        let stripped = if line.len() >= min_indent {
+            &line[min_indent..]
+        } else {
+            line.trim_start()
+        };
+        if stripped.trim().is_empty() {
+            println!();
+        } else if use_color() {
+            use owo_colors::OwoColorize;
+            println!("      {}", stripped.dimmed().italic());
+        } else {
+            println!("      {stripped}");
+        }
+    }
+}
+
+fn print_test_topic() {
+    let paragraph = |text: &str| {
+        for line in text.lines() {
+            println!("  {}", format_backticks(line, use_color()));
+        }
+    };
+
+    println!();
+    paragraph("Write and run tests for a Lisette project.");
+    println!();
+    paragraph(
+        "Tests live in `.test.lis` files beside the code they cover. Mark a\n\
+         function with `#[test]` and check it with `assert`:",
+    );
+    print_test_code(
+        "        #[test]
+        fn adds_two_numbers() {
+          assert add(2, 3) == 5
+        }",
+    );
+    println!();
+    paragraph("Bind and check a pattern in one step with `let assert`:");
+    print_test_code(
+        "        #[test]
+        fn parses_a_port() {
+          let assert Some(port) = parse_port(\"8080\")
+          assert port == 8080
+        }",
+    );
+    println!();
+    paragraph("Give a test a readable title, and a doc comment for context:");
+    print_test_code(
+        "        /// A zero-length input is rejected before any work begins.
+        #[test(\"rejects empty input\")]
+        fn rejects_empty() {
+          let assert Err(message) = run(\"\")
+          assert message.contains(\"empty\")
+        }",
+    );
+    println!();
+    paragraph(
+        "Return `Result<(), error>` to use `?` inside a test. Returning `Err`\n\
+         fails it:",
+    );
+    print_test_code(
+        "        #[test]
+        fn loads_config() -> Result<(), error> {
+          let config = load(\"app.toml\")?
+          assert config.port == 8080
+          Ok(())
+        }",
     );
 
+    println!();
+    println!("  {}", format_bold("The test handle"));
+    println!();
+    paragraph("Take a `t` parameter to reach the test context, for subtests and more:");
+    print_test_code(
+        "        #[test]
+        fn groups_cases(t) {
+          let _ = t.run(\"small inputs\", |t| {
+            assert normalize(1) == 1
+          })
+        }",
+    );
+
+    if let Some(type_info) = build_test_prelude_index()
+        .types
+        .iter()
+        .find(|t| t.name == "TestContext")
+    {
+        print_type(type_info);
+    }
+
+    println!();
+    paragraph("Run them with `lis test`, or `lis test --help` for filters and flags.");
+    println!();
+}
+
+fn prelude_categories(index: &PreludeIndex) -> Vec<(&'static str, Vec<String>)> {
     let primitives: Vec<&TypeInfo> = index
         .types
         .iter()
@@ -831,107 +992,168 @@ fn print_all(index: &PreludeIndex) {
         .filter(|t| matches!(t.kind, TypeKind::Enum))
         .collect();
 
-    println!();
-    println!("  Primitive types");
+    let pick_primitives = |predicate: &dyn Fn(&str) -> bool| -> Vec<String> {
+        primitives
+            .iter()
+            .filter(|t| predicate(&t.name))
+            .map(|t| t.name.clone())
+            .collect()
+    };
+    let mut primitive_leaves = pick_primitives(&|n| n.starts_with("int") || n == "rune");
+    primitive_leaves.extend(pick_primitives(&|n| {
+        n.starts_with("uint") || n == "uintptr" || n == "byte"
+    }));
+    primitive_leaves.extend(pick_primitives(&|n| {
+        n.starts_with("float") || n.starts_with("complex")
+    }));
+    primitive_leaves.extend(pick_primitives(&|n| n == "bool" || n == "string"));
 
-    let signed_types: Vec<&str> = primitives
-        .iter()
-        .filter(|t| t.name.starts_with("int") || t.name == "rune")
-        .map(|t| t.name.as_str())
-        .collect();
-    if !signed_types.is_empty() {
-        println!("    {}", format_dim(&signed_types.join(", ")));
-    }
-
-    let unsigned_types: Vec<&str> = primitives
-        .iter()
-        .filter(|t| t.name.starts_with("uint") || t.name == "uintptr" || t.name == "byte")
-        .map(|t| t.name.as_str())
-        .collect();
-    if !unsigned_types.is_empty() {
-        println!("    {}", format_dim(&unsigned_types.join(", ")));
-    }
-
-    let float_types: Vec<&str> = primitives
-        .iter()
-        .filter(|t| t.name.starts_with("float") || t.name.starts_with("complex"))
-        .map(|t| t.name.as_str())
-        .collect();
-    if !float_types.is_empty() {
-        println!("    {}", format_dim(&float_types.join(", ")));
-    }
-
-    let basic_types: Vec<&str> = primitives
-        .iter()
-        .filter(|t| matches!(t.name.as_str(), "bool" | "string"))
-        .map(|t| t.name.as_str())
-        .collect();
-    if !basic_types.is_empty() {
-        println!("    {}", format_dim(&basic_types.join(", ")));
-    }
-
-    println!();
-    println!("  Compound types");
-
-    let enums_formatted: Vec<String> = enums
+    let mut composite_leaves: Vec<String> = enums
         .iter()
         .map(|t| format_type_with_generics_plain(&t.name, &t.generics))
         .collect();
-    if !enums_formatted.is_empty() {
-        println!("    {}", format_dim(&enums_formatted.join(", ")));
-    }
-
-    let collections: Vec<String> = generic_primitives
-        .iter()
-        .filter(|t| matches!(t.name.as_str(), "Slice" | "Map"))
-        .map(|t| format_type_with_generics_plain(&t.name, &t.generics))
-        .collect();
-    if !collections.is_empty() {
-        println!("    {}", format_dim(&collections.join(", ")));
-    }
-
-    let refs: Vec<String> = generic_primitives
-        .iter()
-        .filter(|t| matches!(t.name.as_str(), "Ref"))
-        .map(|t| format_type_with_generics_plain(&t.name, &t.generics))
-        .collect();
-    if !refs.is_empty() {
-        println!("    {}", format_dim(&refs.join(", ")));
-    }
-
-    let channels: Vec<String> = generic_primitives
-        .iter()
-        .filter(|t| matches!(t.name.as_str(), "Channel" | "Sender" | "Receiver"))
-        .map(|t| format_type_with_generics_plain(&t.name, &t.generics))
-        .collect();
-    if !channels.is_empty() {
-        println!("    {}", format_dim(&channels.join(", ")));
-    }
-
-    let ranges: Vec<String> = structs
-        .iter()
-        .filter(|t| t.name.contains("Range"))
-        .map(|t| format_type_with_generics_plain(&t.name, &t.generics))
-        .collect();
-    if !ranges.is_empty() {
-        println!("    {}", format_dim(&ranges.join(", ")));
-    }
-
-    println!();
-    println!("  Special types");
-    println!(
-        "    {}",
-        format_dim("Unit, Unknown, Never, VarArgs<T>, PanicValue, error")
+    let pick_generic = |names: &[&str]| -> Vec<String> {
+        generic_primitives
+            .iter()
+            .filter(|t| names.contains(&t.name.as_str()))
+            .map(|t| format_type_with_generics_plain(&t.name, &t.generics))
+            .collect()
+    };
+    composite_leaves.extend(pick_generic(&["Array", "Slice", "Map"]));
+    composite_leaves.extend(pick_generic(&["Ref"]));
+    composite_leaves.extend(pick_generic(&["Channel", "Sender", "Receiver"]));
+    composite_leaves.extend(
+        structs
+            .iter()
+            .filter(|t| t.name.contains("Range"))
+            .map(|t| format_type_with_generics_plain(&t.name, &t.generics)),
     );
 
-    println!();
-    println!("  Functions");
-    let fn_names: Vec<String> = index
+    let function_leaves: Vec<String> = index
         .functions
         .iter()
         .map(|f| format!("{}()", f.name))
         .collect();
-    println!("    {}", format_dim(&fn_names.join(", ")));
+
+    let constraint_leaves: Vec<String> = ["Comparable", "Ordered"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let special_leaves: Vec<String> = [
+        "Unit",
+        "Unknown",
+        "Never",
+        "VarArgs<T>",
+        "PanicValue",
+        "error",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let mut extra_leaves = function_leaves;
+    extra_leaves.extend(special_leaves);
+    extra_leaves.extend(constraint_leaves);
+
+    vec![
+        ("primitives", primitive_leaves),
+        ("composites", composite_leaves),
+        ("extras", extra_leaves),
+    ]
+    .into_iter()
+    .filter(|(_, leaves)| !leaves.is_empty())
+    .collect()
+}
+
+const WRAP_WIDTH: usize = 78;
+
+fn wrap_into_lines(items: &[String], area: usize) -> Vec<Vec<&String>> {
+    let mut lines: Vec<Vec<&String>> = Vec::new();
+    let mut current: Vec<&String> = Vec::new();
+    let mut current_width = 0;
+    for item in items {
+        let item_width = item.chars().count();
+        let separator = if current.is_empty() { 0 } else { 3 };
+        if !current.is_empty() && current_width + separator + item_width > area {
+            lines.push(mem::take(&mut current));
+            current_width = 0;
+        }
+        current_width += if current.is_empty() {
+            item_width
+        } else {
+            3 + item_width
+        };
+        current.push(item);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn print_prelude_category(label: &str, label_width: usize, leaves: &[String]) {
+    let area = WRAP_WIDTH.saturating_sub(4 + label_width).max(20);
+    let lines = wrap_into_lines(leaves, area);
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let rendered = line
+            .iter()
+            .map(|leaf| format_magenta(leaf))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let trailing = if line_index + 1 < lines.len() {
+            " ·"
+        } else {
+            ""
+        };
+        if line_index == 0 {
+            let padded_label = format_dim(&format!("{label:<label_width$}"));
+            println!("    {padded_label}{rendered}{trailing}");
+        } else {
+            println!("    {}{rendered}{trailing}", " ".repeat(label_width));
+        }
+    }
+}
+
+fn print_go_stdlib_section(label_width: usize) {
+    let area = WRAP_WIDTH.saturating_sub(4 + label_width).max(20);
+    let label = "packages";
+
+    let mut items: Vec<String> = [
+        "fmt", "os", "io", "bufio", "bytes", "strings", "strconv", "slices", "maps", "errors",
+        "time", "context", "sync", "regexp",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    items.push("etc".to_string());
+    let lines = wrap_into_lines(&items, area);
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let rendered = line
+            .iter()
+            .map(|item| {
+                if item.as_str() == "etc" {
+                    format_white(item)
+                } else {
+                    format_magenta(item)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let trailing = if line_index + 1 < lines.len() {
+            " ·"
+        } else {
+            ""
+        };
+        if line_index == 0 {
+            let padded_label = format_dim(&format!("{label:<label_width$}"));
+            println!("    {padded_label}{rendered}{trailing}");
+        } else {
+            println!("    {}{rendered}{trailing}", " ".repeat(label_width));
+        }
+    }
 }
 
 fn format_dim(s: &str) -> String {
@@ -943,42 +1165,80 @@ fn format_dim(s: &str) -> String {
     }
 }
 
-fn split_doc_and_example(doc: &str) -> (&str, Option<&str>) {
-    if let Some(position) = doc.find("\nExample:\n") {
-        let description = doc[..position].trim_end();
-        let example = doc[position + "\nExample:\n".len()..].trim_end();
-        (description, Some(example))
+fn format_magenta(s: &str) -> String {
+    if use_color() {
+        use owo_colors::OwoColorize;
+        s.bright_magenta().to_string()
     } else {
-        (doc, None)
+        s.to_string()
     }
 }
 
+fn format_white(s: &str) -> String {
+    if use_color() {
+        use owo_colors::OwoColorize;
+        s.white().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn format_bold(s: &str) -> String {
+    if use_color() {
+        use owo_colors::OwoColorize;
+        s.bold().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn format_doc_arg(arg: &str) -> String {
+    if !use_color() {
+        return arg.to_string();
+    }
+    use owo_colors::OwoColorize;
+    arg.split(' ')
+        .map(|token| {
+            if token.starts_with('-') {
+                token.blue().to_string()
+            } else {
+                token.green().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn print_example(example: &str) {
-    let min_indent = example
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    for line in example.lines() {
-        let stripped = if line.len() > min_indent {
-            &line[min_indent..]
-        } else {
-            line.trim_start()
-        };
-        if use_color() {
+    for line in dedent(example).lines() {
+        if line.trim().is_empty() {
+            println!();
+        } else if use_color() {
             use owo_colors::OwoColorize;
-            println!("      {}", stripped.dimmed().italic());
+            println!("      {}", line.dimmed().italic());
         } else {
-            println!("      {}", stripped);
+            println!("      {}", line);
         }
     }
 }
 
+fn print_doc_line(indent: usize, line: &str) {
+    if line.trim().is_empty() {
+        println!();
+    } else {
+        println!(
+            "{}{}",
+            " ".repeat(indent),
+            format_backticks(line, use_color())
+        );
+    }
+}
+
 fn print_doc(doc: &str) {
-    let (description, example) = split_doc_and_example(doc);
+    let doc = drop_callout_lines(doc);
+    let (description, example) = split_example(&doc);
     for line in description.lines() {
-        println!("    {}", format_backticks(line, use_color()));
+        print_doc_line(4, line);
     }
     if let Some(example) = example {
         println!();
@@ -986,43 +1246,50 @@ fn print_doc(doc: &str) {
     }
 }
 
-fn print_type_header(type_info: &TypeInfo) {
+fn print_type_header(type_info: &TypeInfo, include_example: bool) {
     println!();
-    for line in colorize_definition(&type_info.definition).lines() {
+    for line in colorize_code(&type_info.definition).lines() {
         println!("  {}", line);
     }
     if let Some(doc) = &type_info.doc {
-        print_doc(doc);
+        if include_example {
+            print_doc(doc);
+        } else {
+            let (description, _) = split_example(doc);
+            for line in description.lines() {
+                print_doc_line(4, line);
+            }
+        }
     }
 }
 
 fn print_type(type_info: &TypeInfo) {
-    print_type_header(type_info);
+    print_type_header(type_info, true);
     for method in &type_info.methods {
         println!();
-        println!("    {}", colorize_signature(&method.signature));
+        println!("    {}", colorize_code(&method.signature));
         if let Some(doc) = &method.doc {
-            for line in doc.lines() {
-                println!("      {}", format_backticks(line, use_color()));
+            for line in drop_callout_lines(doc).lines() {
+                print_doc_line(6, line);
             }
         }
     }
 }
 
 fn print_method(type_info: &TypeInfo, method: &MethodInfo) {
-    print_type_header(type_info);
+    print_type_header(type_info, false);
     println!();
-    println!("    {}", colorize_signature(&method.signature));
+    println!("    {}", colorize_code(&method.signature));
     if let Some(doc) = &method.doc {
-        for line in doc.lines() {
-            println!("      {}", format_backticks(line, use_color()));
+        for line in drop_callout_lines(doc).lines() {
+            print_doc_line(6, line);
         }
     }
 }
 
 fn print_function(func: &FunctionInfo) {
     println!();
-    println!("  {}", colorize_signature(&func.signature));
+    println!("  {}", colorize_code(&func.signature));
     if let Some(doc) = &func.doc {
         print_doc(doc);
     }
@@ -1064,83 +1331,41 @@ fn print_go_package_header(package: &str) {
 }
 
 fn print_go_package_all(index: &GoPackageIndex) {
-    print_go_package_header(&index.package);
     println!();
     println!(
-        "  Use {} to learn more about a specific item.",
+        "  Run {} to view an item",
         format_method_name(&format!("lis doc go:{}.<item>", index.package))
     );
 
-    if !index.types.is_empty() {
-        println!();
-        println!("  Types");
-        for ti in &index.types {
-            println!("    {}", format_dim(&ti.name));
-        }
-    }
+    let types: Vec<String> = index.types.iter().map(|t| t.name.clone()).collect();
+    let functions: Vec<String> = index
+        .functions
+        .iter()
+        .map(|f| format!("{}()", f.name))
+        .collect();
+    let constants: Vec<String> = index.constants.iter().map(|c| c.name.clone()).collect();
+    let variables: Vec<String> = index.variables.iter().map(|v| v.name.clone()).collect();
 
-    if !index.functions.is_empty() {
-        println!();
-        println!("  Functions");
-        let fn_names: Vec<String> = index
-            .functions
-            .iter()
-            .map(|f| format!("{}()", f.name))
-            .collect();
-        let mut line = String::from("    ");
-        for (i, name) in fn_names.iter().enumerate() {
-            if i > 0 {
-                line.push_str(", ");
-            }
-            if line.len() + name.len() > 80 {
-                println!("{}", format_dim(&line));
-                line = String::from("    ");
-            }
-            line.push_str(name);
-        }
-        if line.len() > 4 {
-            println!("{}", format_dim(&line));
-        }
-    }
+    let categories: Vec<(&str, Vec<String>)> = vec![
+        ("types", types),
+        ("functions", functions),
+        ("constants", constants),
+        ("variables", variables),
+    ]
+    .into_iter()
+    .filter(|(_, items)| !items.is_empty())
+    .collect();
 
-    if !index.constants.is_empty() {
-        println!();
-        println!("  Constants");
-        let const_names: Vec<&str> = index.constants.iter().map(|c| c.name.as_str()).collect();
-        let mut line = String::from("    ");
-        for (i, name) in const_names.iter().enumerate() {
-            if i > 0 {
-                line.push_str(", ");
-            }
-            if line.len() + name.len() > 80 {
-                println!("{}", format_dim(&line));
-                line = String::from("    ");
-            }
-            line.push_str(name);
-        }
-        if line.len() > 4 {
-            println!("{}", format_dim(&line));
-        }
-    }
+    let label_width = categories
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0)
+        + 3;
 
-    if !index.variables.is_empty() {
-        println!();
-        println!("  Variables");
-        let var_names: Vec<&str> = index.variables.iter().map(|v| v.name.as_str()).collect();
-        let mut line = String::from("    ");
-        for (i, name) in var_names.iter().enumerate() {
-            if i > 0 {
-                line.push_str(", ");
-            }
-            if line.len() + name.len() > 80 {
-                println!("{}", format_dim(&line));
-                line = String::from("    ");
-            }
-            line.push_str(name);
-        }
-        if line.len() > 4 {
-            println!("{}", format_dim(&line));
-        }
+    println!();
+    for (label, items) in &categories {
+        print_prelude_category(label, label_width, items);
     }
 }
 
@@ -1157,7 +1382,7 @@ fn print_go_function(index: &GoPackageIndex, func: &FunctionInfo) {
 fn print_go_const(index: &GoPackageIndex, c: &ConstInfo) {
     print_go_package_header(&index.package);
     println!();
-    println!("  {}", colorize_signature(&c.signature));
+    println!("  {}", colorize_code(&c.signature));
     if let Some(doc) = &c.doc {
         print_doc(doc);
     }
@@ -1166,7 +1391,7 @@ fn print_go_const(index: &GoPackageIndex, c: &ConstInfo) {
 fn print_go_var(index: &GoPackageIndex, v: &VarInfo) {
     print_go_package_header(&index.package);
     println!();
-    println!("  {}", colorize_signature(&v.signature));
+    println!("  {}", colorize_code(&v.signature));
     if let Some(doc) = &v.doc {
         print_doc(doc);
     }
@@ -1187,7 +1412,7 @@ fn suggest_go_item<'a>(query: &str, index: &'a GoPackageIndex) -> Option<&'a str
 }
 
 fn suggest_go_package(query: &str) -> Option<&'static str> {
-    let packages = get_go_stdlib_packages();
+    let packages = get_go_stdlib_packages(Target::host());
     packages
         .into_iter()
         .filter(|pkg| levenshtein_distance(&query.to_lowercase(), &pkg.to_lowercase()) <= 2)
@@ -1196,13 +1421,15 @@ fn suggest_go_package(query: &str) -> Option<&'static str> {
 
 fn print_go_packages_list() {
     println!();
+    println!("  Go stdlib");
+    println!();
     println!(
-        "  Go stdlib packages. Use {} to learn more.",
+        "  Run {} to view a package",
         format_method_name("lis doc go:<package>")
     );
     println!();
 
-    let packages = get_go_stdlib_packages();
+    let packages = get_go_stdlib_packages(Target::host());
 
     let max_width = packages.iter().map(|p| p.len()).max().unwrap_or(0);
     let col_width = max_width + 2;
@@ -1214,9 +1441,9 @@ fn print_go_packages_list() {
         for (i, pkg) in chunk.iter().enumerate() {
             if i < chunk.len() - 1 {
                 let padded = format!("{:width$}", pkg, width = col_width);
-                print!("{}", format_dim(&padded));
+                print!("{}", format_magenta(&padded));
             } else {
-                print!("{}", format_dim(pkg));
+                print!("{}", format_magenta(pkg));
             }
         }
         println!();
@@ -1231,11 +1458,32 @@ fn doc_go_package(query: &str) -> i32 {
         return 0;
     }
 
+    if without_prefix.contains('/') && deps::is_third_party(without_prefix) {
+        cli_error!(
+            format!(
+                "`go:{}` is a third-party module, not a Go stdlib package",
+                without_prefix
+            ),
+            "`lis doc` browses only the Lisette prelude and the Go stdlib",
+            "You can browse generated typedefs for a third-party module under `target/.lisette/typedefs/`"
+        );
+        return 1;
+    }
+
     let parts: Vec<&str> = without_prefix.splitn(2, '.').collect();
     let package = parts[0];
     let item_name = parts.get(1).copied();
 
-    let Some(source) = get_go_stdlib_typedef(package) else {
+    let host = Target::host();
+    let Some(source) = get_go_stdlib_typedef(package, host) else {
+        if let Some(targets) = get_go_stdlib_package_targets(package) {
+            cli_error!(
+                format!("`go:{}` is not available on `{}`", package, host),
+                "This Go stdlib package exists, but its surface differs across platforms and your host is not in the supported set",
+                format!("Available on: {}", format_targets(targets))
+            );
+            return 1;
+        }
         let help = if let Some(s) = suggest_go_package(package) {
             format!("Did you mean `lis doc go:{}`?", s)
         } else {
@@ -1312,18 +1560,18 @@ fn doc_go_package(query: &str) -> i32 {
     }
 }
 
-fn has_go_module_matches(module_cache: &GoModuleCache, query_lower: &str) -> bool {
-    for (def_name, def) in &module_cache.definitions {
-        if matches!(def, CachedDefinition::Value { .. })
+fn has_go_package_matches(package_cache: &GoPackageCache, query_lower: &str) -> bool {
+    for (def_name, def) in &package_cache.definitions {
+        let body = &def.as_definition().body;
+        if matches!(body, DefinitionBody::Value { .. })
             && def_name.to_lowercase().contains(query_lower)
         {
             return true;
         }
-        match def {
-            CachedDefinition::TypeAlias { methods, .. }
-            | CachedDefinition::Enum { methods, .. }
-            | CachedDefinition::ValueEnum { methods, .. }
-            | CachedDefinition::Struct { methods, .. } => {
+        match body {
+            DefinitionBody::TypeAlias { methods, .. }
+            | DefinitionBody::Enum { methods, .. }
+            | DefinitionBody::Struct { methods, .. } => {
                 if methods
                     .keys()
                     .any(|m| m.to_lowercase().contains(query_lower))
@@ -1331,14 +1579,13 @@ fn has_go_module_matches(module_cache: &GoModuleCache, query_lower: &str) -> boo
                     return true;
                 }
             }
-            CachedDefinition::Interface { definition, .. } => {
+            DefinitionBody::Interface { definition, .. }
                 if definition
                     .methods
                     .keys()
-                    .any(|m| m.to_lowercase().contains(query_lower))
-                {
-                    return true;
-                }
+                    .any(|m| m.to_lowercase().contains(query_lower)) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -1353,7 +1600,7 @@ fn format_search_line(qualifier: &str, func_name: &str, signature: &str) -> Stri
 
     if use_color() {
         use owo_colors::OwoColorize;
-        let colored_rest = colorize_definition(after_name);
+        let colored_rest = colorize_code(after_name);
         if qualifier.is_empty() {
             format!("    {}{}", func_name.bright_magenta(), colored_rest)
         } else {
@@ -1388,72 +1635,11 @@ pub fn doc_search(query: &str) -> i32 {
     }
 
     let query_lower = query.to_lowercase();
-
     let prelude_index = build_prelude_index();
-    let mut prelude_matches: Vec<SearchMatch> = Vec::new();
+    let target = Target::host();
 
-    for ti in &prelude_index.types {
-        let type_qual = format_type_with_generics_plain(&ti.name, &ti.generics);
-        for mi in &ti.methods {
-            if mi.name.to_lowercase().contains(&query_lower) {
-                prelude_matches.push(SearchMatch {
-                    name: mi.name.clone(),
-                    display: format_search_line(&type_qual, &mi.name, &mi.signature),
-                    doc_path: format!("{}.{}", ti.name, mi.name),
-                });
-            }
-        }
-    }
-    for fi in &prelude_index.functions {
-        if fi.name.to_lowercase().contains(&query_lower) {
-            prelude_matches.push(SearchMatch {
-                name: fi.name.clone(),
-                display: format_search_line("", &fi.name, &fi.signature),
-                doc_path: fi.name.clone(),
-            });
-        }
-    }
-
-    let mut go_matches: Vec<SearchMatch> = Vec::new();
-    let go_cache = try_load_go_stdlib_cache();
-
-    for pkg in get_go_stdlib_packages() {
-        if let Some(ref cache) = go_cache {
-            let module_id = format!("go:{}", pkg);
-            if let Some(module_cache) = cache.modules.get(&module_id)
-                && !has_go_module_matches(module_cache, &query_lower)
-            {
-                continue;
-            }
-        }
-
-        let Some(source) = get_go_stdlib_typedef(pkg) else {
-            continue;
-        };
-        let index = build_go_package_index(source, pkg);
-
-        for fi in &index.functions {
-            if fi.name.to_lowercase().contains(&query_lower) {
-                go_matches.push(SearchMatch {
-                    name: fi.name.clone(),
-                    display: format_search_line(pkg, &fi.name, &fi.signature),
-                    doc_path: format!("{}.{}", pkg, fi.name),
-                });
-            }
-        }
-        for ti in &index.types {
-            let type_qual = format!("{}.{}", pkg, ti.name);
-            for mi in &ti.methods {
-                if mi.name.to_lowercase().contains(&query_lower) {
-                    go_matches.push(SearchMatch {
-                        name: mi.name.clone(),
-                        display: format_search_line(&type_qual, &mi.name, &mi.signature),
-                        doc_path: format!("{}.{}.{}", pkg, ti.name, mi.name),
-                    });
-                }
-            }
-        }
-    }
+    let mut prelude_matches = collect_prelude_matches(&prelude_index, &query_lower);
+    let mut go_matches = collect_go_matches(target, &query_lower);
 
     let rank = |name: &str| -> u8 {
         let lower = name.to_lowercase();
@@ -1471,87 +1657,170 @@ pub fn doc_search(query: &str) -> i32 {
     if prelude_matches.is_empty() && go_matches.is_empty() {
         println!();
         println!("  No matches found.");
-
-        let mut best_name = String::new();
-        let mut best_dist = usize::MAX;
-
-        for ti in &prelude_index.types {
-            for mi in &ti.methods {
-                let d = levenshtein_distance(&query_lower, &mi.name.to_lowercase());
-                if d <= 2 && d < best_dist {
-                    best_name = mi.name.clone();
-                    best_dist = d;
-                }
-            }
-        }
-        for fi in &prelude_index.functions {
-            let d = levenshtein_distance(&query_lower, &fi.name.to_lowercase());
-            if d <= 2 && d < best_dist {
-                best_name = fi.name.clone();
-                best_dist = d;
-            }
-        }
-
-        if best_dist > 0 {
-            'outer: for pkg in get_go_stdlib_packages() {
-                let Some(source) = get_go_stdlib_typedef(pkg) else {
-                    continue;
-                };
-                let index = build_go_package_index(source, pkg);
-                for fi in &index.functions {
-                    let d = levenshtein_distance(&query_lower, &fi.name.to_lowercase());
-                    if d <= 2 && d < best_dist {
-                        best_name = fi.name.clone();
-                        best_dist = d;
-                        if d == 0 {
-                            break 'outer;
-                        }
-                    }
-                }
-                for ti in &index.types {
-                    for mi in &ti.methods {
-                        let d = levenshtein_distance(&query_lower, &mi.name.to_lowercase());
-                        if d <= 2 && d < best_dist {
-                            best_name = mi.name.clone();
-                            best_dist = d;
-                            if d == 0 {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if best_dist <= 2 {
-            println!();
-            println!(
+        println!();
+        match nearest_symbol(&query_lower, &prelude_index, target) {
+            Some(best_name) => println!(
                 "  hint: Did you mean {}?",
                 format_method_name(&format!("lis doc -s {}", best_name))
-            );
-        } else {
-            println!();
-            println!(
+            ),
+            None => println!(
                 "  hint: Run {} to browse prelude types, or {} to list Go packages",
                 format_method_name("lis doc"),
                 format_method_name("lis doc go:")
-            );
+            ),
         }
         return 0;
     }
 
+    render_search_results(&prelude_matches, &go_matches);
+    0
+}
+
+fn collect_prelude_matches(prelude_index: &PreludeIndex, query_lower: &str) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+    for type_info in &prelude_index.types {
+        let type_qualifier = format_type_with_generics_plain(&type_info.name, &type_info.generics);
+        for method_info in &type_info.methods {
+            if method_info.name.to_lowercase().contains(query_lower) {
+                matches.push(SearchMatch {
+                    name: method_info.name.clone(),
+                    display: format_search_line(
+                        &type_qualifier,
+                        &method_info.name,
+                        &method_info.signature,
+                    ),
+                    doc_path: format!("{}.{}", type_info.name, method_info.name),
+                });
+            }
+        }
+    }
+    for function_info in &prelude_index.functions {
+        if function_info.name.to_lowercase().contains(query_lower) {
+            matches.push(SearchMatch {
+                name: function_info.name.clone(),
+                display: format_search_line("", &function_info.name, &function_info.signature),
+                doc_path: function_info.name.clone(),
+            });
+        }
+    }
+    matches
+}
+
+fn collect_go_matches(target: Target, query_lower: &str) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+    let go_cache = try_load_go_stdlib_cache(target);
+
+    for package in get_go_stdlib_packages(target) {
+        if let Some(ref cache) = go_cache {
+            let package_id = format!("go:{}", package);
+            if let Some(package_cache) = cache.packages.get(&package_id)
+                && !has_go_package_matches(package_cache, query_lower)
+            {
+                continue;
+            }
+        }
+
+        let Some(source) = get_go_stdlib_typedef(package, target) else {
+            continue;
+        };
+        let index = build_go_package_index(source, package);
+
+        for function_info in &index.functions {
+            if function_info.name.to_lowercase().contains(query_lower) {
+                matches.push(SearchMatch {
+                    name: function_info.name.clone(),
+                    display: format_search_line(
+                        package,
+                        &function_info.name,
+                        &function_info.signature,
+                    ),
+                    doc_path: format!("{}.{}", package, function_info.name),
+                });
+            }
+        }
+        for type_info in &index.types {
+            let type_qualifier = format!("{}.{}", package, type_info.name);
+            for method_info in &type_info.methods {
+                if method_info.name.to_lowercase().contains(query_lower) {
+                    matches.push(SearchMatch {
+                        name: method_info.name.clone(),
+                        display: format_search_line(
+                            &type_qualifier,
+                            &method_info.name,
+                            &method_info.signature,
+                        ),
+                        doc_path: format!("{}.{}.{}", package, type_info.name, method_info.name),
+                    });
+                }
+            }
+        }
+    }
+    matches
+}
+
+/// Finds the closest symbol name within edit distance 2, for a did-you-mean hint.
+fn nearest_symbol(
+    query_lower: &str,
+    prelude_index: &PreludeIndex,
+    target: Target,
+) -> Option<String> {
+    let mut best_name = String::new();
+    let mut best_distance = usize::MAX;
+    let consider = |name: &str, best_name: &mut String, best_distance: &mut usize| -> usize {
+        let distance = levenshtein_distance(query_lower, &name.to_lowercase());
+        if distance <= 2 && distance < *best_distance {
+            *best_name = name.to_string();
+            *best_distance = distance;
+        }
+        distance
+    };
+
+    for type_info in &prelude_index.types {
+        for method_info in &type_info.methods {
+            consider(&method_info.name, &mut best_name, &mut best_distance);
+        }
+    }
+    for function_info in &prelude_index.functions {
+        consider(&function_info.name, &mut best_name, &mut best_distance);
+    }
+
+    if best_distance > 0 {
+        'packages: for package in get_go_stdlib_packages(target) {
+            let Some(source) = get_go_stdlib_typedef(package, target) else {
+                continue;
+            };
+            let index = build_go_package_index(source, package);
+            for function_info in &index.functions {
+                if consider(&function_info.name, &mut best_name, &mut best_distance) == 0 {
+                    break 'packages;
+                }
+            }
+            for type_info in &index.types {
+                for method_info in &type_info.methods {
+                    if consider(&method_info.name, &mut best_name, &mut best_distance) == 0 {
+                        break 'packages;
+                    }
+                }
+            }
+        }
+    }
+
+    (best_distance <= 2).then_some(best_name)
+}
+
+fn render_search_results(prelude_matches: &[SearchMatch], go_matches: &[SearchMatch]) {
     println!();
-    println!("  Prelude");
+    println!("  Prelude:");
     if prelude_matches.is_empty() {
         println!("    {}", format_dim("(no matches)"));
     } else {
-        for m in &prelude_matches {
+        for m in prelude_matches {
             println!("{}", m.display);
         }
     }
 
     println!();
-    println!("  Go stdlib");
+    println!("  Go stdlib:");
     if go_matches.is_empty() {
         println!("    {}", format_dim("(no matches)"));
     } else {
@@ -1588,7 +1857,6 @@ pub fn doc_search(query: &str) -> i32 {
     }
 
     println!();
-    0
 }
 
 pub fn doc(query: Option<String>) -> i32 {
@@ -1599,6 +1867,52 @@ pub fn doc(query: Option<String>) -> i32 {
             0
         }
         Some(q) if q.starts_with("go:") => doc_go_package(&q),
+        Some(q) if q.eq_ignore_ascii_case("prelude") => {
+            let index = build_prelude_index();
+            print_prelude(&index);
+            0
+        }
+        Some(q) if q.eq_ignore_ascii_case("test") || q.eq_ignore_ascii_case("tests") => {
+            print_test_topic();
+            0
+        }
+        Some(q)
+            if q.eq_ignore_ascii_case("TestContext")
+                || q.to_lowercase().starts_with("testcontext.") =>
+        {
+            let index = build_test_prelude_index();
+            let Some(type_info) = index.types.iter().find(|t| t.name == "TestContext") else {
+                print_test_topic();
+                return 0;
+            };
+            match q.split_once('.') {
+                None => {
+                    print_type(type_info);
+                    0
+                }
+                Some((_, method)) => {
+                    if let Some(method_info) = type_info
+                        .methods
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(method))
+                    {
+                        print_method(type_info, method_info);
+                        0
+                    } else {
+                        let help = match suggest_method(method, type_info) {
+                            Some(s) => format!("Did you mean `lis doc TestContext.{}`?", s),
+                            None => "Run `lis doc test` to see the test handle".to_string(),
+                        };
+                        cli_error!(
+                            format!("`TestContext` has no method `{}`", method),
+                            format!("`{}` is not a method on `TestContext`", method),
+                            help
+                        );
+                        1
+                    }
+                }
+            }
+        }
         Some(q) => {
             let index = build_prelude_index();
             let parts: Vec<&str> = q.splitn(2, '.').collect();
@@ -1674,6 +1988,134 @@ pub fn doc(query: Option<String>) -> i32 {
                     1
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prelude_displays_array_size_parameter() {
+        let index = build_prelude_index();
+        let array = index
+            .types
+            .iter()
+            .find(|t| t.name == "Array")
+            .expect("`Array` is parsed from the prelude");
+
+        assert_eq!(array.definition, "type Array<T, N>");
+    }
+
+    #[test]
+    fn prelude_documents_array_inline_constructors() {
+        let index = build_prelude_index();
+        let array = index
+            .types
+            .iter()
+            .find(|t| t.name == "Array")
+            .expect("`Array` is parsed from the prelude");
+
+        let new = array.methods.first().expect("`Array` has methods");
+        assert_eq!(new.name, "new");
+        assert_eq!(new.signature, "fn new() -> Array<T, N>");
+        assert!(new.doc.is_some());
+
+        let from = array.methods.get(1).expect("`Array` has a second method");
+        assert_eq!(from.name, "from");
+        assert_eq!(
+            from.signature,
+            "fn from(slice: Slice<T>) -> Option<Array<T, N>>"
+        );
+        assert!(from.doc.is_some());
+    }
+
+    #[test]
+    fn signature_omits_unit_return() {
+        let index = build_prelude_index();
+        let map = index
+            .types
+            .iter()
+            .find(|t| t.name == "Map")
+            .expect("`Map` is parsed from the prelude");
+        let delete = map
+            .methods
+            .iter()
+            .find(|m| m.name == "delete")
+            .expect("`Map` documents `delete`");
+
+        assert_eq!(delete.signature, "fn delete(self: mut Map<K, V>, key: K)");
+    }
+
+    #[test]
+    fn definition_shows_generic_bounds() {
+        let index = build_prelude_index();
+        let map = index
+            .types
+            .iter()
+            .find(|t| t.name == "Map")
+            .expect("`Map` is parsed from the prelude");
+
+        assert_eq!(map.definition, "type Map<K: Comparable, V>");
+
+        let min = index
+            .functions
+            .iter()
+            .find(|f| f.name == "min")
+            .expect("`min` is parsed from the prelude");
+
+        assert_eq!(
+            min.signature,
+            "fn min<T: Ordered>(x: T, rest: VarArgs<T>) -> T"
+        );
+    }
+
+    #[test]
+    fn go_struct_definition_hides_private_fields() {
+        let source = r#"
+pub struct File {
+  handle: int,
+  pub Name: string,
+}
+"#;
+        let index = build_go_package_index(source, "os");
+        let file = index
+            .types
+            .iter()
+            .find(|t| t.name == "File")
+            .expect("`File` is parsed from the typedef");
+
+        assert_eq!(file.definition, "struct File { Name: string, .. }");
+    }
+
+    #[test]
+    fn prelude_lists_array_as_a_composite() {
+        let index = build_prelude_index();
+        let composites = prelude_categories(&index)
+            .into_iter()
+            .find(|(name, _)| *name == "composites")
+            .expect("the prelude has composite types")
+            .1;
+
+        assert!(composites.contains(&"Array<T, N>".to_string()));
+    }
+
+    #[test]
+    fn test_prelude_exposes_the_handle_methods() {
+        let index = build_test_prelude_index();
+        let context = index
+            .types
+            .iter()
+            .find(|t| t.name == "TestContext")
+            .expect("`TestContext` is parsed from the test prelude");
+
+        let methods: Vec<&str> = context.methods.iter().map(|m| m.name.as_str()).collect();
+        for expected in ["run", "parallel", "skip", "log"] {
+            assert!(
+                methods.contains(&expected),
+                "the `lis doc test` handle section documents `{expected}`, got: {methods:?}"
+            );
         }
     }
 }

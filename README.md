@@ -1,7 +1,7 @@
 # Lisette
 
 [![crates.io](https://img.shields.io/crates/v/lisette.svg?logo=rust)](https://crates.io/crates/lisette)
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.26.7-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Little language inspired by Rust that compiles to Go.
@@ -16,10 +16,10 @@ Safe and expressive:
 
 Quietly practical:
 
-- Interop with Go ecosystem (WIP)
-- Linter, formatter, 250+ diagnostics
+- Interop with Go's ecosystem
+- Linter, formatter, 500+ diagnostics
 - Fast incremental compiler, readable Go
-- LSP for VSCode, Neovim, Zed, Helix, GoLand
+- LSP for VSCode, Neovim, Zed, GoLand
 
 ## Quick tour
 
@@ -33,8 +33,8 @@ enum Shape {
 
 fn area(shape: Shape) -> float64 {
   match shape {
-    Shape.Circle(r) => 3.14 * r * r,
-    Shape.Rectangle { width, height } => width * height,
+    Circle(r) => 3.14 * r * r,
+    Rectangle { width, height } => width * height,
   }
 }
 ```
@@ -43,18 +43,18 @@ Go interop and `?` for error handling:
 
 ```rust
 import "go:os"
-import "go:io"
+import "go:encoding/json"
 import "go:fmt"
 
 fn load_config(path: string) -> Result<Cfg, error> {
-  let file = os.Open(path)?
-  defer file.Close()
-  let data = io.ReadAll(file)?
-  parse_yaml(data)
+  let data = os.ReadFile(path)?
+  let mut config = Cfg { port: 8080, debug: false }
+  json.Unmarshal(data, &config)?
+  Ok(config)
 }
 
 fn main() {
-  match load_config("app.yaml") {
+  match load_config("app.json") {
     Ok(config) => start(config),
     Err(e) => fmt.Println("error:", e),
   }
@@ -65,7 +65,7 @@ fn main() {
 
 ```rust
 match flag.Lookup("verbose") {
-  Some(f) => fmt.Println(f.Value),
+  Some(f) => fmt.Println(f.DefValue),
   None => fmt.Println("no such flag"),
 }
 
@@ -103,10 +103,9 @@ match rx.receive() {
 
 ## Learn more
 
-- 💡 [`quickstart.md`](docs/intro/quickstart.md) — Set up a Lisette project
-- 🧿 [`safety.md`](docs/intro/safety.md) — Go issues Lisette prevents
-- 📚 [`reference.md`](docs/reference/README.md) — Full language reference
-- 🌎 [`roadmap.md`](docs/intro/roadmap.md) — Status and planned work
+- 💡 [Quickstart](https://lisette.run/docs/intro/quickstart/) - Set up a Lisette project
+- 🧿 [Safety](https://lisette.run/docs/intro/safety/) - Go issues Lisette prevents
+- 📚 [Reference](https://lisette.run/docs/lexemes/) - Full language reference
 
 ## Author
 

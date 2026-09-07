@@ -1,17 +1,23 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nimport \"go:errors\"\n\nfn might_fail(n: int) -> Result<int, error> {\n  if n < 0 {\n    return Err(errors.New(\"negative\"))\n  }\n  Ok(n)\n}\n"
+description: |
+  
+  import "go:errors"
+  
+  fn might_fail(n: int) -> Result<int, error> {
+    if n < 0 {
+      return Err(errors.New("negative"))
+    }
+    Ok(n)
+  }
 ---
 package main
 
-import (
-	"errors"
-	lisette "github.com/ivov/lisette/prelude"
-)
+import "errors"
 
-func might_fail(n int) lisette.Result[int, error] {
+func mightFail(n int) (int, error) {
 	if n < 0 {
-		return lisette.MakeResultErr[int, error](errors.New("negative"))
+		return 0, errors.New("negative")
 	}
-	return lisette.MakeResultOk[int, error](n)
+	return n, nil
 }

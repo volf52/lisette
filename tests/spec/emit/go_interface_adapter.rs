@@ -1,17 +1,15 @@
+use crate::assert_emit_snapshot;
 use crate::assert_emit_snapshot_with_go_typedefs;
 
-// Issue #90: a Lisette concrete whose `Read` returns `Partial<int, error>`
-// must be wrappable as `io.Reader`. The adapter unpacks Partial into
-// Go's native `(int, error)`.
 #[test]
-fn partial_return_is_wrapped_when_used_as_go_interface() {
+fn partial_return_lowers_to_satisfy_go_interface() {
     let input = r#"
 import "go:io"
 
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -61,10 +59,8 @@ pub interface Greeter {
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/simple", typedef)]);
 }
 
-// Mixed adaptation: one method's return is adapted, another is bare.
-// The adapter forwards both; only the adapted method runs the shim.
 #[test]
-fn mixed_adapted_and_bare_methods() {
+fn mixed_lowering_and_bare_methods_satisfy_go_interface() {
     let input = r#"
 import "go:example.com/mixed"
 
@@ -97,17 +93,15 @@ pub interface Service {
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/mixed", typedef)]);
 }
 
-// Two cast sites that refer to the same (concrete, interface) pair
-// share a single synthesized adapter type declaration.
 #[test]
-fn adapter_type_is_deduplicated_across_cast_sites() {
+fn repeated_cast_to_go_interface_uses_lowered_struct_directly() {
     let input = r#"
 import "go:io"
 
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -139,7 +133,7 @@ import "go:io"
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -166,7 +160,7 @@ import "go:io"
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -193,7 +187,7 @@ import "go:io"
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -216,7 +210,7 @@ import "go:io"
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -245,7 +239,7 @@ import "go:io"
 struct Doubler {}
 
 impl Doubler {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -272,13 +266,13 @@ struct A {}
 struct B {}
 
 impl A {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
 
 impl B {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -295,6 +289,41 @@ fn main() {
     assert_emit_snapshot_with_go_typedefs!(input, &[]);
 }
 
+#[test]
+fn nullable_match_destination_preserves_interface_adapter() {
+    let input = r#"
+struct Thing {}
+
+interface Opt {
+  fn find() -> Option<mut Ref<Thing>>
+}
+
+struct Bar<T> {
+  x: Option<T>,
+}
+
+impl<T> Bar<T> {
+  fn find(self) -> Option<T> { self.x }
+}
+
+fn maybe_bar(bar: mut Ref<Bar<mut Ref<Thing>>>) -> Option<mut Ref<Bar<mut Ref<Thing>>>> {
+  Some(bar)
+}
+
+fn main() {
+  let mut bar = Bar { x: Some(&Thing {}) }
+  let opt: Opt = match maybe_bar(&bar) {
+    Some(found) => found,
+    None => { return },
+  }
+  if let Some(thing) = opt.find() {
+    let _ = thing
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
 // Coverage for scenario 9: match arm value. Each arm produces a
 // concrete and the match's result type is a Go interface.
 #[test]
@@ -306,13 +335,13 @@ struct A {}
 struct B {}
 
 impl A {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
 
 impl B {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
 }
@@ -331,21 +360,15 @@ fn main() {
     assert_emit_snapshot_with_go_typedefs!(input, &[]);
 }
 
-// Regression: an interface that embeds another interface must expose
-// its inherited methods in the synthesized adapter. A Lisette struct
-// satisfying `ReadWriteCloser` (which embeds `Reader` and `Writer`)
-// must have the adapter emit `Read` and `Write` even though
-// `ReadWriteCloser.methods` is empty — inherited methods live under
-// `parents`.
 #[test]
-fn adapter_includes_methods_inherited_from_parent_interfaces() {
+fn struct_satisfies_go_interface_with_inherited_methods() {
     let input = r#"
 import "go:example.com/rw"
 
 struct Dev {}
 
 impl Dev {
-  fn Read(self, mut p: Slice<uint8>) -> Partial<int, error> {
+  fn Read(self, p: mut Slice<uint8>) -> Partial<int, error> {
     Partial.Ok(0)
   }
   fn Write(self, p: Slice<uint8>) -> Partial<int, error> {
@@ -353,8 +376,8 @@ impl Dev {
   }
 }
 
-fn use_rw(rw: rw.ReadWriter) {
-  let _ = rw
+fn use_rw(target: rw.ReadWriter) {
+  let _ = target
 }
 
 fn main() {
@@ -364,7 +387,7 @@ fn main() {
 "#;
     let typedef = r#"
 pub interface Reader {
-  fn Read(mut p: Slice<uint8>) -> Partial<int, error>
+  fn Read(p: mut Slice<uint8>) -> Partial<int, error>
 }
 
 pub interface Writer {
@@ -372,21 +395,15 @@ pub interface Writer {
 }
 
 pub interface ReadWriter {
-  impl Reader
-  impl Writer
+  embed Reader
+  embed Writer
 }
 "#;
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/rw", typedef)]);
 }
 
-// Regression: Option<Ref<T>> and Option<Interface> are nullable Go
-// shapes. A Lisette impl of a Go interface method returning such an
-// Option must emit the adapter's Go method with the bare nilable
-// pointer/interface and unwrap `Some(v) -> v, None -> nil`. The old
-// behavior emitted `(T, bool)` which does not satisfy the Go
-// interface.
 #[test]
-fn option_ref_in_interface_method_adapts_to_bare_nilable_pointer() {
+fn option_ref_lowers_to_bare_nilable_pointer_in_interface_impl() {
     let input = r#"
 import "go:example.com/store"
 
@@ -417,15 +434,40 @@ pub interface Storage {
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/store", typedef)]);
 }
 
-// Regression for tea.Cmd alias collapse. A Go function-type alias
-// (`type Cmd func() Msg`) used inside an `Option<Cmd>` in return
-// position must preserve the Cmd name end-to-end — otherwise Go's
-// strict generic inference instantiates `Option[func() Msg]` and
-// rejects it where `Option[Cmd]` is expected. The fix required:
-// (1) `infer_tuple` resolving expected_ty through type variables,
-// (2) `is_generic_container_with_interface` firing for go:-prefixed
-// params, and (3) `resolve_call_type_args` emitting explicit type
-// args for Go function aliases on Some/Ok/Err.
+#[test]
+fn ref_impl_satisfies_option_ref_go_interface_without_adapter() {
+    let input = r#"
+import "go:example.com/store"
+
+struct Store {}
+
+impl Store {
+  fn Find(self, key: string) -> Ref<store.Entry> {
+    store.NewEntry()
+  }
+}
+
+fn use_store(s: store.Storage) {
+  let _ = s
+}
+
+fn main() {
+  let s = Store {}
+  use_store(s as store.Storage)
+}
+"#;
+    let typedef = r#"
+pub struct Entry { pub Name: string }
+
+pub fn NewEntry() -> Ref<Entry>
+
+pub interface Storage {
+  fn Find(key: string) -> Option<Ref<Entry>>
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/store", typedef)]);
+}
+
 #[test]
 fn go_named_function_alias_preserved_through_option_tuple_return() {
     let input = r#"
@@ -582,7 +624,7 @@ fn main() {
 }
 
 #[test]
-fn cast_to_aliased_go_interface_applies_adapter() {
+fn cast_to_aliased_go_interface_resolves_through_alias() {
     let input = r#"
 import "go:example.com/svc"
 
@@ -616,7 +658,7 @@ pub type Alias = Service
 }
 
 #[test]
-fn adapter_collects_methods_from_aliased_parent_interface() {
+fn struct_satisfies_go_interface_with_aliased_parent() {
     let input = r#"
 import "go:example.com/shapes"
 
@@ -646,9 +688,588 @@ pub interface Sized {
 }
 pub type SizedAlias = Sized
 pub interface Shape {
-  impl SizedAlias
+  embed SizedAlias
   fn Name() -> string
 }
 "#;
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn nilable_option_in_tuple_slot_lowers_directly_satisfying_go_interface() {
+    let input = r#"
+import "go:example.com/tea"
+
+struct Model {}
+
+impl Model {
+  fn Update(self, msg: tea.Msg) -> (tea.Model, Option<tea.Cmd>) {
+    (self as tea.Model, Some(tea.Quit))
+  }
+  fn View(self) -> string { "" }
+}
+
+fn main() {
+  let _ = tea.NewProgram(Model {} as tea.Model)
+}
+"#;
+    let typedef = r#"// Package: tea
+
+pub interface Msg {}
+
+pub type Cmd = fn() -> Msg
+
+pub interface Model {
+  fn Update(arg0: Msg) -> (Model, Option<Cmd>)
+  fn View() -> string
+}
+
+pub type Program
+
+pub fn NewProgram(model: Model) -> Ref<Program>
+
+pub fn Quit() -> Msg
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/tea", typedef)]);
+}
+
+#[test]
+fn sentinel_int_hint_wraps_to_option_at_call_site() {
+    let input = r#"
+import "go:example.com/idx"
+
+fn main() {
+  let pos = idx.Find("hello", "lo")
+  let _ = match pos {
+    Some(i) => i,
+    None => -2,
+  }
+}
+"#;
+    let typedef = r#"
+#[go(sentinel_minus_one)]
+pub fn Find(s: string, substr: string) -> Option<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/idx", typedef)]);
+}
+
+#[test]
+fn sentinel_hinted_tail_call_wraps_in_wrapper_fn() {
+    let input = r#"
+import "go:example.com/idx"
+
+fn find(haystack: string, needle: string) -> Option<int> {
+  idx.Find(haystack, needle)
+}
+
+fn main() {
+  let _ = find("hello", "z")
+}
+"#;
+    let typedef = r#"
+#[go(sentinel_minus_one)]
+pub fn Find(s: string, substr: string) -> Option<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/idx", typedef)]);
+}
+
+#[test]
+fn comma_ok_hinted_nullable_tail_call_wraps_in_wrapper_fn() {
+    let input = r#"
+import "go:example.com/info"
+
+fn build_info() -> Option<Ref<info.BuildInfo>> {
+  info.Read()
+}
+
+fn main() {
+  let _ = build_info()
+}
+"#;
+    let typedef = r#"
+#[go(comma_ok)]
+pub fn Read() -> Option<Ref<BuildInfo>>
+
+pub struct BuildInfo {}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/info", typedef)]);
+}
+
+#[test]
+fn generic_named_field_struct_constructor_inserts_adapter() {
+    let input = r#"
+struct Entry { name: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Entry>>
+}
+
+struct MyCache {}
+
+impl MyCache {
+  fn Get(self, _key: string) -> Option<Ref<Entry>> {
+    None
+  }
+}
+
+struct Wrapper<T> {
+  cache: T,
+}
+
+fn main() {
+  let c = MyCache {}
+  let _: Wrapper<Cache> = Wrapper { cache: c }
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[]);
+}
+
+#[test]
+fn generic_tuple_struct_constructor_inserts_adapter() {
+    let input = r#"
+struct Entry { name: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Entry>>
+}
+
+struct MyCache {}
+
+impl MyCache {
+  fn Get(self, _key: string) -> Option<Ref<Entry>> {
+    None
+  }
+}
+
+struct Wrapper<T>(T)
+
+fn main() {
+  let c = MyCache {}
+  let _: Wrapper<Cache> = Wrapper<Cache>(c)
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[]);
+}
+
+#[test]
+fn call_returning_go_interface_widens_into_option_field() {
+    let input = r#"
+import "go:example.com/srv"
+
+fn setup_handler() -> srv.Handler {
+  srv.NewHandler()
+}
+
+fn main() {
+  let _ = &srv.Server { Addr: ":8000", Handler: setup_handler(), .. }
+}
+"#;
+    let typedef = r#"
+pub interface Handler {
+  fn Serve()
+}
+
+pub struct Server {
+  pub Addr: string,
+  pub Handler: Option<Handler>,
+}
+
+pub fn NewHandler() -> Handler
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/srv", typedef)]);
+}
+
+#[test]
+fn array_of_concrete_widens_to_interface_elements_in_argument_position() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn first(errs: Array<error, 2>) -> string {
+  errs[0].Error()
+}
+
+fn test() {
+  let concrete: Array<Boom, 2> = [Boom {}, Boom {}]
+  if first(concrete) != "boom" {
+    panic("array argument lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn array_of_concrete_widens_to_interface_elements_in_let_annotation() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn first(errs: Array<error, 2>) -> string {
+  errs[0].Error()
+}
+
+fn test() {
+  let concrete: Array<Boom, 2> = [Boom {}, Boom {}]
+  let widened: Array<error, 2> = concrete
+  if first(widened) != "boom" {
+    panic("annotated array binding lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn array_of_concrete_widens_to_interface_elements_in_return_position() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn widen() -> Array<error, 2> {
+  let concrete: Array<Boom, 2> = [Boom {}, Boom {}]
+  concrete
+}
+
+fn test() {
+  if widen()[1].Error() != "boom" {
+    panic("returned array lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn array_of_concrete_widens_to_interface_elements_in_struct_field() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+struct Holder {
+  errs: Array<error, 2>,
+}
+
+fn test() {
+  let concrete: Array<Boom, 2> = [Boom {}, Boom {}]
+  let holder = Holder { errs: concrete }
+  if holder.errs[0].Error() != "boom" {
+    panic("struct field lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn array_of_concrete_widens_to_interface_elements_in_assignment() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+struct Quiet {}
+
+impl Quiet {
+  fn Error(self) -> string {
+    "quiet"
+  }
+}
+
+fn test() {
+  let mut errs: Array<error, 2> = [Quiet {}, Quiet {}]
+  let concrete: Array<Boom, 2> = [Boom {}, Boom {}]
+  errs = concrete
+  if errs[0].Error() != "boom" {
+    panic("assignment lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn array_built_at_interface_element_type_needs_no_rebuild() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn first(errs: Array<error, 2>) -> string {
+  errs[0].Error()
+}
+
+fn test() {
+  let errs: Array<error, 2> = [Boom {}, Boom {}]
+  if first(errs) != "boom" {
+    panic("array built at the interface element type was rebuilt wrongly")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_of_concrete_widens_to_interface_elements_in_argument_position() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn describe(pair: (error, int)) -> string {
+  pair.0.Error()
+}
+
+fn test() {
+  let concrete = (Boom {}, 1)
+  if describe(concrete) != "boom" {
+    panic("tuple argument lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_of_concrete_widens_to_interface_elements_in_let_annotation() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn describe(pair: (error, int)) -> string {
+  pair.0.Error()
+}
+
+fn test() {
+  let widened: (error, int) = (Boom {}, 1)
+  if describe(widened) != "boom" {
+    panic("annotated tuple binding lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_of_concrete_widens_to_interface_elements_in_struct_field() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+struct Holder {
+  pair: (error, int),
+}
+
+fn test() {
+  let concrete = (Boom {}, 1)
+  let holder = Holder { pair: concrete }
+  if holder.pair.0.Error() != "boom" {
+    panic("struct field lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_of_concrete_widens_to_interface_elements_in_match_arm() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn describe(pair: (error, int)) -> string {
+  pair.0.Error()
+}
+
+fn test() {
+  let pair: (error, int) = match 1 {
+    1 => (Boom {}, 1),
+    _ => (Boom {}, 2),
+  }
+  if describe(pair) != "boom" {
+    panic("match arm lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn nested_array_of_tuples_widens_to_interface_elements() {
+    let input = r#"
+struct Boom {}
+
+impl Boom {
+  fn Error(self) -> string {
+    "boom"
+  }
+}
+
+fn first(rows: Array<(error, int), 2>) -> string {
+  rows[0].0.Error()
+}
+
+fn test() {
+  let concrete: Array<(Boom, int), 2> = [(Boom {}, 1), (Boom {}, 2)]
+  if first(concrete) != "boom" {
+    panic("nested container lost its interface elements")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_tail_return_wraps_adapter_for_interface_slot() {
+    let input = r#"
+struct Thing {
+  v: int,
+}
+
+interface Box<T> {
+  fn get() -> T
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> Option<Ref<Thing>> {
+    None
+  }
+}
+
+fn make() -> (Box<Option<Ref<Thing>>>, int) {
+  (Bar {}, 2)
+}
+
+fn test() {
+  let pair = make()
+  match pair.0.get() {
+    Some(_) => panic("expected None"),
+    None => {},
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_widens_error_slot_through_adapter() {
+    let input = r#"
+interface Failing<T> {
+  fn get() -> T
+}
+
+struct Boom {}
+
+impl Boom {
+  fn get(self) -> Result<int, error> {
+    Ok(1)
+  }
+}
+
+fn source() -> Result<int, Boom> {
+  Err(Boom {})
+}
+
+fn widen() -> Result<int, Failing<Result<int, error>>> {
+  let n = source()?
+  Ok(n)
+}
+
+fn main() {
+  match widen() {
+    Ok(_) => panic("expected error"),
+    Err(f) => {
+      match f.get() {
+        Ok(v) => {
+          if v != 1 {
+            panic("wrong adapted value")
+          }
+        },
+        Err(_) => panic("expected ok from get"),
+      }
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn return_err_widens_error_slot_through_adapter() {
+    let input = r#"
+interface Failing<T> {
+  fn get() -> T
+}
+
+struct Boom {}
+
+impl Boom {
+  fn get(self) -> Result<int, error> {
+    Ok(1)
+  }
+}
+
+fn bail() -> Result<int, Failing<Result<int, error>>> {
+  return Err(Boom {})
+}
+
+fn main() {
+  match bail() {
+    Ok(_) => panic("expected error"),
+    Err(_) => {},
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
 }

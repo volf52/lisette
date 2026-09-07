@@ -97,3 +97,156 @@ fn test(p: Partial<int, string>) -> bool {
 "#;
     assert_emit_snapshot!(input);
 }
+
+#[test]
+fn fused_partial_match_on_go_write_call() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn write_all(file: Ref<os.File>) {
+  match file.Write(['h', 'i']) {
+    Ok(n) => fmt.Println(n),
+    Both(n, _) => fmt.Println(n),
+    Err(e) => {
+      fmt.Println(e)
+      return
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_selective_partial_both_omits_unused_named_value() {
+    let input = r#"
+import "go:os"
+
+fn write(file: Ref<os.File>) -> Option<error> {
+  if let Partial.Both(written, err) = file.Write(['h', 'i']) {
+    return Some(err)
+  }
+  None
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn impossible_selective_partial_err_keeps_call() {
+    let input = r#"
+import "go:os"
+
+fn write(file: Ref<os.File>) {
+  if let Partial.Err(err) = file.Write(['h', 'i']) {
+    panic(err.Error())
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn selective_partial_with_empty_arms_keeps_call() {
+    let input = r#"
+import "go:os"
+
+fn write(file: Ref<os.File>) {
+  if let Partial.Both(_, _) = file.Write(['h', 'i']) {}
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn selective_partial_literal_payload_falls_back_to_tagged_match() {
+    let input = r#"
+import "go:os"
+
+fn write(file: Ref<os.File>) {
+  match file.Write(['h', 'i']) {
+    Partial.Ok(0) => panic("wrote nothing"),
+    _ => {},
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn selective_partial_ok_wildcard_does_not_bind_nilable_value() {
+    let input = r#"
+import "go:fmt"
+import "go:os"
+
+fn main() {
+  if let Partial.Ok(_) = os.ReadDir(".") {
+    fmt.Println("ok")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn selective_partial_ok_unused_name_does_not_bind_nilable_value() {
+    let input = r#"
+import "go:fmt"
+import "go:os"
+
+fn main() {
+  if let Partial.Ok(entries) = os.ReadDir(".") {
+    fmt.Println("ok")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_partial_match_on_lowered_call() {
+    let input = r#"
+import "go:errors"
+
+fn attempt(ok: bool) -> Partial<int, error> {
+  if ok { Partial.Ok(1) } else { Partial.Err(errors.New("nope")) }
+}
+
+fn test() -> int {
+  match attempt(true) {
+    Partial.Ok(n) => n,
+    Partial.Both(n, _) => n,
+    Partial.Err(_) => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lisette_function_returning_partial_tuple_uses_packed_abi() {
+    let input = r#"
+fn pair<A, B>(a: A, b: B) -> Partial<(A, B), error> {
+  Partial.Ok((a, b))
+}
+
+fn test() {
+  match pair<int, string>(1, "x") {
+    Partial.Ok((first, second)) => {
+      let _ = first
+      let _ = second
+    },
+    Partial.Err(e) => {
+      let _ = e
+    },
+    Partial.Both((first, second), e) => {
+      let _ = first
+      let _ = second
+      let _ = e
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}

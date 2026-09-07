@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn bump(i: Ref<int>) -> int {\n  i.* = 1\n  10\n}\n\nfn main() {\n  let mut i = 0\n  let t = (i, bump(&i))\n  let _ = t\n}\n"
+description: |
+  
+  fn bump(i: mut Ref<int>) -> int {
+    i.* = 1
+    10
+  }
+  
+  fn main() {
+    let mut i = 0
+    let t = (i, bump(&i))
+    let _ = t
+  }
 ---
 package main
 
@@ -13,5 +24,7 @@ func bump(i *int) int {
 
 func main() {
 	i := 0
-	_ = lisette.MakeTuple2(i, bump(&i))
+	v_1 := i
+	t := lisette.MakeTuple2[int, int](v_1, bump(&i))
+	_ = t
 }

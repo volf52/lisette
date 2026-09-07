@@ -1,4 +1,50 @@
-use crate::spec::infer::infer;
+use crate::spec::infer::{infer, infer_with_go_typedefs};
+
+#[test]
+fn nested_matches_in_tuple_report_in_element_order() {
+    let result = infer(
+        r#"
+fn test(first: bool, second: bool) -> (int, int) {
+  (
+    match first { true => 1 },
+    match second { true => 2 },
+  )
+}
+"#,
+    );
+    let offsets: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|error| error.code_str() == Some("infer.non_exhaustive"))
+        .map(|error| error.primary_offset())
+        .collect();
+
+    assert_eq!(offsets.len(), 2, "{:?}", result.errors);
+    assert!(offsets[0] < offsets[1]);
+}
+
+#[test]
+fn match_arm_body_errors_precede_guard_errors() {
+    let result = infer(
+        r#"
+fn test(value: bool, guard: bool, body: bool) -> int {
+  match value {
+    _ if match guard { true => true } => match body { true => 1 },
+    _ => 0,
+  }
+}
+"#,
+    );
+    let offsets: Vec<_> = result
+        .errors
+        .iter()
+        .filter(|error| error.code_str() == Some("infer.non_exhaustive"))
+        .map(|error| error.primary_offset())
+        .collect();
+
+    assert_eq!(offsets.len(), 2, "{:?}", result.errors);
+    assert!(offsets[0] > offsets[1]);
+}
 
 #[test]
 fn test_exhaustive_enum_all_variants() {
@@ -46,6 +92,42 @@ fn test(opt: Option<Option<int>>) -> int {
 }
 "#;
     infer(input).assert_exhaustiveness_error();
+}
+
+#[test]
+fn test_non_exhaustive_reports_gap_under_matched_constructor() {
+    let input = r#"
+fn test(v: Option<(int, string)>) -> string {
+  match v {
+    Some((42, s)) => s,
+  }
+}
+"#;
+    infer(input)
+        .assert_error_contains("Option.None")
+        .assert_error_contains("Option.Some((_, _))");
+}
+
+#[test]
+fn test_non_exhaustive_reports_gaps_under_every_matched_constructor() {
+    let input = r#"
+enum Color {
+  Red,
+  Green,
+  Blue,
+}
+
+fn test(a: Color, b: Color) -> int {
+  match (a, b) {
+    (Color.Red, Color.Red) => 1,
+  }
+}
+"#;
+    infer(input)
+        .assert_error_contains("(Color.Blue, _)")
+        .assert_error_contains("(Color.Green, _)")
+        .assert_error_contains("(Color.Red, Color.Blue)")
+        .assert_error_contains("(Color.Red, Color.Green)");
 }
 
 #[test]
@@ -247,6 +329,21 @@ fn test(opt: Option<int>) -> int {
 }
 "#;
     infer(input).assert_redundancy_error();
+}
+
+#[test]
+fn test_reports_every_redundant_arm() {
+    let input = r#"
+fn test(opt: Option<int>) -> int {
+  match opt {
+    Option.Some(x) => x,
+    Option.None => 0,
+    Option.Some(y) => y,
+    Option.None => 1,
+  }
+}
+"#;
+    infer(input).assert_infer_code_count("redundant_arm", 2);
 }
 
 #[test]
@@ -1123,6 +1220,48 @@ fn test(xs: Slice<int>, ys: Slice<Void>) -> int {
 }
 
 #[test]
+fn test_array_of_never_field_no_redundancy_check() {
+    let input = r#"
+struct Uninhabited {
+  n: Array<Never, 1>,
+  m: int,
+}
+
+fn test(s: Uninhabited) -> int {
+  match s {
+    Uninhabited { m, .. } => m,
+    Uninhabited { m: x, .. } => x,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn test_zero_length_array_of_never_is_inhabited() {
+    let input = r#"
+fn test(arr: Array<Never, 0>) -> int {
+  match arr {
+    [] => 0,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn test_array_of_never_nonempty_subject_is_uninhabited() {
+    let input = r#"
+fn test(arr: Array<Never, 1>) -> int {
+  match arr {
+    [_] => 0,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
 fn test_guard_if_true_not_exhaustive() {
     let input = r#"
 match 42 {
@@ -1730,4 +1869,325 @@ fn handle(msg: Msg) -> int {
 }
 "#;
     infer(input).assert_exhaustiveness_error();
+}
+
+#[test]
+fn test_redundant_string_pattern_raw_vs_escaped() {
+    let input = r#"
+fn classify(s: string) -> int {
+  match s {
+    r"a\nb" => 1,
+    "a\\nb" => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_redundancy_error();
+}
+
+#[test]
+fn test_redundant_string_pattern_unicode_escape_vs_literal() {
+    let input = r#"
+fn classify(s: string) -> int {
+  match s {
+    "A" => 1,
+    "\u{0041}" => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_redundancy_error();
+}
+
+#[test]
+fn test_redundant_string_pattern_hex_escape_vs_literal() {
+    let input = r#"
+fn classify(s: string) -> int {
+  match s {
+    "A" => 1,
+    "\x41" => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_redundancy_error();
+}
+
+#[test]
+fn test_redundant_string_pattern_octal_escape_vs_literal() {
+    let input = r#"
+fn classify(s: string) -> int {
+  match s {
+    "A" => 1,
+    "\101" => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_redundancy_error();
+}
+
+#[test]
+fn test_redundant_integer_pattern_decimal_vs_hex() {
+    let input = r#"
+fn classify(x: int) -> int {
+  match x {
+    1 => 1,
+    0x1 => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_infer_code_count("redundant_arm", 1);
+}
+
+#[test]
+fn test_redundant_negative_integer_pattern_decimal_vs_hex() {
+    let input = r#"
+fn classify(x: int) -> int {
+  match x {
+    -1 => 1,
+    -0x1 => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_infer_code_count("redundant_arm", 1);
+}
+
+#[test]
+fn test_distinct_integer_spellings_are_not_redundant() {
+    let input = r#"
+fn classify(x: int) -> int {
+  match x {
+    1 => 1,
+    0x2 => 2,
+    -1 => 3,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn test_redundant_rune_pattern_char_vs_integer() {
+    let input = r#"
+fn classify(r: rune) -> int {
+  match r {
+    'a' => 1,
+    97 => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_infer_code_count("redundant_arm", 1);
+}
+
+#[test]
+fn test_redundant_char_pattern_hex_escape_vs_plain() {
+    let input = r#"
+fn classify(r: rune) -> int {
+  match r {
+    'a' => 1,
+    '\x61' => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_infer_code_count("redundant_arm", 1);
+}
+
+const LEVELS_TYPEDEF: &str = r#"
+#[go(closed_domain)]
+pub struct Level(int)
+
+pub const Low: Level = 1
+pub const Medium: Level = 2
+pub const High: Level = 3
+"#;
+
+#[test]
+fn test_redundant_closed_domain_pattern_const_vs_hex() {
+    let input = r#"
+import "go:example.com/levels"
+
+fn classify(l: levels.Level) -> int {
+  match l {
+    levels.Low => 1,
+    0x1 => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/levels", LEVELS_TYPEDEF)])
+        .assert_infer_code_count("redundant_arm", 1);
+}
+
+#[test]
+fn test_closed_domain_duplicate_spelling_still_non_exhaustive() {
+    let input = r#"
+import "go:example.com/levels"
+
+fn classify(l: levels.Level) -> int {
+  match l {
+    levels.Low => 1,
+    0x1 => 2,
+    3 => 3,
+  }
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/levels", LEVELS_TYPEDEF)])
+        .assert_exhaustiveness_error();
+}
+
+#[test]
+fn test_tuple_struct_refutable_field_non_exhaustive() {
+    let input = r#"
+struct MP(int, string)
+
+fn test(p: MP) -> int {
+  match p {
+    MP(0, _) => 1,
+  }
+}
+"#;
+    infer(input).assert_exhaustiveness_error();
+}
+
+#[test]
+fn test_tuple_struct_refutable_field_arm_reachable() {
+    let input = r#"
+struct MP(int, string)
+
+fn test(p: MP) -> int {
+  match p {
+    MP(0, _) => 1,
+    MP(n, _) => n,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn test_tuple_struct_refutable_field_exhaustive_with_wildcard() {
+    let input = r#"
+struct MP(int, string)
+
+fn test(p: MP) -> int {
+  match p {
+    MP(0, _) => 1,
+    MP(_, _) => 2,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn test_newtype_refutable_field_non_exhaustive() {
+    let input = r#"
+struct N(int)
+
+fn test(n: N) -> int {
+  match n {
+    N(0) => 1,
+  }
+}
+"#;
+    infer(input).assert_exhaustiveness_error();
+}
+
+#[test]
+fn test_newtype_refutable_field_arm_reachable() {
+    let input = r#"
+struct N(int)
+
+fn test(n: N) -> int {
+  match n {
+    N(0) => 1,
+    N(x) => x,
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn test_generic_struct_interface_field_keeps_catchall_reachable() {
+    let input = r#"
+import "go:example.com/events"
+
+struct Wrapper<T> { value: T }
+
+fn describe(w: Wrapper<events.Event>) -> int {
+  match w {
+    Wrapper { value: events.Token(s) } => s.length(),
+    _ => 0,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Event {}
+pub struct Token(string)
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/events", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn test_generic_struct_variant_interface_field_keeps_catchall_reachable() {
+    let input = r#"
+import "go:example.com/events"
+
+enum Holder<T> {
+  Wrap { item: T },
+}
+
+fn describe(h: Holder<events.Event>) -> int {
+  match h {
+    Holder.Wrap { item: events.Token(s) } => s.length(),
+    _ => 0,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Event {}
+pub struct Token(string)
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/events", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn test_slice_of_interface_element_keeps_catchall_reachable() {
+    let input = r#"
+import "go:example.com/events"
+
+fn describe(es: Slice<events.Event>) -> int {
+  match es {
+    [] => 0,
+    [events.Token(s), ..] => s.length(),
+    _ => 1,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Event {}
+pub struct Token(string)
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/events", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn test_redundant_string_pattern_newline_spellings() {
+    let input = r#"
+fn classify(s: string) -> int {
+  match s {
+    "\n" => 1,
+    "\u{000A}" => 2,
+    _ => 0,
+  }
+}
+"#;
+    infer(input).assert_redundancy_error();
 }

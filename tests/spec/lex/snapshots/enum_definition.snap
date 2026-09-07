@@ -1,6 +1,11 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: \nenum Status {\n  Pending,\n  Complete,\n}\n"
+description: |
+  
+  enum Status {
+    Pending,
+    Complete,
+  }
 ---
 LexResult {
     tokens: [
@@ -66,9 +71,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

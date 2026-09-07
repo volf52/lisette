@@ -14,10 +14,6 @@ type Label struct {
 	text string
 }
 
-func (l Label) String() string {
-	return fmt.Sprintf("Label { text: %v }", l.text)
-}
-
 func (l Label) Show() string {
 	return l.text
 }
@@ -33,7 +29,7 @@ func main() {
 		Value: inner_pair,
 		Label: "coords",
 	}
-	fmt.Println(ops.Describe_tagged_pair(tagged_pair))
+	fmt.Println(ops.DescribeTaggedPair(tagged_pair))
 }
 
 
@@ -41,13 +37,12 @@ func main() {
 package ops
 
 import (
-	"fmt"
 	"github.com/user/myproject/traits"
 	"github.com/user/myproject/types"
 )
 
-func Describe_tagged_pair[A traits.Showable, B traits.Showable](tp types.Tagged[types.Pair[A, B]]) string {
-	return fmt.Sprintf("tagged_pair: %v", tp.Display())
+func DescribeTaggedPair[A traits.Showable, B traits.Showable](tp types.Tagged[types.Pair[A, B]]) string {
+	return "tagged_pair: " + tp.Display()
 }
 
 
@@ -62,26 +57,19 @@ type Showable interface {
 // === types/lib.go ===
 package types
 
-import (
-	"fmt"
-	"github.com/user/myproject/traits"
-)
+import "github.com/user/myproject/traits"
 
 type Pair[A traits.Showable, B traits.Showable] struct {
 	First  A
 	Second B
 }
 
-func (p Pair[A, B]) String() string {
-	return fmt.Sprintf("Pair { first: %v, second: %v }", p.First, p.Second)
-}
-
 func (p Pair[A, B]) Show() string {
-	return fmt.Sprintf("(%v, %v)", p.First.Show(), p.Second.Show())
+	return "(" + p.First.Show() + ", " + p.Second.Show() + ")"
 }
 
 func (p Pair[A, B]) Display() string {
-	return fmt.Sprintf("Pair%v", p.Show())
+	return "Pair" + p.Show()
 }
 
 type Tagged[T traits.Showable] struct {
@@ -89,14 +77,11 @@ type Tagged[T traits.Showable] struct {
 	Label string
 }
 
-func (t Tagged[T]) String() string {
-	return fmt.Sprintf("Tagged { value: %v, label: %v }", t.Value, t.Label)
-}
-
 func (t Tagged[T]) Show() string {
-	return fmt.Sprintf("[%v] %v", t.Label, t.Value.Show())
+	fmtarg_1 := t.Label
+	return "[" + fmtarg_1 + "] " + t.Value.Show()
 }
 
 func (t Tagged[T]) Display() string {
-	return fmt.Sprintf("Tagged%v", t.Show())
+	return "Tagged" + t.Show()
 }

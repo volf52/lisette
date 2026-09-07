@@ -1,29 +1,35 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Thing {\n  name: string,\n}\n\nimpl Thing {\n  fn maybe_create(name: string) -> Option<Thing> {\n    if name.length() > 0 { Some(Thing { name: name }) }\n    else { None }\n  }\n}\n\nfn test() -> Option<Thing> {\n  Thing.maybe_create(\"hello\")\n}\n"
+description: |
+  
+  struct Thing {
+    name: string,
+  }
+  
+  impl Thing {
+    fn maybe_create(name: string) -> Option<Thing> {
+      if name.length() > 0 { Some(Thing { name: name }) }
+      else { None }
+    }
+  }
+  
+  fn test() -> Option<Thing> {
+    Thing.maybe_create("hello")
+  }
 ---
 package main
-
-import (
-	"fmt"
-	lisette "github.com/ivov/lisette/prelude"
-)
 
 type Thing struct {
 	name string
 }
 
-func (t Thing) String() string {
-	return fmt.Sprintf("Thing { name: %v }", t.name)
-}
-
-func Thing_maybe_create(name string) lisette.Option[Thing] {
+func Thing_maybeCreate(name string) (Thing, bool) {
 	if len(name) > 0 {
-		return lisette.MakeOptionSome[Thing](Thing{name: name})
+		return Thing{name: name}, true
 	}
-	return lisette.MakeOptionNone[Thing]()
+	return *new(Thing), false
 }
 
-func test() lisette.Option[Thing] {
-	return Thing_maybe_create("hello")
+func test() (Thing, bool) {
+	return Thing_maybeCreate("hello")
 }

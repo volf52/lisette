@@ -7,7 +7,7 @@ package main
 import "fmt"
 
 type Mapper[T any] interface {
-	Map_val() T
+	MapVal() T
 }
 
 type Filter interface {
@@ -24,11 +24,7 @@ type Score struct {
 	val  int
 }
 
-func (s Score) String() string {
-	return fmt.Sprintf("Score { name: %v, val: %v }", s.name, s.val)
-}
-
-func (s Score) Map_val() string {
+func (s Score) MapVal() string {
 	return s.name
 }
 
@@ -36,9 +32,9 @@ func (s Score) Keep() bool {
 	return s.val > 50
 }
 
-func process_score(item Score) string {
+func processScore(item Score) string {
 	if item.Keep() {
-		return item.Map_val()
+		return item.MapVal()
 	}
 	return "filtered"
 }
@@ -48,5 +44,5 @@ func main() {
 		name: "hello",
 		val:  42,
 	}
-	fmt.Println(process_score(s))
+	fmt.Println(processScore(s))
 }

@@ -1,108 +1,185 @@
-use diagnostics::SemanticResult;
-use emit::{EmitOptions, Emitter};
-use semantics::analyze::{AnalyzeInput, SemanticConfig, analyze};
+use emit::{EmitOptions, Planner};
+use passes::{Analysis, analyze};
 use semantics::loader::Loader;
-use semantics::store::ENTRY_MODULE_ID;
+use semantics::store::ENTRY_PACKAGE_ID;
+use semantics::{AnalysisScope, AnalyzeInput, EntryFile};
 
 use super::filesystem::MockFileSystem;
+use std::collections::BTreeMap;
 
-const ENTRY_FILE_ID: u32 = 0;
-
-pub fn compile_check(fs: MockFileSystem) -> SemanticResult {
+fn compile_with(
+    fs: MockFileSystem,
+    scope: AnalysisScope,
+    locator: deps::TypedefLocator,
+) -> Analysis {
     let main_source = fs
-        .scan_folder(ENTRY_MODULE_ID)
+        .scan_folder(ENTRY_PACKAGE_ID)
         .get("main.lis")
-        .cloned()
+        .map(|c| c.source.clone())
         .expect("main.lis must exist");
 
-    let build_result = syntax::build_ast(&main_source, ENTRY_FILE_ID);
-    if build_result.failed() {
-        return SemanticResult::with_parse_errors(build_result.errors, ENTRY_MODULE_ID);
-    }
-
+    let load_siblings = !matches!(&scope, AnalysisScope::Script { .. });
     analyze(AnalyzeInput {
-        config: SemanticConfig {
-            run_lints: true,
-            standalone_mode: false,
-            load_siblings: true,
-        },
+        load_siblings,
+        scope,
         loader: &fs,
-        source: main_source,
-        filename: "main.lis".to_string(),
-        ast: build_result.ast,
-        project_root: None,
-        locator: deps::TypedefLocator::default(),
-        compile_phase: semantics::analyze::CompilePhase::Check,
+        entry: Some(EntryFile::new(
+            main_source,
+            "main.lis".to_string(),
+            "main.lis".to_string(),
+        )),
+        locator: &locator,
+        compile_phase: semantics::CompilePhase::Check,
+        project_kind: semantics::ProjectKind::Binary,
+        go_module: "",
+        disable_cache: false,
+        recover_target: semantics::RecoverTarget::None,
     })
-    .0
 }
 
-pub fn compile_check_standalone(fs: MockFileSystem) -> SemanticResult {
-    let main_source = fs
-        .scan_folder(ENTRY_MODULE_ID)
-        .get("main.lis")
-        .cloned()
-        .expect("main.lis must exist");
+pub fn compile_check(fs: MockFileSystem) -> Analysis {
+    compile_with(
+        fs,
+        AnalysisScope::Directory,
+        deps::TypedefLocator::default(),
+    )
+}
 
-    let build_result = syntax::build_ast(&main_source, ENTRY_FILE_ID);
-    if build_result.failed() {
-        return SemanticResult::with_parse_errors(build_result.errors, ENTRY_MODULE_ID);
-    }
+pub fn compile_script_entry(
+    fs: MockFileSystem,
+    entry_name: &str,
+    phase: semantics::CompilePhase,
+) -> Analysis {
+    let source = fs
+        .scan_folder(ENTRY_PACKAGE_ID)
+        .get(entry_name)
+        .map(|c| c.source.clone())
+        .unwrap_or_else(|| panic!("entry file `{entry_name}` must exist"));
 
     analyze(AnalyzeInput {
-        config: SemanticConfig {
-            run_lints: true,
-            standalone_mode: true,
-            load_siblings: false,
+        load_siblings: false,
+        scope: AnalysisScope::Script {
+            inside_project: false,
         },
         loader: &fs,
-        source: main_source,
-        filename: "main.lis".to_string(),
-        ast: build_result.ast,
-        project_root: None,
-        locator: deps::TypedefLocator::default(),
-        compile_phase: semantics::analyze::CompilePhase::Check,
+        entry: Some(EntryFile::new(
+            source,
+            entry_name.to_string(),
+            entry_name.to_string(),
+        )),
+        locator: &deps::TypedefLocator::default(),
+        compile_phase: phase,
+        project_kind: semantics::ProjectKind::Binary,
+        go_module: "",
+        disable_cache: true,
+        recover_target: semantics::RecoverTarget::None,
     })
-    .0
+}
+
+pub fn compile_check_with_locator(fs: MockFileSystem, locator: deps::TypedefLocator) -> Analysis {
+    compile_with(fs, AnalysisScope::Directory, locator)
+}
+
+pub fn compile_check_script(fs: MockFileSystem) -> Analysis {
+    compile_with(
+        fs,
+        AnalysisScope::Script {
+            inside_project: false,
+        },
+        deps::TypedefLocator::default(),
+    )
+}
+
+pub fn locator_with_go_dep(module_path: &str, version: &str) -> deps::TypedefLocator {
+    let mut go_deps = BTreeMap::new();
+    go_deps.insert(
+        module_path.to_string(),
+        deps::GoDependency::Remote {
+            version: version.to_string(),
+            via: None,
+        },
+    );
+    deps::TypedefLocator::new(go_deps, None, stdlib::Target::host())
+}
+
+pub fn compile_project_files(
+    fs: MockFileSystem,
+    go_module: &str,
+    sourcemap: bool,
+) -> Vec<emit::OutputFile> {
+    try_compile_project_files(fs, go_module, sourcemap)
+        .unwrap_or_else(|diagnostics| panic!("Emission failed: {diagnostics:?}"))
+}
+
+pub fn try_compile_project_files(
+    fs: MockFileSystem,
+    go_module: &str,
+    sourcemap: bool,
+) -> Result<Vec<emit::OutputFile>, Vec<diagnostics::LisetteDiagnostic>> {
+    try_compile_project_files_with_tests(fs, go_module, sourcemap, false)
+}
+
+pub fn compile_project_files_with_tests(
+    fs: MockFileSystem,
+    go_module: &str,
+    sourcemap: bool,
+    emit_tests: bool,
+) -> Vec<emit::OutputFile> {
+    try_compile_project_files_with_tests(fs, go_module, sourcemap, emit_tests)
+        .unwrap_or_else(|diagnostics| panic!("Emission failed: {diagnostics:?}"))
+}
+
+pub fn try_compile_project_files_with_tests(
+    fs: MockFileSystem,
+    go_module: &str,
+    sourcemap: bool,
+    emit_tests: bool,
+) -> Result<Vec<emit::OutputFile>, Vec<diagnostics::LisetteDiagnostic>> {
+    let main_source = fs
+        .scan_folder(ENTRY_PACKAGE_ID)
+        .get("main.lis")
+        .map(|c| c.source.clone())
+        .expect("main.lis must exist");
+
+    let analysis = analyze(AnalyzeInput {
+        load_siblings: true,
+        scope: AnalysisScope::Directory,
+        loader: &fs,
+        entry: Some(EntryFile::new(
+            main_source,
+            "main.lis".to_string(),
+            "main.lis".to_string(),
+        )),
+        locator: &deps::TypedefLocator::default(),
+        compile_phase: if emit_tests {
+            semantics::CompilePhase::Test
+        } else {
+            semantics::CompilePhase::Emit
+        },
+        project_kind: semantics::ProjectKind::Binary,
+        go_module,
+        disable_cache: true,
+        recover_target: semantics::RecoverTarget::None,
+    });
+    assert!(
+        analysis.errors().is_empty(),
+        "Expected no errors, got: {:?}",
+        analysis.errors()
+    );
+
+    Planner::emit(
+        &analysis.emit_input,
+        go_module,
+        "main",
+        EmitOptions {
+            sourcemap,
+            emit_tests,
+        },
+    )
 }
 
 pub fn compile_project(fs: MockFileSystem, go_module: &str) -> String {
-    let main_source = fs
-        .scan_folder(ENTRY_MODULE_ID)
-        .get("main.lis")
-        .cloned()
-        .expect("main.lis must exist");
-
-    let build_result = syntax::build_ast(&main_source, ENTRY_FILE_ID);
-    assert!(
-        !build_result.failed(),
-        "Expected no parse errors, got: {:?}",
-        build_result.errors
-    );
-
-    let (analysis, _facts) = analyze(AnalyzeInput {
-        config: SemanticConfig {
-            run_lints: true,
-            standalone_mode: false,
-            load_siblings: true,
-        },
-        loader: &fs,
-        source: main_source,
-        filename: "main.lis".to_string(),
-        ast: build_result.ast,
-        project_root: None,
-        locator: deps::TypedefLocator::default(),
-        compile_phase: semantics::analyze::CompilePhase::Emit,
-    });
-
-    assert!(
-        analysis.errors.is_empty(),
-        "Expected no errors, got: {:?}",
-        analysis.errors
-    );
-
-    let options = EmitOptions { debug: false };
-    let mut files = Emitter::emit(&analysis.into_emit_input(), go_module, options);
+    let mut files = compile_project_files(fs, go_module, false);
     files.sort_by(|a, b| a.name.cmp(&b.name));
 
     use std::fmt::Write;

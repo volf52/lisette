@@ -1,28 +1,43 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn get_a() -> Result<int, string> { Ok(10) }\nfn get_b() -> Result<int, string> { Ok(20) }\n\nfn test() -> int {\n  let result = try {\n    let a = get_a()?;\n    let b = get_b()?;\n    a + b\n  };\n  match result {\n    Ok(sum) => sum,\n    Err(_) => 0,\n  }\n}\n"
+description: |
+  
+  fn get_a() -> Result<int, string> { Ok(10) }
+  fn get_b() -> Result<int, string> { Ok(20) }
+  
+  fn test() -> int {
+    let result = try {
+      let a = get_a()?;
+      let b = get_b()?;
+      a + b
+    };
+    match result {
+      Ok(sum) => sum,
+      Err(_) => 0,
+    }
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func get_a() lisette.Result[int, string] {
+func getA() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](10)
 }
 
-func get_b() lisette.Result[int, string] {
+func getB() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](20)
 }
 
 func test() int {
 	var result lisette.Result[int, string]
 	tryResult_1 := func() lisette.Result[int, string] {
-		check_2 := get_a()
+		check_2 := getA()
 		if check_2.Tag != lisette.ResultOk {
 			return lisette.MakeResultErr[int, string](check_2.ErrVal)
 		}
 		a := check_2.OkVal
-		check_3 := get_b()
+		check_3 := getB()
 		if check_3.Tag != lisette.ResultOk {
 			return lisette.MakeResultErr[int, string](check_3.ErrVal)
 		}

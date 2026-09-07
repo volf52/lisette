@@ -3,19 +3,74 @@
 // Go: 0.0.0
 // Lisette: 0.0.0
 
+import "go:cmp"
+import "go:fmt"
+
 /// Empty constraint (any)
 pub fn Clone<T>(v: T) -> T
+
+/// The `S ~[]E` collapse must reach the bound: `K: Sink<Slice<E>>`, not `Sink<S>`.
+#[go(collapsed_type_params, "K, Slice<E>, E")]
+pub fn DrainAll<K: Sink<Slice<E>>, E>(k: K, s: Slice<E>)
+
+/// Array-shape rewrite: A ~[4]E with E any.
+#[go(collapsed_type_params, "Array<E, 4>, E")]
+pub fn Echo4<E>(x: Array<E, 4>) -> Array<E, 4>
 
 // SKIPPED: Either - constraint:union
 // type constraint T cannot be represented
 
+/// Bound by the predeclared error interface; the bare-T return must stay T.
+pub fn FirstError<T: error>(errs: Slice<T>) -> T
+
+/// Bound by a method-only interface declared in this package.
+pub fn GreetAll<T: Greeter>(xs: Slice<T>) -> string
+
+/// Bound by an embedding method-set interface — representable by name.
+pub fn GreetLoud<T: LoudGreeter>(xs: Slice<T>)
+
 pub fn Identity<T>(x: T) -> T
 
-// SKIPPED: Max - constraint:comparable
-// type constraint T cannot be represented
+/// Map-shape rewrite: single map, V any.
+#[go(collapsed_type_params, "Map<K, V>, K, V")]
+pub fn MapClone<K: Comparable, V>(m: Map<K, V>) -> Map<K, V>
 
-// SKIPPED: Min - constraint:comparable
-// type constraint T cannot be represented
+/// Map-shape rewrite: two maps, shared V (V any).
+#[go(collapsed_type_params, "Map<K, V>, Map<K, V>, K, V")]
+pub fn MapCopy<K: Comparable, V>(dst: mut Map<K, V>, src: Map<K, V>)
+
+/// Map-shape rewrite: two maps, shared V (V comparable).
+#[go(collapsed_type_params, "Map<K, V>, Map<K, V>, K, V")]
+pub fn MapEqual<K: Comparable, V: Comparable>(m1: Map<K, V>, m2: Map<K, V>) -> bool
+
+/// Map-shape rewrite: two maps, distinct V.
+#[go(collapsed_type_params, "Map<K, V1>, Map<K, V2>, K, V1, V2")]
+pub fn MapEqualFunc<K: Comparable, V1, V2>(m1: Map<K, V1>, m2: Map<K, V2>, eq: fn(V1, V2) -> bool) -> bool
+
+/// Comparable constraint
+pub fn Max<T: Comparable>(a: T, b: T) -> T
+
+/// Function with ordered constraint
+pub fn Min<T: Ordered>(a: T, b: T) -> T
+
+/// cmp.Ordered constraint (named-identity recognizer)
+pub fn MinOrdered<T: cmp.Ordered>(a: T, b: T) -> T
+
+/// Generic interface bound with a concrete type arg.
+pub fn PushInts<P: Pusher<int, string>>(p: P)
+
+/// Generic interface bound with type params from the surrounding scope.
+pub fn PushOne<T, C, P: Pusher<T, C>>(p: P, t: T, c: C)
+
+/// Bound by an alias of a method-only interface.
+pub fn SalutationsAll<T: Salutation>(xs: Slice<T>)
+
+/// Bound by an external method-only interface (fmt.Stringer).
+pub fn Shout<T: fmt.Stringer>(x: T) -> string
+
+/// Slice-shape rewrite: S ~[]E with E: cmp.Ordered
+#[go(collapsed_type_params, "Slice<E>, E")]
+pub fn SortInts<E: cmp.Ordered>(x: Slice<E>) -> Slice<E>
 
 /// Multiple constraints
 pub fn Swap<T, U>(a: T, b: U) -> (U, T)
@@ -24,11 +79,29 @@ pub struct Box<T> {
   pub Value: T,
 }
 
-// SKIPPED: ConstrainedPair - constraint:comparable
-// type constraint K cannot be represented
-pub type ConstrainedPair
+/// Multiple type parameters with different constraints
+pub struct ConstrainedPair<K: Comparable, V> {
+  pub Key: K,
+  pub Value: V,
+}
 
 pub type Container<T>
+
+/// Generic struct field that binds a type parameter to a generic interface.
+pub struct Driver<T, C, P: Pusher<T, C>> {
+  pub Inner: P,
+}
+
+/// Local method-only interface for cross-package and self-package bound tests.
+pub interface Greeter {
+  fn Greet() -> string
+}
+
+/// Method-set interface that embeds another interface (the hash.Hash shape).
+pub interface LoudGreeter {
+  fn Greet() -> string
+  fn Volume() -> int
+}
 
 /// Ordered constraint (type union)
 pub type Ordered
@@ -38,16 +111,31 @@ pub struct Pair<K, V> {
   pub Value: V,
 }
 
-/// Generic interface - emits as opaque type with type params
-pub interface Transformer<T> {
-  fn Transform(arg0: T) -> T
+/// Generic interface used as a bound; type args must round-trip into the bound.
+pub interface Pusher<T, C> {
+  fn Push(t: T, c: C)
 }
 
-// SKIPPED: GetKey - constraint:comparable
-// type constraint K cannot be represented
+/// Type alias to a method-only interface — exercises *types.Alias path.
+pub type Salutation = Greeter
+
+/// Interface bound whose type argument is itself a shape-collapsed param.
+pub interface Sink<T> {
+  fn Drain(t: T)
+}
+
+/// Generic interface - emits as opaque type with type params
+pub interface Transformer<T> {
+  fn Transform(t: T) -> T
+}
+
+impl<K: Comparable, V> ConstrainedPair<K, V> {
+  /// Method on constrained generic
+  fn GetKey(self) -> K
+}
 
 impl<T> Container<T> {
-  fn Add(self: Ref<Container<T>>, item: T)
+  fn Add(self: mut Ref<Container<T>>, item: T)
   fn Get(self: Ref<Container<T>>, index: int) -> T
   fn IsEmpty(self) -> bool
   fn Len(self: Ref<Container<T>>) -> int

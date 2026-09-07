@@ -1,0 +1,34 @@
+---
+source: tests/spec/emit/patterns.rs
+description: |
+  
+  import "go:example.com/shapes"
+  
+  fn drain(ch: Receiver<shapes.Shape>) -> int {
+    select {
+      match ch.receive() {
+        Some(shapes.Rect { W: w, H: h }) => w * h,
+        None => -1,
+      },
+    }
+  }
+---
+package main
+
+import "example.com/shapes"
+
+func drain(ch <-chan shapes.Shape) int {
+	select {
+	case recv_1, ok := <-ch:
+		if ok {
+			asserted_2, ok_3 := recv_1.(shapes.Rect)
+			if ok_3 {
+				return asserted_2.W * asserted_2.H
+			} else {
+				return -1
+			}
+		} else {
+			return -1
+		}
+	}
+}

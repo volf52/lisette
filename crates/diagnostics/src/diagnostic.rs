@@ -1,10 +1,19 @@
-use miette::{Diagnostic, LabeledSpan, Severity};
 use owo_colors::OwoColorize;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::graphical::FrameLabel;
+use std::cmp::Ordering;
+use std::error::Error;
 use syntax::ParseError;
 use syntax::ast::Span;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Error,
+    Warning,
+    Advice,
+}
 
 /// Source text with a precomputed line-offset index for O(log n) span lookups.
 #[derive(Clone, Debug)]
@@ -26,56 +35,25 @@ impl IndexedSource {
             line_starts: Arc::from(line_starts),
         }
     }
-}
 
-impl miette::SourceCode for IndexedSource {
-    fn read_span<'a>(
-        &'a self,
-        span: &miette::SourceSpan,
-        context_lines_before: usize,
-        context_lines_after: usize,
-    ) -> Result<Box<dyn miette::SpanContents<'a> + 'a>, miette::MietteError> {
-        let src = self.source.as_ref();
-        let offset = span.offset();
-        let len = span.len();
+    pub(crate) fn line_col(&self, offset: usize) -> (usize, usize) {
+        let line = self.line_index_of_offset(offset);
+        (line + 1, offset - self.line_starts[line] + 1)
+    }
 
-        if offset + len > src.len() {
-            return Err(miette::MietteError::OutOfBounds);
+    pub(crate) fn text(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        &self.line_starts
+    }
+
+    pub(crate) fn line_index_of_offset(&self, offset: usize) -> usize {
+        match self.line_starts.binary_search(&offset) {
+            Ok(exact) => exact,
+            Err(index) => index.saturating_sub(1),
         }
-
-        let span_line = match self.line_starts.binary_search(&offset) {
-            Ok(exact) => exact,
-            Err(idx) => idx.saturating_sub(1),
-        };
-
-        let start_line = span_line.saturating_sub(context_lines_before);
-        let start_offset = self.line_starts[start_line];
-        let start_column = if context_lines_before == 0 {
-            offset - self.line_starts[span_line]
-        } else {
-            0
-        };
-
-        let span_end = offset + len.saturating_sub(1);
-        let end_line = match self.line_starts.binary_search(&span_end) {
-            Ok(exact) => exact,
-            Err(idx) => idx.saturating_sub(1),
-        };
-
-        let last_line = (end_line + context_lines_after).min(self.line_starts.len() - 1);
-        let end_offset = if last_line + 1 < self.line_starts.len() {
-            self.line_starts[last_line + 1].min(src.len())
-        } else {
-            src.len()
-        };
-
-        Ok(Box::new(miette::MietteSpanContents::new(
-            &src.as_bytes()[start_offset..end_offset],
-            (start_offset, end_offset - start_offset).into(),
-            start_line,
-            start_column,
-            last_line + 1,
-        )))
     }
 }
 
@@ -87,19 +65,21 @@ fn strip_period(s: &str, strip: bool) -> &str {
     }
 }
 
-fn span_to_labeled(span: &Span, text: String, primary: bool) -> LabeledSpan {
-    let source_span = miette::SourceSpan::new(
-        (span.byte_offset as usize).into(),
-        span.byte_length as usize,
-    );
-    if primary {
-        LabeledSpan::new_primary_with_span(Some(text), source_span)
-    } else {
-        LabeledSpan::new_with_span(Some(text), source_span)
+fn combine_help_and_note(help: Option<&str>, note: Option<&str>, has_code: bool) -> Option<String> {
+    match (help, note) {
+        (Some(help), Some(note)) => Some(format!("{} {}", help, strip_period(note, has_code))),
+        (Some(help), None) => Some(strip_period(help, has_code).to_string()),
+        (None, Some(note)) => Some(strip_period(note, has_code).to_string()),
+        (None, None) => None,
     }
 }
 
-pub use miette::Report;
+#[derive(Debug, Clone)]
+struct Label {
+    span: Span,
+    text: String,
+    primary: bool,
+}
 
 impl From<ParseError> for LisetteDiagnostic {
     fn from(err: ParseError) -> Self {
@@ -172,139 +152,53 @@ where
 #[must_use]
 pub struct LisetteDiagnostic {
     message: String,
-    labels: Vec<LabeledSpan>,
+    labels: Vec<Label>,
     help: Option<String>,
     note: Option<String>,
     severity: Severity,
     code: Option<String>,
-    file_id: Option<u32>,
-    use_color: bool,
+    fix: Option<crate::Fix>,
+    file_location: Option<String>,
 }
 
 impl fmt::Display for LisetteDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.use_color {
-            let styled_message = match self.severity {
-                Severity::Error => {
-                    format_with_backticks(&self.message, true, |s| format!("{}", s.red().bold()))
-                }
-                Severity::Warning => {
-                    format_with_backticks(&self.message, true, |s| format!("{}", s.yellow().bold()))
-                }
-                Severity::Advice => {
-                    format_with_backticks(&self.message, true, |s| format!("{}", s.cyan().bold()))
-                }
-            };
-            write!(f, "{}", styled_message)?;
-        } else {
-            self.message.fmt(f)?;
-        }
-        Ok(())
+        f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for LisetteDiagnostic {}
+impl Error for LisetteDiagnostic {}
 
-struct HelpText<'a> {
-    help: Option<&'a str>,
-    note: Option<&'a str>,
-    diagnostic_code: Option<&'a str>,
-    use_color: bool,
-}
-
-impl fmt::Display for HelpText<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let use_color = self.use_color;
-        let has_code = self.diagnostic_code.is_some();
-
-        let combined = match (self.help, self.note) {
-            (Some(h), Some(n)) => format!("{} {}", h, strip_period(n, has_code)),
-            (Some(h), None) => strip_period(h, has_code).to_string(),
-            (None, Some(n)) => strip_period(n, has_code).to_string(),
-            (None, None) => String::new(),
-        };
-
-        if !combined.is_empty() {
-            if use_color {
-                let styled = format_with_backticks(&combined, true, |s| format!("{}", s.dimmed()));
-                write!(f, "{}", styled)?;
-            } else {
-                write!(f, "{}", combined)?;
-            }
-        }
-
-        if let Some(code) = self.diagnostic_code {
-            let is_listing = self
-                .help
-                .is_some_and(|h| h.lines().skip(1).any(|line| line.starts_with("  ")));
-            let prefix = if is_listing { "\ncode: " } else { " · code: " };
-            if use_color {
-                write!(f, "{}{}", prefix.dimmed(), format!("[{}]", code).dimmed())?;
-            } else {
-                write!(f, "{}[{}]", prefix, code)?;
-            }
-        }
-
-        Ok(())
+fn style_help(text: &str, use_color: bool) -> String {
+    if use_color {
+        format_with_backticks(text, true, |s| format!("{}", s.dimmed()))
+    } else {
+        text.to_string()
     }
 }
 
-impl Diagnostic for LisetteDiagnostic {
-    fn severity(&self) -> Option<Severity> {
-        Some(self.severity)
-    }
-
-    fn help<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
-        let diagnostic_code = self.code.as_deref();
-
-        if self.help.is_none() && self.note.is_none() && diagnostic_code.is_none() {
-            return None;
-        }
-        Some(Box::new(HelpText {
-            help: self.help.as_deref(),
-            note: self.note.as_deref(),
-            diagnostic_code,
-            use_color: self.use_color,
-        }))
-    }
-
-    fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
-        let use_color = self.use_color;
-        let severity = self.severity;
-
-        let formatted_labels = self.labels.iter().map(move |span| {
-            if let Some(label) = span.label() {
-                let formatted = if use_color {
-                    let base_style = match severity {
-                        Severity::Error => |s: &str| format!("{}", s.red()),
-                        Severity::Warning => |s: &str| format!("{}", s.yellow()),
-                        Severity::Advice => |s: &str| format!("{}", s.cyan()),
-                    };
-                    format_with_backticks(label, true, base_style)
-                } else {
-                    label.to_string()
-                };
-                if span.primary() {
-                    LabeledSpan::new_primary_with_span(Some(formatted), *span.inner())
-                } else {
-                    LabeledSpan::new_with_span(Some(formatted), *span.inner())
-                }
-            } else {
-                span.clone()
-            }
-        });
-
-        Some(Box::new(formatted_labels))
-    }
-
-    fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
-        None // rendered with the help text instead
+fn style_code(code: &str, prefix: &str, use_color: bool) -> String {
+    if use_color {
+        format!(
+            "{}{}",
+            format!("{}code: ", prefix).dimmed(),
+            format!("[{}]", code).dimmed()
+        )
+    } else {
+        format!("{}code: [{}]", prefix, code)
     }
 }
 
 impl LisetteDiagnostic {
     pub fn plain_message(&self) -> &str {
         &self.message
+    }
+
+    pub fn plain_label(&self) -> Option<&str> {
+        self.labels
+            .iter()
+            .map(|label| label.text.as_str())
+            .find(|text| !text.is_empty())
     }
 
     pub fn plain_help(&self) -> Option<&str> {
@@ -315,56 +209,55 @@ impl LisetteDiagnostic {
         self.note.as_deref()
     }
 
-    pub fn error(message: impl Into<String>) -> Self {
+    pub fn help_and_note(&self) -> Option<String> {
+        combine_help_and_note(
+            self.help.as_deref(),
+            self.note.as_deref(),
+            self.code.is_some(),
+        )
+    }
+
+    fn new(message: impl Into<String>, severity: Severity) -> Self {
         Self {
             message: message.into(),
             labels: Vec::new(),
             help: None,
             note: None,
-            severity: Severity::Error,
+            severity,
             code: None,
-            file_id: None,
-            use_color: false,
+            fix: None,
+            file_location: None,
         }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::new(message, Severity::Error)
     }
 
     pub fn warn(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            labels: Vec::new(),
-            help: None,
-            note: None,
-            severity: Severity::Warning,
-            code: None,
-            file_id: None,
-            use_color: false,
-        }
+        Self::new(message, Severity::Warning)
     }
 
-    pub fn with_color(mut self, use_color: bool) -> Self {
-        self.use_color = use_color;
-        self
+    pub fn info(message: impl Into<String>) -> Self {
+        Self::new(message, Severity::Advice)
     }
 
     pub fn with_span_label(mut self, span: &Span, text: impl Into<String>) -> Self {
-        if self.file_id.is_none() {
-            self.file_id = Some(span.file_id);
-        }
-        self.labels.push(span_to_labeled(span, text.into(), false));
+        self.push_label(span, text.into(), false);
         self
     }
 
     pub fn with_span_primary_label(mut self, span: &Span, text: impl Into<String>) -> Self {
-        if self.file_id.is_none() {
-            self.file_id = Some(span.file_id);
-        }
-        self.labels.push(span_to_labeled(span, text.into(), true));
+        self.push_label(span, text.into(), true);
         self
     }
 
-    pub fn with_labels(mut self, labels: Vec<LabeledSpan>) -> Self {
-        self.labels.extend(labels);
-        self
+    fn push_label(&mut self, span: &Span, text: String, primary: bool) {
+        self.labels.push(Label {
+            span: *span,
+            text,
+            primary,
+        });
     }
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
@@ -377,57 +270,280 @@ impl LisetteDiagnostic {
         self
     }
 
-    pub fn with_lex_code(mut self, code: &str) -> Self {
-        self.code = Some(format!("lex.{}", code));
+    pub fn with_fix(mut self, fix: crate::Fix) -> Self {
+        assert_eq!(
+            self.file_id(),
+            Some(fix.file_id()),
+            "a fix must edit the file labeled by its diagnostic",
+        );
+        self.fix = Some(fix);
         self
     }
 
-    pub fn with_parse_code(mut self, code: &str) -> Self {
-        self.code = Some(format!("parse.{}", code));
+    pub fn fix(&self) -> Option<&crate::Fix> {
+        self.fix.as_ref()
+    }
+
+    pub(crate) fn with_parse_code(mut self, code: &str) -> Self {
+        self.code = Some(format!("parse.{code}"));
         self
     }
 
     pub fn with_resolve_code(mut self, code: &str) -> Self {
-        self.code = Some(format!("resolve.{}", code));
+        self.code = Some(format!("resolve.{code}"));
         self
     }
 
     pub fn with_infer_code(mut self, code: &str) -> Self {
-        self.code = Some(format!("infer.{}", code));
+        self.code = Some(format!("infer.{code}"));
         self
     }
 
-    pub fn with_lint_code(mut self, code: &str) -> Self {
-        self.code = Some(format!("lint.{}", code));
+    pub(crate) fn with_lint_code(mut self, code: &str) -> Self {
+        debug_assert!(
+            matches!(self.severity, Severity::Warning | Severity::Advice),
+            "with_lint_code requires Warning or Advice severity (got {:?}); \
+             use a phase-specific code constructor for errors",
+            self.severity,
+        );
+        self.code = Some(format!("lint.{code}"));
         self
     }
 
-    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+    pub(crate) fn with_attribute_code(mut self, code: &str) -> Self {
+        self.code = Some(format!("attribute.{code}"));
+        self
+    }
+
+    pub(crate) fn with_emit_code(mut self, code: &str) -> Self {
+        self.code = Some(format!("emit.{code}"));
+        self
+    }
+
+    fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
         self
     }
 
-    pub fn with_source_code(self, source: IndexedSource, filename: String) -> miette::Report {
-        miette::Report::new(self).with_source_code(miette::NamedSource::new(filename, source))
+    pub(crate) fn styled_message(&self, use_color: bool) -> String {
+        if !use_color {
+            return self.message.clone();
+        }
+        match self.severity {
+            Severity::Error => {
+                format_with_backticks(&self.message, true, |s| format!("{}", s.red().bold()))
+            }
+            Severity::Warning => {
+                format_with_backticks(&self.message, true, |s| format!("{}", s.yellow().bold()))
+            }
+            Severity::Advice => {
+                format_with_backticks(&self.message, true, |s| format!("{}", s.blue().bold()))
+            }
+        }
+    }
+
+    pub(crate) fn styled_help_parts(&self, use_color: bool) -> (Option<String>, Option<String>) {
+        let combined = combine_help_and_note(
+            self.help.as_deref(),
+            self.note.as_deref(),
+            self.code.is_some(),
+        )
+        .filter(|text| !text.is_empty());
+        let code = self.code.as_deref();
+
+        match (combined, code) {
+            (None, None) => (None, None),
+            (None, Some(code)) => (None, Some(style_code(code, "", use_color))),
+            (Some(text), None) => (Some(style_help(&text, use_color)), None),
+            (Some(text), Some(code)) if text.contains('\n') => (
+                Some(style_help(&text, use_color)),
+                Some(style_code(code, "", use_color)),
+            ),
+            (Some(text), Some(code)) => (
+                Some(format!(
+                    "{}{}",
+                    style_help(&text, use_color),
+                    style_code(code, " · ", use_color)
+                )),
+                None,
+            ),
+        }
+    }
+
+    pub fn secondary_labels(&self) -> impl Iterator<Item = (Span, &str)> {
+        self.labels
+            .iter()
+            .skip(1)
+            .map(|label| (label.span, label.text.as_str()))
+    }
+
+    pub fn label_count(&self) -> usize {
+        self.labels.len()
+    }
+
+    pub(crate) fn label_file_ids(&self) -> Vec<u32> {
+        let mut file_ids: Vec<u32> = Vec::new();
+        for label in &self.labels {
+            if !file_ids.contains(&label.span.file_id) {
+                file_ids.push(label.span.file_id);
+            }
+        }
+        file_ids
+    }
+
+    pub(crate) fn frame_labels(&self, file_id: u32, use_color: bool) -> Vec<FrameLabel> {
+        self.labels
+            .iter()
+            .filter(|label| label.span.file_id == file_id)
+            .map(|label| {
+                let formatted = if use_color {
+                    let style = |s: &str| match self.severity {
+                        Severity::Error => format!("{}", s.red()),
+                        Severity::Warning => format!("{}", s.yellow()),
+                        Severity::Advice => format!("{}", s.blue()),
+                    };
+                    format_with_backticks(&label.text, true, style)
+                } else {
+                    label.text.clone()
+                };
+                FrameLabel::new(
+                    label.span.byte_offset as usize,
+                    label.span.byte_length as usize,
+                    formatted,
+                    label.primary,
+                )
+            })
+            .collect()
+    }
+
+    /// Byte offset and length of the first label, which anchors the diagnostic.
+    pub fn first_label_span(&self) -> Option<(usize, usize)> {
+        self.labels.first().map(|label| {
+            (
+                label.span.byte_offset as usize,
+                label.span.byte_length as usize,
+            )
+        })
     }
 
     pub fn code_str(&self) -> Option<&str> {
         self.code.as_deref()
     }
 
+    pub fn lint_name(&self) -> Option<&str> {
+        self.code.as_deref()?.strip_prefix("lint.")
+    }
+
     pub fn primary_offset(&self) -> usize {
-        self.labels.first().map(|l| l.offset()).unwrap_or(0)
+        self.labels
+            .first()
+            .map(|label| label.span.byte_offset as usize)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn label_points(&self) -> Vec<(u32, usize)> {
+        self.labels
+            .iter()
+            .map(|label| (label.span.file_id, label.span.byte_offset as usize))
+            .collect()
+    }
+
+    fn location_label(&self) -> Option<&Label> {
+        let file_id = self.file_id()?;
+        self.labels
+            .iter()
+            .filter(|label| label.span.file_id == file_id)
+            .find(|label| label.primary)
+            .or_else(|| self.labels.first())
+    }
+
+    pub fn location_offset(&self) -> Option<usize> {
+        self.location_label()
+            .map(|label| label.span.byte_offset as usize)
+    }
+
+    pub fn with_file_location(mut self, display_path: impl Into<String>) -> Self {
+        self.file_location = Some(display_path.into());
+        self
+    }
+
+    pub fn file_location(&self) -> Option<&str> {
+        self.file_location.as_deref()
+    }
+
+    pub fn located_label(&self) -> Option<&str> {
+        self.location_label()
+            .map(|label| label.text.as_str())
+            .filter(|text| !text.is_empty())
+            .or_else(|| self.plain_label())
+    }
+
+    pub(crate) fn severity_word(&self) -> &'static str {
+        match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Advice => "info",
+        }
     }
 
     pub fn file_id(&self) -> Option<u32> {
-        self.file_id
+        self.labels.first().map(|label| label.span.file_id)
     }
 
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
     }
 
-    pub fn is_warning(&self) -> bool {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn is_warning(&self) -> bool {
         self.severity == Severity::Warning
+    }
+
+    pub fn is_info(&self) -> bool {
+        self.severity == Severity::Advice
+    }
+
+    pub fn sort_key(a: &Self, b: &Self) -> Ordering {
+        a.file_id()
+            .cmp(&b.file_id())
+            .then_with(|| a.primary_offset().cmp(&b.primary_offset()))
+            .then_with(|| a.code_str().cmp(&b.code_str()))
+            .then_with(|| a.plain_message().cmp(b.plain_message()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_constructor_is_advice_severity() {
+        let diagnostic = LisetteDiagnostic::info("advisory");
+        assert!(diagnostic.is_info());
+        assert!(!diagnostic.is_error());
+        assert!(!diagnostic.is_warning());
+        assert_eq!(diagnostic.severity_word(), "info");
+    }
+
+    #[test]
+    #[should_panic(expected = "a fix must edit the file labeled by its diagnostic")]
+    fn rejects_fix_for_a_different_file() {
+        let fix = crate::Fix::new("invalid", crate::Edit::deletion(Span::new(1, 0, 1)));
+        let _ = LisetteDiagnostic::error("invalid")
+            .with_span_label(&Span::new(0, 0, 1), "label")
+            .with_fix(fix);
+    }
+
+    #[test]
+    fn labels_keep_their_own_file_identity() {
+        let diagnostic = LisetteDiagnostic::error("cross-file")
+            .with_span_primary_label(&Span::new(3, 4, 1), "first")
+            .with_span_label(&Span::new(7, 8, 1), "second");
+
+        assert_eq!(diagnostic.file_id(), Some(3));
+        assert_eq!(diagnostic.label_points(), vec![(3, 4), (7, 8)]);
+        assert_eq!(diagnostic.label_file_ids(), vec![3, 7]);
+        assert_eq!(diagnostic.frame_labels(3, false).len(), 1);
+        assert_eq!(diagnostic.frame_labels(7, false).len(), 1);
     }
 }

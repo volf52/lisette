@@ -1,36 +1,11 @@
 use syntax::ast::Expression;
-use syntax::program::Definition;
+use syntax::program::{Definition, DefinitionBody};
 
-use super::super::super::Checker;
+use crate::checker::infer::InferCtx;
 
-impl Checker<'_, '_> {
-    pub(super) fn infer_enum_definition(&mut self, expression: Expression) -> Expression {
-        let Expression::Enum {
-            ref name,
-            name_span,
-            ..
-        } = expression
-        else {
-            unreachable!()
-        };
-        self.check_prelude_shadowing(name, name_span);
-        expression
-    }
-
-    pub(super) fn infer_value_enum_definition(&mut self, expression: Expression) -> Expression {
-        let Expression::ValueEnum {
-            ref name,
-            name_span,
-            ..
-        } = expression
-        else {
-            unreachable!()
-        };
-        self.check_prelude_shadowing(name, name_span);
-        expression
-    }
-
+impl InferCtx<'_> {
     pub(super) fn infer_struct_definition(&mut self, expression: Expression) -> Expression {
+        let store = self.store;
         let Expression::Struct {
             doc,
             attributes,
@@ -38,7 +13,6 @@ impl Checker<'_, '_> {
             name_span,
             generics,
             fields,
-            kind,
             visibility,
             span,
         } = expression
@@ -47,31 +21,29 @@ impl Checker<'_, '_> {
         };
 
         let qualified_name = self.qualify_name(&name);
-        if let Some(Definition::Struct {
-            name: definition_name,
+        if let Some(Definition {
             name_span: definition_name_span,
-            generics: definition_generics,
-            fields: definition_fields,
-            kind: definition_kind,
+            body:
+                DefinitionBody::Struct {
+                    generics: definition_generics,
+                    fields: definition_fields,
+                    ..
+                },
             ..
-        }) = self.store.get_definition(&qualified_name)
+        }) = store.get_definition(&qualified_name)
         {
-            let definition_name = definition_name.clone();
-            let definition_name_span = *definition_name_span;
+            let definition_name_span =
+                definition_name_span.expect("struct definition has a name span");
             let definition_generics = definition_generics.clone();
             let definition_fields = definition_fields.clone();
-            let definition_kind = *definition_kind;
-
-            self.check_prelude_shadowing(&definition_name, definition_name_span);
 
             Expression::Struct {
                 doc,
                 attributes,
-                name: definition_name,
+                name,
                 name_span: definition_name_span,
                 generics: definition_generics,
                 fields: definition_fields,
-                kind: definition_kind,
                 visibility,
                 span,
             }
@@ -83,7 +55,6 @@ impl Checker<'_, '_> {
                 name_span,
                 generics,
                 fields,
-                kind,
                 visibility,
                 span,
             }
@@ -91,8 +62,10 @@ impl Checker<'_, '_> {
     }
 
     pub(super) fn infer_type_alias_definition(&mut self, expression: Expression) -> Expression {
+        let store = self.store;
         let Expression::TypeAlias {
             doc,
+            attributes,
             name,
             name_span,
             generics,
@@ -105,23 +78,25 @@ impl Checker<'_, '_> {
             unreachable!()
         };
 
-        self.check_prelude_shadowing(&name, name_span);
-
         let qualified_name = self.qualify_name(&name);
-        if let Some(Definition::TypeAlias {
-            name: alias_name,
-            generics: definition_generics,
-            annotation: definition_annotation,
+        if let Some(Definition {
             ty: definition_ty,
+            body:
+                DefinitionBody::TypeAlias {
+                    generics: definition_generics,
+                    alias,
+                    ..
+                },
             ..
-        }) = self.store.get_definition(&qualified_name)
+        }) = store.get_definition(&qualified_name)
         {
             Expression::TypeAlias {
                 doc,
-                name: alias_name.clone(),
+                attributes,
+                name,
                 name_span,
                 generics: definition_generics.clone(),
-                annotation: definition_annotation.clone(),
+                annotation: alias.annotation().clone(),
                 ty: definition_ty.clone(),
                 visibility,
                 span,
@@ -129,6 +104,7 @@ impl Checker<'_, '_> {
         } else {
             Expression::TypeAlias {
                 doc,
+                attributes,
                 name,
                 name_span,
                 generics,

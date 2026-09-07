@@ -1,27 +1,35 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Box { x: int }\n\nimpl Box {\n  fn add(self, y: int) -> int { self.x + y }\n}\n\nfn make_box() -> Box { Box { x: 1 } }\n\nfn main() {\n  let v = Box.add(make_box(), 1);\n  let _ = v;\n}\n"
+description: |
+  
+  struct Box { x: int }
+  
+  impl Box {
+    fn add(self, y: int) -> int { self.x + y }
+  }
+  
+  fn make_box() -> Box { Box { x: 1 } }
+  
+  fn main() {
+    let v = Box.add(make_box(), 1);
+    let _ = v;
+  }
 ---
 package main
 
-import "fmt"
-
 type Box struct {
 	x int
-}
-
-func (b Box) String() string {
-	return fmt.Sprintf("Box { x: %v }", b.x)
 }
 
 func (b Box) add(y int) int {
 	return b.x + y
 }
 
-func make_box() Box {
+func makeBox() Box {
 	return Box{x: 1}
 }
 
 func main() {
-	_ = make_box().add(1)
+	v := makeBox().add(1)
+	_ = v
 }

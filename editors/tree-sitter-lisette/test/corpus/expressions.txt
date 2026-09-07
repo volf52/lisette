@@ -120,6 +120,57 @@ let x = r.*
       value: (identifier))))
 
 ================================================================================
+Bitwise operators
+================================================================================
+
+let x = (a | b) ^ c &^ d
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (identifier)
+    value: (binary_expression
+      left: (parenthesized_expression
+        (binary_expression
+          left: (identifier)
+          right: (identifier)))
+      right: (binary_expression
+        left: (identifier)
+        right: (identifier)))))
+
+================================================================================
+Shift operators
+================================================================================
+
+let x = a << 2 >> 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (identifier)
+    value: (binary_expression
+      left: (binary_expression
+        left: (identifier)
+        right: (integer_literal))
+      right: (integer_literal))))
+
+================================================================================
+Unary bitwise not
+================================================================================
+
+let x = ^y
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (identifier)
+    value: (unary_expression
+      (identifier))))
+
+================================================================================
 Field access
 ================================================================================
 
@@ -150,6 +201,34 @@ let x = items[0]
       (integer_literal))))
 
 ================================================================================
+Compound bitwise assignment
+================================================================================
+
+x &= 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (expression_statement
+    (compound_assignment_expression
+      left: (identifier)
+      right: (integer_literal))))
+
+================================================================================
+Compound shift assignment
+================================================================================
+
+x <<= 2
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (expression_statement
+    (compound_assignment_expression
+      left: (identifier)
+      right: (integer_literal))))
+
+================================================================================
 Call
 ================================================================================
 
@@ -165,6 +244,64 @@ let x = foo(1, 2)
       arguments: (arguments
         (integer_literal)
         (integer_literal)))))
+
+================================================================================
+Nested generic call with >> close
+================================================================================
+
+identity<Map<string, Vec<int>>>(42)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (expression_statement
+    (generic_call_expression
+      function: (identifier)
+      type_arguments: (call_type_arguments
+        (generic_type
+          type: (type_identifier)
+          type_arguments: (type_arguments
+            (type_identifier)
+            (generic_type
+              type: (type_identifier)
+              type_arguments: (type_arguments
+                (type_identifier))))))
+      arguments: (arguments
+        (integer_literal)))))
+
+================================================================================
+Call with postfix spread
+================================================================================
+
+foo(xs...)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (expression_statement
+    (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (spread_argument
+          (identifier))))))
+
+================================================================================
+Call with leading args and postfix spread
+================================================================================
+
+foo(a, b, xs...)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (expression_statement
+    (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (identifier)
+        (identifier)
+        (spread_argument
+          (identifier))))))
 
 ================================================================================
 Generic call
@@ -342,6 +479,61 @@ let p = Point { x: 1, y: 2 }
           value: (integer_literal))))))
 
 ================================================================================
+Struct expression with zero-fill spread
+================================================================================
+
+let p = Point { x: 1, .. }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (identifier)
+    value: (struct_expression
+      name: (type_identifier)
+      body: (field_initializer_list
+        (field_initializer
+          field: (field_identifier)
+          value: (integer_literal))
+        (zero_fill_initializer)))))
+
+================================================================================
+Struct expression zero-fill only
+================================================================================
+
+let p = Point { .. }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (identifier)
+    value: (struct_expression
+      name: (type_identifier)
+      body: (field_initializer_list
+        (zero_fill_initializer)))))
+
+================================================================================
+Struct expression with base spread
+================================================================================
+
+let p = Point { x: 1, ..base }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (identifier)
+    value: (struct_expression
+      name: (type_identifier)
+      body: (field_initializer_list
+        (field_initializer
+          field: (field_identifier)
+          value: (integer_literal))
+        (base_field_initializer
+          (identifier))))))
+
+================================================================================
 Closure
 ================================================================================
 
@@ -484,3 +676,63 @@ Rawgo
     (rawgo_directive
       (string_literal
         (string_content)))))
+
+================================================================================
+Generic call with function type argument
+================================================================================
+
+fn main() {
+  let m = Map.new<string, fn(int, int) -> int>()
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_item
+    (identifier)
+    (parameters)
+    (block
+      (let_declaration
+        (identifier)
+        (generic_call_expression
+          (field_expression
+            (identifier)
+            (field_identifier))
+          (call_type_arguments
+            (type_identifier)
+            (function_type
+              (parameter_types
+                (type_identifier)
+                (type_identifier))
+              (type_identifier)))
+          (arguments))))))
+
+================================================================================
+Closure with return type at statement start
+================================================================================
+
+fn make() -> fn() -> int {
+  let mut n = 0
+  || -> int { n }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_item
+    (identifier)
+    (parameters)
+    (function_type
+      (parameter_types)
+      (type_identifier))
+    (block
+      (let_declaration
+        (mutable_specifier)
+        (identifier)
+        (integer_literal))
+      (expression_statement
+        (closure_expression
+          (closure_parameters)
+          (type_identifier)
+          (block
+            (identifier)))))))

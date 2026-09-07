@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test() { @unknown; }\n"
+description: |
+  
+  fn test() { @unknown; }
 ---
 [
     Function {
@@ -15,35 +17,37 @@ description: "input: \nfn test() { @unknown; }\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
-        visibility: Private,
-        body: Block {
-            items: [
-                Unit {
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 13,
-                        byte_length: 8,
-                    },
-                },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 13,
-            },
+        return_type: Var {
+            id: uninferred,
         },
-        ty: Variable(
-            -1,
+        visibility: Private,
+        body: Definition(
+            Block {
+                items: [
+                    Unit {
+                        ty: Var {
+                            id: uninferred,
+                        },
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 13,
+                            byte_length: 8,
+                        },
+                    },
+                ],
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 13,
+                },
+            },
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

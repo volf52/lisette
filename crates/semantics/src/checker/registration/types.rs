@@ -1,317 +1,334 @@
+use crate::checker::EnvResolve;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::ast::{
-    Annotation, EnumFieldDefinition, EnumVariant, Generic, Span, StructFieldDefinition, StructKind,
-    ValueEnumVariant, VariantFields,
+    EnumFieldDefinition, EnumVariant, Expression, Generic, Span, StructFieldDefinition,
+    StructFields, VariantFields,
 };
-use syntax::program::{Definition, MethodSignatures, Visibility};
+use syntax::containment::{EnumPayloads, definition_contains_by_value};
+use syntax::go_names;
+use syntax::go_names::EnumFieldShape;
+use syntax::program::ValueKind;
+use syntax::program::{AliasKind, Definition, DefinitionBody, Methods, Visibility};
+use syntax::types;
+use syntax::types::CompoundKind;
+use syntax::types::SimpleKind;
 use syntax::types::Type;
 
 use super::enum_variant_constructor_type;
-use crate::checker::Checker;
-use syntax::types::TypeVariableState;
+use crate::checker::TaskState;
+use crate::store::Store;
 
-impl Checker<'_, '_> {
-    pub(super) fn populate_enum(
-        &mut self,
-        name: &str,
-        name_span: &Span,
-        generics: &[Generic],
-        variants: &[EnumVariant],
-        span: &Span,
-        doc: &Option<String>,
-    ) {
+struct EnumFieldSlot<'a> {
+    variant_name: &'a str,
+    field_name: &'a str,
+    shape: EnumFieldShape,
+    field_type: &'a Type,
+}
+
+impl TaskState {
+    pub(super) fn populate_enum(&mut self, store: &mut Store, expression: &mut Expression) {
+        let Expression::Enum {
+            name,
+            name_span,
+            generics,
+            variants,
+            span,
+            doc,
+            attributes,
+            ..
+        } = expression
+        else {
+            unreachable!("populate_enum called with non-Enum expression");
+        };
+        let attributes = super::collect_enum_attributes(attributes);
         let qualified_name = self.qualify_name(name);
-        let enum_ty = self
-            .store
+        let enum_ty = store
             .get_type(&qualified_name)
             .expect("enum type must exist")
             .clone();
 
-        self.scopes.push();
-        self.put_in_scope(generics);
-        self.validate_generic_bounds(generics, span);
-        self.scopes.pop();
+        let (generics, new_variants) = self.with_scope(|this| {
+            this.put_in_scope(generics);
+            this.resolve_generic_bounds(&*store, generics, span);
+            let new_variants: Vec<_> = variants
+                .iter()
+                .map(|variant| this.resolve_enum_variant_fields(&*store, variant, span))
+                .collect();
+            (generics.clone(), new_variants)
+        });
 
-        let new_variants: Vec<_> = variants
-            .iter()
-            .map(|v| self.resolve_enum_variant_fields(v, generics, span))
-            .collect();
+        self.check_enum_field_slot_collisions(name, &new_variants);
 
-        self.check_enum_field_type_conflicts(name, &new_variants);
-
-        for new_variant in &new_variants {
-            self.add_enum_variant_to_scope(new_variant, name, &enum_ty, generics);
-        }
+        let default_variant = self.resolve_default_variant(&*store, &new_variants);
 
         let visibility = self
-            .store
-            .get_module(&self.cursor.module_id)
-            .expect("current module must exist in store")
+            .current_package(&*store)
             .definitions
             .get(qualified_name.as_str())
-            .map(|definition| definition.visibility().clone())
+            .map(|definition| definition.visibility)
             .unwrap_or(Visibility::Private);
 
-        let is_prelude = self.cursor.module_id == "prelude";
-
-        let variant_definitions: Vec<_> = new_variants
-            .iter()
-            .map(|v| {
-                let variant_ty = enum_variant_constructor_type(v, &enum_ty, generics);
-                let qualified_variant_name = format!("{}.{}", qualified_name, v.name);
-                let simple_qualified_name = if is_prelude {
-                    Some(self.qualify_name(&v.name))
-                } else {
-                    None
-                };
-                (
-                    qualified_variant_name,
-                    simple_qualified_name,
-                    variant_ty,
-                    v.name_span,
-                    v.doc.clone(),
-                )
-            })
-            .collect();
-
-        if self.is_lis() && self.type_definition_exists(&qualified_name) {
+        if self.is_lis(&*store) && self.type_definition_exists(&*store, &qualified_name) {
             self.sink.push(diagnostics::infer::duplicate_definition(
                 "enum", name, *name_span,
             ));
         }
 
-        let module = self
-            .store
-            .get_module_mut(&self.cursor.module_id)
-            .expect("current module must exist in store");
+        let package = self.current_package_mut(store);
 
-        for (qualified_variant_name, simple_name, variant_ty, variant_name_span, variant_doc) in
-            variant_definitions
-        {
-            let definition = Definition::Value {
-                visibility: visibility.clone(),
-                ty: variant_ty,
-                name_span: Some(variant_name_span),
-                allowed_lints: vec![],
-                go_hints: vec![],
-                go_name: None,
-                doc: variant_doc,
-            };
-            module
-                .definitions
-                .insert(qualified_variant_name.into(), definition.clone());
-
-            if let Some(simple_qualified_name) = simple_name {
-                module
-                    .definitions
-                    .entry(simple_qualified_name.into())
-                    .or_insert(definition);
-            }
-        }
-
-        module.definitions.insert(
-            qualified_name.clone().into(),
-            Definition::Enum {
+        package.definitions.insert(
+            qualified_name.clone(),
+            Definition {
                 visibility,
                 ty: enum_ty,
-                name: name.into(),
-                name_span: *name_span,
-                generics: generics.to_vec(),
-                variants: new_variants,
-                methods: MethodSignatures::default(),
+                name_span: Some(*name_span),
                 doc: doc.clone(),
-            },
-        );
-
-        self.check_recursive_type(&qualified_name, name, name_span);
-    }
-
-    pub(super) fn populate_value_enum(
-        &mut self,
-        name: &str,
-        name_span: &Span,
-        underlying_ty: Option<&Annotation>,
-        variants: &[ValueEnumVariant],
-        doc: &Option<String>,
-    ) {
-        if !self.is_d_lis() {
-            let span = variants
-                .first()
-                .map(|v| v.value_span)
-                .unwrap_or_else(|| *name_span);
-            self.sink
-                .push(diagnostics::infer::value_enum_in_source_file(name, span));
-            return;
-        }
-
-        let qualified_name = self.qualify_name(name);
-        let base_enum_ty = self
-            .store
-            .get_type(&qualified_name)
-            .expect("enum type must exist")
-            .clone();
-
-        let visibility = self
-            .store
-            .get_module(&self.cursor.module_id)
-            .expect("current module must exist in store")
-            .definitions
-            .get(qualified_name.as_str())
-            .map(|definition| definition.visibility().clone())
-            .unwrap_or(Visibility::Private);
-
-        let underlying_ty =
-            underlying_ty.map(|annotation| self.convert_to_type(annotation, name_span));
-
-        let enum_ty = if let (Type::Constructor { id, params, .. }, Some(underlying)) =
-            (&base_enum_ty, &underlying_ty)
-        {
-            Type::Constructor {
-                id: id.clone(),
-                params: params.clone(),
-                underlying_ty: Some(Box::new(underlying.clone())),
-            }
-        } else {
-            base_enum_ty
-        };
-
-        for variant in variants {
-            let qualified_variant_name = format!("{}.{}", qualified_name, variant.name);
-            let module = self
-                .store
-                .get_module_mut(&self.cursor.module_id)
-                .expect("current module must exist in store");
-            module.definitions.insert(
-                qualified_variant_name.into(),
-                Definition::Value {
-                    visibility: visibility.clone(),
-                    ty: enum_ty.clone(),
-                    name_span: Some(variant.name_span),
-                    allowed_lints: vec![],
-                    go_hints: vec![],
-                    go_name: None,
-                    doc: variant.doc.clone(),
+                body: DefinitionBody::Enum {
+                    generics,
+                    variants: new_variants,
+                    methods: Methods::default(),
+                    attributes,
+                    default_variant,
                 },
-            );
-        }
-
-        let scope = self.scopes.current_mut();
-        for variant in variants {
-            let qualified_variant_name = format!("{}.{}", name, variant.name);
-            scope.values.insert(qualified_variant_name, enum_ty.clone());
-            scope
-                .values
-                .insert(variant.name.to_string(), enum_ty.clone());
-        }
-
-        let module = self
-            .store
-            .get_module_mut(&self.cursor.module_id)
-            .expect("current module must exist in store");
-
-        module.definitions.insert(
-            qualified_name.into(),
-            Definition::ValueEnum {
-                visibility,
-                ty: enum_ty,
-                name: name.into(),
-                name_span: *name_span,
-                variants: variants.to_vec(),
-                underlying_ty,
-                methods: Default::default(),
-                doc: doc.clone(),
             },
         );
     }
 
-    /// Check for Go-level field name collisions across enum variants.
-    ///
-    /// Computes the Go field name for every variant field (struct fields get
-    /// capitalized, single-tuple fields use the variant name, multi-tuple fields
-    /// use variant name + index) and rejects same-name-different-type conflicts.
-    fn check_enum_field_type_conflicts(&mut self, name: &str, variants: &[EnumVariant]) {
-        if self.cursor.module_id == "prelude" {
+    /// Runs after `normalize_registered_component_types`.
+    pub(crate) fn derive_enum_constructor_values(
+        &mut self,
+        store: &mut Store,
+        items: &[Expression],
+    ) {
+        for item in items {
+            let Expression::Enum { name, .. } = item else {
+                continue;
+            };
+            let qualified_name = self.qualify_name(name);
+            let Some(definition) = store.get_definition(&qualified_name) else {
+                continue;
+            };
+            let DefinitionBody::Enum {
+                generics, variants, ..
+            } = &definition.body
+            else {
+                continue;
+            };
+            let visibility = definition.visibility;
+            let generics = generics.clone();
+            let variants = variants.clone();
+            let Some(enum_ty) = store.get_type(&qualified_name).cloned() else {
+                continue;
+            };
+            let is_prelude = self.cursor.package_id() == "prelude";
+
+            let enum_grants_write = variants.iter().any(|variant| match &variant.fields {
+                VariantFields::Unit => false,
+                VariantFields::Tuple(fields) | VariantFields::Struct(fields) => {
+                    fields.iter().any(|field| store.demotion_changes(&field.ty))
+                }
+            });
+
+            for variant in &variants {
+                self.add_enum_variant_to_scope(
+                    variant,
+                    name,
+                    &enum_ty,
+                    &generics,
+                    enum_grants_write,
+                );
+            }
+
+            let variant_definitions: Vec<_> = variants
+                .iter()
+                .map(|v| {
+                    let variant_ty =
+                        enum_variant_constructor_type(v, &enum_ty, &generics, enum_grants_write);
+                    let qualified_variant_name = qualified_name.with_segment(&v.name);
+                    let simple_qualified_name = if is_prelude {
+                        Some(self.qualify_name(&v.name))
+                    } else {
+                        None
+                    };
+                    (
+                        qualified_variant_name,
+                        simple_qualified_name,
+                        variant_ty,
+                        v.name_span,
+                        v.doc.clone(),
+                    )
+                })
+                .collect();
+
+            let package = self.current_package_mut(store);
+
+            for (qualified_variant_name, simple_name, variant_ty, variant_name_span, variant_doc) in
+                variant_definitions
+            {
+                let definition = Definition {
+                    visibility,
+                    ty: variant_ty,
+                    name_span: Some(variant_name_span),
+                    doc: variant_doc,
+                    body: DefinitionBody::Value {
+                        kind: ValueKind::Runtime,
+                        allowed_lints: vec![],
+                        go_hints: vec![],
+                        go_name: None,
+                        go_type_param_recipe: None,
+                        superseded_by: None,
+                    },
+                };
+                package
+                    .definitions
+                    .insert(qualified_variant_name, definition.clone());
+
+                if let Some(simple_qualified_name) = simple_name {
+                    package
+                        .definitions
+                        .entry(simple_qualified_name)
+                        .or_insert(definition);
+                }
+            }
+        }
+    }
+
+    /// Emit's layout dedupes by Go name, so a survivor would take the first type.
+    fn check_enum_field_slot_collisions(&mut self, name: &str, variants: &[EnumVariant]) {
+        if self.cursor.package_id() == "prelude" {
             return;
         }
 
-        // (variant_name, field_name, is_struct, type, span)
-        let mut seen: rustc_hash::FxHashMap<String, (&str, &str, bool, &Type, Span)> =
-            rustc_hash::FxHashMap::default();
+        let slots = go_names::enum_field_slots(name, variants);
 
-        for variant in variants {
-            let is_struct = variant.fields.is_struct();
-            let single_field = variant.fields.len() == 1;
+        let mut seen: FxHashMap<String, EnumFieldSlot<'_>> = FxHashMap::default();
+
+        for (vi, variant) in variants.iter().enumerate() {
+            let Some(field_shape) = go_names::enum_field_shape(&variant.fields) else {
+                continue;
+            };
 
             for (fi, field) in variant.fields.iter().enumerate() {
-                // Mirror the Go field name logic from enum_layout.rs
-                let go_name = if is_struct {
-                    let mut chars = field.name.chars();
-                    match chars.next() {
-                        None => String::new(),
-                        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                    }
-                } else if single_field {
-                    variant.name.to_string()
-                } else {
-                    format!("{}{}", variant.name, fi)
-                };
+                let go_name = slots[vi][fi].clone();
 
-                let resolved = field.ty.resolve();
+                let resolved = field.ty.resolve_in(&self.env);
                 let annotation_span = field.annotation.get_span();
                 let span = if !annotation_span.is_dummy() {
                     annotation_span
                 } else {
                     variant.name_span
                 };
-                if let Some(&(v_a, f_a, is_struct_a, ty_a, _)) = seen.get(&go_name) {
-                    if ty_a.resolve() != resolved {
-                        let loc_a = if is_struct_a {
-                            format!("{}.{}.{}", name, v_a, f_a)
-                        } else {
-                            format!("{}.{}", name, v_a)
-                        };
-                        let loc_b = if is_struct {
-                            format!("{}.{}.{}", name, variant.name, field.name)
-                        } else {
-                            format!("{}.{}", name, variant.name)
-                        };
-                        self.sink.push(diagnostics::infer::enum_field_type_conflict(
-                            &loc_a,
-                            &ty_a.resolve().to_string(),
-                            &loc_b,
-                            &resolved.to_string(),
-                            span,
-                        ));
-                    }
-                } else {
+                let Some(previous) = seen.get(&go_name) else {
                     seen.insert(
                         go_name,
-                        (&variant.name, &field.name, is_struct, &field.ty, span),
+                        EnumFieldSlot {
+                            variant_name: &variant.name,
+                            field_name: &field.name,
+                            shape: field_shape,
+                            field_type: &field.ty,
+                        },
                     );
+                    continue;
+                };
+
+                let ty_a_resolved = previous.field_type.resolve_in(&self.env);
+                if matches!(ty_a_resolved, Type::Error)
+                    || matches!(resolved, Type::Error)
+                    || ty_a_resolved == resolved
+                {
+                    continue;
                 }
+
+                let loc_a = if previous.shape == EnumFieldShape::Struct {
+                    format!("{}.{}.{}", name, previous.variant_name, previous.field_name)
+                } else {
+                    format!("{}.{}", name, previous.variant_name)
+                };
+                let loc_b = if field_shape == EnumFieldShape::Struct {
+                    format!("{}.{}.{}", name, variant.name, field.name)
+                } else {
+                    format!("{}.{}", name, variant.name)
+                };
+                self.sink.push(diagnostics::infer::enum_field_type_conflict(
+                    &loc_a,
+                    &ty_a_resolved.to_string(),
+                    &loc_b,
+                    &resolved.to_string(),
+                    &go_name,
+                    span,
+                ));
             }
         }
     }
 
+    fn resolve_default_variant(
+        &mut self,
+        store: &Store,
+        variants: &[EnumVariant],
+    ) -> Option<usize> {
+        let in_typedef = self.is_d_lis(store);
+        let mut marked: Option<(usize, Span)> = None;
+        for (index, variant) in variants.iter().enumerate() {
+            for attribute in variant
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.name == "default")
+            {
+                if !attribute.args.is_empty() {
+                    self.sink
+                        .push(diagnostics::attribute::default_takes_no_arguments(
+                            &attribute.span,
+                        ));
+                }
+                if in_typedef {
+                    self.sink
+                        .push(diagnostics::attribute::default_variant_in_typedef(
+                            &attribute.span,
+                        ));
+                    continue;
+                }
+                if let Some((_, first_span)) = marked {
+                    self.sink
+                        .push(diagnostics::attribute::duplicate_default_variant(
+                            &attribute.span,
+                            &first_span,
+                        ));
+                    continue;
+                }
+                if !matches!(variant.fields, VariantFields::Unit) {
+                    self.sink
+                        .push(diagnostics::attribute::default_variant_with_payload(
+                            &variant.name_span,
+                        ));
+                    continue;
+                }
+                marked = Some((index, attribute.span));
+            }
+        }
+        marked.map(|(index, _)| index)
+    }
+
     fn resolve_enum_variant_fields(
         &mut self,
+        store: &Store,
         enum_variant: &EnumVariant,
-        enum_generics: &[Generic],
         span: &Span,
     ) -> EnumVariant {
         let new_fields = match &enum_variant.fields {
             VariantFields::Unit => VariantFields::Unit,
             VariantFields::Tuple(fields) => {
-                let resolved_fields = self.resolve_enum_fields(fields, enum_generics, span);
+                let resolved_fields = self.resolve_enum_fields(store, fields, span);
                 VariantFields::Tuple(resolved_fields)
             }
             VariantFields::Struct(fields) => {
-                let resolved_fields = self.resolve_enum_fields(fields, enum_generics, span);
+                let resolved_fields = self.resolve_enum_fields(store, fields, span);
                 VariantFields::Struct(resolved_fields)
             }
         };
 
         EnumVariant {
             doc: enum_variant.doc.clone(),
+            attributes: enum_variant.attributes.clone(),
             name: enum_variant.name.clone(),
             name_span: enum_variant.name_span,
             fields: new_fields,
@@ -320,268 +337,282 @@ impl Checker<'_, '_> {
 
     fn resolve_enum_fields(
         &mut self,
+        store: &Store,
         fields: &[EnumFieldDefinition],
-        enum_generics: &[Generic],
         span: &Span,
     ) -> Vec<EnumFieldDefinition> {
-        self.scopes.push();
-        self.put_in_scope(enum_generics);
-
-        let resolved_fields = fields
+        fields
             .iter()
             .map(|f| {
-                let resolved_ty = self.convert_to_type(&f.annotation, span);
-                if let Type::Variable(var) = &f.ty {
-                    *var.borrow_mut() = TypeVariableState::Link(resolved_ty.clone());
+                let resolved_ty = self.convert_to_type(store, &f.annotation, span);
+                if let Type::Var { id, .. } = &f.ty {
+                    self.env.bind(*id, resolved_ty.clone());
                 }
                 EnumFieldDefinition {
                     ty: resolved_ty,
                     ..f.clone()
                 }
             })
-            .collect();
-
-        self.scopes.pop();
-
-        resolved_fields
+            .collect()
     }
 
-    pub(crate) fn add_enum_variant_to_scope(
+    fn add_enum_variant_to_scope(
         &mut self,
         variant: &EnumVariant,
         enum_name: &str,
         enum_ty: &Type,
         generics: &[Generic],
+        enum_grants_write: bool,
     ) {
-        let enum_variant_constructor_ty = enum_variant_constructor_type(variant, enum_ty, generics);
+        let enum_variant_constructor_ty =
+            enum_variant_constructor_type(variant, enum_ty, generics, enum_grants_write);
         let qualified_name = format!("{}.{}", enum_name, variant.name);
 
         let scope = self.scopes.current_mut();
 
-        scope
-            .values
-            .insert(qualified_name.clone(), enum_variant_constructor_ty.clone());
+        scope.insert_value(qualified_name.clone(), enum_variant_constructor_ty.clone());
 
-        scope
-            .values
-            .entry(variant.name.to_string())
-            .or_insert(enum_variant_constructor_ty);
+        scope.insert_value_if_absent(variant.name.to_string(), enum_variant_constructor_ty);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn populate_struct(
-        &mut self,
-        name: &str,
-        name_span: &Span,
-        generics: &[Generic],
-        fields: &[StructFieldDefinition],
-        kind: StructKind,
-        span: &Span,
-        doc: &Option<String>,
-    ) {
+    pub(super) fn populate_struct(&mut self, store: &mut Store, expression: &mut Expression) {
+        let Expression::Struct {
+            name,
+            name_span,
+            generics,
+            fields,
+            span,
+            doc,
+            attributes,
+            ..
+        } = expression
+        else {
+            unreachable!("populate_struct called with non-Struct expression");
+        };
+        let attributes = super::collect_struct_attributes(attributes);
         let qualified_name = self.qualify_name(name);
-        let struct_ty = self
-            .store
+        let struct_ty = store
             .get_type(&qualified_name)
             .expect("struct type scheme must exist")
             .clone();
 
-        self.scopes.push();
-        self.put_in_scope(generics);
-        self.validate_generic_bounds(generics, span);
+        let (generics, new_fields) = self.with_scope(|this| {
+            this.put_in_scope(generics);
+            this.resolve_generic_bounds(&*store, generics, span);
 
-        let new_fields: Vec<StructFieldDefinition> = fields
-            .iter()
-            .map(|f| {
-                let field_ty = self.convert_to_type(&f.annotation, span);
-                StructFieldDefinition {
-                    ty: field_ty,
-                    ..f.clone()
-                }
-            })
-            .collect();
+            let new_fields = fields
+                .iter()
+                .map(|field| {
+                    let field_ty = this.convert_to_type(&*store, &field.annotation, span);
+                    let visibility = if field.is_embedded() {
+                        embed_field_visibility(&*store, &field_ty)
+                    } else {
+                        field.visibility
+                    };
+                    StructFieldDefinition {
+                        ty: field_ty,
+                        visibility,
+                        ..field.clone()
+                    }
+                })
+                .collect();
 
-        self.scopes.pop();
-
-        // Single-field non-generic tuple structs (e.g. `struct FileMode(uint32)`) are
-        // emitted as Go type aliases (`type FileMode uint32`). Set underlying_ty so the
-        // type checker allows numeric casts through them.
-        let struct_ty = if kind == StructKind::Tuple && new_fields.len() == 1 && generics.is_empty()
-        {
-            match struct_ty {
-                Type::Constructor { id, params, .. } => Type::Constructor {
-                    id,
-                    params,
-                    underlying_ty: Some(Box::new(new_fields[0].ty.clone())),
-                },
-                other => other,
-            }
-        } else {
-            struct_ty
-        };
+            let new_fields = match fields {
+                StructFields::Record(_) => StructFields::Record(new_fields),
+                StructFields::Tuple(_) => StructFields::Tuple(new_fields),
+            };
+            (generics.clone(), new_fields)
+        });
 
         let visibility = self
-            .store
-            .get_module(&self.cursor.module_id)
-            .expect("current module must exist in store")
+            .current_package(&*store)
             .definitions
             .get(qualified_name.as_str())
-            .map(|definition| definition.visibility().clone())
+            .map(|definition| definition.visibility)
             .unwrap_or(Visibility::Private);
 
-        if self.is_lis() && self.type_definition_exists(&qualified_name) {
+        if self.is_lis(&*store) && self.type_definition_exists(&*store, &qualified_name) {
             self.sink.push(diagnostics::infer::duplicate_definition(
                 "struct", name, *name_span,
             ));
         }
 
-        self.store
-            .get_module_mut(&self.cursor.module_id)
-            .expect("current module must exist in store")
-            .definitions
-            .insert(
-                qualified_name.clone().into(),
-                Definition::Struct {
-                    visibility,
-                    ty: struct_ty,
-                    name: name.into(),
-                    name_span: *name_span,
-                    generics: generics.to_vec(),
+        self.current_package_mut(store).definitions.insert(
+            qualified_name.clone(),
+            Definition {
+                visibility,
+                ty: struct_ty,
+                name_span: Some(*name_span),
+                doc: doc.clone(),
+                body: DefinitionBody::Struct {
+                    generics,
                     fields: new_fields,
-                    kind,
                     methods: Default::default(),
-                    constructor: None,
-                    doc: doc.clone(),
+                    attributes,
                 },
-            );
-
-        self.check_recursive_type(&qualified_name, name, name_span);
+            },
+        );
     }
 
-    /// Check whether a type is recursive without Ref indirection.
-    /// A type that contains itself (directly or through Option, Tuple, etc.) without going
-    /// through Ref has infinite size and is rejected by Go.
-    fn check_recursive_type(&mut self, qualified_name: &str, struct_name: &str, name_span: &Span) {
-        if self.contains_type_without_ref(
-            qualified_name,
-            qualified_name,
-            &mut rustc_hash::FxHashSet::default(),
-        ) {
+    pub(super) fn validate_package_embeds(&mut self, store: &Store, package_id: &str) {
+        let Some(package) = store.get_package(package_id) else {
+            return;
+        };
+        for definition in package.definitions.values() {
+            if definition
+                .name_span
+                .is_some_and(|span| package.is_typedef(span.file_id))
+            {
+                continue;
+            }
+            let DefinitionBody::Struct { fields, .. } = &definition.body else {
+                continue;
+            };
+            for field in fields.iter().filter(|f| f.is_embedded()) {
+                self.validate_embed_target(store, &field.ty, field.name_span);
+            }
+        }
+    }
+
+    fn validate_embed_target(&mut self, store: &Store, ty: &Type, span: Span) {
+        let display = ty.to_string();
+        let resolved = store.deep_resolve_alias(ty);
+
+        if resolved.is_option() {
+            self.sink.push(diagnostics::embed::option_target(span));
+            return;
+        }
+
+        let promotion_target = embed_promotion_target(store, &resolved);
+        if is_imported_nominal(&promotion_target)
+            && !is_faithful_imported_embed_target(store, &promotion_target)
+        {
             self.sink
-                .push(diagnostics::infer::recursive_type(struct_name, *name_span));
+                .push(diagnostics::embed::imported_target(&display, span));
+            return;
+        }
+
+        if resolved.is_ref() {
+            match resolved
+                .inner()
+                .map(|inner| store.deep_resolve_alias(&inner))
+            {
+                Some(inner) if inner.is_ref() => {
+                    self.sink
+                        .push(diagnostics::embed::nested_ref(&display, span));
+                }
+                Some(inner) if store.is_interface(&inner) => {
+                    self.sink
+                        .push(diagnostics::embed::pointer_to_interface(&display, span));
+                }
+                Some(inner) if is_pointer_backed_newtype(store, &inner) => {
+                    self.sink
+                        .push(diagnostics::embed::pointer_backed_newtype(&display, span));
+                }
+                Some(inner) if is_deferred_local_target(store, &inner) => {
+                    self.sink
+                        .push(diagnostics::embed::defined_type(&display, span));
+                }
+                Some(inner)
+                    if is_embeddable_nominal(&inner) && has_selector_surface(store, &inner) => {}
+                _ => self
+                    .sink
+                    .push(diagnostics::embed::no_surface(&display, span)),
+            }
+            return;
+        }
+
+        if is_pointer_backed_newtype(store, &resolved) {
+            self.sink
+                .push(diagnostics::embed::pointer_backed_newtype(&display, span));
+            return;
+        }
+
+        if is_deferred_local_target(store, &resolved) {
+            self.sink
+                .push(diagnostics::embed::defined_type(&display, span));
+            return;
+        }
+
+        if !is_embeddable_nominal(&resolved) || !has_selector_surface(store, &resolved) {
+            self.sink
+                .push(diagnostics::embed::no_surface(&display, span));
         }
     }
 
-    /// Check if a type transitively contains the target type without passing through Ref.
-    /// `target_id` is the qualified name of the type we're checking for recursion.
-    /// `current_id` is the qualified name of the type whose fields we're inspecting.
-    fn contains_type_without_ref(
-        &self,
-        target_id: &str,
-        current_id: &str,
-        visited: &mut rustc_hash::FxHashSet<String>,
-    ) -> bool {
-        if !visited.insert(current_id.to_string()) {
-            return false; // Already checked this type
+    pub(super) fn check_package_recursive_types(&mut self, store: &Store, package_id: &str) {
+        if package_id.starts_with("go:") {
+            return;
         }
+        let Some(package) = store.get_package(package_id) else {
+            return;
+        };
 
-        if let Some(fields) = self.store.get_struct_fields(current_id) {
-            for field in fields {
-                if self.type_contains_target_without_ref(target_id, &field.ty, visited) {
-                    return true;
+        let mut targets: Vec<(&str, &str, Span)> = package
+            .definitions
+            .iter()
+            .filter(|(_, definition)| matches!(definition.body, DefinitionBody::Struct { .. }))
+            .filter_map(|(qualified_name, definition)| {
+                let span = definition.name_span?;
+                if package.is_typedef(span.file_id) {
+                    return None;
                 }
+                Some((qualified_name.as_str(), qualified_name.last_segment(), span))
+            })
+            .collect();
+        targets.sort_by_key(|(_, _, span)| (span.file_id, span.byte_offset));
+
+        let mut flagged: FxHashSet<String> = FxHashSet::default();
+        for (qualified_name, name, span) in targets {
+            if definition_contains_by_value(
+                qualified_name,
+                qualified_name,
+                EnumPayloads::Skip,
+                &flagged,
+                |id| store.get_definition(id),
+            ) {
+                self.sink
+                    .push(diagnostics::infer::recursive_type(name, span));
+                flagged.insert(qualified_name.to_string());
             }
-        }
-
-        // Check enum variant payloads.
-        // Skip direct self-references (e.g. `Node(Tree, Tree)`) — the emitter wraps
-        // those in pointers automatically. Only flag indirect recursion through other
-        // types (e.g. `Node(Box<Tree>)` where Box is a value-type struct).
-        if let Some(variants) = self.store.get_enum_variants(current_id) {
-            for variant in variants {
-                for field in &variant.fields {
-                    if let Type::Constructor { id, .. } = field.ty.resolve()
-                        && id == target_id
-                    {
-                        continue;
-                    }
-                    if self.type_contains_target_without_ref(target_id, &field.ty, visited) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    fn type_contains_target_without_ref(
-        &self,
-        target_id: &str,
-        ty: &Type,
-        visited: &mut rustc_hash::FxHashSet<String>,
-    ) -> bool {
-        match ty {
-            Type::Constructor { id, params, .. } => {
-                // Ref, Slice, and Map provide heap indirection in Go (pointer,
-                // slice header, map pointer) — don't treat as direct containment.
-                if matches!(
-                    id.as_str(),
-                    "Ref" | "prelude.Ref" | "Slice" | "prelude.Slice" | "Map" | "prelude.Map"
-                ) {
-                    return false;
-                }
-
-                if id == target_id {
-                    return true;
-                }
-
-                for param in params {
-                    if self.type_contains_target_without_ref(target_id, param, visited) {
-                        return true;
-                    }
-                }
-
-                if (self.store.get_struct_fields(id).is_some()
-                    || self.store.get_enum_variants(id).is_some())
-                    && self.contains_type_without_ref(target_id, id, visited)
-                {
-                    return true;
-                }
-
-                false
-            }
-            Type::Tuple(elements) => elements
-                .iter()
-                .any(|e| self.type_contains_target_without_ref(target_id, e, visited)),
-            _ => false,
         }
     }
 
-    pub(super) fn populate_type_alias(
-        &mut self,
-        name: &str,
-        name_span: &Span,
-        generics: &[Generic],
-        annotation: &Annotation,
-        span: &Span,
-        doc: &Option<String>,
-    ) {
+    pub(super) fn populate_type_alias(&mut self, store: &mut Store, expression: &mut Expression) {
+        self.with_scope(|this| this.populate_type_alias_in_scope(store, expression));
+    }
+
+    fn populate_type_alias_in_scope(&mut self, store: &mut Store, expression: &mut Expression) {
+        let Expression::TypeAlias {
+            name,
+            name_span,
+            generics,
+            annotation,
+            attributes,
+            span,
+            doc,
+            ..
+        } = expression
+        else {
+            unreachable!("populate_type_alias called with non-TypeAlias expression");
+        };
         let qualified_name = self.qualify_name(name);
 
+        self.put_in_scope(generics);
+        self.resolve_generic_bounds(&*store, generics, span);
+        let generics = generics.clone();
+
         if annotation.is_opaque() {
-            if self.is_lis() {
+            if self.is_lis(&*store) {
                 self.sink
                     .push(diagnostics::infer::opaque_type_outside_typedef(*span));
             }
 
             let visibility = self
-                .store
-                .get_module(&self.cursor.module_id)
-                .expect("current module must exist in store")
+                .current_package(&*store)
                 .definitions
                 .get(qualified_name.as_str())
-                .map(|definition| definition.visibility().clone())
+                .map(|definition| definition.visibility)
                 .unwrap_or(Visibility::Private);
 
             let alias_ty = if name == "Never" && generics.is_empty() {
@@ -592,23 +623,41 @@ impl Checker<'_, '_> {
                     .map(|g| Type::Parameter(g.name.clone()))
                     .collect();
 
-                let constructor_ty = Type::Constructor {
-                    id: qualified_name.clone().into(),
-                    params,
-                    underlying_ty: None,
+                let canonical_ty = if self.cursor.package_id() == "prelude" {
+                    if let Some(simple) = SimpleKind::from_name(name) {
+                        Type::Simple(simple)
+                    } else if let Some(compound) = CompoundKind::from_name(name) {
+                        Type::Compound {
+                            kind: compound,
+                            args: params,
+                            writable: false,
+                        }
+                    } else {
+                        Type::Nominal {
+                            id: qualified_name.clone(),
+                            params,
+                            writable: false,
+                        }
+                    }
+                } else {
+                    Type::Nominal {
+                        id: qualified_name.clone(),
+                        params,
+                        writable: false,
+                    }
                 };
 
                 if generics.is_empty() {
-                    constructor_ty
+                    canonical_ty
                 } else {
                     Type::Forall {
                         vars: generics.iter().map(|g| g.name.clone()).collect(),
-                        body: Box::new(constructor_ty),
+                        body: Box::new(canonical_ty),
                     }
                 }
             };
 
-            if self.is_lis() && self.type_definition_exists(&qualified_name) {
+            if self.is_lis(&*store) && self.type_definition_exists(&*store, &qualified_name) {
                 self.sink.push(diagnostics::infer::duplicate_definition(
                     "type alias",
                     name,
@@ -616,74 +665,64 @@ impl Checker<'_, '_> {
                 ));
             }
 
-            self.store
-                .get_module_mut(&self.cursor.module_id)
-                .expect("current module must exist in store")
-                .definitions
-                .insert(
-                    qualified_name.into(),
-                    Definition::TypeAlias {
-                        visibility,
-                        name: name.into(),
-                        name_span: *name_span,
-                        generics: generics.to_vec(),
-                        annotation: annotation.clone(),
-                        ty: alias_ty,
+            self.current_package_mut(store).definitions.insert(
+                qualified_name,
+                Definition {
+                    visibility,
+                    ty: alias_ty,
+                    name_span: Some(*name_span),
+                    doc: doc.clone(),
+                    body: DefinitionBody::TypeAlias {
+                        generics,
+                        alias: AliasKind::Opaque(annotation.clone()),
                         methods: Default::default(),
-                        doc: doc.clone(),
+                        attributes: super::collect_struct_attributes(attributes),
                     },
-                );
+                },
+            );
 
             return;
         }
 
-        self.scopes.push();
+        let body_ty = self.convert_to_type(&*store, annotation, span);
+        let is_function_body = matches!(body_ty, Type::Function(_));
 
-        self.put_in_scope(generics);
-        self.validate_generic_bounds(generics, span);
-
-        let body_ty = self.convert_to_type(annotation, span);
-
-        if self.is_alias_body_circular(&body_ty, &qualified_name) {
+        let body_ty = if !is_function_body
+            && self.is_alias_body_circular(&*store, &body_ty, &qualified_name)
+        {
             self.sink
                 .push(diagnostics::infer::circular_type_alias(name, *span));
-        }
-
-        let body_ty = if matches!(body_ty, Type::Function { .. }) {
-            let params: Vec<Type> = generics
-                .iter()
-                .map(|g| Type::Parameter(g.name.clone()))
-                .collect();
-            Type::Constructor {
-                id: qualified_name.clone().into(),
-                params,
-                underlying_ty: Some(Box::new(body_ty)),
-            }
+            Type::Error
         } else {
             body_ty
         };
 
+        let params: Vec<Type> = generics
+            .iter()
+            .map(|g| Type::Parameter(g.name.clone()))
+            .collect();
+        let alias_reference = Type::Nominal {
+            id: qualified_name.clone(),
+            params,
+            writable: false,
+        };
         let alias_ty = if generics.is_empty() {
-            body_ty
+            alias_reference
         } else {
             Type::Forall {
                 vars: generics.iter().map(|g| g.name.clone()).collect(),
-                body: Box::new(body_ty),
+                body: Box::new(alias_reference),
             }
         };
 
-        self.scopes.pop();
-
         let visibility = self
-            .store
-            .get_module(&self.cursor.module_id)
-            .expect("current module must exist in store")
+            .current_package(&*store)
             .definitions
             .get(qualified_name.as_str())
-            .map(|definition| definition.visibility().clone())
+            .map(|definition| definition.visibility)
             .unwrap_or(Visibility::Private);
 
-        if self.is_lis() && self.type_definition_exists(&qualified_name) {
+        if self.is_lis(&*store) && self.type_definition_exists(&*store, &qualified_name) {
             self.sink.push(diagnostics::infer::duplicate_definition(
                 "type alias",
                 name,
@@ -691,26 +730,27 @@ impl Checker<'_, '_> {
             ));
         }
 
-        self.store
-            .get_module_mut(&self.cursor.module_id)
-            .expect("current module must exist in store")
-            .definitions
-            .insert(
-                qualified_name.into(),
-                Definition::TypeAlias {
-                    visibility,
-                    name: name.into(),
-                    name_span: *name_span,
-                    generics: generics.to_vec(),
-                    annotation: annotation.clone(),
-                    ty: alias_ty,
+        self.current_package_mut(store).definitions.insert(
+            qualified_name,
+            Definition {
+                visibility,
+                ty: alias_ty,
+                name_span: Some(*name_span),
+                doc: doc.clone(),
+                body: DefinitionBody::TypeAlias {
+                    generics,
+                    alias: AliasKind::Transparent {
+                        annotation: annotation.clone(),
+                        target: body_ty,
+                    },
                     methods: Default::default(),
-                    doc: doc.clone(),
+                    attributes: super::collect_struct_attributes(attributes),
                 },
-            );
+            },
+        );
     }
 
-    fn is_alias_body_circular(&self, body_ty: &Type, qualified_name: &str) -> bool {
+    fn is_alias_body_circular(&self, store: &Store, body_ty: &Type, qualified_name: &str) -> bool {
         if Self::type_contains_name(body_ty, qualified_name) {
             return true;
         }
@@ -728,12 +768,19 @@ impl Checker<'_, '_> {
             }
             seen.push(name.clone());
 
-            if let Some(Definition::TypeAlias { ty, .. }) = self.store.get_definition(&name) {
-                let body = ty.unwrap_forall().clone();
-                if Self::type_contains_name(&body, qualified_name) {
+            if let Some(Definition {
+                body:
+                    DefinitionBody::TypeAlias {
+                        alias: AliasKind::Transparent { target, .. },
+                        ..
+                    },
+                ..
+            }) = store.get_definition(&name)
+            {
+                if Self::type_contains_name(target, qualified_name) {
                     return true;
                 }
-                Self::collect_type_refs(&body, &mut to_visit);
+                Self::collect_type_refs(target, &mut to_visit);
             }
         }
 
@@ -741,60 +788,135 @@ impl Checker<'_, '_> {
     }
 
     fn type_contains_name(ty: &Type, name: &str) -> bool {
-        match ty {
-            Type::Constructor {
-                id,
-                params,
-                underlying_ty,
-            } => {
-                id.as_str() == name
-                    || params.iter().any(|p| Self::type_contains_name(p, name))
-                    || underlying_ty
-                        .as_deref()
-                        .is_some_and(|u| Self::type_contains_name(u, name))
-            }
-            Type::Tuple(elements) => elements.iter().any(|e| Self::type_contains_name(e, name)),
-            Type::Function {
-                params,
-                return_type,
-                ..
-            } => {
-                params.iter().any(|p| Self::type_contains_name(p, name))
-                    || Self::type_contains_name(return_type, name)
-            }
-            Type::Forall { body, .. } => Self::type_contains_name(body, name),
-            _ => false,
+        if let Type::Nominal { id, .. } = ty
+            && id.as_str() == name
+        {
+            return true;
         }
+        ty.children()
+            .iter()
+            .any(|c| Self::type_contains_name(c, name))
     }
 
     fn collect_type_refs(ty: &Type, refs: &mut Vec<String>) {
-        match ty {
-            Type::Constructor {
-                id,
-                params,
-                underlying_ty,
-            } => {
-                refs.push(id.to_string());
-                params.iter().for_each(|p| Self::collect_type_refs(p, refs));
-                if let Some(u) = underlying_ty {
-                    Self::collect_type_refs(u, refs);
-                }
-            }
-            Type::Tuple(elements) => {
-                elements
-                    .iter()
-                    .for_each(|e| Self::collect_type_refs(e, refs));
-            }
-            Type::Function {
-                params,
-                return_type,
-                ..
-            } => {
-                params.iter().for_each(|p| Self::collect_type_refs(p, refs));
-                Self::collect_type_refs(return_type, refs);
-            }
-            Type::Forall { body, .. } => Self::collect_type_refs(body, refs),
-            _ => {}
+        if let Type::Nominal { id, .. } = ty {
+            refs.push(id.to_string());
         }
+        for c in ty.children() {
+            Self::collect_type_refs(c, refs);
+        }
+    }
+}
+
+fn is_embeddable_nominal(ty: &Type) -> bool {
+    matches!(ty, Type::Nominal { .. }) && !ty.is_option()
+}
+
+fn is_imported_nominal(ty: &Type) -> bool {
+    matches!(ty, Type::Nominal { id, .. } if id.as_str().starts_with(types::GO_IMPORT_PREFIX))
+}
+
+fn is_faithful_imported_embed_target(store: &Store, ty: &Type) -> bool {
+    is_faithful_imported_graph(store, ty, &mut FxHashSet::default())
+}
+
+fn is_faithful_imported_graph(store: &Store, ty: &Type, seen: &mut FxHashSet<String>) -> bool {
+    let target = store.deep_resolve_alias(&embed_promotion_target(store, ty));
+    let Type::Nominal { id, .. } = &target else {
+        return false;
+    };
+    if !id.as_str().starts_with(types::GO_IMPORT_PREFIX) {
+        return false;
+    }
+    if !seen.insert(id.to_string()) {
+        return true;
+    }
+    let Some(definition) = store.get_definition(id.as_str()) else {
+        return false;
+    };
+    // `#[go(hidden_embed)]` looks flat but hides an embed bindgen could not emit, so it is not faithful.
+    if definition.has_hidden_embed() {
+        return false;
+    }
+    match &definition.body {
+        DefinitionBody::Struct {
+            fields: StructFields::Record(fields),
+            generics,
+            ..
+        } if generics.is_empty() => fields
+            .iter()
+            .filter(|field| field.is_embedded())
+            .all(|field| is_faithful_imported_graph(store, &field.ty, seen)),
+        DefinitionBody::Struct { generics, .. } if generics.is_empty() => {
+            has_selector_surface(store, &target)
+        }
+        DefinitionBody::Interface { .. } => has_selector_surface(store, &target),
+        DefinitionBody::TypeAlias { .. } => has_selector_surface(store, &target),
+        _ => false,
+    }
+}
+
+fn embed_promotion_target(store: &Store, ty: &Type) -> Type {
+    let mut target = ty.clone();
+    while target.is_option() || target.is_ref() {
+        let Some(inner) = target.inner() else { break };
+        target = store.deep_resolve_alias(&inner);
+    }
+    target
+}
+
+// A local tuple struct, newtype, or enum: needs the resolver, so hard-errored for now.
+fn is_deferred_local_target(store: &Store, ty: &Type) -> bool {
+    let Type::Nominal { id, .. } = ty else {
+        return false;
+    };
+    let id = id.as_str();
+    if id.starts_with(types::GO_IMPORT_PREFIX) {
+        return false;
+    }
+    match store.get_definition(id).map(|definition| &definition.body) {
+        Some(
+            DefinitionBody::Struct {
+                fields: StructFields::Record(_),
+                ..
+            }
+            | DefinitionBody::Interface { .. },
+        ) => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn has_selector_surface(store: &Store, ty: &Type) -> bool {
+    if store.type_has_any_method(ty) {
+        return true;
+    }
+    let Type::Nominal { id, .. } = ty else {
+        return false;
+    };
+    let id = id.as_str();
+    let is_newtype = store.get_definition(id).is_some_and(Definition::is_newtype);
+    !is_newtype && store.fields_of(id).is_some_and(|fields| !fields.is_empty())
+}
+
+fn is_pointer_backed_newtype(store: &Store, ty: &Type) -> bool {
+    store
+        .underlying_type(ty)
+        .is_some_and(|underlying| store.deep_resolve_alias(&underlying).is_ref())
+}
+
+// Mirror the written type's own visibility: peel storage (`Option`/`Ref`), not aliases.
+fn embed_field_visibility(store: &Store, field_ty: &Type) -> Visibility {
+    let mut target = field_ty.clone();
+    while target.is_option() || target.is_ref() {
+        let Some(inner) = target.inner() else { break };
+        target = inner;
+    }
+    let public = matches!(&target, Type::Nominal { id, .. }
+        if store.get_definition(id.as_str()).is_some_and(|d| d.visibility.is_public()));
+    if public {
+        Visibility::Public
+    } else {
+        Visibility::Private
     }
 }

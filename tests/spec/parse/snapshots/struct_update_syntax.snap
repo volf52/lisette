@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test() { let result = Point { x: 1, ..base_point }; }\n"
+description: |
+  
+  fn test() { let result = Point { x: 1, ..base_point }; }
 ---
 [
     Function {
@@ -15,105 +17,101 @@ description: "input: \nfn test() { let result = Point { x: 1, ..base_point }; }\
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Let {
-                    binding: Binding {
-                        pattern: Identifier {
-                            identifier: "result",
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 17,
-                                byte_length: 6,
-                            },
-                        },
-                        annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
-                    },
-                    value: StructCall {
-                        name: "Point",
-                        field_assignments: [
-                            StructFieldAssignment {
-                                name: "x",
-                                name_span: Span {
-                                    file_id: 0,
-                                    byte_offset: 34,
-                                    byte_length: 1,
-                                },
-                                value: Literal {
-                                    literal: Integer {
-                                        value: 1,
-                                        text: None,
-                                    },
-                                    ty: Variable(
-                                        -1,
-                                    ),
-                                    span: Span {
-                                        file_id: 0,
-                                        byte_offset: 37,
-                                        byte_length: 1,
-                                    },
-                                },
-                            },
-                        ],
-                        spread: Some(
-                            Identifier {
-                                value: "base_point",
-                                ty: Variable(
-                                    -1,
-                                ),
+        body: Definition(
+            Block {
+                items: [
+                    Let {
+                        binding: Binding {
+                            pattern: Identifier {
+                                identifier: "result",
                                 span: Span {
                                     file_id: 0,
-                                    byte_offset: 42,
-                                    byte_length: 10,
+                                    byte_offset: 17,
+                                    byte_length: 6,
                                 },
-                                binding_id: None,
-                                qualified: None,
                             },
-                        ),
-                        ty: Variable(
-                            -1,
-                        ),
+                            annotation: None,
+                            ty: Var {
+                                id: uninferred,
+                            },
+                        },
+                        value: StructCall {
+                            name: "Point",
+                            field_assignments: [
+                                StructFieldAssignment {
+                                    name: "x",
+                                    name_span: Span {
+                                        file_id: 0,
+                                        byte_offset: 34,
+                                        byte_length: 1,
+                                    },
+                                    value: Literal {
+                                        literal: Integer {
+                                            value: 1,
+                                            text: None,
+                                        },
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
+                                        span: Span {
+                                            file_id: 0,
+                                            byte_offset: 37,
+                                            byte_length: 1,
+                                        },
+                                    },
+                                },
+                            ],
+                            spread: From(
+                                Identifier {
+                                    value: "base_point",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 42,
+                                        byte_length: 10,
+                                    },
+                                    resolution: Unresolved,
+                                },
+                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
+                            span: Span {
+                                file_id: 0,
+                                byte_offset: 26,
+                                byte_length: 28,
+                            },
+                        },
+                        mode: Plain,
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 26,
-                            byte_length: 28,
+                            byte_offset: 13,
+                            byte_length: 41,
                         },
                     },
-                    mutable: false,
-                    mut_span: None,
-                    else_block: None,
-                    else_span: None,
-                    typed_pattern: None,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 13,
-                        byte_length: 41,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 46,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 46,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

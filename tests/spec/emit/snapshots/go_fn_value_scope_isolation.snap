@@ -1,25 +1,31 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nimport \"go:fmt\"\nimport \"go:strconv\"\n\nfn main() {\n  {\n    let f = strconv.Atoi\n    let _ = f(\"1\")\n  }\n  let f = |s: string| -> int { 0 }\n  let r = f(\"2\")\n  fmt.Println(r)\n}\n"
+description: |
+  
+  import "go:fmt"
+  import "go:strconv"
+  
+  fn main() {
+    {
+      let f = strconv.Atoi
+      let _ = f("1")
+    }
+    let f = |s: string| -> int { 0 }
+    let r = f("2")
+    fmt.Println(r)
+  }
 ---
 package main
 
 import (
 	"fmt"
-	lisette "github.com/ivov/lisette/prelude"
 	"strconv"
 )
 
 func main() {
 	{
-		f := func(arg0 string) lisette.Result[int, error] {
-			ret_1, ret_2 := strconv.Atoi(arg0)
-			if ret_2 != nil {
-				return lisette.MakeResultErr[int, error](ret_2)
-			}
-			return lisette.MakeResultOk[int, error](ret_1)
-		}
-		_ = f("1")
+		f := strconv.Atoi
+		f("1")
 	}
 	f := func(_ string) int {
 		return 0

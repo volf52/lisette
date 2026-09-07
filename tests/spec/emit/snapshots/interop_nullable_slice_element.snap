@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:flag\"\n\nfn main() {\n  let arr: Slice<fn(string) -> Option<Ref<flag.Flag>>> = [flag.Lookup]\n  let r = arr[0](\"verbose\")\n  match r {\n    Some(v) => { let _ = v },\n    None => {},\n  }\n}\n"
+description: |
+  
+  import "go:flag"
+  
+  fn main() {
+    let arr: Slice<fn(string) -> Option<Ref<flag.Flag>>> = [flag.Lookup]
+    let r = arr[0]("verbose")
+    match r {
+      Some(v) => { let _ = v },
+      None => {},
+    }
+  }
 ---
 package main
 
@@ -10,14 +21,9 @@ import (
 )
 
 func main() {
-	arr := []func(string) lisette.Option[*flag.Flag]{func(arg0 string) lisette.Option[*flag.Flag] {
-		raw_1 := flag.Lookup(arg0)
-		if raw_1 != nil {
-			return lisette.MakeOptionSome[*flag.Flag](raw_1)
-		}
-		return lisette.MakeOptionNone[*flag.Flag]()
-	}}
-	r := arr[0]("verbose")
+	arr := []func(string) *flag.Flag{flag.Lookup}
+	raw_1 := arr[0]("verbose")
+	r := lisette.OptionFromNilable[*flag.Flag](raw_1, raw_1 == nil)
 	if r.Tag == lisette.OptionSome {
 		_ = r.SomeVal
 	}

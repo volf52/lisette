@@ -1,0 +1,56 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+import "github.com/user/myproject/shapes"
+
+func main() {
+	_ = shapes.TestLocalStatic()
+}
+
+
+// === shapes/types.go ===
+package shapes
+
+type Point struct {
+	X float64
+	Y float64
+}
+
+func Point_New(x, y float64) Point {
+	return Point{
+		X: x,
+		Y: y,
+	}
+}
+
+type Builder struct {
+	X float64
+	Y float64
+}
+
+func Builder_New() Builder {
+	return Builder{
+		X: 0.0,
+		Y: 0.0,
+	}
+}
+
+func (b Builder) WithX(x float64) Builder {
+	return Builder{
+		X: x,
+		Y: b.Y,
+	}
+}
+
+
+// === shapes/use_types.go ===
+package shapes
+
+func TestLocalStatic() float64 {
+	p := Point_New(1.0, 2.0)
+	b := Builder_New().WithX(5.0)
+	return p.X + b.X
+}

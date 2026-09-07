@@ -1,0 +1,32 @@
+---
+source: tests/spec/emit/functions.rs
+description: |
+  
+  import "go:mime"
+  
+  fn use_fn(f: fn(string) -> Partial<(string, Map<string, string>), error>) {
+    let _ = f("text/plain")
+  }
+  
+  fn main() {
+    use_fn(mime.ParseMediaType)
+  }
+---
+package main
+
+import (
+	lisette "github.com/ivov/lisette/prelude"
+	"mime"
+)
+
+func useFn(f func(string) (lisette.Tuple2[string, map[string]string], error)) {
+	f("text/plain")
+}
+
+func main() {
+	useFn(func(arg0 string) (lisette.Tuple2[string, map[string]string], error) {
+		ret_1, ret_2, ret_3 := mime.ParseMediaType(arg0)
+		tup_4 := lisette.MakeTuple2(ret_1, ret_2)
+		return tup_4, ret_3
+	})
+}

@@ -275,7 +275,19 @@ fn numeric_float_literal_not_in_int_context() {
 }
 
 #[test]
-fn numeric_int_literal_flexibility_not_through_generics() {
+fn numeric_int_literal_adapts_through_generic_constructor() {
+    infer(
+        r#"
+    fn main() {
+      let x: Option<int32> = Some(5);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_cross_family_through_generic_constructor() {
     infer(
         r#"
     fn main() {
@@ -283,15 +295,226 @@ fn numeric_int_literal_flexibility_not_through_generics() {
     }
         "#,
     )
-    .assert_type_mismatch();
+    .assert_no_errors();
 }
 
 #[test]
-fn numeric_int_literal_in_generic_requires_explicit_cast() {
+fn numeric_float_literal_in_generic_constructor() {
     infer(
         r#"
     fn main() {
       let x: Option<float64> = Some(42.0);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_result_ok() {
+    infer(
+        r#"
+    fn main() {
+      let x: Result<int32, string> = Ok(5);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_result_err() {
+    infer(
+        r#"
+    fn main() {
+      let x: Result<string, int32> = Err(5);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_nested_generic_constructor() {
+    infer(
+        r#"
+    fn main() {
+      let xs: Slice<Option<int32>> = [Some(1), Some(2)];
+      let opt: Option<Slice<int32>> = Some([1, 2, 3]);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_generic_function() {
+    infer(
+        r#"
+    fn id<T>(x: T) -> T { x }
+    fn main() {
+      let x: int32 = id(1);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_struct_literal() {
+    infer(
+        r#"
+    struct Box<T> { value: T }
+    fn main() {
+      let x: Box<int32> = Box { value: 1 };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_aliased_struct_literal() {
+    infer(
+        r#"
+    struct Box<T> { value: T }
+    type MyBox<T> = Box<T>
+    fn main() {
+      let _x: MyBox<int32> = Box { value: 1 };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_multi_hop_numeric_alias() {
+    infer(
+        r#"
+    type A = B
+    type B = int32
+    fn main() {
+      let _x: A = 1;
+      let _y: Option<A> = Some(2);
+      let mut m: mut Map<A, string> = Map.new();
+      m[3] = "v";
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_multi_hop_alias_constructor() {
+    infer(
+        r#"
+    type A<T> = B<T>
+    type B<T> = Option<T>
+    fn main() {
+      let _a: A<int32> = Some(1);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_multi_hop_alias_struct_literal() {
+    infer(
+        r#"
+    struct Box<T> { value: T }
+    type A<T> = B<T>
+    type B<T> = Box<T>
+    fn main() {
+      let _a: A<int32> = Box { value: 1 };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_payload_adapts_through_aliased_struct_literal() {
+    infer(
+        r#"
+    interface Printable { fn print() -> string }
+    struct Text {}
+    impl Text { fn print(self) -> string { "x" } }
+    struct Box<T> { value: T }
+    type MyBox<T> = Box<T>
+    fn main() {
+      let _a: MyBox<Printable> = Box { value: Text {} };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_payload_adapts_through_struct_literal() {
+    infer(
+        r#"
+    interface Printable { fn print() -> string }
+    struct Text {}
+    impl Text { fn print(self) -> string { "x" } }
+    struct Box<T> { value: T }
+    fn main() {
+      let _a: Box<Printable> = Box { value: Text {} };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_tuple_struct_constructor() {
+    infer(
+        r#"
+    struct Wrap<T>(T)
+    fn main() {
+      let x: Wrap<int32> = Wrap(1);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_adapts_through_user_alias() {
+    infer(
+        r#"
+    type MyInt = int32
+    fn main() {
+      let a: MyInt = 1;
+      let b: Option<MyInt> = Some(2);
+      let mut m: mut Map<MyInt, string> = Map.new();
+      m[3] = "v";
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn numeric_int_literal_overflow_through_user_alias() {
+    infer(
+        r#"
+    type Tiny = int8
+    fn main() {
+      let _x: Tiny = 200;
+    }
+        "#,
+    )
+    .assert_infer_code("integer_literal_overflow");
+}
+
+#[test]
+fn numeric_int_literal_adapts_as_map_key() {
+    infer(
+        r#"
+    fn main() {
+      let mut m: mut Map<int32, string> = Map.new();
+      m[5] = "v";
     }
         "#,
     )
@@ -372,7 +595,7 @@ fn cast_literal_with_type_context_is_redundant() {
     }
         "#,
     )
-    .assert_infer_code("redundant_cast");
+    .assert_infer_code("redundant_conversion");
 }
 
 #[test]
@@ -385,7 +608,7 @@ fn cast_negative_literal_with_type_context_is_redundant() {
     }
         "#,
     )
-    .assert_infer_code("redundant_cast");
+    .assert_infer_code("redundant_conversion");
 }
 
 #[test]
@@ -398,7 +621,7 @@ fn cast_paren_negative_literal_with_type_context_is_redundant() {
     }
         "#,
     )
-    .assert_infer_code("redundant_cast");
+    .assert_infer_code("redundant_conversion");
 }
 
 #[test]
@@ -479,6 +702,62 @@ fn cast_rune_to_int() {
 }
 
 #[test]
+fn cast_rune_to_string() {
+    infer(
+        r#"
+    fn main() {
+      let r: rune = 'A';
+      let s: string = r as string;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn cast_byte_to_rune() {
+    infer(
+        r#"
+    fn main() {
+      let b: byte = 65;
+      let r: rune = b as rune;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn cast_custom_rune_type_to_string() {
+    infer(
+        r#"
+    type MyRune = rune
+
+    fn main() {
+      let r: MyRune = 'A';
+      let s: string = r as string;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn cast_custom_byte_type_to_rune() {
+    infer(
+        r#"
+    type MyByte = byte
+
+    fn main() {
+      let b: MyByte = 65;
+      let r: rune = b as rune;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
 fn cast_invalid_string_to_int() {
     infer(
         r#"
@@ -487,7 +766,7 @@ fn cast_invalid_string_to_int() {
     }
         "#,
     )
-    .assert_infer_code("invalid_cast");
+    .assert_infer_code("invalid_conversion");
 }
 
 #[test]
@@ -499,7 +778,7 @@ fn cast_invalid_bool_to_int() {
     }
         "#,
     )
-    .assert_infer_code("invalid_cast");
+    .assert_infer_code("invalid_conversion");
 }
 
 #[test]
@@ -513,7 +792,7 @@ fn cast_invalid_struct_to_int() {
     }
         "#,
     )
-    .assert_infer_code("invalid_cast");
+    .assert_infer_code("invalid_conversion");
 }
 
 #[test]
@@ -551,7 +830,7 @@ fn cast_chained_error() {
     }
         "#,
     )
-    .assert_infer_code("chained_cast");
+    .assert_infer_code("chained_conversion");
 }
 
 #[test]
@@ -563,7 +842,7 @@ fn cast_chained_with_parens_error() {
     }
         "#,
     )
-    .assert_infer_code("chained_cast");
+    .assert_infer_code("chained_conversion");
 }
 
 #[test]
@@ -751,6 +1030,145 @@ fn numeric_does_not_unify_with_bool() {
         "#,
     )
     .assert_type_mismatch();
+}
+
+#[test]
+fn comparison_rejects_mixed_float_widths() {
+    infer(
+        r#"
+    fn main() -> bool {
+      let a: float32 = 1.5;
+      let b: float64 = 1.25;
+      a > b
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn equality_rejects_mixed_signed_int_widths() {
+    infer(
+        r#"
+    fn main() -> bool {
+      let a: int32 = 1;
+      let b: int64 = 2;
+      a == b
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn comparison_rejects_mixed_unsigned_int_widths() {
+    infer(
+        r#"
+    fn main() -> bool {
+      let a: uint32 = 1;
+      let b: uint64 = 2;
+      a >= b
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn comparison_rejects_machine_int_against_sized_int() {
+    infer(
+        r#"
+    fn main() -> bool {
+      let a: int = 1;
+      let b: int64 = 2;
+      a < b
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn comparison_rejects_aliases_over_mixed_int_widths() {
+    infer(
+        r#"
+    type Narrow = int32
+    type Wide = int64
+    fn main() -> bool {
+      let a: Narrow = 1;
+      let b: Wide = 2;
+      a == b
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn comparison_accepts_cast_between_float_widths() {
+    infer(
+        r#"
+    fn main() -> bool {
+      let a: float32 = 1.5;
+      let b: float64 = 1.25;
+      a as float64 > b
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn comparison_accepts_go_aliased_scalars() {
+    infer(
+        r#"
+    fn main() -> bool {
+      let a: byte = 1;
+      let b: uint8 = 2;
+      let c: rune = 'x';
+      let d: int32 = 3;
+      a == b && c > d
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn comparison_accepts_distinct_aliases_over_one_type() {
+    infer(
+        r#"
+    type Score = int
+    type Points = int
+    fn main() -> bool {
+      let a: Score = 1;
+      let b: Points = 2;
+      let c: int = 3;
+      a == b && a > c
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn comparison_accepts_aliases_over_go_aliased_scalars() {
+    infer(
+        r#"
+    type ByteAlias = byte
+    type Uint8Alias = uint8
+    type RuneAlias = rune
+    type Int32Alias = int32
+    fn main() -> bool {
+      let a: ByteAlias = 1;
+      let b: Uint8Alias = 2;
+      let c: RuneAlias = 'x';
+      let d: Int32Alias = 3;
+      a == b && c > d
+    }
+        "#,
+    )
+    .assert_no_errors();
 }
 
 #[test]
@@ -1353,19 +1771,19 @@ fn occurs_check_in_collection() {
 }
 
 #[test]
-fn unknown_in_var_type_disallowed_in_lis_file() {
+fn unknown_in_var_type_allowed_in_lis_file() {
     infer(
         r#"
     fn main() {
-      let x: Unknown = 42;
+      let x: Unknown = get_unknown();
     }
         "#,
     )
-    .assert_infer_code("unknown_outside_typedef");
+    .assert_no_errors();
 }
 
 #[test]
-fn unknown_in_param_type_disallowed_in_lis_file() {
+fn unknown_in_param_type_allowed_in_lis_file() {
     infer(
         r#"
     fn process(x: Unknown) -> int {
@@ -1373,19 +1791,328 @@ fn unknown_in_param_type_disallowed_in_lis_file() {
     }
         "#,
     )
-    .assert_infer_code("unknown_outside_typedef");
+    .assert_no_errors();
 }
 
 #[test]
-fn unknown_in_return_type_disllowed_in_lis_file() {
+fn unknown_in_return_type_allowed_in_lis_file() {
     infer(
         r#"
     fn get_value() -> Unknown {
-      return 42;
+      return get_unknown();
     }
         "#,
     )
-    .assert_infer_code("unknown_outside_typedef");
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_in_const_annotation_disallowed() {
+    infer(
+        r#"
+    const X: Unknown = 42;
+        "#,
+    )
+    .assert_infer_code("unknown_in_const_annotation");
+}
+
+#[test]
+fn unknown_in_const_annotation_nested_disallowed() {
+    infer(
+        r#"
+    const XS: Slice<Unknown> = [];
+        "#,
+    )
+    .assert_infer_code("unknown_in_const_annotation");
+}
+
+#[test]
+fn unknown_in_const_annotation_via_alias_disallowed() {
+    infer(
+        r#"
+    type Erased = Unknown;
+    const X: Erased = 42;
+        "#,
+    )
+    .assert_infer_code("unknown_in_const_annotation");
+}
+
+#[test]
+fn unknown_in_bound_position_disallowed() {
+    infer(
+        r#"
+    fn f<T: Unknown>(x: T) {}
+        "#,
+    )
+    .assert_infer_code("unknown_in_bound_position");
+}
+
+#[test]
+fn unknown_in_struct_field_allowed_in_lis_file() {
+    infer(
+        r#"
+    struct Bag {
+      pub value: Unknown,
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_in_let_mut_map_allowed() {
+    infer(
+        r#"
+    fn main() {
+      let mut m: mut Map<string, Unknown> = Map.new();
+      m["k"] = "alice";
+      m["n"] = 42;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_in_slice_literal_heterogeneous() {
+    infer(
+        r#"
+    fn main() {
+      let xs: Slice<Unknown> = ["alice", 30, true];
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_alias_declares_without_error() {
+    infer(
+        r#"
+    type Claims = Map<string, Unknown>;
+    type Erased = Unknown;
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_as_map_key_surface_disallowed() {
+    infer(
+        r#"
+    fn main() {
+      let m: Map<Unknown, int> = Map.new();
+    }
+        "#,
+    )
+    .assert_infer_code("unknown_as_map_key");
+}
+
+#[test]
+fn unknown_as_map_key_turbofish_compiles() {
+    // Non-surface forms inherit Go's runtime panic semantics; only direct
+    // surface annotations of `Map<Unknown, _>` are statically rejected.
+    infer(
+        r#"
+    fn main() {
+      let m = Map.new<Unknown, int>();
+      let _ = m;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_as_map_key_via_alias_disallowed() {
+    infer(
+        r#"
+    type K = Unknown;
+    fn main() {
+      let m: Map<K, int> = Map.new();
+    }
+        "#,
+    )
+    .assert_infer_code("unknown_as_map_key");
+}
+
+#[test]
+fn unknown_as_map_key_via_nested_alias_disallowed() {
+    infer(
+        r#"
+    type K1 = Unknown;
+    type K2 = K1;
+    fn main() {
+      let m: Map<K2, int> = Map.new();
+    }
+        "#,
+    )
+    .assert_infer_code("unknown_as_map_key");
+}
+
+#[test]
+fn unknown_as_map_key_turbofish_via_alias_compiles() {
+    infer(
+        r#"
+    type K = Unknown;
+    fn main() {
+      let m = Map.new<K, int>();
+      let _ = m;
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_alias_map_key_requires_comparable_bound() {
+    infer(
+        r#"
+    type Claims<K, V> = Map<K, V>;
+        "#,
+    )
+    .assert_infer_code_once("missing_map_key_bound");
+}
+
+#[test]
+fn method_generic_map_key_requires_comparable_bound() {
+    infer(
+        r#"
+    struct Bag<T> {}
+    impl<T> Bag<T> {
+      pub fn make<K>(self) -> Map<K, T> { panic("unreachable") }
+    }
+        "#,
+    )
+    .assert_infer_code_once("missing_map_key_bound");
+}
+
+#[test]
+fn option_unknown_accepts_concrete_some() {
+    infer(
+        r#"
+    fn opt_unknown() -> Option<Unknown> {
+      Some("x")
+    }
+    fn main() {
+      let _ = opt_unknown();
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn result_unknown_accepts_concrete_ok() {
+    infer(
+        r#"
+    fn ok_unknown() -> Result<Unknown, error> {
+      Ok(42)
+    }
+    fn main() {
+      let _ = ok_unknown();
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_map_return_from_typedef_api_allowed() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "ffi",
+        "bindings.d.lis",
+        r#"
+    pub fn make() -> Map<Unknown, int>
+        "#,
+    );
+    fs.add_file(
+        "ffi",
+        "main.lis",
+        r#"
+    fn main() {
+      let _ = make()
+    }
+        "#,
+    );
+    infer_package("ffi", fs).assert_no_errors();
+}
+
+#[test]
+fn receiver_generic_map_key_requires_comparable_bound() {
+    infer(
+        r#"
+    struct Bag<K> {}
+    impl<K> Bag<K> {
+      fn make(self) -> Map<K, int> { panic("unreachable") }
+    }
+        "#,
+    )
+    .assert_infer_code_once("missing_map_key_bound");
+}
+
+#[test]
+fn generic_reaching_map_key_through_struct_requires_comparable_bound() {
+    infer(
+        r#"
+    struct Key<T: Comparable> { values: Map<T, int> }
+    struct Outer<T> { key: Key<T> }
+        "#,
+    )
+    .assert_infer_code_once("missing_bound_on_param");
+}
+
+#[test]
+fn generic_reaching_map_key_through_function_signature_requires_comparable_bound() {
+    infer(
+        r#"
+    struct Key<T: Comparable> { values: Map<T, int> }
+    fn use_key<T>(key: Key<T>) {}
+        "#,
+    )
+    .assert_infer_code_once("missing_bound_on_param");
+}
+
+#[test]
+fn generic_using_ordered_type_requires_ordered_bound() {
+    infer(
+        r#"
+    import "go:cmp"
+
+    struct OrderedValue<T: cmp.Ordered> { value: T }
+    struct Outer<T> { value: OrderedValue<T> }
+        "#,
+    )
+    .assert_infer_code_once("missing_bound_on_param");
+}
+
+#[test]
+fn generic_using_ordered_type_with_matching_bound_is_allowed() {
+    infer(
+        r#"
+    import "go:cmp"
+
+    struct OrderedValue<T: cmp.Ordered> { value: T }
+    struct Outer<T: cmp.Ordered> { value: OrderedValue<T> }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn tuple_unknown_accepts_concrete_at_unknown_position() {
+    infer(
+        r#"
+    fn pair() -> (int, Unknown) {
+      (1, "two")
+    }
+    fn main() {
+      let _ = pair();
+    }
+        "#,
+    )
+    .assert_no_errors();
 }
 
 #[test]
@@ -1400,7 +2127,7 @@ fn unknown_in_param_type_allowed_in_typedef_file() {
     }
         "#,
     );
-    infer_module("ffi", fs).assert_no_errors();
+    infer_package("ffi", fs).assert_no_errors();
 }
 
 #[test]
@@ -1423,6 +2150,44 @@ fn unknown_rejects_downcast_to_concrete() {
     fn test() {
       let data = get_unknown();
       process(data)
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn unknown_map_accepts_matching_unknown_map() {
+    infer(
+        r#"
+    fn test() {
+      let m = get_unknown_map();
+      takes_unknown_map(m)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unknown_map_rejects_concrete_value_type() {
+    infer(
+        r#"
+    fn test() {
+      takes_unknown_map(Map.from([("k", "v")]))
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn unknown_slice_rejects_concrete_element_type() {
+    infer(
+        r#"
+    fn test() {
+      let xs: Slice<int> = [1, 2, 3]
+      takes_unknown_slice(xs)
     }
         "#,
     )
@@ -1596,7 +2361,7 @@ fn interface_inheritance_simple() {
     }
 
     interface Logger {
-      impl Display;
+      embed Display;
       fn log() -> ();
     }
 
@@ -1637,7 +2402,7 @@ fn interface_inheritance_methods_available() {
     }
 
     interface Logger {
-      impl Display;
+      embed Display;
       fn log() -> ();
     }
 
@@ -1678,7 +2443,7 @@ fn interface_inheritance_with_type_parameters() {
     }
 
     interface Logger<T> {
-      impl Display<T>;
+      embed Display<T>;
       fn log() -> ();
     }
 
@@ -1719,7 +2484,7 @@ fn interface_inheritance_missing_parent_method_produces_error() {
     }
 
     interface Logger {
-      impl Display;
+      embed Display;
       fn log() -> ();
     }
 
@@ -1909,7 +2674,7 @@ fn expected_type_propagation_option_with_interface() {
     infer(
         r#"
     interface Printable {
-      fn display(self) -> string
+      fn display() -> string
     }
 
     struct Text { content: string }
@@ -1931,7 +2696,7 @@ fn expected_type_propagation_result_with_interface() {
     infer(
         r#"
     interface Printable {
-      fn display(self) -> string
+      fn display() -> string
     }
 
     struct Text { content: string }
@@ -1953,7 +2718,7 @@ fn expected_type_propagation_does_not_make_variable_covariant() {
     infer(
         r#"
     interface Printable {
-      fn display(self) -> string
+      fn display() -> string
     }
 
     struct Text { content: string }
@@ -2514,7 +3279,7 @@ fn self_referential_fbound_accepts_matching_type() {
     infer(
         r#"
         pub interface Cloner<T: Cloner<T>> {
-          fn clone(self) -> T
+          fn clone() -> T
         }
 
         struct Foo{}
@@ -2538,7 +3303,7 @@ fn self_referential_fbound_rejects_mismatched_type() {
     infer(
         r#"
         pub interface Cloner<T: Cloner<T>> {
-          fn clone(self) -> T
+          fn clone() -> T
         }
 
         struct Foo{}

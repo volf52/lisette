@@ -1,8 +1,10 @@
-use tower_lsp::lsp_types::*;
+use crate::protocol::*;
 
 use syntax::ast::Expression;
+use syntax::types::unqualified_name;
 
 use crate::traversal::find_enclosing_call;
+use syntax::types::Type;
 pub(crate) fn handle(items: &[Expression], offset: u32) -> Option<SignatureHelp> {
     let call_expression = find_enclosing_call(items, offset)?;
 
@@ -15,27 +17,28 @@ pub(crate) fn handle(items: &[Expression], offset: u32) -> Option<SignatureHelp>
 
     let func_ty = expression.get_type();
     let func_ty_inner = match &func_ty {
-        syntax::types::Type::Forall { body, .. } => body.as_ref(),
+        Type::Forall { body, .. } => body.as_ref(),
         other => other,
     };
-    let syntax::types::Type::Function {
-        params,
-        return_type,
-        ..
-    } = func_ty_inner
-    else {
+    let Type::Function(f) = func_ty_inner else {
         return None;
     };
+    let params = &f.params;
+    let return_type = &f.return_type;
 
     let func_name = match expression.as_ref() {
-        Expression::Identifier { value, .. } => value.rsplit('.').next().unwrap_or(value.as_str()),
+        Expression::Identifier { value, .. } => unqualified_name(value),
         Expression::DotAccess { member, .. } => member.as_str(),
         _ => "fn",
     };
 
-    let display_params = params.as_slice();
-
-    let param_strs: Vec<String> = display_params.iter().map(|p| p.to_string()).collect();
+    let param_strs: Vec<String> = params
+        .iter()
+        .map(|param| match &param.name {
+            Some(name) => format!("{name}: {}", param.ty),
+            None => param.ty.to_string(),
+        })
+        .collect();
     let signature = format!("fn {func_name}({}) -> {return_type}", param_strs.join(", "));
 
     let raw_active = args

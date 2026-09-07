@@ -1,17 +1,19 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nstruct P { v: int }\nfn test() {\n  let p = P { v: 1 }\n  let _ = match p {\n    P { v } => (),\n  }\n}\n"
+description: |
+  
+  struct P { v: int }
+  fn test() {
+    let p = P { v: 1 }
+    let _ = match p {
+      P { v } => (),
+    }
+  }
 ---
 package main
 
-import "fmt"
-
 type P struct {
 	v int
-}
-
-func (p P) String() string {
-	return fmt.Sprintf("P { v: %v }", p.v)
 }
 
 func test() {

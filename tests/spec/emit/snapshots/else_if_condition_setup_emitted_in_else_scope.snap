@@ -1,0 +1,44 @@
+---
+source: tests/spec/emit/control_flow.rs
+description: |
+  
+  fn track(flag: mut Ref<bool>) -> Result<int, error> {
+    flag.* = true
+    Ok(1)
+  }
+  
+  fn test() {
+    let mut ran = false
+    if true {
+      let _ = 1
+    } else if track(&ran).is_ok() {
+      let _ = 2
+    } else {
+      let _ = 3
+    }
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func track(flag *bool) (int, error) {
+	*flag = true
+	return 1, nil
+}
+
+func test() {
+	ran := false
+	if true {
+	} else {
+		ret_1, ret_2 := track(&ran)
+		var result_3 lisette.Result[int, error]
+		if ret_2 != nil {
+			result_3 = lisette.MakeResultErr[int, error](ret_2)
+		} else {
+			result_3 = lisette.MakeResultOk[int, error](ret_1)
+		}
+		if result_3.IsOk() {
+		}
+	}
+}

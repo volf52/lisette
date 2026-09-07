@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nimport \"go:flag\"\n\nfn main() {\n  let f = flag.UnquoteUsage\n  let fl = flag.Lookup(\"verbose\")\n  match fl {\n    Some(v) => { let _ = f(v) },\n    None => {},\n  }\n}\n"
+description: |
+  
+  import "go:flag"
+  
+  fn main() {
+    let f = flag.UnquoteUsage
+    let fl = flag.Lookup("verbose")
+    match fl {
+      Some(v) => { let _ = f(v) },
+      None => {},
+    }
+  }
 ---
 package main
 
@@ -10,19 +21,10 @@ import (
 )
 
 func main() {
-	f := func(arg0 *flag.Flag) lisette.Tuple2[string, string] {
-		ret_1, ret_2 := flag.UnquoteUsage(arg0)
-		return lisette.MakeTuple2(ret_1, ret_2)
-	}
-	raw_4 := flag.Lookup("verbose")
-	var fl lisette.Option[*flag.Flag]
-	if raw_4 != nil {
-		fl = lisette.MakeOptionSome[*flag.Flag](raw_4)
-	} else {
-		fl = lisette.MakeOptionNone[*flag.Flag]()
-	}
+	f := flag.UnquoteUsage
+	raw_1 := flag.Lookup("verbose")
+	fl := lisette.OptionFromNilable[*flag.Flag](raw_1, raw_1 == nil)
 	if fl.Tag == lisette.OptionSome {
-		v := fl.SomeVal
-		_ = f(v)
+		f(fl.SomeVal)
 	}
 }

@@ -1,29 +1,20 @@
+use crate::checker::EnvResolve;
+use crate::facts::StatementTailCheck;
+use crate::store::Store;
 use syntax::EcoString;
 use syntax::ast::DeadCodeCause;
-use syntax::ast::{BinaryOperator, Expression, Span, UnaryOperator};
-use syntax::program::Visibility;
+use syntax::ast::{BinaryOperator, Expression, IdentifierResolution, Span, UnaryOperator};
+use syntax::program::DefinitionBody;
+use syntax::types::CompoundKind;
 use syntax::types::Type;
 
-use super::super::Checker;
-use super::super::checks::{check_is_non_addressable, check_non_addressable_assignment_target};
-use crate::checker::PostInferenceCheck;
-use crate::facts::DiscardedTailKind;
-
-/// Checks whether an assignment target expression contains a deref (`.* `)
-/// anywhere in its chain. For example, `p.*.x` is a `DotAccess` wrapping a
-/// `Unary::Deref`, and mutations through a deref don't require the variable
-/// to be declared `mut` since they mutate the pointed-to value.
-pub(crate) fn contains_deref(expression: &Expression) -> bool {
-    match expression {
-        Expression::Unary {
-            operator: UnaryOperator::Deref,
-            ..
-        } => true,
-        Expression::DotAccess { expression, .. } => contains_deref(expression),
-        Expression::IndexedAccess { expression, .. } => contains_deref(expression),
-        _ => false,
-    }
-}
+use super::super::addressability::{
+    check_is_non_addressable, check_non_addressable_assignment_target,
+};
+use super::super::context::UseContext;
+use super::calls::phantom_type_params;
+use super::operators::InferredOperand;
+use crate::checker::infer::InferCtx;
 
 /// Checks whether an expression contains a stored Reference (`&var_name`) to a specific variable.
 /// Used to detect self-referential assignment patterns like `x = Foo { field: &x }`.
@@ -65,7 +56,7 @@ fn contains_stored_reference_to(expression: &Expression, var_name: &str) -> bool
                     contains_stored_reference_to(expr, var_name)
                 }
             };
-            args.iter().any(check) || spread.as_ref().as_ref().is_some_and(check)
+            args.iter().any(check) || spread.as_deref().is_some_and(check)
         }
         // Recurse but skip immediately-dereferenced contexts
         Expression::Binary { left, right, .. } => {
@@ -85,15 +76,15 @@ fn contains_stored_reference_to(expression: &Expression, var_name: &str) -> bool
     }
 }
 
-impl Checker<'_, '_> {
+impl InferCtx<'_> {
     pub(super) fn infer_paren(
         &mut self,
         expression: Box<Expression>,
         span: Span,
         expected_ty: &Type,
-        parent_is_subexpression: bool,
+        is_subexpression: bool,
     ) -> Expression {
-        if !parent_is_subexpression {
+        if !is_subexpression {
             match &*expression {
                 Expression::Return { span: s, .. } => {
                     self.sink
@@ -113,8 +104,7 @@ impl Checker<'_, '_> {
             }
         }
 
-        self.inference.in_subexpression = parent_is_subexpression;
-        let new_expression = self.infer_expression(*expression, expected_ty);
+        let new_expression = self.infer_expression_at(*expression, expected_ty, is_subexpression);
         let new_ty = new_expression.get_type();
 
         Expression::Paren {
@@ -132,13 +122,12 @@ impl Checker<'_, '_> {
     ) -> Expression {
         if items.is_empty() {
             let unit_ty = self.type_unit();
-            let resolved = expected_ty.resolve();
-            if let Type::Constructor { id, params, .. } = &resolved
-                && id.ends_with("Map")
-                && params.len() == 2
+            let resolved = expected_ty.resolve_in(&self.env);
+            if let Some((CompoundKind::Map, args)) = resolved.as_compound()
+                && args.len() == 2
             {
-                let k = params[0].resolve();
-                let v = params[1].resolve();
+                let k = args[0].resolve_in(&self.env);
+                let v = args[1].resolve_in(&self.env);
                 self.sink
                     .push(diagnostics::infer::invalid_map_initialization(&k, &v, span));
             } else {
@@ -151,15 +140,15 @@ impl Checker<'_, '_> {
             };
         }
 
-        self.scopes.push();
-        self.register_types_and_values(&items, &Visibility::Local);
-
-        let new_items = self.infer_block_items(items, expected_ty.clone());
-
-        let last_item = new_items.last().expect("block must have at least one item");
-        let block_ty = last_item.get_type();
-
-        self.scopes.pop();
+        let (new_items, block_ty) = self.with_scope(|this| {
+            this.register_block_local_items(&items);
+            let new_items = this.infer_block_items(items, expected_ty.clone());
+            let block_ty = new_items
+                .last()
+                .expect("block must have at least one item")
+                .get_type();
+            (new_items, block_ty)
+        });
 
         Expression::Block {
             items: new_items,
@@ -174,39 +163,82 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
+        let store = self.store;
         let inner_ty = self.new_type_var();
         let new_expression = self.infer_expression(*expression, &inner_ty);
 
-        let resolved_inner = inner_ty.resolve();
+        let resolved_inner = inner_ty.resolve_in(&self.env);
         let is_already_ref = resolved_inner.is_ref();
 
-        // Collapse &ref_var to ref_var — adding another reference layer is a no-op
+        if !is_already_ref
+            && matches!(resolved_inner.unwrap_forall(), Type::Nominal { .. })
+            && store.is_interface(&store.peel_alias(&resolved_inner))
+        {
+            self.sink.push(diagnostics::infer::ref_of_interface_value(
+                &resolved_inner,
+                span,
+            ));
+            self.unify(expected_ty, &Type::Error, &span);
+            return Expression::Reference {
+                expression: new_expression.into(),
+                ty: Type::Error,
+                span,
+            };
+        }
+
+        // Collapse &ref_var to ref_var, adding another reference layer is a no-op
         let ref_ty = if is_already_ref {
             self.facts
                 .add_overused_reference(span, new_expression.get_var_name());
             resolved_inner
         } else {
-            self.type_reference(inner_ty.clone())
+            // A construction or a call result is a fresh cell that no binding shares.
+            let writable = match new_expression.unwrap_parens() {
+                Expression::StructCall { .. } | Expression::Call { .. } => true,
+                other => self.place_permits_write(other),
+            };
+            let constructed = new_expression.unwrap_parens().get_span();
+            match self.read_only_constructions.remove(&constructed) {
+                Some(components) => {
+                    self.read_only_constructions.insert(span, components);
+                }
+                None => {
+                    self.read_only_constructions.remove(&span);
+                }
+            }
+            Type::qualified_compound(CompoundKind::Ref, vec![inner_ty.clone()], writable)
         };
 
-        self.unify(expected_ty, &ref_ty, &span);
-
+        // Addressability and const diagnostics come before any qualifier mismatch.
+        let mut not_addressable = false;
         if !is_already_ref {
-            if self.has_newtype_dot0_in_chain(&new_expression) {
-                self.sink
-                    .push(diagnostics::infer::reference_through_newtype(span));
-            }
-
-            if let Some(kind) = check_is_non_addressable(&new_expression) {
+            if let Some(kind) = check_is_non_addressable(&new_expression, &self.env, self.store) {
                 self.sink
                     .push(diagnostics::infer::non_addressable_expression(kind, span));
+                not_addressable = true;
+            } else if let Expression::Identifier { resolution, .. } = &new_expression
+                && let Some(qname) = resolution.definition()
+                && self.is_const_name(store, qname)
+            {
+                self.sink
+                    .push(diagnostics::infer::non_addressable_const(span));
+                not_addressable = true;
             }
 
             if let Some(var_name) = new_expression.get_var_name()
                 && let Some(binding_id) = self.scopes.lookup_binding_id(&var_name)
             {
-                self.facts.mark_mutated(binding_id);
+                self.facts.mark_alias_mutated(binding_id);
+                if ref_ty.is_writable() && expected_ty.resolve_in(&self.env).is_writable() {
+                    self.record_loop_copy_write(&var_name, span);
+                }
             }
+        }
+
+        if not_addressable {
+            self.unify(expected_ty, &Type::Error, &span);
+        } else {
+            self.unify(expected_ty, &ref_ty, &span);
         }
 
         Expression::Reference {
@@ -222,11 +254,19 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
+        let store = self.store;
         let binding_id = self.scopes.lookup_binding_id(&value);
         if let Some(id) = binding_id {
             // Don't mark assignment targets as "used" - only mark actual uses
-            if !self.is_inferring_assignment_target() {
+            if !self.is_assignment_target_context() {
                 self.facts.mark_used(id);
+                if let Some(inference) = self
+                    .binding_inference
+                    .get_mut(&id)
+                    .and_then(|binding| binding.as_loop_element_mut())
+                {
+                    inference.reads.push(span);
+                }
             }
 
             if let Some(binding_fact) = self.facts.bindings.get(&id) {
@@ -236,45 +276,128 @@ impl Checker<'_, '_> {
         }
 
         let qualified: Option<EcoString> = if binding_id.is_none() {
-            self.lookup_qualified_name(&value).map(EcoString::from)
+            self.lookup_qualified_name(store, &value).or_else(|| {
+                let (owner, method) = value.rsplit_once('.')?;
+                let owner = self.lookup_qualified_name(store, owner)?;
+                store.get_method(&owner, method)?;
+                Some(format!("{owner}.{method}").into())
+            })
         } else {
             None
         };
 
         if let Some(ref qname) = qualified
-            && let Some(definition_span) = self.get_definition_name_span(qname.as_str())
+            && let Some(definition) = store.get_definition(qname.as_str())
+        {
+            if let Some(definition_span) = definition.name_span {
+                self.facts.add_usage(span, definition_span);
+            }
+            if store.is_test_definition(definition)
+                && store.test_index.contains_qualified(qname.as_str())
+            {
+                self.sink
+                    .push(diagnostics::infer::test_function_not_callable(span, &value));
+            }
+            let names_a_type = match &definition.body {
+                DefinitionBody::Enum { .. } | DefinitionBody::Interface { .. } => true,
+                DefinitionBody::TypeAlias { .. } => store
+                    .deep_struct_kind(definition.ty.unwrap_forall())
+                    .is_none(),
+                _ => false,
+            };
+            if names_a_type && !self.is_callee_context() && !self.is_dot_access_base() {
+                self.sink
+                    .push(diagnostics::infer::type_used_as_value(&value, span));
+            }
+        }
+        if let Some(ref qname) = qualified
+            && store.get_definition(qname.as_str()).is_none()
+            && let Some((owner, name)) = qname.rsplit_once('.')
+            && let Some(method) = store.get_method(owner, name)
+            && let Some(definition_span) = method.name_span
         {
             self.facts.add_usage(span, definition_span);
         }
 
-        let ty = match self.lookup_type(&value) {
+        let ty = match self.lookup_type(store, &value) {
             Some(ty) => ty,
             None => {
                 if value == "self" {
                     self.sink
                         .push(diagnostics::infer::self_in_static_method(span));
                 } else {
-                    self.error_name_not_found(&value, span);
+                    self.error_name_not_found(&value, span, expected_ty);
                 }
                 Type::Error
             }
         };
 
+        if ty.as_import_namespace().is_some() && !self.is_dot_access_base() {
+            self.sink
+                .push(diagnostics::infer::package_namespace_used_as_value(
+                    &value, span,
+                ));
+        }
+
+        if !self.is_callee_context() && !self.is_assignment_target_context() {
+            let phantom = phantom_type_params(&ty);
+            if !phantom.is_empty() {
+                self.sink
+                    .push(diagnostics::infer::uninferable_generic_reference(
+                        &value, &phantom, span,
+                    ));
+            }
+        }
+
         let (identifier_ty, _) = self.instantiate(&ty);
+
+        let coerced_to_unconstrained_value = !self.is_callee_context()
+            && !self.is_assignment_target_context()
+            && expected_ty.resolve_in(&self.env).is_variable();
 
         self.unify(expected_ty, &identifier_ty, &span);
 
-        if !self.scopes.is_callee_context() {
-            self.check_native_value_usage(&value, &identifier_ty, span);
+        if coerced_to_unconstrained_value {
+            self.register_function_value_obligations(&value, &identifier_ty, span);
         }
+
+        if let Some(enum_id) = self.enum_of_variant(store, &value) {
+            let nominal = match &identifier_ty {
+                Type::Nominal { .. } => Some(&identifier_ty),
+                Type::Function(function) => match function.return_type.as_ref() {
+                    nominal @ Type::Nominal { .. } => Some(nominal),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(nominal) = nominal {
+                self.register_construction_obligations(&enum_id, nominal, span);
+            }
+        }
+
+        let resolution = match (binding_id, qualified) {
+            (Some(id), None) => IdentifierResolution::Binding(id),
+            (None, Some(definition)) => IdentifierResolution::Definition(definition),
+            (None, None) => IdentifierResolution::Unresolved,
+            (Some(_), Some(_)) => unreachable!("identifier cannot be local and global"),
+        };
 
         Expression::Identifier {
             value,
             ty: identifier_ty,
             span,
-            binding_id,
-            qualified,
+            resolution,
         }
+    }
+
+    pub(super) fn enum_of_variant(&mut self, store: &Store, value: &str) -> Option<EcoString> {
+        let (type_part, variant_name) = value.rsplit_once('.')?;
+        let qualified = self.lookup_qualified_name(store, type_part)?;
+        store
+            .variants_of(qualified.as_str())?
+            .iter()
+            .any(|variant| variant.name == variant_name)
+            .then_some(qualified)
     }
 
     pub(super) fn infer_assignment(
@@ -284,31 +407,54 @@ impl Checker<'_, '_> {
         compound_operator: Option<BinaryOperator>,
         span: Span,
     ) -> Expression {
+        let store = self.store;
         let target_ty = self.new_type_var();
         // Prevent simple assignment targets from being marked as "used" in the lint system.
         // Complex targets like `a[i]` or `r.*` have subexpressions that ARE being read.
         let is_simple_target = matches!(&*target, Expression::Identifier { .. });
-        if is_simple_target {
-            self.set_inferring_assignment_target();
-        }
-        let new_target = self.infer_expression(*target, &target_ty);
-        if is_simple_target {
-            self.clear_inferring_assignment_target();
-        }
+        let new_target = if is_simple_target {
+            self.with_use_context(UseContext::AssignmentTarget, |state| {
+                state.infer_expression(*target, &target_ty)
+            })
+        } else {
+            self.infer_expression(*target, &target_ty)
+        };
 
-        if let Some(kind) = check_non_addressable_assignment_target(&new_target) {
+        if let Some(kind) =
+            check_non_addressable_assignment_target(&new_target, &self.env, self.store)
+        {
             self.sink
                 .push(diagnostics::infer::non_addressable_assignment(kind, span));
         }
 
-        self.check_newtype_field_assignment(&new_target, span);
-        self.check_map_field_chain_assignment(&new_target, span);
+        if compound_operator.is_some()
+            && let Some(var_name) = new_target.get_var_name()
+            && !self.scopes.lookup_mutable(&var_name)
+            && self.imports.namespace(&var_name).is_none()
+        {
+            let peeled = store.peel_alias(&target_ty.resolve_in(&self.env));
+            if peeled.is_ref() && peeled.is_writable() {
+                self.report_disallowed_mutation(store, &var_name, span, false, None);
+                if let Some(binding_id) = self.scopes.lookup_binding_id(&var_name) {
+                    self.facts.mark_used(binding_id);
+                }
+                let inner = peeled
+                    .inner()
+                    .map(|ty| ty.resolve_in(&self.env))
+                    .unwrap_or_else(|| self.new_type_var());
+                let new_value =
+                    self.with_value_context(|state| state.infer_expression(*value, &inner));
+                return Expression::Assignment {
+                    target: new_target.into(),
+                    value: new_value.into(),
+                    compound_operator,
+                    span,
+                };
+            }
+        }
 
-        // Propagates type information to the RHS (e.g., lambda params
-        // get their types from a Map's value type).
-        let value_expected = target_ty.resolve();
-        let new_value = self.infer_expression(*value, &value_expected);
-        let value_ty = new_value.get_type();
+        let (new_value, value_ty) =
+            self.infer_assignment_value(&new_target, &target_ty, value, compound_operator, span);
 
         // Track mutation for binding-rooted targets. Call-based lvalues
         // (e.g., `get().*.x = ...`) have no local binding to track.
@@ -319,41 +465,11 @@ impl Checker<'_, '_> {
                 if compound_operator.is_some() {
                     self.facts.mark_used(binding_id);
                 }
-                self.facts.mark_mutated(binding_id);
-            }
-
-            let is_mutable = self.scopes.lookup_mutable(&var_name);
-
-            let is_deref = contains_deref(&new_target);
-
-            // Mutation through a Ref<T> binding doesn't require mut — the pointer
-            // isn't being reassigned, the pointee is being mutated through it.
-            let binding_is_ref = self
-                .scopes
-                .lookup_value(&var_name)
-                .map(|t| t.resolve().is_ref())
-                .unwrap_or(false);
-
-            let can_mutate = is_mutable || is_deref || binding_is_ref;
-
-            if !can_mutate {
-                let self_type_name = if var_name == "self" {
-                    self.lookup_type("self")
-                        .and_then(|t| t.get_name().map(str::to_owned))
+                if self.scopes.binding_crosses_function_boundary(&var_name) {
+                    self.facts.mark_alias_mutated(binding_id);
                 } else {
-                    None
-                };
-                let is_match_arm = self
-                    .scopes
-                    .lookup_binding_id(&var_name)
-                    .and_then(|id| self.facts.bindings.get(&id))
-                    .is_some_and(|b| b.kind.is_match_arm());
-                self.sink.push(diagnostics::infer::disallowed_mutation(
-                    &var_name,
-                    span,
-                    self_type_name.as_deref(),
-                    is_match_arm,
-                ));
+                    self.facts.mark_mutated(binding_id);
+                }
             }
 
             // Check for self-referential assignment: x = Expr { field: &x }
@@ -364,9 +480,27 @@ impl Checker<'_, '_> {
             }
         }
 
+        // A write through a reference needs it writable, a direct write a mutable binding.
+        match self.classify_write_target(&new_target) {
+            super::permission::WriteTarget::Through { governing } => {
+                if !governing.is_writable() {
+                    self.report_write_through_read_only(&new_target, &governing, span);
+                }
+            }
+            super::permission::WriteTarget::Binding { name } => {
+                if !self.scopes.lookup_mutable(&name) && self.imports.namespace(&name).is_none() {
+                    let rhs_is_ref = store.peel_alias(&value_ty.resolve_in(&self.env)).is_ref();
+                    self.report_disallowed_mutation(store, &name, span, rhs_is_ref, None);
+                } else {
+                    self.record_loop_copy_write(&name, span);
+                }
+            }
+            super::permission::WriteTarget::Other => {}
+        }
+
         // Only unify if the RHS type is still a variable (not yet resolved).
         // If the RHS was inferred with `value_expected` from the target, the
-        // type inference already emitted any mismatch diagnostic — a second
+        // type inference already emitted any mismatch diagnostic, a second
         // unify here would duplicate it.
         if value_ty.is_variable() {
             self.unify(&target_ty, &value_ty, &span);
@@ -380,13 +514,122 @@ impl Checker<'_, '_> {
         }
     }
 
+    fn infer_assignment_value(
+        &mut self,
+        new_target: &Expression,
+        target_ty: &Type,
+        value: Box<Expression>,
+        compound_operator: Option<BinaryOperator>,
+        span: Span,
+    ) -> (Expression, Type) {
+        // Propagates type information to the RHS (e.g., lambda params
+        // get their types from a Map's value type).
+        let value_expected = target_ty.resolve_in(&self.env);
+        if let Some(operator) = compound_operator {
+            let inferred = self.infer_binary_with_left(
+                operator,
+                InferredOperand::new(new_target.clone(), target_ty.clone()),
+                value,
+                &value_expected,
+                span,
+            );
+            let Expression::Binary { right, .. } = inferred.expression else {
+                unreachable!("infer_binary_with_left always returns a binary")
+            };
+            (*right, inferred.ty)
+        } else {
+            let new_value = self.infer_expression(*value, &value_expected);
+            let value_ty = new_value.get_type();
+            (new_value, value_ty)
+        }
+    }
+
+    pub(super) fn report_disallowed_mutation(
+        &mut self,
+        store: &Store,
+        var_name: &str,
+        span: Span,
+        rhs_is_ref: bool,
+        writing_callee: Option<&str>,
+    ) {
+        use diagnostics::infer::MutationHint;
+        let binding_id = self.scopes.lookup_binding_id(var_name);
+        if let Some(id) = binding_id
+            && !self.reported_immutable.insert(id)
+        {
+            return;
+        }
+        if let Some(id) = binding_id
+            && let Some(inference) = self
+                .binding_inference
+                .get(&id)
+                .and_then(|binding| binding.as_loop_element())
+        {
+            self.sink.push(diagnostics::infer::immutable_loop_binding(
+                var_name,
+                inference.collection.as_deref(),
+                span,
+            ));
+            return;
+        }
+        let self_type_name = if var_name == "self" {
+            let target = self.scopes.impl_receiver_type().map(Type::stringify);
+            target.or_else(|| {
+                self.lookup_type(store, "self")
+                    .and_then(|t| t.get_name().map(str::to_owned))
+            })
+        } else {
+            None
+        };
+        let binding_kind = binding_id
+            .and_then(|id| self.facts.bindings.get(&id))
+            .map(|b| b.kind);
+        let is_const = self.is_const_var(store, var_name);
+        let pointer_type = (!rhs_is_ref && var_name != "self" && !is_const)
+            .then(|| self.lookup_type(store, var_name))
+            .flatten()
+            .map(|ty| store.peel_alias(&ty.resolve_in(&self.env)))
+            .filter(|ty| ty.is_ref() && ty.is_writable())
+            .map(|ty| ty.to_string());
+        let mut diagnostic = diagnostics::infer::disallowed_mutation(
+            var_name,
+            span,
+            self_type_name.as_deref(),
+            binding_kind,
+            is_const,
+            pointer_type
+                .as_deref()
+                .map(MutationHint::Pointer)
+                .or(writing_callee.map(MutationHint::WritingCallee)),
+        );
+        if !is_const
+            && pointer_type.is_none()
+            && let Some(id) = binding_id
+            && self
+                .binding_inference
+                .get(&id)
+                .and_then(|binding| binding.as_let())
+                .is_some_and(|inference| inference.mutability.can_add_mut())
+            && let Some(declaration) = self.facts.bindings.get(&id).map(|b| b.span)
+        {
+            diagnostic = diagnostic.with_fix(diagnostics::Fix::new(
+                format!("Declare `{var_name}` mutable"),
+                diagnostics::Edit::replacement(
+                    Span::new(declaration.file_id, declaration.byte_offset, 0),
+                    "mut ",
+                ),
+            ));
+        }
+        self.sink.push(diagnostic);
+    }
+
     pub(super) fn infer_tuple(
         &mut self,
         elements: Vec<Expression>,
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
-        let expected_elements: Vec<Type> = match expected_ty.resolve() {
+        let expected_elements: Vec<Type> = match expected_ty.resolve_in(&self.env) {
             Type::Tuple(elems) if elems.len() == elements.len() => elems,
             _ => elements.iter().map(|_| self.new_type_var()).collect(),
         };
@@ -399,15 +642,11 @@ impl Checker<'_, '_> {
             })
             .collect();
 
-        for elem in &inferred_elements {
-            self.check_not_temp_producing(elem);
-        }
-
         let element_types: Vec<Type> = inferred_elements.iter().map(|e| e.get_type()).collect();
 
         let tuple_ty = Type::Tuple(element_types);
 
-        self.unify(&tuple_ty, expected_ty, &span);
+        self.unify(expected_ty, &tuple_ty, &span);
 
         Expression::Tuple {
             elements: inferred_elements,
@@ -428,13 +667,12 @@ impl Checker<'_, '_> {
         for (i, item) in items.into_iter().enumerate() {
             if diverged_at.is_some() {
                 let dead_item_ty = self.new_type_var();
-                let inferred_item = self.infer_expression(item, &dead_item_ty);
+                let inferred_item = self.infer_root_expression(item, &dead_item_ty);
                 new_items.push(inferred_item);
                 continue;
             }
 
             let is_last = i == items_len - 1;
-            let is_literal = matches!(item, Expression::Literal { .. });
             let item_span = item.get_span();
 
             let is_statement_only = matches!(
@@ -443,28 +681,28 @@ impl Checker<'_, '_> {
                     | Expression::Assignment { .. }
                     | Expression::Task { .. }
                     | Expression::Defer { .. }
+                    | Expression::Assert { .. }
             );
 
             let suppress_unused_check = item.is_control_flow();
 
-            let callee_name = item.callee_name();
-
-            // Reject statement-only items (let, =, task, defer) as block tail
-            // when the block is expected to produce a non-unit value.
+            // Reject statement-only items (let, =, task, defer, assert) as block
+            // tail when the block is expected to produce a non-unit value.
             if is_last && is_statement_only {
-                let expected = last_item_expected_ty.resolve();
+                let expected = self.env.resolve(&last_item_expected_ty);
                 if last_item_expected_ty.is_ignored() {
-                    // ignored context — never fire
-                } else if matches!(expected, Type::Variable(_)) {
-                    // Type not yet resolved — defer check until after inference
-                    self.post_inference_checks
-                        .push(PostInferenceCheck::StatementTail {
+                    // ignored context, never fire
+                } else if matches!(expected, Type::Var { .. }) {
+                    self.facts
+                        .deferred
+                        .statement_tails
+                        .push(StatementTailCheck {
                             expected_ty: last_item_expected_ty.clone(),
                             span: item_span,
                         });
-                } else if !expected.is_unit() {
+                } else if !expected.is_unit() && !expected.is_error() {
                     self.sink
-                        .push(diagnostics::infer::statement_as_tail(item_span));
+                        .push(diagnostics::infer::statement_as_tail(item_span, &expected));
                 }
             }
 
@@ -478,69 +716,13 @@ impl Checker<'_, '_> {
                 self.new_type_var()
             };
 
-            let prev_ctx = if !is_last {
-                Some(self.scopes.set_statement_context())
+            let inferred_item = if !is_last {
+                self.with_use_context(UseContext::Statement, |state| {
+                    state.infer_root_expression(item, &expression_ty)
+                })
             } else {
-                None
+                self.infer_root_expression(item, &expression_ty)
             };
-
-            // Mark as top-level statement so `Err(x)?`/`None?` is allowed here
-            // but rejected when nested inside a compound sub-expression.
-            self.inference.in_subexpression = false;
-            let inferred_item = self.infer_expression(item, &expression_ty);
-
-            if let Some(ctx) = prev_ctx {
-                self.scopes.restore_use_context(ctx);
-            }
-
-            if !is_statement_only && !suppress_unused_check && !is_last {
-                let mut allowed_lints = callee_name
-                    .as_ref()
-                    .map(|name| self.callee_allowed_lints(name, &inferred_item))
-                    .unwrap_or_default();
-
-                // Channel send returns bool but fire-and-forget is the common pattern
-                if Self::is_channel_send(&inferred_item) {
-                    allowed_lints.push("unused_value".to_string());
-                }
-
-                self.check_unused_expression(
-                    item_span,
-                    &expression_ty.resolve(),
-                    is_literal,
-                    &allowed_lints,
-                );
-            }
-
-            if is_last
-                && !is_statement_only
-                && !suppress_unused_check
-                && last_item_expected_ty.is_ignored()
-                && let Some(callee_return_ty) = Self::get_call_return_type(&inferred_item)
-            {
-                let resolved = callee_return_ty.resolve();
-                let classification = if resolved.is_result() {
-                    Some(("unused_result", DiscardedTailKind::Result))
-                } else if resolved.is_option() {
-                    Some(("unused_option", DiscardedTailKind::Option))
-                } else if resolved.is_partial() {
-                    Some(("unused_partial", DiscardedTailKind::Partial))
-                } else {
-                    None
-                };
-
-                if let Some((lint_name, kind)) = classification {
-                    let allowed_lints = callee_name
-                        .as_ref()
-                        .map(|name| self.callee_allowed_lints(name, &inferred_item))
-                        .unwrap_or_default();
-
-                    if !allowed_lints.contains(&lint_name.to_string()) {
-                        self.facts
-                            .add_discarded_tail(item_span, kind, resolved.to_string());
-                    }
-                }
-            }
 
             if let Some(cause) = inferred_item.diverges() {
                 diverged_at = Some((i, cause));
@@ -558,32 +740,86 @@ impl Checker<'_, '_> {
         new_items
     }
 
-    pub(super) fn error_name_not_found(&mut self, variable_name: &str, span: Span) {
-        if self.imports.failed_imports.contains(variable_name) {
+    fn error_name_not_found(&mut self, variable_name: &str, span: Span, expected_ty: &Type) {
+        let store = self.store;
+        if self.imports.is_failed(variable_name) {
             return;
         }
 
         let mut available_names = self.scopes.collect_all_value_names();
 
-        let module = self
-            .store
-            .get_module(&self.cursor.module_id)
-            .expect("current module must exist in store");
-        for qualified_name in module.definitions.keys() {
+        let package = self.current_package(store);
+        for qualified_name in package.definitions.keys() {
             let parts: Vec<&str> = qualified_name.rsplitn(2, '.').collect();
             if parts.len() == 2 {
-                let module_name = parts[1];
+                let package_name = parts[1];
                 let name = parts[0];
-                if module_name == module.id {
+                if package_name == package.id {
                     available_names.push(name.to_string());
                 }
             }
         }
 
+        let hint_ty = if matches!(variable_name, "nil" | "null" | "Nil" | "undefined") {
+            let resolved = expected_ty.resolve_in(&self.env);
+            (!resolved.is_variable() && !resolved.is_error()).then_some(resolved)
+        } else {
+            None
+        };
+
+        let qualified = self.qualified_name_suggestion(variable_name, expected_ty);
+        let test_fn_name = self.scopes.test_fn_name().map(str::to_string);
         self.sink.push(diagnostics::infer::name_not_found(
             variable_name,
             span,
             &available_names,
+            hint_ty.as_ref(),
+            qualified.as_deref(),
+            test_fn_name.as_deref(),
         ));
+    }
+
+    fn qualified_name_suggestion(&self, name: &str, expected_ty: &Type) -> Option<String> {
+        self.expected_enum_variant(name, expected_ty)
+            .or_else(|| self.receiver_field(name))
+    }
+
+    fn expected_enum_variant(&self, name: &str, expected_ty: &Type) -> Option<String> {
+        let declared = expected_ty.resolve_in(&self.env);
+        let peeled = self.store.peel_alias(&declared);
+        self.store.variant_of(peeled.get_qualified_id()?, name)?;
+        self.qualified_variant(&declared, name)
+            .or_else(|| self.qualified_variant(&peeled, name))
+    }
+
+    fn qualified_variant(&self, ty: &Type, name: &str) -> Option<String> {
+        let id = ty.get_qualified_id()?;
+        if matches!(
+            self.store.get_definition(id).map(|definition| &definition.body),
+            Some(DefinitionBody::TypeAlias { generics, .. }) if !generics.is_empty()
+        ) {
+            return None;
+        }
+        let local = ty.get_name()?;
+        let package = self.store.package_for_qualified_name(id)?;
+        if package == self.cursor.package_id() || self.imports.unprefixed_imports.contains(package)
+        {
+            return Some(format!("{local}.{name}"));
+        }
+        let (prefix, _) = self
+            .imports
+            .packages()
+            .find(|(_, package_id)| *package_id == package)?;
+        Some(format!("{prefix}.{local}.{name}"))
+    }
+
+    fn receiver_field(&self, name: &str) -> Option<String> {
+        let receiver = self.scopes.lookup_value("self")?.resolve_in(&self.env);
+        let receiver = self.store.peel_alias(&receiver.strip_refs());
+        let fields = self.store.fields_of(receiver.get_qualified_id()?)?;
+        fields
+            .iter()
+            .any(|field| field.name == name)
+            .then(|| format!("self.{name}"))
     }
 }

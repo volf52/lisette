@@ -522,6 +522,112 @@ fn test(m: Map<string, int>) -> int {
 }
 
 #[test]
+fn for_loop_tuple_pattern_map_discard_value() {
+    let input = r#"
+fn test(m: Map<string, int>) -> Slice<string> {
+  let mut keys: Slice<string> = []
+  for (key, _) in m {
+    keys = keys.append(key)
+  }
+  keys
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_iter_seq_single_value() {
+    let input = r#"
+import "go:maps"
+import "go:fmt"
+
+fn main() {
+  let m = Map.from([("a", 1)])
+  for k in maps.Keys(m) {
+    fmt.Println(k)
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_iter_seq2_key_value() {
+    let input = r#"
+import "go:maps"
+import "go:fmt"
+
+fn main() {
+  let m = Map.from([("a", 1)])
+  for (k, v) in maps.All(m) {
+    fmt.Println(f"{k}={v}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_iter_seq_compound_pattern() {
+    let input = r#"
+import "go:slices"
+import "go:fmt"
+
+struct Point {
+  x: int,
+  y: int,
+}
+
+fn main() {
+  let points = [Point { x: 1, y: 2 }]
+  for Point { x, y } in slices.Values(points) {
+    fmt.Println(f"{x},{y}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_iter_seq_break() {
+    let input = r#"
+import "go:slices"
+import "go:fmt"
+
+fn main() {
+  for n in slices.Values([1, 2, 3]) {
+    if n > 1 {
+      break
+    }
+    fmt.Println(f"{n}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_strings_split_seq() {
+    let input = r#"
+import "go:strings"
+import "go:fmt"
+
+fn main() {
+  for part in strings.SplitSeq("a,b,c", ",") {
+    fmt.Println(part)
+  }
+  for part in strings.SplitAfterSeq("a,b,c", ",") {
+    fmt.Println(part)
+  }
+  for part in strings.FieldsSeq("a b c") {
+    fmt.Println(part)
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn for_loop_map_both_wildcards() {
     let input = r#"
 fn test(m: Map<string, int>) -> int {
@@ -662,6 +768,22 @@ fn test() -> int {
 }
 
 #[test]
+fn for_loop_range_start_frozen_before_call_bound() {
+    let input = r#"
+fn test() -> int {
+  let mut n = 1
+  let consume = || -> int { n = 5; 4 }
+  let mut sum = 0
+  for i in n..consume() {
+    sum += i
+  }
+  sum
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn for_loop_range_from_call() {
     let input = r#"
 fn get_range() -> Range<int> { 0..5 }
@@ -734,6 +856,37 @@ fn test() {
   for _ in 0..3 {
     do_work();
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_range_with_unread_binding_drops_the_clause() {
+    let input = r#"
+fn do_work() {}
+
+fn test() {
+  for i in 0..3 {
+    do_work();
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_nonzero_start_keeps_the_counted_form() {
+    let input = r#"
+fn test(from: int) -> int {
+  let mut sum = 0
+  for i in 1..5 {
+    sum = sum + i
+  }
+  for j in from..5 {
+    sum = sum + j
+  }
+  sum
 }
 "#;
     assert_emit_snapshot!(input);
@@ -842,6 +995,50 @@ fn test() -> int {
     ((1, 2), 3) => 6,
     ((x, y), z) => x + y + z,
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn boolean_branch_assign_collapses_to_condition() {
+    let input = r#"
+fn test(a: int, b: int) -> bool {
+  let direct = if a > 0 { true } else { false }
+  let and_arm = if a > 0 { b > 1 } else { false }
+  let or_arm = if a > 0 { true } else { b > 1 }
+  let negated = if a > 0 { false } else { true }
+  direct && and_arm && or_arm && negated
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn float_binding_from_block_keeps_var_declaration() {
+    let input = r#"
+fn test() -> float64 {
+  let scaled: float64 = { 42 }
+  scaled
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn boolean_match_assign_collapses_to_condition() {
+    let input = r#"
+enum Node {
+  Number(int),
+  Null,
+}
+
+fn test(node: Node) -> bool {
+  let matched = match node {
+    Number(n) => n == 42,
+    _ => false,
+  }
+  matched
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1230,7 +1427,7 @@ fn let_else_or_pattern() {
 enum E { A(int), B(int), C }
 
 fn test(e: E) -> int {
-  let A(x) | B(x) = e else { return 0; };
+  let E.A(x) | E.B(x) = e else { return 0; };
   x
 }
 "#;
@@ -1332,6 +1529,123 @@ fn test(opt: Option<int>) -> string {
 }
 
 #[test]
+fn match_guard_pins_mutated_subject() {
+    let input = r#"
+fn test(opt: Option<int>) -> int {
+  let mut current = opt
+  let clear = || -> bool { current = None; true }
+  match current {
+    Some(x) if clear() => x,
+    Some(_) => 1,
+    None => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_pins_shadowed_mutated_subject() {
+    let input = r#"
+fn test(opt: Option<int>) -> int {
+  let current = opt
+  let mut current = current
+  let clear = || -> bool { current = None; false }
+  match current {
+    Some(x) if clear() => x,
+    Some(y) => y,
+    None => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn format_string_guard_keeps_the_jump_target() {
+    let input = r#"
+fn label(n: int) -> Result<string, string> { Ok("x") }
+
+fn test(opt: Option<int>) -> Result<int, string> {
+  let mut out = 0
+  match opt {
+    Some(x) if f"v{label(x)?}" == "vx" => { out = 1 },
+    Some(_) => { out = 2 },
+    None => { out = 3 },
+  }
+  Ok(out)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn flattened_disjunctive_guard_groups_against_the_pattern_test() {
+    let input = r#"
+fn test(opt: Option<int>, flag: bool) -> int {
+  let mut out = 0
+  match opt {
+    Some(x) if x > 10 || flag => { out = 1 },
+    Some(_) => { out = 2 },
+    None => { out = 3 },
+  }
+  out
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn flattened_guard_binding_shadowed_by_the_arm_body_is_dropped() {
+    let input = r#"
+import "go:fmt"
+
+fn test(opt: Option<int>) {
+  match opt {
+    Some(x) if x > 0 => { let x = 5; fmt.Println(x) },
+    _ => (),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn flattened_guard_binds_only_what_the_arm_body_reads() {
+    let input = r#"
+import "go:fmt"
+
+fn test(opt: Option<int>) {
+  match opt {
+    Some(a) if a > 10 => fmt.Println("big"),
+    Some(b) if b > 0 => fmt.Print(f"small: {b}\n"),
+    Some(c) => fmt.Println(c),
+    None => fmt.Println("none"),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn guard_needing_statement_lowering_keeps_the_jump_target() {
+    let input = r#"
+fn check(n: int) -> Result<bool, string> { Ok(n > 0) }
+
+fn test(opt: Option<int>) -> Result<int, string> {
+  let mut out = 0
+  match opt {
+    Some(x) if check(x)? => { out = 1 },
+    Some(_) => { out = 2 },
+    None => { out = 0 },
+  }
+  Ok(out)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn match_guard_with_binding() {
     let input = r#"
 fn test(opt: Option<int>) -> int {
@@ -1417,6 +1731,98 @@ fn test() -> int {
     Some(_) => 0,
     None => -1,
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_on_last_tested_result_variant() {
+    let input = r#"
+fn test(r: Result<int, string>, flag: bool) -> int {
+  match r {
+    Ok(_) => 1,
+    Err(_) if flag => 2,
+    Err(_) => 3,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_on_last_tested_option_variant() {
+    let input = r#"
+fn test(o: Option<int>, flag: bool) -> int {
+  match o {
+    Some(_) => 1,
+    None if flag => 2,
+    None => 3,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_on_last_tested_enum_variant() {
+    let input = r#"
+enum Shape { Circle(int), Square(int), Tri(int) }
+
+fn test(s: Shape) -> int {
+  match s {
+    Circle(r) => r,
+    Square(w) => w,
+    Tri(h) if h > 10 => h * 2,
+    Tri(h) => h,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_on_last_tested_variant_with_binding() {
+    let input = r#"
+fn test(r: Result<int, string>) -> string {
+  match r {
+    Ok(_) => "ok",
+    Err(e) if e == "boom" => "boom",
+    Err(e) => e,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_on_the_only_variant() {
+    let input = r#"
+enum One { Only(int) }
+
+fn test(o: One) -> int {
+  match o {
+    Only(n) if n > 0 => n,
+    Only(n) => -n,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_guard_on_last_tested_variant_in_statement_position() {
+    let input = r#"
+fn check(n: int) -> Result<bool, string> { Ok(n > 0) }
+
+fn test(o: Option<int>) -> Result<int, string> {
+  let mut out = 0
+  match o {
+    Some(_) => { out = 1 },
+    None if check(0)? => { out = 2 },
+    None => { out = 3 },
+  }
+  Ok(out)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1545,7 +1951,7 @@ enum E { A(int), B(int) }
 fn test() -> int {
   let mut current: Option<E> = Some(E.A(5));
   let mut sum = 0;
-  while let Some(A(x)) | Some(B(x)) = current {
+  while let Some(E.A(x)) | Some(E.B(x)) = current {
     sum = sum + x;
     current = None;
   }
@@ -1771,7 +2177,7 @@ fn risky() -> Result<int, string> { Ok(1) }
 fn test() {
   let result: Result<int, string> = try {
     let _ = risky()?;
-    loop {}
+    loop { panic("unreachable") }
   };
   let _ = result;
 }
@@ -1921,6 +2327,24 @@ fn divide(a: int, b: int) -> Option<int> {
 fn test() {
   if let Some(x) = divide(100, 10) {
     let _ = fmt.Print(f"Result: {x}\n");
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn if_let_none_on_comma_ok_call() {
+    let input = r#"
+import "go:fmt"
+
+fn divide(a: int, b: int) -> Option<int> {
+  if b == 0 { None } else { Some(a / b) }
+}
+
+fn test() {
+  if let None = divide(100, 0) {
+    let _ = fmt.Print("division by zero\n");
   }
 }
 "#;
@@ -2147,6 +2571,20 @@ fn test(items: Slice<int>) -> int {
 }
 
 #[test]
+fn breakless_loop_tail_omits_unreachable_panic() {
+    let input = r#"
+fn serve(n: int) -> int {
+  loop {
+    if n > 0 {
+      return n
+    }
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn continue_in_match_in_loop() {
     let input = r#"
 fn test(items: Slice<int>) -> int {
@@ -2303,6 +2741,24 @@ fn test() {
   let mut i = 0
   while W(1).0 == 1 && i < 1 {
     i = i + 1
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn if_generic_struct_literal_method_callee_in_condition() {
+    let input = r#"
+struct Box<T> { v: T }
+
+impl<T> Box<T> {
+  fn ok(self) -> bool { true }
+}
+
+fn test() {
+  if Box { v: 1 }.ok() {
+    let _ = 1
   }
 }
 "#;
@@ -2930,6 +3386,26 @@ fn test() {
 }
 
 #[test]
+fn match_guard_cannot_mutate_inlined_identifier_subject() {
+    let input = r#"
+fn bump_false(r: mut Ref<int>) -> bool {
+  r.* = 1
+  false
+}
+
+fn test() -> int {
+  let mut x = 0
+  match x {
+    0 if bump_false(&x) => -1,
+    1 => 1,
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn match_in_recover_unused_subject() {
     let input = r#"
 struct P { v: int }
@@ -2994,6 +3470,19 @@ fn test() {
   let _ | _ = 1 else {
     panic("x")
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_or_pattern_irrefutable_binding() {
+    let input = r#"
+fn test() -> int {
+  let x | x = 42 else {
+    return 0
+  }
+  x
 }
 "#;
     assert_emit_snapshot!(input);
@@ -3131,7 +3620,7 @@ fn test() {
 }
 
 #[test]
-fn let_else_or_pattern_scope_leak_after() {
+fn let_else_or_pattern_outer_preserved_when_pattern_uses_different_name() {
     let input = r#"
 enum E {
   A(int),
@@ -3140,12 +3629,12 @@ enum E {
 }
 fn test() {
   let x = 5
-  let _ = x
   let e = E.A(9)
-  let E.A(x) | E.B(x) = e else {
+  let E.A(y) | E.B(y) = e else {
     return
   }
-  if x != 5 { panic("shadow") }
+  if y != 9 { panic("pattern") }
+  if x != 5 { panic("outer") }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -3254,7 +3743,7 @@ fn test() {
 #[test]
 fn while_condition_with_setup_statements_inside_loop() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = i.* + 1
   i.*
 }
@@ -3271,7 +3760,7 @@ fn test() {
 #[test]
 fn while_binary_condition_with_capture_inside_loop() {
     let input = r#"
-fn bump(i: Ref<int>) -> int {
+fn bump(i: mut Ref<int>) -> int {
   i.* = i.* + 1
   i.*
 }
@@ -3280,6 +3769,104 @@ fn test() {
   while i < 3 && bump(&i) > 0 {
     let _ = i
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn else_if_condition_setup_emitted_in_else_scope() {
+    let input = r#"
+fn track(flag: mut Ref<bool>) -> Result<int, error> {
+  flag.* = true
+  Ok(1)
+}
+
+fn test() {
+  let mut ran = false
+  if true {
+    let _ = 1
+  } else if track(&ran).is_ok() {
+    let _ = 2
+  } else {
+    let _ = 3
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn diverging_if_shadowed_else_binding_does_not_leak() {
+    let input = r#"
+fn test(c: bool) -> int {
+  let count = 10
+  if c {
+    return 0
+  } else {
+    let count = 5
+    let _ = count
+  }
+  count
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_map_alias_tuple_destructuring() {
+    let input = r#"
+type Table = Map<string, int>
+
+fn sum(t: Table) -> int {
+  let mut total = 0
+  for (k, v) in t {
+    total = total + k.length() + v
+  }
+  total
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_range_alias_uses_stored_range_form() {
+    let input = r#"
+type Span = Range<int>
+
+fn sum(r: Span) -> int {
+  let mut total = 0
+  for i in r {
+    total = total + i
+  }
+  total
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_loop_channel_alias_uses_single_var_range() {
+    let input = r#"
+type Inbox = Channel<int>
+
+fn drain(ch: Inbox) -> int {
+  let mut total = 0
+  for value in ch {
+    total = total + value
+  }
+  total
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn if_let_discarded_with_mismatched_branches() {
+    let input = r#"
+fn test(opt: Option<int>) {
+  if let Some(x) = opt { x } else { "fallback" }
+  ()
 }
 "#;
     assert_emit_snapshot!(input);

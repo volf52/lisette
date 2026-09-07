@@ -1,17 +1,27 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn get_end() -> int { 5 }\n\nfn test() -> int {\n  let mut sum = 0;\n  for i in 0..get_end() {\n    sum = sum + i;\n  };\n  sum\n}\n"
+description: |
+  
+  fn get_end() -> int { 5 }
+  
+  fn test() -> int {
+    let mut sum = 0;
+    for i in 0..get_end() {
+      sum = sum + i;
+    };
+    sum
+  }
 ---
 package main
 
-func get_end() int {
+func getEnd() int {
 	return 5
 }
 
 func test() int {
 	sum := 0
-	_bound_1 := get_end()
-	for i := 0; i < _bound_1; i++ {
+	bound_1 := getEnd()
+	for i := range bound_1 {
 		sum += i
 	}
 	return sum

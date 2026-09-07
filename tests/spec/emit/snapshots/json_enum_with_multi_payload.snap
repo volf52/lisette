@@ -1,11 +1,18 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \n#[json]\nenum Shape {\n  Rectangle(float64, float64),\n  Point,\n}\n"
+description: |
+  
+  #[json]
+  enum Shape {
+    Rectangle(float64, float64),
+    Point,
+  }
 ---
 package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -17,7 +24,7 @@ func MakeShapePoint() Shape {
 	return Shape{Tag: ShapePoint}
 }
 
-type ShapeTag int
+type ShapeTag uint8
 
 const (
 	ShapeRectangle ShapeTag = iota
@@ -28,17 +35,6 @@ type Shape struct {
 	Tag        ShapeTag
 	Rectangle0 float64
 	Rectangle1 float64
-}
-
-func (s Shape) String() string {
-	switch s.Tag {
-	case ShapeRectangle:
-		return fmt.Sprintf("Shape.Rectangle(%v, %v)", s.Rectangle0, s.Rectangle1)
-	case ShapePoint:
-		return "Shape.Point"
-	default:
-		return fmt.Sprintf("Shape(%d)", s.Tag)
-	}
 }
 
 func (s Shape) MarshalJSON() ([]byte, error) {
@@ -65,7 +61,7 @@ func (s *Shape) UnmarshalJSON(data []byte) error {
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(data, &obj); err != nil {
-		return fmt.Errorf("invalid Shape JSON")
+		return errors.New("invalid Shape JSON")
 	}
 	for key, val := range obj {
 		switch key {
@@ -86,5 +82,5 @@ func (s *Shape) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("unknown Shape variant: %s", key)
 		}
 	}
-	return fmt.Errorf("empty Shape JSON object")
+	return errors.New("empty Shape JSON object")
 }

@@ -1,6 +1,12 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nenum Color {\n  Red,\n  Green,\n  Blue,\n}\n"
+description: |
+  
+  enum Color {
+    Red,
+    Green,
+    Blue,
+  }
 ---
 [
     Enum {
@@ -16,6 +22,7 @@ description: "input: \nenum Color {\n  Red,\n  Green,\n  Blue,\n}\n"
         variants: [
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Red",
                 name_span: Span {
                     file_id: 0,
@@ -26,6 +33,7 @@ description: "input: \nenum Color {\n  Red,\n  Green,\n  Blue,\n}\n"
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Green",
                 name_span: Span {
                     file_id: 0,
@@ -36,6 +44,7 @@ description: "input: \nenum Color {\n  Red,\n  Green,\n  Blue,\n}\n"
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Blue",
                 name_span: Span {
                     file_id: 0,

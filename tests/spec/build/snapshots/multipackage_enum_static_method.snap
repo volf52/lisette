@@ -1,0 +1,44 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+import "github.com/user/myproject/shapes"
+
+func main() {
+	c := shapes.Color_Default()
+	_ = c
+}
+
+
+// === shapes/mod.go ===
+package shapes
+
+func MakeColorRed() Color {
+	return Color{Tag: ColorRed}
+}
+
+func MakeColorGreen() Color {
+	return Color{Tag: ColorGreen}
+}
+
+func MakeColorBlue() Color {
+	return Color{Tag: ColorBlue}
+}
+
+type ColorTag uint8
+
+const (
+	ColorRed ColorTag = iota
+	ColorGreen
+	ColorBlue
+)
+
+type Color struct {
+	Tag ColorTag
+}
+
+func Color_Default() Color {
+	return MakeColorRed()
+}

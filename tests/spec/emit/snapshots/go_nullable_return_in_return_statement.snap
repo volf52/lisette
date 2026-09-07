@@ -1,22 +1,25 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nimport \"go:flag\"\n\nfn get(name: string) -> Option<Ref<flag.Flag>> {\n  flag.Lookup(name)\n}\n\nfn main() {\n  let _ = get(\"x\");\n}\n"
+description: |
+  
+  import "go:flag"
+  
+  fn get(name: string) -> Option<Ref<flag.Flag>> {
+    flag.Lookup(name)
+  }
+  
+  fn main() {
+    let _ = get("x");
+  }
 ---
 package main
 
-import (
-	"flag"
-	lisette "github.com/ivov/lisette/prelude"
-)
+import "flag"
 
-func get(name string) lisette.Option[*flag.Flag] {
-	raw_1 := flag.Lookup(name)
-	if raw_1 != nil {
-		return lisette.MakeOptionSome[*flag.Flag](raw_1)
-	}
-	return lisette.MakeOptionNone[*flag.Flag]()
+func get(name string) *flag.Flag {
+	return flag.Lookup(name)
 }
 
 func main() {
-	_ = get("x")
+	get("x")
 }

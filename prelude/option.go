@@ -1,15 +1,17 @@
 package lisette
 
 import (
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 )
 
-type OptionTag int
+type OptionTag uint8
 
 const (
-	OptionSome OptionTag = iota
-	OptionNone
+	OptionNone OptionTag = iota
+	OptionSome
 )
 
 type Option[T any] struct {
@@ -23,6 +25,34 @@ func MakeOptionSome[T any](arg T) Option[T] {
 
 func MakeOptionNone[T any]() Option[T] {
 	return Option[T]{Tag: OptionNone}
+}
+
+// OptionFromCommaOk wraps a Go comma-ok pair `(value, ok)` into an
+// `Option[T]`.
+func OptionFromCommaOk[T any](val T, ok bool) Option[T] {
+	if ok {
+		return Option[T]{Tag: OptionSome, SomeVal: val}
+	}
+	return Option[T]{Tag: OptionNone}
+}
+
+// OptionFromNilable wraps a Go nilable `T` (pointer, function, interface,
+// map, slice, channel) into an `Option[T]`.
+func OptionFromNilable[T any](val T, isNil bool) Option[T] {
+	if isNil {
+		return Option[T]{Tag: OptionNone}
+	}
+	return Option[T]{Tag: OptionSome, SomeVal: val}
+}
+
+// OptionFromPointer wraps a Go `*T` into an `Option[T]`, dereferencing the
+// pointer for the Some branch. Used when reading Go-imported struct fields
+// declared `*T` (T value-typed) — the Lisette typedef is `Option<T>`.
+func OptionFromPointer[T any](ptr *T) Option[T] {
+	if ptr == nil {
+		return Option[T]{Tag: OptionNone}
+	}
+	return Option[T]{Tag: OptionSome, SomeVal: *ptr}
 }
 
 func (opt Option[T]) IsSome() bool {
@@ -74,6 +104,13 @@ func (opt Option[T]) String() string {
 	return "None"
 }
 
+func (opt Option[T]) DebugString() string {
+	if opt.Tag == OptionSome {
+		return fmt.Sprintf("Some(%s)", Debug(opt.SomeVal))
+	}
+	return "None"
+}
+
 func (opt Option[T]) IsZero() bool {
 	return opt.Tag == OptionNone
 }
@@ -87,11 +124,35 @@ func (opt Option[T]) MarshalJSON() ([]byte, error) {
 
 func (opt *Option[T]) UnmarshalJSON(data []byte) error {
 	if string(data) == "null" {
-		opt.Tag = OptionNone
+		*opt = Option[T]{Tag: OptionNone}
 		return nil
 	}
-	opt.Tag = OptionSome
-	return json.Unmarshal(data, &opt.SomeVal)
+	value := opt.SomeVal
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*opt = Option[T]{Tag: OptionSome, SomeVal: value}
+	return nil
+}
+
+func (opt *Option[T]) Scan(src any) error {
+	var n sql.Null[T]
+	if err := n.Scan(src); err != nil {
+		return err
+	}
+	if n.Valid {
+		*opt = Option[T]{Tag: OptionSome, SomeVal: n.V}
+	} else {
+		*opt = Option[T]{Tag: OptionNone}
+	}
+	return nil
+}
+
+func (opt Option[T]) Value() (driver.Value, error) {
+	if opt.Tag == OptionNone {
+		return nil, nil
+	}
+	return sql.Null[T]{V: opt.SomeVal, Valid: true}.Value()
 }
 
 func OptionMap[T any, U any](opt Option[T], f func(T) U) Option[U] {

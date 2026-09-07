@@ -1,52 +1,103 @@
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::io;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-include!(concat!(env!("OUT_DIR"), "/go_version.rs"));
+use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+
+include!(concat!(env!("OUT_DIR"), "/go_versions.rs"));
 
 use deps::TypedefLocator;
 use emit::{OutputFile, PRELUDE_IMPORT_PATH};
+use lisette::pipeline::ProjectKind;
+use stdlib::Target;
 
-pub fn go_command() -> Command {
+pub fn go_command(target: Target) -> Command {
     let mut c = Command::new("go");
     // Isolate from any user-side env that would change Go's mode against
-    // lisette's `target/`: a stray `go.work` (workspace mode) or a stray
-    // `GOFLAGS=-mod=vendor` (vendor mode) both turn into multi-line errors
-    // for unrelated `lis add` invocations otherwise.
+    // lisette's `target/`: a stray `go.work` (workspace mode), a stray
+    // `GOFLAGS=-mod=vendor` (vendor mode), or `GO111MODULE=off` (GOPATH mode)
+    // all turn into unrelated errors otherwise.
     c.env("GOWORK", "off");
     c.env("GOFLAGS", "");
+    c.env("GO111MODULE", "on");
+    c.env("GOOS", target.goos);
+    c.env("GOARCH", target.goarch);
     c
 }
 
-pub fn require_go() -> Result<(), i32> {
+pub fn toolchain_failure() -> Option<GoCliError> {
     match go_status() {
-        GoStatus::Ready => Ok(()),
-        GoStatus::Absent => {
-            crate::cli_error!(
-                "Go is not installed",
-                "`go` is not in PATH",
-                "Install Go from https://go.dev/dl/"
-            );
-            Err(1)
-        }
-        GoStatus::Outdated { found, required } => {
-            crate::cli_error!(
-                "Go version is outdated",
-                format!("Found Go {}, but {} or later is required", found, required),
-                "Upgrade Go at https://go.dev/dl/"
-            );
-            Err(1)
-        }
+        GoStatus::Ready => None,
+        GoStatus::Absent => Some(GoCliError {
+            message: "Go is not installed: `go` is not in PATH".to_string(),
+            hint: "Install Go from https://go.dev/dl/",
+        }),
+        GoStatus::Outdated { found, required } => Some(GoCliError {
+            message: format!("Found Go {}, but {} or later is required", found, required),
+            hint: "Upgrade Go at https://go.dev/dl/",
+        }),
     }
 }
 
-pub fn go_mod_version() -> String {
-    let parts: Vec<&str> = GO_VERSION.split('.').collect();
+pub fn toolchain_failure_message() -> Option<String> {
+    toolchain_failure().map(|failure| format!("{}. {}", failure.message, failure.hint))
+}
+
+/// [`toolchain_failure`], but only when the failed command's own output
+/// blames the Go version. Anything else keeps its real error: an unmet
+/// pin does not mean the version caused this particular failure.
+pub fn toolchain_failure_for(go_output: &str) -> Option<GoCliError> {
+    let version_refusal = go_output.contains("requires go")
+        || go_output.contains("toolchain not available")
+        || go_output.contains("cannot find \"go1");
+    if version_refusal {
+        toolchain_failure()
+    } else {
+        None
+    }
+}
+
+pub fn is_go_present() -> bool {
+    !matches!(go_status(), GoStatus::Absent)
+}
+
+fn major_minor(version: &str) -> String {
+    let parts: Vec<&str> = version.split('.').collect();
     format!(
         "{}.{}",
         parts.first().unwrap_or(&"1"),
         parts.get(1).unwrap_or(&"21")
     )
+}
+
+pub fn toolchain_go_directive() -> String {
+    major_minor(GO_TOOLCHAIN_VERSION)
+}
+
+pub fn language_go_directive() -> String {
+    major_minor(GO_LANGUAGE_VERSION)
+}
+
+pub fn go_directive_for(kind: ProjectKind) -> String {
+    match kind {
+        ProjectKind::Library => language_go_directive(),
+        ProjectKind::Binary => toolchain_go_directive(),
+    }
+}
+
+// The `src/main.lis` probe mirrors `resolve_project_layout`'s kind rule,
+// for callers without a resolved layout.
+pub fn project_go_directive(project_root: &Path) -> String {
+    let kind = if project_root.join("src/main.lis").exists() {
+        ProjectKind::Binary
+    } else {
+        ProjectKind::Library
+    };
+    go_directive_for(kind)
 }
 
 enum GoStatus {
@@ -80,24 +131,46 @@ fn go_status() -> GoStatus {
     let major: u32 = major.parse().unwrap_or(0);
     let minor: u32 = minor.parse().unwrap_or(0);
 
-    let min_parts: Vec<&str> = GO_VERSION.split('.').collect();
+    let min_parts: Vec<&str> = GO_TOOLCHAIN_VERSION.split('.').collect();
     let min_major: u32 = min_parts.first().and_then(|s| s.parse().ok()).unwrap_or(1);
     let min_minor: u32 = min_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     if major > min_major || (major == min_major && minor >= min_minor) {
-        GoStatus::Ready
-    } else {
-        GoStatus::Outdated {
-            found: version.to_string(),
-            required: format!("{}.{}", min_major, min_minor),
-        }
+        return GoStatus::Ready;
+    }
+
+    // GOTOOLCHAIN auto/path (auto is the Go 1.21+ default) makes an older
+    // go command switch to the toolchain a `go` directive requires, so the
+    // installed version is not a reliable failure cause.
+    if toolchain_switch_enabled() {
+        return GoStatus::Ready;
+    }
+
+    GoStatus::Outdated {
+        found: version.to_string(),
+        required: toolchain_go_directive(),
     }
 }
 
-pub fn go_fmt(path: &Path) -> Result<(), String> {
-    let output = Command::new("gofmt")
-        .arg("-w")
-        .arg(path)
+fn toolchain_switch_enabled() -> bool {
+    let Ok(output) = Command::new("go").args(["env", "GOTOOLCHAIN"]).output() else {
+        return false;
+    };
+    let value = String::from_utf8_lossy(&output.stdout);
+    let value = value.trim();
+    value == "auto" || value == "path" || value.ends_with("+auto") || value.ends_with("+path")
+}
+
+pub fn go_fmt_paths(paths: &[PathBuf]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("gofmt");
+    cmd.arg("-w");
+    for path in paths {
+        cmd.arg(path);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run `gofmt`: {}", e))?;
 
@@ -109,21 +182,66 @@ pub fn go_fmt(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn write_go_mod(dir: &Path, module_name: &str, locator: &TypedefLocator) -> Result<(), String> {
+pub fn write_go_mod(
+    dir: &Path,
+    module_name: &str,
+    locator: &TypedefLocator,
+    go_directive: &str,
+) -> Result<(), String> {
+    let content = go_mod_content(module_name, locator, go_directive)?;
+    write_go_mod_content(dir, &content)
+}
+
+pub fn go_mod_content(
+    module_name: &str,
+    locator: &TypedefLocator,
+    go_directive: &str,
+) -> Result<String, String> {
     let prelude_version = env!("CARGO_PKG_VERSION");
 
     let mut requires = vec![format!("\t{} v{}", PRELUDE_IMPORT_PATH, prelude_version)];
+    let mut replace_lines: Vec<String> = Vec::new();
 
     for (module_path, dep) in locator.deps() {
-        requires.push(format!("\t{} {}", module_path, dep.version));
+        match dep {
+            deps::GoDependency::Remote { version, .. } => {
+                requires.push(format!("\t{} {}", module_path, version));
+            }
+            deps::GoDependency::Replaced { source, .. } => {
+                requires.push(format!(
+                    "\t{} {}",
+                    module_path,
+                    deps::placeholder_require_version(module_path)
+                ));
+                match source {
+                    deps::ReplacementSource::Module { path, version } => {
+                        replace_lines
+                            .push(format!("replace {} => {} {}", module_path, path, version));
+                    }
+                    deps::ReplacementSource::Local { path } => {
+                        let local_dir =
+                            resolve_local_module_dir(locator.project_root(), module_path, path)?;
+                        replace_lines.push(format!(
+                            "replace {} => {}",
+                            module_path,
+                            go_mod_quote(&local_dir.display().to_string())
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     let mut content = format!(
         "module {}\n\ngo {}\n\nrequire (\n{}\n)\n",
         module_name,
-        go_mod_version(),
+        go_directive,
         requires.join("\n"),
     );
+
+    for line in &replace_lines {
+        content.push_str(&format!("\n{}\n", line));
+    }
 
     if cfg!(debug_assertions) {
         let prelude_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prelude");
@@ -131,104 +249,352 @@ pub fn write_go_mod(dir: &Path, module_name: &str, locator: &TypedefLocator) -> 
             content.push_str(&format!(
                 "\nreplace {} => {}\n",
                 PRELUDE_IMPORT_PATH,
-                canonical.display()
+                go_mod_quote(&canonical.display().to_string())
             ));
         }
     }
 
+    Ok(content)
+}
+
+fn write_go_mod_content(dir: &Path, content: &str) -> Result<(), String> {
     let go_mod_path = dir.join("go.mod");
+    let lisette_dir = dir.join(".lisette");
+    let stamp_path = lisette_dir.join("go.mod.stamp");
 
-    // Skip write if content unchanged; invalidate go.sum if content changed
-    let content_changed = fs::read_to_string(&go_mod_path)
-        .map(|existing| existing != content)
-        .unwrap_or(true);
+    // Stamp tracks pre-tidy content; on-disk go.mod diverges after tidy prunes requires.
+    let stamp_matches = go_mod_path.exists()
+        && fs::read_to_string(&stamp_path).is_ok_and(|existing| existing == content);
 
-    if content_changed {
-        fs::write(&go_mod_path, &content).map_err(|e| format!("Failed to write go.mod: {}", e))?;
+    if !stamp_matches {
+        fs::write(&go_mod_path, content).map_err(|e| format!("Failed to write go.mod: {}", e))?;
         let _ = fs::remove_file(dir.join("go.sum"));
+        let _ = fs::remove_file(lisette_dir.join("go.mod.tidy"));
+        let _ = fs::create_dir_all(&lisette_dir);
+        let _ = fs::write(&stamp_path, content);
     }
-
-    let _ = fs::remove_dir_all(dir.join("lisette"));
 
     Ok(())
 }
 
-pub fn write_go_outputs(dir: &Path, files: &[OutputFile], heading: &str) -> Result<(), i32> {
+/// The manifest path stays project-relative for portability, only the emitted
+/// `target/go.mod` needs the absolute form.
+fn resolve_local_module_dir(
+    project_root: Option<&Path>,
+    module_path: &str,
+    declared_path: &str,
+) -> Result<PathBuf, String> {
+    let declared = Path::new(declared_path);
+    let joined = if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        let Some(project_root) = project_root else {
+            return Err(format!(
+                "local module `{}` declares the relative path `{}` but no project root is available to resolve it",
+                module_path, declared_path
+            ));
+        };
+        project_root.join(declared)
+    };
+    let dir = joined.canonicalize().map_err(|_| {
+        format!(
+            "local module `{}` is declared at `{}`, but that directory does not exist",
+            module_path, declared_path
+        )
+    })?;
+    if !dir.join("go.mod").exists() {
+        return Err(format!(
+            "local module `{}` is declared at `{}`, but that directory has no `go.mod`",
+            module_path, declared_path
+        ));
+    }
+    Ok(dir)
+}
+
+/// Unquoted paths with spaces fail `go.mod` parsing.
+fn go_mod_quote(path: &str) -> String {
+    format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub struct GoCliError {
+    pub message: String,
+    pub hint: &'static str,
+}
+
+pub struct ManifestEntry {
+    pub name: String,
+    pub content_hash: u64,
+    pub imports: Vec<String>,
+}
+
+struct StoredManifestEntry {
+    content_hash: u64,
+    imports: Vec<String>,
+}
+
+impl StoredManifestEntry {
+    fn with_name(self, name: String) -> ManifestEntry {
+        ManifestEntry {
+            name,
+            content_hash: self.content_hash,
+            imports: self.imports,
+        }
+    }
+}
+
+pub struct EmitWriteResult {
+    pub changed: Vec<PathBuf>,
+    pub new_manifest: Vec<ManifestEntry>,
+}
+
+pub fn write_go_outputs(dir: &Path, files: &[OutputFile]) -> Result<EmitWriteResult, GoCliError> {
+    let mut prior_manifest = read_emit_manifest(dir);
+    let mut new_manifest: Vec<ManifestEntry> = Vec::with_capacity(files.len());
+    let mut changed: Vec<PathBuf> = Vec::with_capacity(files.len());
+
     for file in files {
         let go_file_path = dir.join(&file.name);
-        let go_code = file.to_go();
+        let go_code = file.to_go_unformatted();
+        let hash = hash_go_code(&go_code);
+        let prior = prior_manifest.remove_entry(&file.name);
+
+        if let Some((name, entry)) = prior
+            && entry.content_hash == hash
+            && go_file_path.exists()
+        {
+            new_manifest.push(entry.with_name(name));
+            continue;
+        }
 
         if let Some(parent) = go_file_path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
-            crate::cli_error!(
-                heading,
-                format!("Failed to create directory `{}`: {}", parent.display(), e),
-                "Check directory permissions"
-            );
-            return Err(1);
+            return Err(GoCliError {
+                message: format!("Failed to create directory `{}`: {}", parent.display(), e),
+                hint: "Check directory permissions",
+            });
         }
 
         if let Err(e) = fs::write(&go_file_path, &go_code) {
-            crate::cli_error!(
-                heading,
-                format!("Failed to write `{}`: {}", go_file_path.display(), e),
-                "Check file permissions"
-            );
-            return Err(1);
+            return Err(GoCliError {
+                message: format!("Failed to write `{}`: {}", go_file_path.display(), e),
+                hint: "Check file permissions",
+            });
+        }
+
+        let mut imports: Vec<String> = file
+            .imports
+            .iter()
+            .map(|import| import.path.clone())
+            .collect();
+        imports.sort();
+        imports.dedup();
+        new_manifest.push(ManifestEntry {
+            name: file.name.clone(),
+            content_hash: hash,
+            imports,
+        });
+        changed.push(go_file_path);
+    }
+
+    // Preserve entries for files emit skipped this build but still on disk.
+    for (name, entry) in prior_manifest {
+        if dir.join(&name).exists() {
+            new_manifest.push(entry.with_name(name));
         }
     }
+
+    Ok(EmitWriteResult {
+        changed,
+        new_manifest,
+    })
+}
+
+/// Hash of the sorted union of external (non-stdlib, non-local) Go imports.
+pub fn compute_import_set_hash(manifest: &[ManifestEntry], go_module_name: &str) -> u64 {
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for entry in manifest {
+        for path in &entry.imports {
+            if is_external_import(path, go_module_name) {
+                paths.insert(path.as_str());
+            }
+        }
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for path in paths {
+        for &b in path.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h ^= b'\n' as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn is_external_import(path: &str, go_module_name: &str) -> bool {
+    deps::is_third_party(path)
+        && path != go_module_name
+        && !path
+            .strip_prefix(go_module_name)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+pub fn invalidate_go_mod_stamp(dir: &Path) {
+    let _ = fs::remove_file(dir.join(".lisette").join("go.mod.stamp"));
+}
+
+fn emit_manifest_path(dir: &Path) -> PathBuf {
+    dir.join(".lisette").join("emit-manifest")
+}
+
+// FNV-1a: deterministic across Rust versions.
+fn hash_go_code(content: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in content.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn read_emit_manifest(dir: &Path) -> HashMap<String, StoredManifestEntry> {
+    let Ok(content) = fs::read_to_string(emit_manifest_path(dir)) else {
+        return Default::default();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let name = parts.next()?;
+            let hash = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let imports = parts
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split(',').map(|p| p.to_string()).collect())
+                .unwrap_or_default();
+            Some((
+                name.to_string(),
+                StoredManifestEntry {
+                    content_hash: hash,
+                    imports,
+                },
+            ))
+        })
+        .collect()
+}
+
+pub fn write_emit_manifest(dir: &Path, entries: &[ManifestEntry]) {
+    let path = emit_manifest_path(dir);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let content: String = entries
+        .iter()
+        .map(|e| {
+            format!(
+                "{}\t{:016x}\t{}\n",
+                e.name,
+                e.content_hash,
+                e.imports.join(",")
+            )
+        })
+        .collect();
+    let _ = fs::write(&path, content);
+}
+
+pub fn finalize_go_dir(
+    dir: &Path,
+    target: Target,
+    changed_paths: &[PathBuf],
+    import_set_hash: u64,
+) -> Result<(), GoCliError> {
+    if let Err(e) = go_fmt_paths(changed_paths) {
+        return Err(toolchain_failure_for(&e).unwrap_or_else(|| GoCliError {
+            message: format!("Go format failed: {}", e),
+            hint: "Check Go installation with `go version`",
+        }));
+    }
+
+    if let Err(e) = ensure_go_sum(dir, target, import_set_hash) {
+        return Err(toolchain_failure_for(&e).unwrap_or_else(|| GoCliError {
+            message: format!("Failed to resolve Go dependencies: {}", e),
+            hint: "Check Go installation and network connectivity",
+        }));
+    }
+
     Ok(())
 }
 
-pub fn finalize_go_dir(dir: &Path, heading: &str) -> Result<(), i32> {
-    if let Err(e) = go_fmt(dir) {
-        crate::cli_error!(
-            heading,
-            format!("Go format failed: {}", e),
-            "Check Go installation with `go version`"
-        );
-        return Err(1);
-    }
-
-    if let Err(e) = ensure_go_sum(dir) {
-        crate::cli_error!(
-            heading,
-            format!("Failed to resolve Go dependencies: {}", e),
-            "Check Go installation and network connectivity"
-        );
-        return Err(1);
-    }
-
-    Ok(())
+fn tidy_marker_path(dir: &Path) -> PathBuf {
+    dir.join(".lisette").join("go.mod.tidy")
 }
 
-pub fn ensure_go_sum(dir: &Path) -> Result<(), String> {
-    let go_sum_path = dir.join("go.sum");
-    if let Ok(content) = fs::read_to_string(&go_sum_path) {
-        // go.mod hash + source hash lines
-        if content.lines().count() >= 2 {
-            return Ok(());
-        }
-    }
-    go_mod_tidy(dir)
+pub fn emit_target_path(dir: &Path) -> PathBuf {
+    dir.join(".lisette").join("emit.target")
 }
 
-pub fn prewarm_module_cache() {
+pub fn read_emit_target(dir: &Path) -> Option<String> {
+    fs::read_to_string(emit_target_path(dir))
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+pub fn write_emit_target(dir: &Path, target: Target) {
+    let path = emit_target_path(dir);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, format!("{}\n", target));
+}
+
+pub fn clear_emit_target(dir: &Path) -> io::Result<()> {
+    match fs::remove_file(emit_target_path(dir)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn read_tidy_marker(dir: &Path) -> Option<u64> {
+    let s = fs::read_to_string(tidy_marker_path(dir)).ok()?;
+    u64::from_str_radix(s.trim(), 16).ok()
+}
+
+fn write_tidy_marker(dir: &Path, import_set_hash: u64) {
+    let path = tidy_marker_path(dir);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, format!("{:016x}\n", import_set_hash));
+}
+
+pub fn ensure_go_sum(dir: &Path, target: Target, import_set_hash: u64) -> Result<(), String> {
+    if read_tidy_marker(dir) == Some(import_set_hash) {
+        return Ok(());
+    }
+    let result = go_mod_tidy(dir, target);
+    if result.is_ok() {
+        write_tidy_marker(dir, import_set_hash);
+    }
+    result
+}
+
+pub fn prewarm_module_cache(target: Target) {
     let prelude_version = env!("CARGO_PKG_VERSION");
-    let _ = go_command()
+    let _ = go_command(target)
         .args([
             "mod",
             "download",
             &format!("{}@v{}", PRELUDE_IMPORT_PATH, prelude_version),
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn();
 }
 
-fn go_mod_tidy(path: &Path) -> Result<(), String> {
-    let output = go_command()
+fn go_mod_tidy(path: &Path, target: Target) -> Result<(), String> {
+    let output = go_command(target)
         .args(["mod", "tidy"])
         .current_dir(path)
         .output()
@@ -240,4 +606,514 @@ fn go_mod_tidy(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub fn binary_name(go_module_name: &str, target: Target) -> String {
+    with_exe_suffix(binary_stem(go_module_name), target)
+}
+
+pub fn cross_binary_name(go_module_name: &str, target: Target) -> String {
+    let stem = binary_stem(go_module_name);
+    with_exe_suffix(
+        format!("{}_{}_{}", stem, target.goos, target.goarch),
+        target,
+    )
+}
+
+fn binary_stem(go_module_name: &str) -> String {
+    let stem = go_module_name.rsplit('/').next().unwrap_or(go_module_name);
+    sanitize_binary_stem(stem)
+}
+
+pub fn run_binary_name(target: Target) -> String {
+    with_exe_suffix("lis-run".to_string(), target)
+}
+
+fn with_exe_suffix(stem: String, target: Target) -> String {
+    if target.goos == "windows" {
+        format!("{stem}.exe")
+    } else {
+        stem
+    }
+}
+
+/// Binary filename stem usable on every host (drops reserved names and characters).
+pub fn sanitize_binary_stem(name: &str) -> String {
+    let mut stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    stem = stem.trim_start_matches(['.', '_']).to_string();
+
+    while stem.ends_with(".go") {
+        stem.truncate(stem.len() - ".go".len());
+    }
+
+    if stem.is_empty() || stem == "testdata" || stem == "vendor" || is_windows_reserved_name(&stem)
+    {
+        return "app".to_string();
+    }
+
+    stem
+}
+
+/// Reserved on Windows regardless of extension, keyed on the pre-dot segment
+/// (`con.txt` too); checked on every host so the name is host-independent.
+fn is_windows_reserved_name(stem: &str) -> bool {
+    let base = stem.split('.').next().unwrap_or(stem);
+    let lower = base.to_ascii_lowercase();
+    if matches!(lower.as_str(), "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    (lower.starts_with("com") || lower.starts_with("lpt"))
+        && bytes.len() == 4
+        && (b'1'..=b'9').contains(&bytes[3])
+}
+
+pub fn is_go_output_flag(token: &str) -> bool {
+    matches!(token, "-o" | "--o") || token.starts_with("-o=") || token.starts_with("--o=")
+}
+
+pub fn is_go_json_flag(token: &str) -> bool {
+    matches!(token, "-json" | "--json")
+        || token.starts_with("-json=")
+        || token.starts_with("--json=")
+}
+
+pub fn is_go_selection_flag(token: &str) -> bool {
+    if !token.starts_with('-') {
+        return false;
+    }
+    let stripped = token.trim_start_matches('-');
+    let stripped = stripped.strip_prefix("test.").unwrap_or(stripped);
+    let base = stripped.split('=').next().unwrap_or(stripped);
+    matches!(base, "run" | "skip" | "list")
+}
+
+/// `go_flags` follow the default `-o` so a caller `-o` wins. `output_path` must
+/// be absolute, since `go build` runs with `build_dir` as cwd.
+pub fn build_binary(
+    build_dir: &Path,
+    output_path: &Path,
+    target: Target,
+    go_flags: &[String],
+) -> Result<(), GoCliError> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| GoCliError {
+            message: format!("Failed to create `{}`: {}", parent.display(), e),
+            hint: "Check directory permissions",
+        })?;
+    }
+
+    let mut cmd = go_command(target);
+    cmd.arg("build").arg("-o").arg(output_path);
+    for flag in go_flags {
+        cmd.arg(flag);
+    }
+    cmd.arg(".").current_dir(build_dir);
+
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(GoCliError {
+            message: "`go build` failed".to_string(),
+            hint: "Review the Go compiler output above",
+        }),
+        Err(e) => Err(toolchain_failure().unwrap_or_else(|| GoCliError {
+            message: format!("Failed to execute `go build`: {}", e),
+            hint: "Check Go installation with `go version`",
+        })),
+    }
+}
+
+pub fn verify_go_packages(
+    build_dir: &Path,
+    target: Target,
+    go_flags: &[String],
+) -> Result<(), GoCliError> {
+    let mut cmd = go_command(target);
+    cmd.arg("build");
+    for flag in go_flags {
+        cmd.arg(flag);
+    }
+    cmd.arg("./...").current_dir(build_dir);
+
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(GoCliError {
+            message: "`go build ./...` failed".to_string(),
+            hint: "Review the Go compiler output above",
+        }),
+        Err(e) => Err(toolchain_failure().unwrap_or_else(|| GoCliError {
+            message: format!("Failed to execute `go build`: {}", e),
+            hint: "Check Go installation with `go version`",
+        })),
+    }
+}
+
+/// An action from one line of `go test -json` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoTestAction {
+    Attr,
+    BuildFail,
+    BuildOutput,
+    Fail,
+    Output,
+    Pass,
+    Run,
+    Skip,
+    #[serde(other)]
+    Other,
+}
+
+/// One line of `go test -json` output (`elapsed` is in seconds).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct GoTestEvent {
+    pub action: GoTestAction,
+    #[serde(default)]
+    pub package: String,
+    pub test: Option<String>,
+    pub elapsed: Option<f64>,
+    pub output: Option<String>,
+    /// `build-*` events name the package here, not in `package`.
+    pub import_path: Option<String>,
+    /// `attr` events carry a key/value.
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
+pub struct TestRun {
+    pub events: Vec<GoTestEvent>,
+    pub success: bool,
+}
+
+/// Run tests. `None` runs every package (`go test ./...`); `Some` runs each
+/// `(package, run_regex)` as its own `go test -run` invocation and aggregates.
+pub fn run_tests(
+    build_dir: &Path,
+    target: Target,
+    go_flags: &[String],
+    scopes: Option<&[(String, String)]>,
+) -> Result<TestRun, GoCliError> {
+    let Some(scopes) = scopes else {
+        return run_go_test(build_dir, target, go_flags, "./...", None);
+    };
+    let mut events = Vec::new();
+    let mut success = true;
+    for (package, run_regex) in scopes {
+        let run = run_go_test(build_dir, target, go_flags, package, Some(run_regex))?;
+        events.extend(run.events);
+        success &= run.success;
+    }
+    Ok(TestRun { events, success })
+}
+
+fn run_go_test(
+    build_dir: &Path,
+    target: Target,
+    go_flags: &[String],
+    package: &str,
+    run_pattern: Option<&str>,
+) -> Result<TestRun, GoCliError> {
+    let mut cmd = go_command(target);
+    cmd.arg("test").arg("-json").arg("-count=1");
+    if let Some(pattern) = run_pattern {
+        cmd.arg("-run").arg(pattern);
+    }
+    for flag in go_flags {
+        cmd.arg(flag);
+    }
+    cmd.arg(package)
+        .current_dir(build_dir)
+        .stdout(Stdio::piped());
+
+    let spawn_error = || {
+        toolchain_failure().unwrap_or_else(|| GoCliError {
+            message: "Failed to execute `go test`".to_string(),
+            hint: "Check Go installation with `go version`",
+        })
+    };
+
+    let mut child = cmd.spawn().map_err(|_| spawn_error())?;
+
+    let mut events = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<GoTestEvent>(&line) {
+                events.push(event);
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|_| spawn_error())?;
+
+    Ok(TestRun {
+        events,
+        success: status.success(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn linux() -> Target {
+        Target::new("linux", "amd64")
+    }
+
+    fn windows() -> Target {
+        Target::new("windows", "amd64")
+    }
+
+    #[test]
+    fn unknown_go_test_action_deserializes_as_other() {
+        let event: GoTestEvent = serde_json::from_str(r#"{"Action":"pause"}"#).unwrap();
+
+        assert_eq!(event.action, GoTestAction::Other);
+    }
+
+    #[test]
+    fn binary_name_uses_last_module_segment() {
+        assert_eq!(binary_name("myproj", linux()), "myproj");
+        assert_eq!(binary_name("github.com/u/myproj", linux()), "myproj");
+    }
+
+    #[test]
+    fn cross_binary_name_carries_the_target_before_any_suffix() {
+        assert_eq!(cross_binary_name("greet", linux()), "greet_linux_amd64");
+        assert_eq!(
+            cross_binary_name("greet", windows()),
+            "greet_windows_amd64.exe"
+        );
+        assert_eq!(
+            cross_binary_name("weird name!", linux()),
+            "weird_name__linux_amd64"
+        );
+    }
+
+    fn locator_with(deps: Vec<(&str, deps::GoDependency)>) -> TypedefLocator {
+        let map = deps
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect::<BTreeMap<_, _>>();
+        TypedefLocator::new(map, None, Target::host())
+    }
+
+    #[test]
+    fn write_go_mod_emits_synthetic_require_and_replace_for_replaced_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = locator_with(vec![(
+            "github.com/df-mc/dragonfly",
+            deps::GoDependency::Replaced {
+                source: deps::ReplacementSource::Module {
+                    path: "github.com/fork/dragonfly".to_string(),
+                    version: "v0.0.0-20260101000000-abcdef123456".to_string(),
+                },
+                via: None,
+            },
+        )]);
+
+        let go_directive = toolchain_go_directive();
+        write_go_mod(dir.path(), "example.com/app", &locator, &go_directive).unwrap();
+        let content = fs::read_to_string(dir.path().join("go.mod")).unwrap();
+
+        assert!(
+            content.contains("github.com/df-mc/dragonfly v0.0.0\n"),
+            "{}",
+            content
+        );
+        assert!(
+            content.contains(
+                "replace github.com/df-mc/dragonfly => github.com/fork/dragonfly v0.0.0-20260101000000-abcdef123456"
+            ),
+            "{}",
+            content
+        );
+    }
+
+    #[test]
+    fn write_go_mod_uses_major_matched_synthetic_for_v2_replaced_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        let locator = locator_with(vec![(
+            "example.com/lib/v2",
+            deps::GoDependency::Replaced {
+                source: deps::ReplacementSource::Module {
+                    path: "github.com/fork/lib/v2".to_string(),
+                    version: "v2.3.0".to_string(),
+                },
+                via: None,
+            },
+        )]);
+
+        let go_directive = toolchain_go_directive();
+        write_go_mod(dir.path(), "example.com/app", &locator, &go_directive).unwrap();
+        let content = fs::read_to_string(dir.path().join("go.mod")).unwrap();
+
+        assert!(
+            content.contains("example.com/lib/v2 v2.0.0\n"),
+            "{}",
+            content
+        );
+        assert!(
+            content.contains("replace example.com/lib/v2 => github.com/fork/lib/v2 v2.3.0"),
+            "{}",
+            content
+        );
+    }
+
+    fn local_dep(path: &str) -> deps::GoDependency {
+        deps::GoDependency::Replaced {
+            source: deps::ReplacementSource::Local {
+                path: path.to_string(),
+            },
+            via: None,
+        }
+    }
+
+    #[test]
+    fn write_go_mod_local_emits_synthetic_require_and_quoted_directory_replace() {
+        let project = tempfile::tempdir().unwrap();
+        let module_dir = project.path().join("foo");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(module_dir.join("go.mod"), "module example.com/me/foo\n").unwrap();
+        let target_dir = project.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let mut go_deps = BTreeMap::new();
+        go_deps.insert("example.com/me/foo".to_string(), local_dep("foo"));
+        let locator =
+            TypedefLocator::new(go_deps, Some(project.path().to_path_buf()), Target::host());
+
+        let go_directive = toolchain_go_directive();
+        write_go_mod(&target_dir, "example.com/app", &locator, &go_directive).unwrap();
+        let content = fs::read_to_string(target_dir.join("go.mod")).unwrap();
+
+        assert!(
+            content.contains("example.com/me/foo v0.0.0\n"),
+            "{}",
+            content
+        );
+        let canonical = module_dir.canonicalize().unwrap();
+        let expected = format!("replace example.com/me/foo => \"{}\"", canonical.display());
+        assert!(content.contains(&expected), "{}", content);
+    }
+
+    #[test]
+    fn write_go_mod_local_errors_on_missing_directory_or_missing_go_mod() {
+        let project = tempfile::tempdir().unwrap();
+        let target_dir = project.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let mut go_deps = BTreeMap::new();
+        go_deps.insert("example.com/me/foo".to_string(), local_dep("foo"));
+        let locator = TypedefLocator::new(
+            go_deps.clone(),
+            Some(project.path().to_path_buf()),
+            Target::host(),
+        );
+        let error = write_go_mod(
+            &target_dir,
+            "example.com/app",
+            &locator,
+            &toolchain_go_directive(),
+        )
+        .unwrap_err();
+        assert!(error.contains("example.com/me/foo"), "{}", error);
+        assert!(error.contains("does not exist"), "{}", error);
+
+        fs::create_dir_all(project.path().join("foo")).unwrap();
+        let locator =
+            TypedefLocator::new(go_deps, Some(project.path().to_path_buf()), Target::host());
+        let error = write_go_mod(
+            &target_dir,
+            "example.com/app",
+            &locator,
+            &toolchain_go_directive(),
+        )
+        .unwrap_err();
+        assert!(error.contains("no `go.mod`"), "{}", error);
+    }
+
+    #[test]
+    fn go_mod_quote_escapes_backslashes_and_quotes() {
+        assert_eq!(go_mod_quote("/plain/path"), "\"/plain/path\"");
+        assert_eq!(go_mod_quote("/with space/x"), "\"/with space/x\"");
+        assert_eq!(
+            go_mod_quote("C:\\Users\\dev\\foo"),
+            "\"C:\\\\Users\\\\dev\\\\foo\""
+        );
+    }
+
+    #[test]
+    fn is_go_output_flag_catches_every_go_spelling() {
+        assert!(is_go_output_flag("-o"));
+        assert!(is_go_output_flag("--o"));
+        assert!(is_go_output_flag("-o=dist/app"));
+        assert!(is_go_output_flag("--o=dist/app"));
+        assert!(!is_go_output_flag("-trimpath"));
+        assert!(!is_go_output_flag("-ofoo"));
+        assert!(!is_go_output_flag("--output"));
+    }
+
+    #[test]
+    fn binary_name_appends_exe_on_windows() {
+        assert_eq!(binary_name("myproj", windows()), "myproj.exe");
+        assert_eq!(run_binary_name(windows()), "lis-run.exe");
+        assert_eq!(run_binary_name(linux()), "lis-run");
+    }
+
+    #[test]
+    fn sanitize_replaces_illegal_chars() {
+        assert_eq!(sanitize_binary_stem("weird name!"), "weird_name_");
+    }
+
+    #[test]
+    fn sanitize_never_ends_in_go() {
+        assert_eq!(sanitize_binary_stem("foo.go"), "foo");
+        assert_eq!(sanitize_binary_stem("foo.go.go"), "foo");
+    }
+
+    #[test]
+    fn sanitize_strips_leading_reserved_prefixes() {
+        assert_eq!(sanitize_binary_stem(".hidden"), "hidden");
+        assert_eq!(sanitize_binary_stem("_x"), "x");
+    }
+
+    #[test]
+    fn sanitize_falls_back_for_empty_or_reserved() {
+        assert_eq!(sanitize_binary_stem("___"), "app");
+        assert_eq!(sanitize_binary_stem("testdata"), "app");
+        assert_eq!(sanitize_binary_stem("vendor"), "app");
+    }
+
+    #[test]
+    fn sanitize_avoids_windows_reserved_device_names() {
+        assert_eq!(sanitize_binary_stem("con"), "app");
+        assert_eq!(sanitize_binary_stem("CON"), "app");
+        assert_eq!(sanitize_binary_stem("NuL"), "app");
+        assert_eq!(sanitize_binary_stem("com1"), "app");
+        assert_eq!(sanitize_binary_stem("LPT9"), "app");
+        assert_eq!(sanitize_binary_stem("com0"), "com0");
+        assert_eq!(sanitize_binary_stem("com10"), "com10");
+        assert_eq!(sanitize_binary_stem("console"), "console");
+    }
+
+    #[test]
+    fn sanitize_avoids_dotted_windows_reserved_names() {
+        assert_eq!(sanitize_binary_stem("con.txt"), "app");
+        assert_eq!(sanitize_binary_stem("NUL.anything"), "app");
+        assert_eq!(sanitize_binary_stem("com1.foo"), "app");
+        assert_eq!(sanitize_binary_stem("foo.con"), "foo.con");
+        assert_eq!(sanitize_binary_stem("console.txt"), "console.txt");
+    }
 }

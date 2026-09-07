@@ -1,10 +1,17 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nenum Res { Ok(int), Err(int) }\n\nfn test(r: Res, threshold: int) -> int {\n  match r {\n    Ok(x) | Err(x) if x > threshold => 100,\n    _ => 0,\n  }\n}\n"
+description: |
+  
+  enum Res { Ok(int), Err(int) }
+  
+  fn test(r: Res, threshold: int) -> int {
+    match r {
+      Ok(x) | Err(x) if x > threshold => 100,
+      _ => 0,
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeResOk(arg0 int) Res {
 	return Res{Tag: ResOk, Ok: arg0}
@@ -14,7 +21,7 @@ func MakeResErr(arg0 int) Res {
 	return Res{Tag: ResErr, Err: arg0}
 }
 
-type ResTag int
+type ResTag uint8
 
 const (
 	ResOk ResTag = iota
@@ -27,29 +34,18 @@ type Res struct {
 	Err int
 }
 
-func (r Res) String() string {
-	switch r.Tag {
-	case ResOk:
-		return fmt.Sprintf("Res.Ok(%v)", r.Ok)
-	case ResErr:
-		return fmt.Sprintf("Res.Err(%v)", r.Err)
-	default:
-		return fmt.Sprintf("Res(%d)", r.Tag)
-	}
-}
-
 func test(r Res, threshold int) int {
 	if r.Tag == ResOk {
-		x := r.Ok
-		if x > threshold {
+		if r.Ok > threshold {
 			return 100
 		}
 	}
 	if r.Tag == ResErr {
-		x := r.Err
-		if x > threshold {
+		if r.Err > threshold {
 			return 100
 		}
 	}
-	return 0
+	{
+		return 0
+	}
 }

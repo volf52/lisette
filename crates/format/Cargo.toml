@@ -13,5 +13,8 @@ doctest = false
 test = false
 
 [dependencies]
-syntax = { package = "lisette-syntax", version = "0.1.17", path = "../syntax" }
-unicode-segmentation = "1.11"
+syntax = { package = "lisette-syntax", version = "=0.12.1", path = "../syntax" }
+unicode-width = "0.2"
+
+[lints]
+workspace = true

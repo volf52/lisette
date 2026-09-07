@@ -1,3 +1,4 @@
+use crate::_harness::emit_with_sourcemap;
 use crate::assert_emit_snapshot;
 
 #[test]
@@ -51,6 +52,71 @@ fn test(s: string, i: int) -> rune {
 }
 
 #[test]
+fn string_bytes() {
+    let input = r#"
+fn test(s: string) -> Slice<byte> {
+  s.bytes()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_runes() {
+    let input = r#"
+fn test(s: string) -> Slice<rune> {
+  s.runes()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_runes_zero_alloc() {
+    let input = r#"
+import "go:fmt"
+fn test(s: string) {
+  for r in s.runes() {
+    fmt.Println(r)
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_bytes_zero_alloc() {
+    let input = r#"
+import "go:fmt"
+fn test(s: string) {
+  for b in s.bytes() {
+    fmt.Println(b)
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn for_bytes_loop_captures_mutated_receiver() {
+    let input = r#"
+fn main() {
+  let mut s = "ab"
+  let mut count = 0
+  for b in s.bytes() {
+    count += 1
+    s = ""
+    let _ = b
+  }
+  if count != 2 {
+    panic("expected count 2 — bytes loop must iterate over the original string")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn slice_new() {
     let input = r#"
 fn test() -> Slice<int> {
@@ -61,10 +127,270 @@ fn test() -> Slice<int> {
 }
 
 #[test]
+fn slice_new_unknown_element_explicit_type_arg() {
+    let input = r#"
+fn test() {
+  let mut s = Slice.new<Unknown>()
+  s = s.append("Lilian")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn slice_new_with_void_function_element() {
     let input = r#"
 fn test() -> Slice<fn(int)> {
   Slice.new<fn(int)>()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_make() {
+    let input = r#"
+fn test() -> Slice<byte> {
+  Slice.make<byte>(1024)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_make_inferred_type() {
+    let input = r#"
+fn test() -> Slice<string> {
+  Slice.make(5)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_make_runtime_length() {
+    let input = r#"
+fn test(n: int) -> Slice<int> {
+  Slice.make<int>(n)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_make_zero_filled() {
+    let input = r#"
+fn main() {
+  let xs = Slice.make<int>(3)
+  if xs.length() != 3 {
+    panic("expected length 3")
+  }
+  if xs.capacity() != 3 {
+    panic("expected capacity 3")
+  }
+  if xs.get(0).unwrap_or(-1) != 0 {
+    panic("expected zero-filled elements")
+  }
+  let empty = Slice.make<int>(0)
+  if !empty.is_empty() {
+    panic("expected an empty slice for zero length")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_make_read_loop() {
+    let input = r#"
+import "go:strings"
+
+fn main() {
+  let mut reader = strings.NewReader("hello world")
+  let mut buffer = Slice.make<byte>(8)
+  let n = reader.Read(buffer).unwrap_or(0)
+  if n != 8 {
+    panic("expected to read 8 bytes into the buffer")
+  }
+  let head = buffer[..n] as string
+  if head != "hello wo" {
+    panic("expected the first 8 bytes of the input")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_reserve_after_new() {
+    let input = r#"
+fn test() -> Slice<int> {
+  Slice.new<int>().reserve(4096)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_reserve_self_reassign_not_clipped() {
+    let input = r#"
+fn test() {
+  let mut acc = [1, 2, 3]
+  acc = acc.reserve(50)
+  let _ = acc
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_reserve_value_position_clips_receiver() {
+    let input = r#"
+fn test(source: Slice<int>) -> Slice<int> {
+  let grown = source.reserve(10)
+  grown
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_reserve_accumulator_round_trip() {
+    let input = r#"
+fn main() {
+  let mut acc = Slice.new<int>().reserve(64)
+  if acc.length() != 0 {
+    panic("expected an empty accumulator")
+  }
+  if acc.capacity() < 64 {
+    panic("expected reserved capacity")
+  }
+  let start = acc.capacity()
+  acc = acc.append(1)
+  acc = acc.append(2)
+  if acc.capacity() != start {
+    panic("expected appends within reserved capacity not to reallocate")
+  }
+  if acc.get(1).unwrap_or(-1) != 2 {
+    panic("expected appended elements to be readable")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_make_fills_elements_without_go_zero() {
+    let input = r#"
+fn main() {
+  let mut maps = Slice.make<mut Map<string, int>>(2)
+  let mut first = maps.get(0).unwrap_or(Map.new<string, int>())
+  first["k"] = 1
+  let second = maps.get(1).unwrap_or(Map.new<string, int>())
+  if first.length() != 1 {
+    panic("expected a writable empty map element")
+  }
+  if second.length() != 0 {
+    panic("expected each element to get its own map")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn append_from_call_result_does_not_alias() {
+    let input = r#"
+fn identity(s: Slice<int>) -> Slice<int> {
+  s
+}
+
+fn main() {
+  let mut base = [1, 2]
+  base = base.append(3)
+  let u = identity(base).append(7)
+  base[0] = 99
+  if u.get(0).unwrap_or(-1) != 1 {
+    panic("a call-produced receiver must not alias the argument")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn append_results_do_not_alias() {
+    let input = r#"
+fn main() {
+  let base = [1, 2]
+  let t = base.append(3)
+  let u1 = t.append(7)
+  let u2 = t.append(8)
+  if u1.get(3).unwrap_or(-1) != 7 {
+    panic("append results must not share a backing array")
+  }
+  if u2.get(3).unwrap_or(-1) != 8 {
+    panic("append results must not share a backing array")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn append_from_zero_growth_append_does_not_alias() {
+    let input = r#"
+fn main() {
+  let mut s = [1, 2]
+  s = s.append(3)
+  let u1 = s.append().append(7)
+  let u2 = s.append().append(8)
+  if u1.get(3).unwrap_or(-1) != 7 {
+    panic("a zero-growth append receiver must not be treated as fresh")
+  }
+  if u2.get(3).unwrap_or(-1) != 8 {
+    panic("a zero-growth append receiver must not be treated as fresh")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn block_tail_append_reads_receiver_before_argument_effects() {
+    let input = r#"
+struct Holder {
+  slc: Slice<()>,
+}
+
+fn main() {
+  let mut h = Holder { slc: [] }
+  let bump = || { h.slc = [(), (), ()] }
+  let ys = {
+    h.slc.append(bump())
+  }
+  if ys.length() != 1 {
+    panic("the receiver must be read before argument effects run")
+  }
+  if h.slc.length() != 3 {
+    panic("the argument mutation must still apply")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn append_base_mutation_does_not_leak_into_result() {
+    let input = r#"
+fn main() {
+  let mut t = [1, 2]
+  t = t.append(3)
+  let u = t.append(7)
+  t[0] = 99
+  if u.get(0).unwrap_or(-1) != 1 {
+    panic("mutating the base must not write through to an append result")
+  }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -121,6 +447,66 @@ fn test(m: Map<string, int>, key: string) -> Option<int> {
 }
 
 #[test]
+fn map_get_match_subject_fuses() {
+    let input = r#"
+import "go:fmt"
+
+fn test(m: Map<string, int>, key: string) -> int {
+  match m.get(key) {
+    Some(v) => v,
+    None => { fmt.Print("missing\n"); 0 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_get_let_else_shadowed_binding_freshens() {
+    let input = r#"
+fn test(m: Map<string, string>, v: int) -> string {
+  let _ = v + 1
+  let Some(v) = m.get("a") else {
+    return ""
+  }
+  v
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_get_let_else_shadow_outer_visible_in_else() {
+    let input = r#"
+fn test(m: Map<string, string>, x: int) -> string {
+  let Some(x) = m.get("a") else {
+    if x > 0 {
+      return "positive"
+    }
+    return "negative"
+  }
+  x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_get_let_else_reserved_name_binding() {
+    let input = r#"
+fn test(m: Map<string, int>) -> int {
+  let len = 3
+  let _ = len + 1
+  let Some(len) = m.get("a") else {
+    return 0
+  }
+  len
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn slice_append() {
     let input = r#"
 fn test(s: Slice<int>) -> Slice<int> {
@@ -141,32 +527,22 @@ fn test(s: Slice<int>) -> Slice<int> {
 }
 
 #[test]
+fn slice_append_no_args_into_var() {
+    let input = r#"
+fn test(s: Slice<int>, flag: bool) -> Slice<int> {
+  let out = if flag { s.append() } else { s }
+  out
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn slice_append_reassign() {
     let input = r#"
 fn test(items: Slice<int>) {
-  let mut s = items
+  let mut s = items.clone()
   s = s.append(1, 2, 3)
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn slice_extend() {
-    let input = r#"
-fn test(a: Slice<int>, b: Slice<int>) -> Slice<int> {
-  a.extend(b)
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn slice_extend_reassign() {
-    let input = r#"
-fn test(items: Slice<int>, b: Slice<int>) {
-  let mut a = items
-  a = a.extend(b)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -176,20 +552,8 @@ fn test(items: Slice<int>, b: Slice<int>) {
 fn slice_append_statement() {
     let input = r#"
 fn test(items: Slice<int>) -> Slice<int> {
-  let mut s = items
+  let mut s = items.clone()
   s = s.append(4)
-  s
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn slice_extend_statement() {
-    let input = r#"
-fn test(items: Slice<int>, extra: Slice<int>) -> Slice<int> {
-  let mut s = items
-  s = s.extend(extra)
   s
 }
 "#;
@@ -220,7 +584,7 @@ fn test(s: Slice<int>) {
 #[test]
 fn slice_copy_from() {
     let input = r#"
-fn test(dst: Slice<int>, src: Slice<int>) -> int {
+fn test(dst: mut Slice<int>, src: Slice<int>) -> int {
   dst.copy_from(src)
 }
 "#;
@@ -248,10 +612,302 @@ fn test(s: Slice<int>, f: fn(int) -> string) -> Slice<string> {
 }
 
 #[test]
+fn slice_map_lambda_becomes_a_loop() {
+    let input = r#"
+fn test(s: Slice<int>) -> Slice<int> {
+  s.map(|x| x * 2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_map_capturing_lambda_becomes_a_loop() {
+    let input = r#"
+fn test(s: Slice<int>, factor: int) -> Slice<int> {
+  let mut seen = 0
+  let doubled = s.map(|x| {
+    seen += 1
+    x * factor
+  })
+  doubled.append(seen)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_map_on_a_call_receiver_reads_it_once() {
+    let input = r#"
+fn source() -> Slice<int> { [1, 2] }
+
+fn test() -> Slice<int> {
+  source().map(|x| x * 2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_filter_with_an_unused_parameter_names_the_element() {
+    let input = r#"
+fn test(s: Slice<int>) -> Slice<int> {
+  s.filter(|_x| true)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_map_with_an_unused_parameter_drops_the_element() {
+    let input = r#"
+fn test(s: Slice<int>) -> Slice<int> {
+  s.map(|_x| 7)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_map_deferring_lambda_keeps_the_helper() {
+    let input = r#"
+import "go:fmt"
+
+fn test(s: Slice<int>) -> Slice<int> {
+  s.map(|x| {
+    defer fmt.Println(x)
+    x * 2
+  })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_fold_capturing_lambda_keeps_the_helper() {
+    let input = r#"
+fn test(s: Slice<int>) -> fn(int) -> int {
+  s.fold(|y| y, |acc, x| {
+    |y| acc(y) + x
+  })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_fold_spawning_lambda_keeps_the_helper() {
+    let input = r#"
+import "go:fmt"
+
+fn test(s: Slice<int>) -> int {
+  s.fold(0, |acc, x| {
+    task {
+      fmt.Println(acc)
+    }
+    acc + x
+  })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_map_returning_lambda_keeps_the_helper() {
+    let input = r#"
+fn test(s: Slice<int>) -> Slice<int> {
+  s.map(|x| {
+    if x > 0 {
+      return x
+    }
+    0
+  })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn slice_contains() {
     let input = r#"
 fn test(s: Slice<int>, v: int) -> bool {
   s.contains(v)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_equals() {
+    let input = r#"
+fn test(a: Slice<int>, b: Slice<int>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_equals_through_ref_alias() {
+    let input = r#"
+type IntSliceRef = Ref<Slice<int>>
+fn test(a: IntSliceRef, b: Slice<int>) -> bool {
+  a.equals(b)
+}
+"#;
+    let go = emit_with_sourcemap(input).go_code();
+    assert!(
+        go.contains("slices.Equal(*a"),
+        "equals on a ref-alias slice must deref the pointer and use the slices helper like a bare ref: {go}"
+    );
+    assert!(
+        !go.contains("SliceEquals"),
+        "must not fall through to the undefined nominal helper: {go}"
+    );
+    assert!(
+        go.contains("func test(a IntSliceRef,"),
+        "the alias name must be preserved in the emitted signature, not flattened to the bare pointer: {go}"
+    );
+}
+
+#[test]
+fn slice_equals_negated() {
+    let input = r#"
+fn test(a: Slice<int>, b: Slice<int>) -> bool {
+  !a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn nested_slice_equals() {
+    let input = r#"
+fn test(a: Slice<Slice<int>>, b: Slice<Slice<int>>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_equals_comparable_generic() {
+    let input = r#"
+fn test<T: Comparable>(a: Slice<T>, b: Slice<T>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_equals_ufcs() {
+    let input = r#"
+fn test(a: Slice<int>, b: Slice<int>) -> bool {
+  Slice.equals(a, b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_contains_comparable_element() {
+    let input = r#"
+fn test(a: Slice<int>, value: int) -> bool {
+  a.contains(value)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn nested_slice_contains() {
+    let input = r#"
+fn test(a: Slice<Slice<int>>, value: Slice<int>) -> bool {
+  a.contains(value)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_of_map_contains() {
+    let input = r#"
+fn test(a: Slice<Map<string, int>>, value: Map<string, int>) -> bool {
+  a.contains(value)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_contains_comparable_generic() {
+    let input = r#"
+fn test<T: Comparable>(a: Slice<T>, value: T) -> bool {
+  a.contains(value)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_contains_ufcs() {
+    let input = r#"
+fn test(a: Slice<Slice<int>>, value: Slice<int>) -> bool {
+  Slice.contains(a, value)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_contains_evaluates_its_target_once() {
+    let input = r#"
+fn target(calls: mut Ref<int>) -> Slice<int> {
+  calls.* += 1
+  [9]
+}
+
+fn main() {
+  let xs: Slice<Slice<int>> = [[1], [2], [3]]
+  let mut calls = 0
+  let found = xs.contains(target(&calls))
+  if found {
+    panic("9 is not in the slice")
+  }
+  if calls != 1 {
+    panic(f"expected 1 call, got {calls}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_equals() {
+    let input = r#"
+fn test(a: Map<string, int>, b: Map<string, int>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_of_slice_equals() {
+    let input = r#"
+fn test(a: Map<string, Slice<int>>, b: Map<string, Slice<int>>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_of_map_equals() {
+    let input = r#"
+fn test(a: Slice<Map<string, int>>, b: Slice<Map<string, int>>) -> bool {
+  a.equals(b)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -361,6 +1017,17 @@ fn test() -> Map<string, int> {
 }
 
 #[test]
+fn map_new_unknown_value_explicit_type_args() {
+    let input = r#"
+fn test() {
+  let mut m = Map.new<string, Unknown>()
+  m["key"] = "value"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn map_length() {
     let input = r#"
 fn test(m: Map<string, int>) -> int {
@@ -383,7 +1050,7 @@ fn test(m: Map<string, int>) -> bool {
 #[test]
 fn map_delete() {
     let input = r#"
-fn test(mut m: Map<string, int>, key: string) {
+fn test(m: mut Map<string, int>, key: string) {
   m.delete(key)
 }
 "#;
@@ -395,6 +1062,75 @@ fn map_from_pairs() {
     let input = r#"
 fn test() -> Map<string, int> {
   Map.from([("alice", 95), ("bob", 82)])
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_from_pairs_with_unknown_value() {
+    let input = r#"
+fn test() {
+  let m = Map.from<string, Unknown>([("one", "two")])
+  if m.length() != 1 {
+    panic("Map.from lost its entry when widening values to Unknown")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_from_struct_values_elides_the_value_type() {
+    let input = r#"
+struct Point {
+  x: int,
+  y: int
+}
+
+fn test() -> Map<string, Point> {
+  Map.from([("a", Point { x: 1, y: 2 }), ("b", Point { x: 3, y: 4 })])
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_value_calling_a_method_on_a_literal_keeps_its_type() {
+    let input = r#"
+struct Point {
+  x: int,
+  y: int
+}
+
+impl Point {
+  fn scaled(self) -> Point { Point { x: self.x * 2, y: self.y * 2 } }
+}
+
+fn test() -> Map<string, Point> {
+  Map.from([("a", Point { x: 1, y: 2 }.scaled())])
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_from_non_literal_keys_keeps_prelude_call() {
+    let input = r#"
+const KEY = "a"
+
+fn test() -> Map<string, int> {
+  Map.from([(KEY, 1), (KEY, 2)])
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_from_numeric_keys_keeps_prelude_call() {
+    let input = r#"
+fn test() -> Map<int, int> {
+  Map.from([(65, 1), ('A', 2)])
 }
 "#;
     assert_emit_snapshot!(input);
@@ -615,6 +1351,121 @@ fn test(err: error) {
 }
 
 #[test]
+fn builtin_min_two_ints() {
+    let input = r#"
+fn test() -> int {
+  min(1, 2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_max_three_floats() {
+    let input = r#"
+fn test() -> float64 {
+  max(1.0, 2.0, 3.0)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_types_a_literal_of_another_default() {
+    let input = r#"
+fn test() -> float64 {
+  let two: float64 = min(1, 2)
+  let three: float64 = min(1, 2, 3)
+  let narrow: float32 = min(1, 2)
+  two / three + narrow as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_types_a_character_literal_into_an_int_slot() {
+    let input = r#"
+fn test() -> int {
+  let letter: int = min('a', 'b')
+  letter
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+/// One argument Go can already type settles the call, so no wrap is emitted.
+#[test]
+fn builtin_max_leaves_go_inference_alone_when_an_operand_types_it() {
+    let input = r#"
+fn test(measured: float64) -> float64 {
+  let promoted: float64 = max(1, 2.5)
+  let from_operand: float64 = max(1, measured)
+  promoted + from_operand
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_types_a_literal_into_a_newtype() {
+    let input = r#"
+struct Ticket(int)
+struct Label(string)
+
+fn test() -> Ticket {
+  let label: Label = max("a", "b")
+  let _ = label
+  min(1, 2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_strings() {
+    let input = r#"
+fn test() -> string {
+  min("a", "b")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_max_sized_integers() {
+    let input = r#"
+fn test(a: byte, b: byte, c: rune, d: rune) -> rune {
+  let _ = min(a, b)
+  max(c, d)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_named_go_type() {
+    let input = r#"
+import "go:time"
+
+fn test(a: time.Duration, b: time.Duration) -> time.Duration {
+  min(a, b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_min_explicit_type_arg_into_unknown() {
+    let input = r#"
+fn test() -> Unknown {
+  min<byte>(1, 2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn string_is_empty_negated() {
     let input = r#"
 fn test(s: string) -> bool {
@@ -663,6 +1514,252 @@ fn main() {
   let f = Option.map
   let x = f(Some(1), |v| v + 1)
   let _ = x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn prelude_method_value_capture_with_option_returning_callback() {
+    let input = r#"
+fn main() {
+  let f = Option.and_then
+  let x = f(Some(1), |v| Some(v * 2))
+  let _ = x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn prelude_dispatch_with_prelude_constructor_arg() {
+    let input = r#"
+fn main() {
+  let opt: Option<int> = Some(1)
+  let r = opt.and_then(Some)
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn prelude_dispatch_with_user_fn_arg() {
+    let input = r#"
+fn doubler(x: int) -> Option<int> { Some(x * 2) }
+fn main() {
+  let opt: Option<int> = Some(1)
+  let r = opt.and_then(doubler)
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn prelude_dispatch_with_captured_prelude_constructor() {
+    let input = r#"
+fn main() {
+  let g = Some
+  let opt: Option<int> = Some(1)
+  let r = opt.and_then(g)
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn prelude_dispatch_with_captured_user_fn_local() {
+    let input = r#"
+fn doubler(x: int) -> Option<int> { Some(x * 2) }
+fn main() {
+  let g = doubler
+  let opt: Option<int> = Some(1)
+  let r = opt.and_then(g)
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_range() {
+    let input = r#"
+fn test(s: string) -> string {
+  s.substring(0..5)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_range_inclusive() {
+    let input = r#"
+fn test(s: string) -> string {
+  s.substring(0..=4)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_range_from() {
+    let input = r#"
+fn test(s: string) -> string {
+  s.substring(6..)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_range_to() {
+    let input = r#"
+fn test(s: string) -> string {
+  s.substring(..5)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_range_to_inclusive() {
+    let input = r#"
+fn test(s: string) -> string {
+  s.substring(..=4)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_stored_range_to() {
+    let input = r#"
+fn test(s: string, r: RangeTo<int>) -> string {
+  s.substring(r)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_range_value_eval_order() {
+    let input = r#"
+import "go:fmt"
+
+fn make_s() -> string {
+  fmt.Println("receiver")
+  "hello"
+}
+
+fn make_range() -> Range<int> {
+  fmt.Println("range")
+  1..4
+}
+
+fn main() {
+  fmt.Println(make_s().substring(make_range()))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_ufcs() {
+    let input = r#"
+fn test(s: string) -> string {
+  string.substring(s, 0..5)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_alias_receiver() {
+    let input = r#"
+type MyString = string
+
+fn test(s: MyString, r: RangeTo<int>) -> string {
+  s.substring(r)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_native_method_on_alias() {
+    let input = r#"
+type MyString = string
+
+fn test(s: MyString) -> bool {
+  s.contains("foo")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_ref_receiver_range_literal() {
+    let input = r#"
+fn test(r: Ref<string>) -> string {
+  r.substring(1..4)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_ref_receiver_range_value() {
+    let input = r#"
+fn test(r: Ref<string>, range: Range<int>) -> string {
+  r.substring(range)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_substring_aliased_range() {
+    let input = r#"
+type Prefix = RangeTo<int>
+fn test(s: string, r: Prefix) -> string {
+  s.substring(r)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_index_aliased_range() {
+    let input = r#"
+type Prefix = RangeTo<int>
+fn test(xs: Slice<int>, r: Prefix) -> Slice<int> {
+  xs[r]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_index_aliased_range_from() {
+    let input = r#"
+type Suffix = RangeFrom<int>
+fn test(xs: Slice<int>, r: Suffix) -> Slice<int> {
+  xs[r]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn mut_subslice_clones_for_aliased_range() {
+    let input = r#"
+type Prefix = Range<int>
+fn test(arr: Slice<int>, r: Prefix) -> Slice<int> {
+  let mut owned = arr[r].clone()
+  owned[0] = 99
+  owned
 }
 "#;
     assert_emit_snapshot!(input);

@@ -1,20 +1,31 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test(x: int) -> string {\n  let result = match x {\n    n if n < 10 => {\n      let result = n * n\n      f\"small({result})\"\n    },\n    _ => \"other\",\n  }\n  result\n}\n"
+description: |
+  
+  fn test(x: int) -> string {
+    let result = match x {
+      n if n < 10 => {
+        let result = n * n
+        f"small({result})"
+      },
+      _ => "other",
+    }
+    result
+  }
 ---
 package main
 
 import "fmt"
 
 func test(x int) string {
-	for {
-		{
-			n := x
-			if n < 10 {
-				result_2 := n * n
-				return fmt.Sprintf("small(%v)", result_2)
-			}
-		}
-		return "other"
+	var result string
+	switch {
+	case x < 10:
+		n := x
+		result_1 := n * n
+		result = fmt.Sprintf("small(%d)", result_1)
+	default:
+		result = "other"
 	}
+	return result
 }

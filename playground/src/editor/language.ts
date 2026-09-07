@@ -8,7 +8,7 @@ export const LISETTE_KEYWORDS = [
   "as", "break", "continue", "else", "for", "if", "in", "loop",
   "match", "return", "while",
   // storage
-  "const", "enum", "fn", "impl", "interface", "struct", "type", "var",
+  "const", "embed", "enum", "fn", "impl", "interface", "struct", "type", "var",
   // modifiers
   "pub", "mut",
   // others
@@ -99,10 +99,10 @@ export function registerLanguage(monaco: typeof Monaco): void {
 
     operators: [
       "|>", "->", "=>", "?", "::", ":", "..", "..=",
-      "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
+      "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "&^=", "<<=", ">>=",
       "==", "!=", "<", ">", "<=", ">=",
       "&&", "||", "!", "+", "-", "*", "/", "%",
-      "&", "|", "^", "~", "<<", ">>",
+      "&", "|", "^", "&^", "~", "<<", ">>",
       ".*",
     ],
 
@@ -331,7 +331,7 @@ export const LISETTE_SNIPPETS: SnippetDef[] = [
   },
   {
     label: "interface",
-    insertText: "interface ${1:Name} {\n\tfn ${2:method}(self) -> ${3:ReturnType}\n}",
+    insertText: "interface ${1:Name} {\n\tfn ${2:method}() -> ${3:ReturnType}\n}",
     documentation: "Interface definition",
   },
   {
@@ -437,7 +437,7 @@ export function registerCompletionProvider(
       try {
         wasmItems = await getWasmCompletions(model, position);
       } catch {
-        // WASM not ready – fall back to static completions only
+        // WASM not ready, fall back to static completions only
       }
 
       return {

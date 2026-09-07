@@ -1,0 +1,450 @@
+use ecow::EcoString;
+use rustc_hash::FxHashSet as HashSet;
+use std::slice;
+use syntax::ast::{
+    BinaryOperator, Binding, Expression, FormatStringPart, Literal, Pattern, Span, UnaryOperator,
+};
+use syntax::program::DefinitionBody;
+use syntax::types::{SimpleKind, Type, unqualified_name};
+
+use crate::passes::walk::visit_ast;
+use semantics::store::Store;
+
+pub(super) use crate::passes::comparison::{
+    expressions_equivalent, flip_comparison, is_side_effect_free, negate_comparison,
+    signed_integer_literal,
+};
+
+pub(super) fn first_param_is_self(params: &[Binding]) -> bool {
+    params.first().is_some_and(|param| {
+        matches!(&param.pattern, Pattern::Identifier { identifier, .. } if identifier == "self")
+    })
+}
+
+pub(super) fn struct_field_names(
+    store: &Store,
+    ty: &Type,
+    name: &str,
+) -> Option<HashSet<EcoString>> {
+    let Type::Nominal { id, .. } = ty.strip_refs() else {
+        return None;
+    };
+    let def = store.get_definition(id.as_str())?;
+    match &def.body {
+        DefinitionBody::Struct { fields, .. } => {
+            Some(fields.iter().map(|f| f.name.clone()).collect())
+        }
+        DefinitionBody::Enum { variants, .. } => {
+            let variant_name = unqualified_name(name);
+            let variant = variants.iter().find(|v| v.name == variant_name)?;
+            Some(variant.fields.iter().map(|f| f.name.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn is_float_operand(store: &Store, expression: &Expression) -> bool {
+    let resolved = store.deep_resolve_alias(&expression.get_type());
+    store
+        .underlying_simple_kind(&resolved)
+        .is_some_and(SimpleKind::is_float)
+}
+
+pub(super) fn is_zero_literal(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::Literal {
+            literal: Literal::Integer { value: 0, .. },
+            ..
+        }
+    )
+}
+
+pub(super) fn is_one_literal(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::Literal {
+            literal: Literal::Integer { value: 1, .. },
+            ..
+        }
+    )
+}
+
+pub(super) fn bool_literal(expression: &Expression) -> Option<bool> {
+    if let Expression::Literal {
+        literal: Literal::Boolean(b),
+        ..
+    } = expression
+    {
+        Some(*b)
+    } else {
+        None
+    }
+}
+
+pub(super) fn is_empty_block(expression: &Expression) -> bool {
+    matches!(expression, Expression::Block { items, .. } if items.is_empty())
+}
+
+pub(super) fn is_eager_safe(expression: &Expression) -> bool {
+    match expression.unwrap_parens() {
+        Expression::Identifier { .. } => true,
+        Expression::Literal { literal, .. } => literal_is_eager_safe(literal),
+        Expression::DotAccess {
+            expression: inner, ..
+        } => is_eager_safe(inner),
+        _ => false,
+    }
+}
+
+pub(super) fn is_pure_mapper(expression: &Expression) -> bool {
+    matches!(expression.unwrap_parens(), Expression::Lambda { .. }) || is_eager_safe(expression)
+}
+
+// Unlike `is_eager_safe`, a slice literal is excluded: moving its allocation
+// onto the success path is not a free simplification.
+fn is_cheap_constant(expression: &Expression) -> bool {
+    match expression.unwrap_parens() {
+        Expression::Identifier { .. } => true,
+        Expression::Literal { literal, .. } => {
+            !matches!(literal, Literal::Slice(_)) && literal_is_eager_safe(literal)
+        }
+        Expression::DotAccess {
+            expression: inner, ..
+        } => is_cheap_constant(inner),
+        _ => false,
+    }
+}
+
+// The body of a closure that is a cheap constant referencing none of the
+// closure's parameters, so it can move into the matching eager combinator.
+pub(super) fn constant_closure_value(argument: &Expression) -> Option<&Expression> {
+    let Expression::Lambda { params, body, .. } = argument.unwrap_parens() else {
+        return None;
+    };
+    let body = unwrap_block(body);
+    if !is_cheap_constant(body) {
+        return None;
+    }
+    for param in params {
+        match &param.pattern {
+            Pattern::WildCard { .. } => {}
+            Pattern::Identifier { identifier, .. } => {
+                if mentions_identifier(body, identifier.as_str()) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(body)
+}
+
+fn literal_is_eager_safe(literal: &Literal) -> bool {
+    match literal {
+        Literal::Slice(elements) => elements.iter().all(is_eager_safe),
+        Literal::FormatString(parts) => parts
+            .iter()
+            .all(|part| matches!(part, FormatStringPart::Text(_))),
+        _ => true,
+    }
+}
+
+// Whether an expression is safe to hoist out of a short-circuiting per-element
+// scan (`filter`/`find`, `any`/`contains`) that may never have evaluated it.
+pub(super) fn expression_is_pure(expression: &Expression, store: &Store) -> bool {
+    match expression.unwrap_parens() {
+        Expression::Identifier { .. } => true,
+        Expression::Literal { literal, .. } => literal_is_pure(literal, store),
+        Expression::Unary {
+            operator: UnaryOperator::Deref,
+            ..
+        } => false,
+        Expression::Unary {
+            expression: inner, ..
+        } => expression_is_pure(inner, store),
+        Expression::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            binary_operator_cannot_panic(*operator, left, right, store)
+                && expression_is_pure(left, store)
+                && expression_is_pure(right, store)
+        }
+        // Field access auto-derefs, which panics on a nilable Go pointer.
+        Expression::DotAccess {
+            expression: inner, ..
+        } => !store.is_nilable_go_type(&inner.get_type()) && expression_is_pure(inner, store),
+        Expression::Block { items, .. } => {
+            matches!(items.as_slice(), [single] if expression_is_pure(single, store))
+        }
+        _ => false,
+    }
+}
+
+// `/` `%` panic on zero, `<<` `>>` on a negative count, and interface/`any`
+// `==`/`!=` on a non-comparable dynamic value; scalar `==`/`!=` is safe.
+fn binary_operator_cannot_panic(
+    operator: BinaryOperator,
+    left: &Expression,
+    right: &Expression,
+    store: &Store,
+) -> bool {
+    match operator {
+        BinaryOperator::Division
+        | BinaryOperator::Remainder
+        | BinaryOperator::ShiftLeft
+        | BinaryOperator::ShiftRight => false,
+        BinaryOperator::Equal | BinaryOperator::NotEqual => {
+            store.underlying_simple_kind(&left.get_type()).is_some()
+                && store.underlying_simple_kind(&right.get_type()).is_some()
+        }
+        _ => true,
+    }
+}
+
+// An interpolated f-string lowers to `fmt.Sprint`, which can call a user `String()`.
+fn literal_is_pure(literal: &Literal, store: &Store) -> bool {
+    match literal {
+        Literal::Slice(elements) => elements.iter().all(|e| expression_is_pure(e, store)),
+        Literal::FormatString(parts) => parts
+            .iter()
+            .all(|part| matches!(part, FormatStringPart::Text(_))),
+        _ => true,
+    }
+}
+
+pub(super) fn span_text<'a>(source: &'a str, expression: &Expression) -> Option<&'a str> {
+    let span = expression.get_span();
+    source.get(span.byte_offset as usize..span.end() as usize)
+}
+
+pub(super) fn replacement_drops_comment(source: &str, span: Span, replacement: &str) -> bool {
+    let Some(original) = source.get(span.byte_offset as usize..span.end() as usize) else {
+        return false;
+    };
+    original.matches("//").count() > replacement.matches("//").count()
+}
+
+/// Whether `expression` binds at least as tightly as a postfix operator.
+pub(super) fn is_postfix_tight(expression: &Expression) -> bool {
+    match expression {
+        Expression::Identifier { .. }
+        | Expression::Literal { .. }
+        | Expression::DotAccess { .. }
+        | Expression::IndexedAccess { .. }
+        | Expression::Paren { .. }
+        | Expression::Propagate { .. } => true,
+        // A `|>` pipeline lowers to a `Call` with its piped arg before the callee.
+        Expression::Call {
+            expression: callee,
+            args,
+            ..
+        } => args
+            .iter()
+            .all(|arg| arg.get_span().byte_offset >= callee.get_span().byte_offset),
+        _ => false,
+    }
+}
+
+pub(super) fn lambda_is_annotated(expression: &Expression) -> bool {
+    matches!(
+        expression.unwrap_parens(),
+        Expression::Lambda { params, return_annotation, .. }
+            if !return_annotation.is_unknown()
+                || params.iter().any(|param| param.annotation.is_some())
+    )
+}
+
+pub(super) fn as_tight_operand(text: &str, expression: &Expression) -> String {
+    if is_postfix_tight(expression) {
+        text.to_string()
+    } else {
+        format!("({text})")
+    }
+}
+
+/// Whether every argument sits after `receiver` in source, distinguishing a
+/// written `receiver.method(args)` from a `|>` pipeline (piped value before it).
+pub(super) fn reads_as_method_call(receiver: &Expression, args: &[Expression]) -> bool {
+    let receiver_end = receiver.get_span().end();
+    args.iter()
+        .all(|arg| arg.get_span().byte_offset >= receiver_end)
+}
+
+// The single identifier bound by a one-field enum-variant pattern such as
+// `Some(v)` or `Err(e)`, if the variant name matches.
+pub(super) fn enum_variant_binding<'a>(pattern: &'a Pattern, variant: &str) -> Option<&'a str> {
+    let Pattern::EnumVariant {
+        identifier,
+        fields,
+        rest,
+        ..
+    } = pattern
+    else {
+        return None;
+    };
+    if unqualified_name(identifier) != variant || *rest || fields.len() != 1 {
+        return None;
+    }
+    let Pattern::Identifier {
+        identifier: name, ..
+    } = &fields[0]
+    else {
+        return None;
+    };
+    Some(name.as_str())
+}
+
+pub(super) fn wrapped_single_arg<'a>(
+    expression: &'a Expression,
+    variant: &str,
+) -> Option<&'a Expression> {
+    let Expression::Call {
+        expression: callee,
+        args,
+        ..
+    } = expression.unwrap_parens()
+    else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let Expression::Identifier { value, .. } = callee.unwrap_parens() else {
+        return None;
+    };
+    if unqualified_name(value) != variant {
+        return None;
+    }
+    Some(&args[0])
+}
+
+pub(super) fn is_bare_identifier(expression: &Expression, name: &str) -> bool {
+    matches!(expression.unwrap_parens(), Expression::Identifier { value, .. }
+        if value.as_str() == name)
+}
+
+pub(super) fn method_call<'a>(
+    expression: &'a Expression,
+    name: &str,
+) -> Option<(&'a Expression, &'a [Expression], &'a Span)> {
+    let Expression::Call {
+        expression: callee,
+        args,
+        span,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    let Expression::DotAccess {
+        expression: receiver,
+        member,
+        ..
+    } = callee.unwrap_parens()
+    else {
+        return None;
+    };
+    (member.as_str() == name).then_some((receiver.as_ref(), args.as_slice(), span))
+}
+
+pub(super) fn time_now_namespace(expression: &Expression) -> Option<&Expression> {
+    let (namespace, args, _) = method_call(expression.unwrap_parens(), "Now")?;
+    (args.is_empty() && namespace.get_type().as_import_namespace() == Some("go:time"))
+        .then_some(namespace)
+}
+
+pub(super) fn unary_lambda(expression: &Expression) -> Option<(&str, &Expression)> {
+    let Expression::Lambda { params, body, .. } = expression.unwrap_parens() else {
+        return None;
+    };
+    let [param] = params.as_slice() else {
+        return None;
+    };
+    let Pattern::Identifier { identifier, .. } = &param.pattern else {
+        return None;
+    };
+    Some((identifier.as_str(), unwrap_block(body)))
+}
+
+pub(super) fn unwrap_block(expression: &Expression) -> &Expression {
+    match expression.unwrap_parens() {
+        Expression::Block { items, .. } if items.len() == 1 => unwrap_block(&items[0]),
+        other => other,
+    }
+}
+
+pub(super) fn is_identity_lambda(expression: &Expression) -> bool {
+    unary_lambda(expression).is_some_and(|(param, body)| is_bare_identifier(body, param))
+}
+
+pub(super) fn wraps_binding(body: &Expression, variant: &str, binding: &str) -> bool {
+    wrapped_single_arg(body, variant).is_some_and(|arg| is_bare_identifier(arg, binding))
+}
+
+pub(super) fn is_none_pattern(pattern: &Pattern) -> bool {
+    matches!(pattern, Pattern::EnumVariant { identifier, fields, rest, .. }
+        if unqualified_name(identifier) == "None" && fields.is_empty() && !*rest)
+}
+
+pub(super) fn enum_has_multiple_variants(ty: &Type, store: &Store) -> bool {
+    matches!(ty.strip_refs(), Type::Nominal { id, .. }
+        if store.variants_of(id.as_str()).is_some_and(|variants| variants.len() >= 2))
+}
+
+pub(super) fn mentions_identifier(expression: &Expression, name: &str) -> bool {
+    let mut found = false;
+    visit_ast(
+        slice::from_ref(expression),
+        &mut |node, _| {
+            if let Expression::Identifier { value, .. } = node {
+                found |= value.as_str() == name;
+            }
+        },
+        &mut |_, _| {},
+    );
+    found
+}
+
+// `?`, `return`, `break`, and `continue` target a scope outside a synthesized
+// closure, and `defer` schedules at the enclosing function's return, so a body
+// containing any of them cannot move across a closure boundary unchanged.
+pub(super) fn has_escaping_control_flow(body: &Expression) -> bool {
+    let mut found = false;
+    visit_ast(
+        slice::from_ref(body),
+        &mut |node, _| {
+            found |= matches!(
+                node,
+                Expression::Return { .. }
+                    | Expression::Propagate { .. }
+                    | Expression::Break { .. }
+                    | Expression::Continue { .. }
+                    | Expression::Defer { .. }
+            );
+        },
+        &mut |_, _| {},
+    );
+    found
+}
+
+pub(super) fn reaches_loop_jump(expression: &Expression, include_break: bool) -> bool {
+    match expression {
+        Expression::Continue { .. } => true,
+        Expression::Break { .. } if include_break => true,
+        Expression::For { iterable, .. } => reaches_loop_jump(iterable, include_break),
+        Expression::While { condition, .. } => reaches_loop_jump(condition, include_break),
+        Expression::WhileLet { scrutinee, .. } => reaches_loop_jump(scrutinee, include_break),
+        Expression::Loop { .. }
+        | Expression::Function { .. }
+        | Expression::Lambda { .. }
+        | Expression::Task { .. } => false,
+        _ => expression
+            .children()
+            .into_iter()
+            .any(|child| reaches_loop_jump(child, include_break)),
+    }
+}

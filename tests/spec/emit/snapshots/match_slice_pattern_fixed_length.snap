@@ -1,15 +1,19 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test(items: Slice<int>) -> int {\n  match items {\n    [a, b, c] => a + b + c,\n    _ => 0,\n  }\n}\n"
+description: |
+  
+  fn test(items: Slice<int>) -> int {
+    match items {
+      [a, b, c] => a + b + c,
+      _ => 0,
+    }
+  }
 ---
 package main
 
 func test(items []int) int {
 	if len(items) == 3 {
-		a := items[0]
-		b := items[1]
-		c := items[2]
-		return a + b + c
+		return items[0] + items[1] + items[2]
 	}
 	return 0
 }

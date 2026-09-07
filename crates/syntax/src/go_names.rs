@@ -1,0 +1,746 @@
+//! Go identifier computation shared by the checker and the emitter, so
+//! neither has to mirror the other's naming policy.
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
+
+use crate::EcoString;
+use crate::ast::StructFieldDefinition;
+use crate::ast::{EnumVariant, VariantFields};
+use crate::attributes;
+use crate::program::Methods;
+use crate::types::{GO_IMPORT_PREFIX, Type};
+
+/// Go reserved keywords that cannot be used as identifiers.
+/// See: https://go.dev/ref/spec#Keywords
+pub const GO_KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+];
+
+/// Go predeclared identifiers (builtin functions, types, constants).
+/// See: https://go.dev/ref/spec#Predeclared_identifiers
+pub const GO_BUILTINS: &[&str] = &[
+    // Builtin functions
+    "any",
+    "append",
+    "cap",
+    "clear",
+    "close",
+    "complex",
+    "copy",
+    "delete",
+    "imag",
+    "init",
+    "len",
+    "make",
+    "max",
+    "min",
+    "new",
+    "panic",
+    "print",
+    "println",
+    "real",
+    "recover",
+    // Predeclared types
+    "bool",
+    "byte",
+    "comparable",
+    "complex64",
+    "complex128",
+    "error",
+    "float32",
+    "float64",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "rune",
+    "string",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+    // Predeclared constants
+    "false",
+    "iota",
+    "nil",
+    "true",
+];
+
+pub const ENUM_TAG_FIELD: &str = "Tag";
+
+pub const ENUM_STRINGER_METHOD: &str = "String";
+pub const ENUM_GO_STRINGER_METHOD: &str = "GoString";
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+pub fn snake_to_camel(s: &str) -> String {
+    let camel: String = s.split('_').map(capitalize_first).collect();
+    if camel.is_empty() || camel.starts_with(char::is_uppercase) {
+        camel
+    } else {
+        format!("X{}", camel)
+    }
+}
+
+fn split_underscore_prefix(s: &str) -> (&str, &str) {
+    s.split_at(s.len() - s.trim_start_matches('_').len())
+}
+
+fn camel_segment(segment: &str) -> String {
+    if segment.chars().any(char::is_lowercase) {
+        return capitalize_first(segment);
+    }
+    let mut chars = segment.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first
+            .to_uppercase()
+            .chain(chars.flat_map(char::to_lowercase))
+            .collect(),
+    }
+}
+
+pub fn screaming_snake_to_camel(s: &str) -> String {
+    let (prefix, rest) = split_underscore_prefix(s);
+    let converted: String = rest.split('_').map(camel_segment).collect();
+    format!("{}{}", prefix, converted)
+}
+
+pub fn snake_to_lower_camel(s: &str) -> String {
+    let (prefix, rest) = split_underscore_prefix(s);
+    let mut segments = rest.split('_');
+    let mut out = String::from(prefix);
+    if let Some(first) = segments.next() {
+        out.push_str(first);
+    }
+    for segment in segments {
+        out.push_str(&capitalize_first(segment));
+    }
+    out
+}
+
+/// The emitted Go name of an unexported method.
+pub fn unexported_method_go_name(name: &str) -> String {
+    escape_keyword(&snake_to_lower_camel(name)).into_owned()
+}
+
+pub fn escape_keyword(name: &str) -> Cow<'_, str> {
+    if GO_KEYWORDS.contains(&name) {
+        Cow::Owned(format!("{}_", name))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+pub fn is_go_reserved_word(name: &str) -> bool {
+    GO_KEYWORDS.contains(&name) || GO_BUILTINS.contains(&name)
+}
+
+pub fn escape_type_name(name: &str) -> Cow<'_, str> {
+    if is_go_reserved_word(name) {
+        Cow::Owned(format!("{}_", name))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Whether a struct field emits its camelized Go name.
+pub fn struct_field_is_exported(field: &StructFieldDefinition, struct_forces_export: bool) -> bool {
+    !field.is_embedded()
+        && (field.visibility.is_public()
+            || struct_forces_export
+            || field
+                .attributes()
+                .iter()
+                .any(attributes::field_attribute_forces_export))
+}
+
+/// A struct field's emitted Go name under the shared export policy.
+pub fn struct_field_go_name(
+    field: &StructFieldDefinition,
+    struct_forces_export: bool,
+) -> Cow<'_, str> {
+    if struct_field_is_exported(field, struct_forces_export) {
+        Cow::Owned(escape_keyword(&snake_to_camel(&field.name)).into_owned())
+    } else if field.is_embedded() {
+        escape_keyword(&field.name)
+    } else {
+        Cow::Owned(escape_keyword(&snake_to_lower_camel(&field.name)).into_owned())
+    }
+}
+
+/// A candidate method's standing, resolved by the caller on its declaring owner.
+#[derive(Clone)]
+pub enum ConformanceCandidate {
+    /// The method exists in the available method set, but its owner metadata is unavailable.
+    Unresolved,
+    Resolved {
+        depth: usize,
+        owner: EcoString,
+        shadowed: bool,
+    },
+}
+
+/// The three payload layouts that affect an enum field's emitted Go name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumFieldShape {
+    Struct,
+    TupleSingle,
+    TupleMultiple,
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use crate::ast::Annotation;
+    use crate::ast::Span;
+    use crate::ast::{EnumFieldDefinition, VariantFields};
+    use crate::types::Type;
+
+    #[test]
+    fn enum_field_shape_captures_only_name_relevant_layouts() {
+        let field = EnumFieldDefinition {
+            name: "field0".into(),
+            name_span: Span::dummy(),
+            annotation: Annotation::Unknown,
+            ty: Type::uninferred(),
+        };
+
+        assert_eq!(enum_field_shape(&VariantFields::Unit), None);
+        assert_eq!(
+            enum_field_shape(&VariantFields::Tuple(vec![field.clone()])),
+            Some(EnumFieldShape::TupleSingle)
+        );
+        assert_eq!(
+            enum_field_shape(&VariantFields::Tuple(vec![field.clone(), field.clone()])),
+            Some(EnumFieldShape::TupleMultiple)
+        );
+        assert_eq!(
+            enum_field_shape(&VariantFields::Struct(vec![field])),
+            Some(EnumFieldShape::Struct)
+        );
+    }
+}
+
+pub fn enum_field_shape(fields: &VariantFields) -> Option<EnumFieldShape> {
+    match fields {
+        VariantFields::Unit => None,
+        VariantFields::Struct(_) => Some(EnumFieldShape::Struct),
+        VariantFields::Tuple(fields) if fields.len() == 1 => Some(EnumFieldShape::TupleSingle),
+        VariantFields::Tuple(_) => Some(EnumFieldShape::TupleMultiple),
+    }
+}
+
+/// Whether an interface's requirements match implementations by exact source
+/// spelling rather than by emitted Go name.
+pub fn interface_matches_by_source_name(interface_id: &str, interface_is_public: bool) -> bool {
+    !interface_id.starts_with(GO_IMPORT_PREFIX)
+        && (interface_id.starts_with("prelude.") || !interface_is_public)
+}
+
+/// Resolve which implementing method satisfies an interface requirement, by
+/// emitted Go name under Go's selector rules.
+pub fn conformance_method<'a>(
+    methods: &'a Methods,
+    interface_id: &str,
+    interface_is_public: bool,
+    method_name: &str,
+    candidate: &dyn Fn(&str) -> ConformanceCandidate,
+) -> Option<(&'a EcoString, &'a Type)> {
+    if interface_matches_by_source_name(interface_id, interface_is_public) {
+        return methods
+            .get_key_value(method_name)
+            .map(|(name, method)| (name, &method.ty));
+    }
+    select_by_emitted_name(methods, interface_id, method_name, candidate, false)
+}
+
+pub fn conformance_method_if_public<'a>(
+    methods: &'a Methods,
+    interface_id: &str,
+    interface_is_public: bool,
+    method_name: &str,
+    candidate: &dyn Fn(&str) -> ConformanceCandidate,
+) -> Option<(&'a EcoString, &'a Type)> {
+    if interface_matches_by_source_name(interface_id, interface_is_public) {
+        return None;
+    }
+    select_by_emitted_name(methods, interface_id, method_name, candidate, true)
+}
+
+struct EmittedMethodMatch<'a> {
+    depth: usize,
+    exact: bool,
+    owner: Option<EcoString>,
+    name: &'a EcoString,
+    ty: &'a Type,
+}
+
+fn select_by_emitted_name<'a>(
+    methods: &'a Methods,
+    interface_id: &str,
+    method_name: &str,
+    candidate: &dyn Fn(&str) -> ConformanceCandidate,
+    as_if_public: bool,
+) -> Option<(&'a EcoString, &'a Type)> {
+    let want = if interface_id.starts_with(GO_IMPORT_PREFIX) {
+        Cow::Borrowed(method_name)
+    } else {
+        Cow::Owned(snake_to_camel(method_name))
+    };
+    let mut matches = Vec::new();
+    for (name, method) in methods {
+        let ty = &method.ty;
+        let exported = method.visibility.is_public();
+        let exact = name == method_name;
+        let (depth, owner, shadowed) = match candidate(name) {
+            ConformanceCandidate::Unresolved => (0, None, false),
+            ConformanceCandidate::Resolved {
+                depth,
+                owner,
+                shadowed,
+            } => (depth, Some(owner), shadowed),
+        };
+        if shadowed {
+            continue;
+        }
+        if as_if_public && (exported || exact) {
+            continue;
+        }
+        let emitted = if exported || as_if_public {
+            Cow::Owned(snake_to_camel(name))
+        } else {
+            Cow::Owned(snake_to_lower_camel(name))
+        };
+        if !exact && emitted != *want {
+            continue;
+        }
+        matches.push(EmittedMethodMatch {
+            depth,
+            exact,
+            owner,
+            name,
+            ty,
+        });
+    }
+    let depth = matches.iter().map(|candidate| candidate.depth).min()?;
+    matches.retain(|candidate| candidate.depth == depth);
+    if matches
+        .iter()
+        .any(|candidate| candidate.owner.as_ref() != matches[0].owner.as_ref())
+    {
+        return None;
+    }
+    matches
+        .into_iter()
+        .min_by_key(|candidate| (!candidate.exact, candidate.name.clone()))
+        .map(|candidate| (candidate.name, candidate.ty))
+}
+
+pub fn is_builtin_enum_member(go_name: &str) -> bool {
+    go_name == ENUM_TAG_FIELD
+        || go_name == ENUM_STRINGER_METHOD
+        || go_name == ENUM_GO_STRINGER_METHOD
+}
+
+/// Go struct field name for an enum variant field. Emit's enum layout and
+/// the checker's cross-variant conflict check must both use this single
+/// authority so their notions of a field's Go name cannot drift.
+pub fn enum_field_go_name(
+    variant_name: &str,
+    field_name: &str,
+    field_index: usize,
+    shape: EnumFieldShape,
+    enum_name: &str,
+) -> String {
+    if shape == EnumFieldShape::Struct {
+        let base = snake_to_camel(field_name);
+        if is_builtin_enum_member(&base) {
+            escape_keyword(&format!("{}{}", variant_name, base)).into_owned()
+        } else {
+            escape_keyword(&base).into_owned()
+        }
+    } else if shape == EnumFieldShape::TupleSingle {
+        let base = variant_name.to_string();
+        if is_builtin_enum_member(&base) {
+            format!("{}{}_", enum_name, base)
+        } else {
+            base
+        }
+    } else {
+        let base = format!("{}{}", variant_name, field_index);
+        if is_builtin_enum_member(&base) {
+            format!("{}{}_{}", enum_name, variant_name, field_index)
+        } else {
+            base
+        }
+    }
+}
+
+/// Go field name per enum field, indexed by variant then field. Same-typed
+/// fields share one slot, which enum spread reads. Types compare structurally,
+/// erring toward prefixing, which is the safe direction.
+pub fn enum_field_slots(enum_name: &str, variants: &[EnumVariant]) -> Vec<Vec<String>> {
+    let mut slots: Vec<Vec<String>> = variants
+        .iter()
+        .map(|variant| match enum_field_shape(&variant.fields) {
+            None => Vec::new(),
+            Some(shape) => variant
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    enum_field_go_name(&variant.name, &field.name, index, shape, enum_name)
+                })
+                .collect(),
+        })
+        .collect();
+
+    let contested = contested_slots(variants, &slots);
+    if contested.is_empty() {
+        return slots;
+    }
+
+    for (variant, names) in variants.iter().zip(&mut slots) {
+        if enum_field_shape(&variant.fields) != Some(EnumFieldShape::Struct) {
+            continue;
+        }
+        for (field, name) in variant.fields.iter().zip(names) {
+            if contested.contains(name.as_str()) {
+                *name = escape_keyword(&format!("{}{}", variant.name, snake_to_camel(&field.name)))
+                    .into_owned();
+            }
+        }
+    }
+
+    slots
+}
+
+fn contested_slots(variants: &[EnumVariant], slots: &[Vec<String>]) -> HashSet<String> {
+    let mut claimed: HashMap<&str, &Type> = HashMap::default();
+    let mut contested = HashSet::default();
+
+    for (variant, names) in variants.iter().zip(slots) {
+        for (field, name) in variant.fields.iter().zip(names) {
+            if matches!(field.ty, Type::Error) {
+                continue;
+            }
+            match claimed.get(name.as_str()) {
+                None => {
+                    claimed.insert(name, &field.ty);
+                }
+                Some(first) => {
+                    if **first != field.ty {
+                        contested.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    contested
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::{Method, MethodOrigin, Visibility};
+
+    fn method(visibility: Visibility) -> Method {
+        Method {
+            source_name: "method".into(),
+            ty: Type::Error,
+            visibility,
+            origin: MethodOrigin::Declared,
+            name_span: None,
+            doc: None,
+            allowed_lints: vec![],
+            go_hints: vec![],
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn snake_to_camel_converts_and_normalizes() {
+        assert_eq!(snake_to_camel("user_id"), "UserId");
+        assert_eq!(snake_to_camel("foo_bar"), "FooBar");
+        assert_eq!(snake_to_camel("fooBar"), "FooBar");
+        assert_eq!(snake_to_camel("x"), "X");
+        assert_eq!(snake_to_camel("x_"), "X");
+    }
+
+    #[test]
+    fn screaming_snake_to_camel_converts_constants() {
+        assert_eq!(screaming_snake_to_camel("MAX_SIZE"), "MaxSize");
+        assert_eq!(screaming_snake_to_camel("HTTP_TIMEOUT"), "HttpTimeout");
+        assert_eq!(screaming_snake_to_camel("A"), "A");
+        assert_eq!(screaming_snake_to_camel("MAX_SIZE_2"), "MaxSize2");
+        assert_eq!(screaming_snake_to_camel("max_size"), "MaxSize");
+    }
+
+    #[test]
+    fn screaming_snake_to_camel_preserves_visibility_and_tails() {
+        assert_eq!(screaming_snake_to_camel("_INTERNAL"), "_Internal");
+        assert_eq!(screaming_snake_to_camel("HTTPTimeout"), "HTTPTimeout");
+        assert_eq!(screaming_snake_to_camel("定数"), "定数");
+    }
+
+    #[test]
+    fn snake_to_lower_camel_converts_private_names() {
+        assert_eq!(snake_to_lower_camel("retry_count"), "retryCount");
+        assert_eq!(snake_to_lower_camel("used_private"), "usedPrivate");
+        assert_eq!(snake_to_lower_camel("helper"), "helper");
+        assert_eq!(snake_to_lower_camel("foo_bar_"), "fooBar");
+    }
+
+    #[test]
+    fn snake_to_lower_camel_preserves_prefix_and_first_segment() {
+        assert_eq!(snake_to_lower_camel("_temp_val"), "_tempVal");
+        assert_eq!(snake_to_lower_camel("挨拶_する"), "挨拶する");
+        assert_eq!(snake_to_lower_camel("Read"), "Read");
+    }
+
+    #[test]
+    fn unexported_method_go_name_escapes_keywords() {
+        assert_eq!(unexported_method_go_name("select"), "select_");
+        assert_eq!(unexported_method_go_name("do_select"), "doSelect");
+    }
+
+    #[test]
+    fn snake_to_camel_prefixes_uncased_names() {
+        assert_eq!(snake_to_camel("挨拶"), "X挨拶");
+        assert_eq!(snake_to_camel("挨拶_する"), "X挨拶する");
+        assert_eq!(snake_to_camel("épée"), "Épée");
+    }
+
+    #[test]
+    fn escape_keyword_appends_underscore() {
+        assert_eq!(escape_keyword("type"), "type_");
+        assert_eq!(escape_keyword("Type"), "Type");
+        assert_eq!(escape_keyword("target"), "target");
+    }
+
+    #[test]
+    fn escape_type_name_covers_keywords_and_predeclared() {
+        assert_eq!(escape_type_name("range"), "range_");
+        assert_eq!(escape_type_name("len"), "len_");
+        assert_eq!(escape_type_name("init"), "init_");
+        assert_eq!(escape_type_name("iota"), "iota_");
+        assert_eq!(escape_type_name("int"), "int_");
+        assert_eq!(escape_type_name("Len"), "Len");
+        assert_eq!(escape_type_name("Point"), "Point");
+    }
+
+    #[test]
+    fn enum_field_go_name_struct_fields() {
+        assert_eq!(
+            enum_field_go_name("Click", "target_id", 0, EnumFieldShape::Struct, "Event",),
+            "TargetId"
+        );
+        assert_eq!(
+            enum_field_go_name("Click", "tag", 0, EnumFieldShape::Struct, "Event"),
+            "ClickTag"
+        );
+        assert_eq!(
+            enum_field_go_name("Click", "string", 0, EnumFieldShape::Struct, "Event"),
+            "ClickString"
+        );
+        assert_eq!(
+            enum_field_go_name("Click", "go_string", 0, EnumFieldShape::Struct, "Event"),
+            "ClickGoString"
+        );
+    }
+
+    fn at_depth(depth: usize) -> impl Fn(&str) -> ConformanceCandidate {
+        move |_| ConformanceCandidate::Resolved {
+            depth,
+            owner: "main.T".into(),
+            shadowed: false,
+        }
+    }
+
+    #[test]
+    fn conformance_method_matches_source_then_emitted_name() {
+        let mut methods = Methods::default();
+        methods.insert("read".into(), method(Visibility::Public));
+        methods.insert("close".into(), method(Visibility::Public));
+
+        let via_emitted = conformance_method(&methods, "go:io", true, "Read", &at_depth(0));
+        assert_eq!(via_emitted.map(|(name, _)| name.as_str()), Some("read"));
+
+        methods.insert("read".into(), method(Visibility::Private));
+        let private_method = conformance_method(&methods, "go:io", true, "Read", &at_depth(0));
+        assert_eq!(private_method, None);
+
+        let initialism =
+            conformance_method(&methods, "go:net/http", true, "ServeHTTP", &at_depth(0));
+        assert_eq!(initialism, None);
+
+        methods.insert("Read".into(), method(Visibility::Private));
+        let via_source = conformance_method(&methods, "go:io", true, "Read", &at_depth(0));
+        assert_eq!(via_source.map(|(name, _)| name.as_str()), Some("Read"));
+    }
+
+    #[test]
+    fn conformance_method_accepts_unresolved_candidates() {
+        let mut methods = Methods::default();
+        methods.insert("read".into(), method(Visibility::Private));
+
+        let selected = conformance_method_if_public(&methods, "go:io", true, "Read", &|_| {
+            ConformanceCandidate::Unresolved
+        });
+
+        assert_eq!(selected.map(|(name, _)| name.as_str()), Some("read"));
+    }
+
+    #[test]
+    fn conformance_method_if_public_finds_private_near_misses() {
+        let mut methods = Methods::default();
+        methods.insert("write".into(), method(Visibility::Private));
+
+        let private_hit =
+            conformance_method_if_public(&methods, "go:io", true, "Write", &at_depth(0));
+        assert_eq!(private_hit.map(|(name, _)| name.as_str()), Some("write"));
+
+        methods.insert("write".into(), method(Visibility::Public));
+        let already_exported =
+            conformance_method_if_public(&methods, "go:io", true, "Write", &at_depth(0));
+        assert_eq!(already_exported, None);
+
+        methods.insert("write".into(), method(Visibility::Private));
+        let exact_name =
+            conformance_method_if_public(&methods, "main.W", true, "write", &at_depth(0));
+        assert_eq!(exact_name, None);
+
+        let source_matched =
+            conformance_method_if_public(&methods, "main.W", false, "write", &at_depth(0));
+        assert_eq!(source_matched, None);
+    }
+
+    #[test]
+    fn conformance_method_prefers_shallow_over_exact() {
+        let mut methods = Methods::default();
+        methods.insert("describe".into(), method(Visibility::Public));
+        methods.insert("Describe".into(), method(Visibility::Public));
+        let candidate = |name: &str| ConformanceCandidate::Resolved {
+            depth: if name == "Describe" { 1 } else { 0 },
+            owner: if name == "Describe" {
+                "main.Base"
+            } else {
+                "main.Outer"
+            }
+            .into(),
+            shadowed: false,
+        };
+
+        let shallow = conformance_method(&methods, "go:reg", true, "Describe", &candidate);
+        assert_eq!(shallow.map(|(name, _)| name.as_str()), Some("describe"));
+
+        let same_depth = conformance_method(&methods, "go:reg", true, "Describe", &at_depth(0));
+        assert_eq!(same_depth.map(|(name, _)| name.as_str()), Some("Describe"));
+    }
+
+    #[test]
+    fn conformance_method_rejects_equal_depth_cross_owner_ambiguity() {
+        let mut methods = Methods::default();
+        methods.insert("get_item".into(), method(Visibility::Public));
+        methods.insert("getItem".into(), method(Visibility::Public));
+        let promoted = |name: &str| ConformanceCandidate::Resolved {
+            depth: 1,
+            owner: if name == "get_item" {
+                "main.A"
+            } else {
+                "main.B"
+            }
+            .into(),
+            shadowed: false,
+        };
+
+        let ambiguous = conformance_method(&methods, "go:reg", true, "GetItem", &promoted);
+        assert_eq!(ambiguous, None);
+    }
+
+    #[test]
+    fn conformance_method_skips_field_shadowed_candidates() {
+        let mut methods = Methods::default();
+        methods.insert("getItem".into(), method(Visibility::Public));
+        let shadowed = |_: &str| ConformanceCandidate::Resolved {
+            depth: 1,
+            owner: "main.Base".into(),
+            shadowed: true,
+        };
+
+        let hidden = conformance_method(&methods, "go:reg", true, "GetItem", &shadowed);
+        assert_eq!(hidden, None);
+    }
+
+    #[test]
+    fn conformance_method_gates_on_interface_kind() {
+        let mut methods = Methods::default();
+        methods.insert("run".into(), method(Visibility::Public));
+
+        let public_lisette = conformance_method(&methods, "main.Runner", true, "Run", &at_depth(0));
+        assert_eq!(public_lisette.map(|(name, _)| name.as_str()), Some("run"));
+
+        let private_lisette =
+            conformance_method(&methods, "main.Runner", false, "Run", &at_depth(0));
+        assert_eq!(private_lisette, None);
+
+        let prelude = conformance_method(&methods, "prelude.Runner", true, "Run", &at_depth(0));
+        assert_eq!(prelude, None);
+    }
+
+    #[test]
+    fn enum_field_go_name_tuple_fields() {
+        assert_eq!(
+            enum_field_go_name("Click", "0", 0, EnumFieldShape::TupleSingle, "Event"),
+            "Click"
+        );
+        assert_eq!(
+            enum_field_go_name("Tag", "0", 0, EnumFieldShape::TupleSingle, "Event"),
+            "EventTag_"
+        );
+        assert_eq!(
+            enum_field_go_name("String", "0", 0, EnumFieldShape::TupleSingle, "Event"),
+            "EventString_"
+        );
+        assert_eq!(
+            enum_field_go_name("Click", "1", 1, EnumFieldShape::TupleMultiple, "Event"),
+            "Click1"
+        );
+    }
+}

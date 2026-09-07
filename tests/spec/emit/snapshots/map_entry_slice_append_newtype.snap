@@ -1,19 +1,23 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Wrap(Slice<int>)\n\nfn main() {\n  let mut m = Map.new<string, Wrap>()\n  m[\"a\"] = Wrap([])\n  m[\"a\"] = Wrap(m[\"a\"].0.append(1))\n}\n"
+description: |
+  
+  struct Wrap(Slice<int>)
+  
+  fn main() {
+    let mut m = Map.new<string, Wrap>()
+    m["a"] = Wrap([])
+    m["a"] = Wrap(m["a"].0.append(1))
+  }
 ---
 package main
 
-import "fmt"
-
 type Wrap []int
-
-func (w Wrap) String() string {
-	return fmt.Sprintf("Wrap(%v)", []int(w))
-}
 
 func main() {
 	m := make(map[string]Wrap)
 	m["a"] = Wrap([]int{})
-	m["a"] = Wrap(append([]int(m["a"]), 1))
+	base_2 := m
+	recv_1 := ([]int)(m["a"])
+	base_2["a"] = Wrap(append(recv_1[:len(recv_1):len(recv_1)], 1))
 }

@@ -1,18 +1,20 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nstruct Point { x: int, y: int }\n\nfn test() {\n  while Point { x: 1, y: 2 }.x > 0 {\n    break\n  }\n}\n"
+description: |
+  
+  struct Point { x: int, y: int }
+  
+  fn test() {
+    while Point { x: 1, y: 2 }.x > 0 {
+      break
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 type Point struct {
 	x int
 	y int
-}
-
-func (p Point) String() string {
-	return fmt.Sprintf("Point { x: %v, y: %v }", p.x, p.y)
 }
 
 func test() {

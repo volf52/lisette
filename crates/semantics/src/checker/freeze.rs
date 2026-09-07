@@ -1,0 +1,581 @@
+//! Post-inference freeze pass.
+//!
+//! After inference finishes, every `Type` field reachable through the AST is
+//! env-resolved: bound type variables are substituted with their values,
+//! unbound vars are left as-is. Downstream crates (emit, lsp, format, cache)
+//! therefore do not need access to the checker's `TypeEnv`: the emitter maps
+//! any remaining unbound `Type::Var` to Go's `any`.
+
+use crate::facts::Facts;
+use crate::facts::GenericBoundOrigin;
+use syntax::ast::{
+    Binding, EnumFieldDefinition, Expression, FormatStringPart, Literal, Pattern, SelectArm,
+    SequencePatternResolution, StructFieldDefinition, StructSpread, VariantFields,
+};
+use syntax::types::Bound;
+use syntax::types::Type;
+
+use crate::checker::type_env::TypeEnv;
+use crate::store::Store;
+
+pub struct FreezeFolder<'a> {
+    env: &'a TypeEnv,
+    store: &'a Store,
+}
+
+impl<'a> FreezeFolder<'a> {
+    pub fn new(env: &'a TypeEnv, store: &'a Store) -> Self {
+        Self { env, store }
+    }
+
+    fn normalize_ref_aliases(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Nominal {
+                id,
+                params,
+                writable,
+            } => {
+                let peeled = self.store.peel_alias(ty);
+                if peeled.is_ref() {
+                    return self.normalize_ref_aliases(&peeled);
+                }
+                Type::Nominal {
+                    id: id.clone(),
+                    params: params
+                        .iter()
+                        .map(|p| self.normalize_ref_aliases(p))
+                        .collect(),
+                    writable: *writable,
+                }
+            }
+            Type::Compound {
+                kind,
+                args,
+                writable,
+            } => Type::qualified_compound(
+                *kind,
+                args.iter().map(|a| self.normalize_ref_aliases(a)).collect(),
+                *writable,
+            ),
+            Type::Tuple(elements) => Type::Tuple(
+                elements
+                    .iter()
+                    .map(|e| self.normalize_ref_aliases(e))
+                    .collect(),
+            ),
+            Type::Function(f) => f.rebuild(
+                f.params
+                    .iter()
+                    .map(|p| p.with_type(self.normalize_ref_aliases(&p.ty)))
+                    .collect(),
+                f.bounds.iter().map(|b| self.normalize_bound(b)).collect(),
+                Box::new(self.normalize_ref_aliases(&f.return_type)),
+            ),
+            Type::Forall { vars, body } => Type::Forall {
+                vars: vars.clone(),
+                body: Box::new(self.normalize_ref_aliases(body)),
+            },
+            _ => ty.clone(),
+        }
+    }
+
+    fn normalize_bound(&self, bound: &Bound) -> Bound {
+        Bound {
+            param_name: bound.param_name.clone(),
+            generic: self.normalize_ref_aliases(&bound.generic),
+            ty: self.normalize_ref_aliases(&bound.ty),
+        }
+    }
+
+    pub fn freeze_items(&mut self, mut items: Vec<Expression>) -> Vec<Expression> {
+        for item in &mut items {
+            self.freeze_expr(item);
+        }
+        items
+    }
+
+    fn freeze_expr(&mut self, expression: &mut Expression) {
+        if let Expression::Binary { .. } = expression {
+            let mut current = expression;
+            loop {
+                match current {
+                    Expression::Binary {
+                        left, right, ty, ..
+                    } => {
+                        self.freeze_expr_ty(ty);
+                        self.freeze_expr(right.as_mut());
+                        current = left.as_mut();
+                    }
+                    leaf => {
+                        self.freeze_expr(leaf);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        self.recurse_children(expression);
+        self.freeze_outer(expression);
+    }
+
+    fn recurse_children(&mut self, expression: &mut Expression) {
+        match expression {
+            Expression::Block { items, .. }
+            | Expression::TryBlock { items, .. }
+            | Expression::RecoverBlock { items, .. }
+            | Expression::Tuple {
+                elements: items, ..
+            } => {
+                for item in items {
+                    self.freeze_expr(item);
+                }
+            }
+
+            Expression::ImplBlock { methods, .. } => {
+                for method in methods {
+                    self.freeze_expr(method);
+                }
+            }
+
+            Expression::Call {
+                expression,
+                args,
+                spread,
+                ..
+            } => {
+                self.freeze_expr(expression.as_mut());
+                for arg in args {
+                    self.freeze_expr(arg);
+                }
+                if let Some(spread) = spread.as_mut() {
+                    self.freeze_expr(spread);
+                }
+            }
+
+            Expression::If {
+                condition,
+                consequence,
+                alternative,
+                ..
+            } => {
+                self.freeze_expr(condition.as_mut());
+                self.freeze_expr(consequence.as_mut());
+                if let Some(alternative) = alternative {
+                    self.freeze_expr(alternative.as_mut());
+                }
+            }
+
+            Expression::IfLet {
+                scrutinee,
+                consequence,
+                alternative,
+                ..
+            } => {
+                self.freeze_expr(scrutinee.as_mut());
+                self.freeze_expr(consequence.as_mut());
+                if let Some(alternative) = alternative.expression_mut() {
+                    self.freeze_expr(alternative);
+                }
+            }
+
+            Expression::Match { subject, arms, .. } => {
+                self.freeze_expr(subject.as_mut());
+                for arm in arms {
+                    self.freeze_pattern(&mut arm.pattern);
+                    self.freeze_expr(arm.expression.as_mut());
+                    if let Some(guard) = &mut arm.guard {
+                        self.freeze_expr(guard.as_mut());
+                    }
+                }
+            }
+
+            Expression::Let { value, mode, .. } => {
+                self.freeze_expr(value.as_mut());
+                if let Some(else_block) = mode.else_block_mut() {
+                    self.freeze_expr(else_block);
+                }
+            }
+
+            Expression::Return { expression, .. }
+            | Expression::Propagate { expression, .. }
+            | Expression::Unary { expression, .. }
+            | Expression::Paren { expression, .. }
+            | Expression::DotAccess { expression, .. }
+            | Expression::Reference { expression, .. }
+            | Expression::Task { expression, .. }
+            | Expression::Defer { expression, .. }
+            | Expression::Assert { expression, .. }
+            | Expression::Cast { expression, .. } => {
+                self.freeze_expr(expression.as_mut());
+            }
+
+            Expression::Const { expression, .. } => {
+                if let Some(value) = expression.value_mut() {
+                    self.freeze_expr(value);
+                }
+            }
+
+            Expression::IndexedAccess {
+                expression, index, ..
+            } => {
+                self.freeze_expr(expression.as_mut());
+                self.freeze_expr(index.as_mut());
+            }
+
+            Expression::Assignment { target, value, .. } => {
+                self.freeze_expr(target.as_mut());
+                self.freeze_expr(value.as_mut());
+            }
+
+            Expression::StructCall {
+                field_assignments,
+                spread,
+                ..
+            } => {
+                for assignment in field_assignments {
+                    self.freeze_expr(assignment.value.as_mut());
+                }
+                if let StructSpread::From(spread) = spread {
+                    self.freeze_expr(spread.as_mut());
+                }
+            }
+
+            Expression::Function { body, .. } => {
+                if let Some(body) = body.definition_mut() {
+                    self.freeze_expr(body);
+                }
+            }
+
+            Expression::Lambda { body, .. } | Expression::Loop { body, .. } => {
+                self.freeze_expr(body.as_mut());
+            }
+
+            Expression::For { iterable, body, .. } => {
+                self.freeze_expr(iterable.as_mut());
+                self.freeze_expr(body.as_mut());
+            }
+
+            Expression::While {
+                condition, body, ..
+            } => {
+                self.freeze_expr(condition.as_mut());
+                self.freeze_expr(body.as_mut());
+            }
+
+            Expression::WhileLet {
+                scrutinee, body, ..
+            } => {
+                self.freeze_expr(scrutinee.as_mut());
+                self.freeze_expr(body.as_mut());
+            }
+
+            Expression::Select { arms, .. } => {
+                for arm in arms {
+                    self.recurse_select_arm(arm);
+                }
+            }
+
+            Expression::Break {
+                value: Some(value), ..
+            } => {
+                self.freeze_expr(value.as_mut());
+            }
+
+            Expression::Range { start, end, .. } => {
+                if let Some(start) = start {
+                    self.freeze_expr(start.as_mut());
+                }
+                if let Some(end) = end {
+                    self.freeze_expr(end.as_mut());
+                }
+            }
+
+            Expression::Literal { literal, .. } => match literal {
+                Literal::Slice(elements) => {
+                    for element in elements {
+                        self.freeze_expr(element);
+                    }
+                }
+                Literal::FormatString(parts) => {
+                    for part in parts {
+                        if let FormatStringPart::Expression(expression) = part {
+                            self.freeze_expr(expression.as_mut());
+                        }
+                    }
+                }
+                _ => {}
+            },
+
+            Expression::Binary { .. }
+            | Expression::Interface { .. }
+            | Expression::Identifier { .. }
+            | Expression::Enum { .. }
+            | Expression::Struct { .. }
+            | Expression::TypeAlias { .. }
+            | Expression::VariableDeclaration { .. }
+            | Expression::PackageImport { .. }
+            | Expression::Break { value: None, .. }
+            | Expression::Continue { .. }
+            | Expression::Unit { .. }
+            | Expression::RawGo { .. } => {}
+        }
+    }
+
+    fn recurse_select_arm(&mut self, arm: &mut SelectArm) {
+        match arm {
+            SelectArm::Receive {
+                binding,
+                receive_expression,
+                body,
+            } => {
+                self.freeze_pattern(binding);
+                self.freeze_expr(receive_expression.as_mut());
+                self.freeze_expr(body.as_mut());
+            }
+            SelectArm::Send {
+                send_expression,
+                body,
+            } => {
+                self.freeze_expr(send_expression.as_mut());
+                self.freeze_expr(body.as_mut());
+            }
+            SelectArm::MatchReceive {
+                receive_expression,
+                arms,
+            } => {
+                self.freeze_expr(receive_expression.as_mut());
+                for arm in arms {
+                    self.freeze_pattern(&mut arm.pattern);
+                    self.freeze_expr(arm.expression.as_mut());
+                    if let Some(guard) = &mut arm.guard {
+                        self.freeze_expr(guard.as_mut());
+                    }
+                }
+            }
+            SelectArm::WildCard { body } => {
+                self.freeze_expr(body.as_mut());
+            }
+        }
+    }
+
+    pub fn freeze_facts(&self, facts: &mut Facts) {
+        for check in &mut facts.deferred.generic_calls {
+            self.env.resolve_in_place(&mut check.ty);
+        }
+        for obligation in &mut facts.deferred.generic_bounds {
+            self.env.resolve_in_place(&mut obligation.argument);
+            self.env.resolve_in_place(&mut obligation.required);
+            if let GenericBoundOrigin::Construction {
+                enclosing_return_type: Some(return_type),
+                ..
+            } = &mut obligation.origin
+            {
+                self.env.resolve_in_place(return_type);
+            }
+            for (_, bounds) in &mut obligation.available_bounds {
+                for bound in bounds {
+                    self.env.resolve_in_place(bound);
+                }
+            }
+        }
+        for check in &mut facts.deferred.empty_collections {
+            self.env.resolve_in_place(&mut check.ty);
+        }
+        for check in &mut facts.deferred.empty_literals {
+            self.env.resolve_in_place(&mut check.ty);
+        }
+        for check in &mut facts.deferred.slice_makes {
+            self.env.resolve_in_place(&mut check.ty);
+        }
+        for check in &mut facts.deferred.statement_tails {
+            self.env.resolve_in_place(&mut check.expected_ty);
+        }
+    }
+
+    fn freeze_ty(&self, ty: &mut Type) {
+        self.env.resolve_in_place(ty);
+    }
+
+    fn freeze_expr_ty(&self, ty: &mut Type) {
+        self.env.resolve_in_place(ty);
+        *ty = self.normalize_ref_aliases(ty);
+    }
+
+    fn freeze_binding(&self, binding: &mut Binding) {
+        self.freeze_ty(&mut binding.ty);
+        self.freeze_pattern(&mut binding.pattern);
+    }
+
+    fn freeze_pattern(&self, pattern: &mut Pattern) {
+        match pattern {
+            Pattern::Literal { ty, .. } | Pattern::Unit { ty, .. } => self.freeze_ty(ty),
+            Pattern::EnumVariant { ty, fields, .. } => {
+                self.freeze_ty(ty);
+                for f in fields {
+                    self.freeze_pattern(f);
+                }
+            }
+            Pattern::Struct { ty, fields, .. } => {
+                self.freeze_ty(ty);
+                for f in fields {
+                    self.freeze_pattern(&mut f.value);
+                }
+            }
+            Pattern::Slice {
+                prefix, resolution, ..
+            } => {
+                for p in prefix {
+                    self.freeze_pattern(p);
+                }
+                match resolution {
+                    SequencePatternResolution::Slice { element_type }
+                    | SequencePatternResolution::Array { element_type, .. } => {
+                        self.freeze_ty(element_type);
+                    }
+                    SequencePatternResolution::Unresolved => {}
+                }
+            }
+            Pattern::Tuple { elements, .. } => {
+                for e in elements {
+                    self.freeze_pattern(e);
+                }
+            }
+            Pattern::Or { patterns, .. } => {
+                for p in patterns {
+                    self.freeze_pattern(p);
+                }
+            }
+            Pattern::AsBinding { pattern, .. } => self.freeze_pattern(pattern),
+            Pattern::WildCard { .. } | Pattern::Identifier { .. } => {}
+        }
+    }
+
+    fn freeze_struct_field(&self, field: &mut StructFieldDefinition) {
+        self.freeze_ty(&mut field.ty);
+    }
+
+    fn freeze_enum_field(&self, field: &mut EnumFieldDefinition) {
+        self.freeze_ty(&mut field.ty);
+    }
+
+    fn freeze_variant_fields(&self, vf: &mut VariantFields) {
+        match vf {
+            VariantFields::Unit => {}
+            VariantFields::Tuple(fields) | VariantFields::Struct(fields) => {
+                for f in fields {
+                    self.freeze_enum_field(f);
+                }
+            }
+        }
+    }
+
+    /// Freeze all `Type` fields on the outer expression and on any nested
+    /// structural nodes (bindings, patterns, variant fields, interface
+    /// methods) that `recurse_children` does not walk.
+    fn freeze_outer(&mut self, expression: &mut Expression) {
+        match expression {
+            Expression::Literal { ty, .. }
+            | Expression::Identifier { ty, .. }
+            | Expression::Call { ty, .. }
+            | Expression::If { ty, .. }
+            | Expression::Match { ty, .. }
+            | Expression::Tuple { ty, .. }
+            | Expression::StructCall { ty, .. }
+            | Expression::DotAccess { ty, .. }
+            | Expression::Return { ty, .. }
+            | Expression::Propagate { ty, .. }
+            | Expression::TryBlock { ty, .. }
+            | Expression::RecoverBlock { ty, .. }
+            | Expression::ImplBlock { ty, .. }
+            | Expression::Binary { ty, .. }
+            | Expression::Unary { ty, .. }
+            | Expression::Paren { ty, .. }
+            | Expression::Const { ty, .. }
+            | Expression::VariableDeclaration { ty, .. }
+            | Expression::Loop { ty, .. }
+            | Expression::Reference { ty, .. }
+            | Expression::IndexedAccess { ty, .. }
+            | Expression::Task { ty, .. }
+            | Expression::Defer { ty, .. }
+            | Expression::Assert { ty, .. }
+            | Expression::Select { ty, .. }
+            | Expression::Unit { ty, .. }
+            | Expression::Range { ty, .. }
+            | Expression::Cast { ty, .. }
+            | Expression::Block { ty, .. } => self.freeze_expr_ty(ty),
+
+            Expression::Function {
+                ty,
+                return_type,
+                params,
+                ..
+            } => {
+                self.freeze_ty(ty);
+                self.freeze_ty(return_type);
+                for p in params {
+                    self.freeze_binding(p);
+                }
+            }
+
+            Expression::Lambda { ty, params, .. } => {
+                self.freeze_ty(ty);
+                for p in params {
+                    self.freeze_binding(p);
+                }
+            }
+
+            Expression::Let { ty, binding, .. } => {
+                self.freeze_ty(ty);
+                self.freeze_binding(binding);
+            }
+
+            Expression::IfLet { ty, pattern, .. } => {
+                self.freeze_ty(ty);
+                self.freeze_pattern(pattern);
+            }
+
+            Expression::For { binding, .. } => {
+                self.freeze_binding(binding);
+            }
+
+            Expression::WhileLet { pattern, .. } => {
+                self.freeze_pattern(pattern);
+            }
+
+            Expression::Struct { fields, .. } => {
+                for f in fields {
+                    self.freeze_struct_field(f);
+                }
+            }
+
+            Expression::Enum { variants, .. } => {
+                for v in variants {
+                    self.freeze_variant_fields(&mut v.fields);
+                }
+            }
+
+            Expression::TypeAlias { ty, .. } => self.freeze_ty(ty),
+
+            Expression::Interface {
+                parents,
+                method_signatures,
+                ..
+            } => {
+                for parent in parents {
+                    self.freeze_ty(&mut parent.ty);
+                }
+                for signature in method_signatures {
+                    self.freeze_expr(signature);
+                }
+            }
+
+            Expression::Assignment { .. }
+            | Expression::While { .. }
+            | Expression::Break { .. }
+            | Expression::Continue { .. }
+            | Expression::PackageImport { .. }
+            | Expression::RawGo { .. } => {}
+        }
+    }
+}

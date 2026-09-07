@@ -1,45 +1,42 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use lisette_semantics::checker::infer::InferCtx;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(source) = std::str::from_utf8(data) else {
         return;
     };
 
-    let ast_result = lisette_syntax::build_ast(source, 0);
-    if ast_result.failed() {
+    let mut ast_result = lisette_syntax::build_ast(source, 0);
+    if ast_result.has_errors() {
         return;
     }
 
-    let desugar_result = lisette_syntax::desugar::desugar(ast_result.ast);
-    if !desugar_result.errors.is_empty() {
-        return;
-    }
-
-    let sink = lisette_diagnostics::DiagnosticSink::new();
+    let sink = lisette_diagnostics::LocalSink::new();
     let mut store = lisette_semantics::store::Store::new();
-    store.add_module("fuzz");
+    store.add_package("fuzz");
     lisette_semantics::prelude::parse_and_register_prelude(&mut store, &sink);
 
-    let mut checker = lisette_semantics::checker::Checker::new(&mut store, &sink);
-    checker
-        .ufcs_methods
-        .extend(lisette_semantics::prelude::compute_prelude_ufcs(checker.store));
-    checker.cursor.module_id = "fuzz".to_string();
-    checker.put_prelude_in_scope();
+    let mut checker = lisette_semantics::checker::TaskState::for_package("fuzz");
+    checker.put_prelude_in_scope(&store);
 
     checker.register_types_and_values(
-        &desugar_result.ast,
+        &mut store,
+        &mut ast_result.ast,
         &lisette_syntax::program::Visibility::Private,
     );
+    checker.finalize_registration(&mut store);
 
-    for expression in desugar_result.ast {
-        let type_var = checker.new_type_var();
-        let _ = checker.infer_expression(expression, &type_var);
+    let mut ctx = InferCtx::new(&mut checker, &store);
+    for expression in ast_result.ast {
+        let type_var = ctx.new_type_var();
+        let _ = ctx.infer_root_expression(expression, &type_var);
 
-        if checker.failed() {
+        if ctx.failed() {
             break;
         }
     }
+    ctx.resolve_branch_subsumptions();
+    ctx.resolve_select_exhaustiveness();
 });

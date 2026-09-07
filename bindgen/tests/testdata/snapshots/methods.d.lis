@@ -3,14 +3,22 @@
 // Go: 0.0.0
 // Lisette: 0.0.0
 
+/// Synthesized from a Go anonymous struct type.
+#[go(anon_struct)]
+pub struct AnonX {
+  pub X: int,
+}
+
 pub fn GetValue() -> string
 
 pub type A
 
 pub type B
 
-/// Type with anonymous struct field - methods should skip due to receiver type
-pub type BadReceiver
+/// Type with an anonymous-struct field - bindgen synthesizes a named type for it
+pub struct BadReceiver {
+  pub Data: AnonX,
+}
 
 pub struct Counter {
   pub Value: int,
@@ -29,11 +37,11 @@ impl BadReceiver {
 }
 
 impl Counter {
-  fn Add(self: Ref<Counter>, n: int) -> int
+  fn Add(self: mut Ref<Counter>, n: int) -> int
   fn Get(self) -> int
-  fn Increment(self: Ref<Counter>)
+  fn Increment(self: mut Ref<Counter>)
   /// Variadic method - tests convertMethod variadic path
   fn Log(self: Ref<Counter>, format: string, args: VarArgs<Unknown>)
   /// Method with unnamed params - tests convertMethod unnamed param path
-  fn Process(self: Ref<Counter>, arg0: string, arg1: int)
+  fn Process(self: Ref<Counter>, s: string, n: int)
 }

@@ -56,20 +56,20 @@ bindgen/bin/bindgen pkg github.com/gorilla/mux \
 
 Some Go types map 1:1 to Lisette types.
 
-| Go                     | Lisette                               |
-| ---------------------- | ------------------------------------- |
-| `string`               | identical                             |
-| `bool`                 | identical                             |
-| `int`, `int64`, etc.   | identical                             |
-| `uint8`, `uint16` etc. | identical                             |
-| `float32`, `float64`   | identical                             |
-| `any`, `interface{}`   | `Unknown`                             |
-| `[]T`                  | `Slice<T>`                            |
-| `[N]T`                 | `Slice<T>` with `#[go(array_return)]` |
-| `map[K]V`              | `Map<K, V>`                           |
-| `chan T`               | `Channel<T>`                          |
-| `<-chan T`             | `Receiver<T>`                         |
-| `chan<- T`             | `Sender<T>`                           |
+| Go                     | Lisette         |
+| ---------------------- | ----------------|
+| `string`               | identical       |
+| `bool`                 | identical       |
+| `int`, `int64`, etc.   | identical       |
+| `uint8`, `uint16` etc. | identical       |
+| `float32`, `float64`   | identical       |
+| `any`, `interface{}`   | `Unknown`       |
+| `[]T`                  | `Slice<T>`      |
+| `[N]T`                 | `Array<T, N>`   |
+| `map[K]V`              | `Map<K, V>`     |
+| `chan T`               | `Channel<T>`    |
+| `<-chan T`             | `Receiver<T>`   |
+| `chan<- T`             | `Sender<T>`     |
 
 ## Contextual mappings
 
@@ -85,7 +85,7 @@ Other Go types map to Lisette types based on context.
 | `(T, error)` (non-exclusive)  | `Partial<T, error>`         |
 | `(T1, T2, error)`             | `Result<(T1, T2), error>`   |
 
-Some Go functions return `(T, error)` where both values may be simultaneously meaningful, such as `io.Reader.Read`. These map to `Partial<T, error>` instead of `Result<T, error>`. Bindgen detects this automatically for methods on types implementing `io.Reader`, `io.Writer`, `io.ReaderAt`, and `io.WriterAt`. Other functions can be marked manually via the `partial_result` config override.
+Some Go functions return `(T, error)` where both values may be simultaneously meaningful, such as `io.Reader.Read`. These map to `Partial<T, error>` instead of `Result<T, error>`. Bindgen detects this automatically for methods on types implementing `io.Reader`, `io.Writer`, `io.ReaderAt`, `io.WriterAt`, `io.StringWriter`, `io.ReaderFrom`, and `io.WriterTo`. Other functions can be marked manually via the `partial_result` config override.
 
 When `error` is the sole return type, it typically maps to `Result<(), error>`. Two exceptions: functions that create errors (e.g. `errors.New`) return `error` directly, and methods that unwrap errors (e.g. `Unwrap`, `Err`, `Cause`) return `Option<error>`.
 
@@ -121,11 +121,11 @@ fn LoadAndDelete(self: Ref<Map>, key: Unknown) -> (Unknown, bool)
 | Pointer in struct field       | `Option<Ref<T>>` |
 | Pointer in container element  | `Option<Ref<T>>` |
 
-Pointers in function return types are typically non-nilable, unless a [heuristic](internal/convert/nilcheck.go) says otherwise.
+For pointer and interface return types, bindgen runs an [SSA nilability analysis](internal/convert/nilness.go) over the whole loaded program: a return proven non-nil on every path emits `Ref<T>`, a witnessed nil path emits `Option<Ref<T>>`, and an inconclusive body falls back to constructor-name heuristics and config overrides.
 
 ```go
 func Open(name string) (*File, error)  // non-nil on success (typical case)
-func NewFile(fd uintptr, name string) *File  // nil on invalid fd (heuristic)
+func NewFile(fd uintptr, name string) *File  // nil on invalid fd (proven nil path)
 ```
 
 ```rs
@@ -133,9 +133,21 @@ pub fn Open(name: string) -> Result<Ref<File>, error>
 pub fn NewFile(fd: uint, name: string) -> Option<Ref<File>>
 ```
 
-### Value enums
+A `(T, error)` return presumes `T` non-nil on success, but when the analysis witnesses a return site where both values are nil, the payload demotes to `Option`:
 
-Groups of iota-based constants sharing a named type map to value enums:
+```go
+func (r *Reader) Next() (*Entry, error)  // returns nil, nil at end of section
+```
+
+```rs
+fn Next(self: Ref<Reader>) -> Result<Option<Ref<Entry>>, error>
+```
+
+The same applies per element in plain tuples, so `encoding/pem.Decode` emits `(Option<Ref<Block>>, Slice<byte>)`.
+
+### Named primitive types
+
+A Go `type X <primitive>` declaration maps to a single-field tuple struct.
 
 ```go
 type Month int
@@ -147,14 +159,13 @@ const (
 ```
 
 ```rs
-pub enum Month: int {
-  January = 1,
-  February = 2,
-  // ...
-}
+pub struct Month(int)
+
+pub const January: Month = 1
+pub const February: Month = 2
+// ...
 ```
 
-Value enums are a `.d.lis`-only construct for representing iota-based constant groups.
 
 ### Opaque types
 
@@ -176,20 +187,28 @@ Bindgen accepts a config file with per-package overrides:
       "allow_unused_result": {
         "fmt": ["Print", "Printf", "Println"],
       },
+
+      // Suppress unused_value on fluent registration APIs whose return is a
+      // shared singleton callers idiomatically discard.
+      // e.g. `web.Get/Post` in beego returns `*HttpServer` for chaining
+      "allow_unused_value": {
+        "github.com/beego/beego/v2/server/web": ["Get", "Post"],
+      },
     },
 
     // Override type mapping decisions
     "types": {
-      // Turn `Ref<T>` into `Option<Ref<T>>`
-      // e.g. `os.NewFile` returns `Option<Ref<File>>`
+      // Turn `Ref<T>` into `Option<Ref<T>>` when the analysis cannot see
+      // the nil path itself
       "nilable_return": {
-        "os": ["NewFile"],
+        "example.com/pkg": ["NewHandle"],
       },
 
-      // Turn `Option<Ref<T>>` into `Ref<T>`
-      // e.g. `reflect.TypeOf` returns `Ref<Type>`
+      // Turn `Option<Ref<T>>` into `Ref<T>` for API invariants the analysis
+      // cannot prove
+      // e.g. `sync.OnceValue` never returns a nil function value
       "non_nilable_return": {
-        "reflect": ["TypeOf"],
+        "sync": ["OnceValue"],
       },
 
       // Return `error` directly instead of `Result<(), error>`
@@ -211,12 +230,6 @@ Bindgen accepts a config file with per-package overrides:
         "io": ["ReadAtLeast", "ReadFull"],
       },
 
-      // Return `Never` instead of `()` for functions that do not return normally
-      // e.g. `os.Exit` returns `Never`
-      "never_return": {
-        "os": ["Exit"],
-      },
-
       // Keep `(T, bool)` as tuple instead of `Option<T>`
       // e.g. `math/big.Rat.Float32` returns `(float32, bool)`
       "bool_as_flag": {
@@ -229,6 +242,40 @@ Bindgen accepts a config file with per-package overrides:
         "io": {
           "CopyBuffer": ["buf"],
         },
+      },
+
+      // Mark a result as one callers write, where no aliasing fact can be
+      // stated. Prefer `returns_view_of` when the aliasing fact is known.
+      // e.g. `w.Header().Set(...)` needs `mut net/http.Header`
+      "writable_return": {
+        "net/http": ["ResponseWriter.Header"],
+      },
+
+      // Force `Ref<T>` parameter to `Option<Ref<T>>` when inference did not
+      // e.g. `rp` in `mongo.Client.Ping(ctx, rp)` accepts nil
+      "nilable_param": {
+        "go.mongodb.org/mongo-driver/v2/mongo": {
+          "Client.Ping": ["rp"],
+        },
+      },
+
+      // Keep `Ref<T>` parameter when inference wrongly proved it accepts nil
+      "non_nilable_param": {},
+
+      // Allow constructing a type at its Go zero value, verified against Go's docs.
+      // Applies to types with no visible fields, which are refused by default
+      // e.g. `sync.Mutex` documents its zero value as an unlocked mutex
+      "zero_safe": {
+        "sync": ["Mutex", "WaitGroup"],
+      },
+
+      // Deny constructing a struct by literal, forcing its Go constructor.
+      // Applies to structs with visible fields, which are admitted by default.
+      // Use for types whose zero value panics, verified against Go's docs or
+      // by probing the zero value
+      // e.g. a zero `csv.Writer` panics on `Write` (nil internal writer)
+      "zero_unsafe": {
+        "encoding/csv": ["Reader", "Writer"],
       },
     },
   },

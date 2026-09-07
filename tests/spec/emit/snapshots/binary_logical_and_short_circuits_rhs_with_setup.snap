@@ -1,0 +1,46 @@
+---
+source: tests/spec/emit/expressions.rs
+description: |
+  
+  fn track(flag: mut Ref<bool>) -> Result<int, error> {
+    flag.* = true
+    Ok(1)
+  }
+  
+  fn test() {
+    let mut ran = false
+    if false && track(&ran).is_ok() {
+      panic("body should not run")
+    }
+    if ran {
+      panic("rhs evaluated despite short-circuit")
+    }
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func track(flag *bool) (int, error) {
+	*flag = true
+	return 1, nil
+}
+
+func test() {
+	ran := false
+	if false && func() bool {
+		ret_1, ret_2 := track(&ran)
+		var result_3 lisette.Result[int, error]
+		if ret_2 != nil {
+			result_3 = lisette.MakeResultErr[int, error](ret_2)
+		} else {
+			result_3 = lisette.MakeResultOk[int, error](ret_1)
+		}
+		return result_3.IsOk()
+	}() {
+		panic("body should not run")
+	}
+	if ran {
+		panic("rhs evaluated despite short-circuit")
+	}
+}

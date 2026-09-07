@@ -1,0 +1,295 @@
+use crate::ast::Expression;
+use crate::types::Symbol;
+use crate::types::{CompoundKind, SimpleKind, Type};
+
+pub fn resolved_definition(expression: &Expression) -> Option<&str> {
+    match expression.unwrap_parens() {
+        Expression::Identifier { resolution, .. } => resolution.definition(),
+        Expression::DotAccess { resolution, .. } => resolution.definition(),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ChannelOperation<'a> {
+    Receive {
+        channel: &'a Expression,
+    },
+    Send {
+        channel: &'a Expression,
+        value: &'a Expression,
+    },
+}
+
+impl<'a> ChannelOperation<'a> {
+    pub fn channel(self) -> &'a Expression {
+        match self {
+            Self::Receive { channel } | Self::Send { channel, .. } => channel,
+        }
+    }
+
+    pub fn value(self) -> Option<&'a Expression> {
+        match self {
+            Self::Receive { .. } => None,
+            Self::Send { value, .. } => Some(value),
+        }
+    }
+}
+
+pub fn channel_operation(expression: &Expression) -> Option<ChannelOperation<'_>> {
+    let Expression::Call {
+        expression: callee,
+        args,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+
+    let (channel, method, operands): (&Expression, &str, &[Expression]) = match callee.as_ref() {
+        Expression::DotAccess {
+            expression: channel,
+            member,
+            ..
+        } => (channel, member, args),
+        Expression::Identifier { value, .. } if has_channel_ufcs_prefix(value) => {
+            let (channel, operands) = args.split_first()?;
+            (channel, value.rsplit('.').next()?, operands)
+        }
+        _ => return None,
+    };
+
+    match (method, operands) {
+        ("receive", []) => Some(ChannelOperation::Receive { channel }),
+        ("send", [value]) => Some(ChannelOperation::Send { channel, value }),
+        _ => None,
+    }
+}
+
+fn has_channel_ufcs_prefix(identifier: &str) -> bool {
+    let Some((prefix, _)) = identifier.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        prefix.rsplit('.').next(),
+        Some("Channel" | "Sender" | "Receiver")
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverCoercion {
+    /// Insert `&` to convert `T` to `Ref<T>`
+    AutoAddress,
+    /// Insert `*` to convert `Ref<T>` to `T`
+    AutoDeref,
+}
+
+/// What a dot access resolved to during type checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DotAccessKind {
+    /// Named struct field access
+    StructField { is_exported: bool },
+    /// Tuple struct field access (e.g., `point.0` on `struct Point(int, int)`).
+    /// `is_newtype` is true when the struct has exactly 1 field and no generics,
+    /// meaning access should emit a type cast rather than `.F0`.
+    TupleStructField { is_newtype: bool },
+    /// Tuple element access (e.g., `t.0`, `t.1`)
+    TupleElement,
+    /// Package member access (e.g., `mod.func`)
+    PackageMember,
+    /// ADT enum variant constructor (e.g., `makeColorRed[T]()`)
+    EnumVariant,
+    /// Instance method (has `self` receiver)
+    InstanceMethod { is_exported: bool },
+    /// Instance method used as a first-class value (not called).
+    /// E.g., `Point.area` used as a callback. The emitter needs to know
+    /// whether the receiver is a pointer to emit Go method expression syntax.
+    InstanceMethodValue {
+        is_exported: bool,
+        is_pointer_receiver: bool,
+    },
+    /// Static method (no `self` receiver)
+    StaticMethod { is_exported: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DotAccessResolution {
+    Unresolved,
+    StructField {
+        is_exported: bool,
+        declaring_type: Option<Symbol>,
+    },
+    TupleStructField {
+        is_newtype: bool,
+    },
+    TupleElement,
+    PackageMember {
+        definition: Option<Symbol>,
+    },
+    EnumVariant {
+        definition: Symbol,
+    },
+    InstanceMethod {
+        is_exported: bool,
+        receiver_coercion: Option<ReceiverCoercion>,
+        definition: Option<Symbol>,
+    },
+    InstanceMethodValue {
+        is_exported: bool,
+        is_pointer_receiver: bool,
+        definition: Option<Symbol>,
+    },
+    StaticMethod {
+        is_exported: bool,
+        definition: Symbol,
+    },
+}
+
+impl DotAccessResolution {
+    pub fn kind(&self) -> Option<DotAccessKind> {
+        Some(match self {
+            Self::Unresolved => return None,
+            Self::StructField { is_exported, .. } => DotAccessKind::StructField {
+                is_exported: *is_exported,
+            },
+            Self::TupleStructField { is_newtype } => DotAccessKind::TupleStructField {
+                is_newtype: *is_newtype,
+            },
+            Self::TupleElement => DotAccessKind::TupleElement,
+            Self::PackageMember { .. } => DotAccessKind::PackageMember,
+            Self::EnumVariant { .. } => DotAccessKind::EnumVariant,
+            Self::InstanceMethod { is_exported, .. } => DotAccessKind::InstanceMethod {
+                is_exported: *is_exported,
+            },
+            Self::InstanceMethodValue {
+                is_exported,
+                is_pointer_receiver,
+                ..
+            } => DotAccessKind::InstanceMethodValue {
+                is_exported: *is_exported,
+                is_pointer_receiver: *is_pointer_receiver,
+            },
+            Self::StaticMethod { is_exported, .. } => DotAccessKind::StaticMethod {
+                is_exported: *is_exported,
+            },
+        })
+    }
+
+    pub fn declaring_type(&self) -> Option<&Symbol> {
+        match self {
+            Self::StructField { declaring_type, .. } => declaring_type.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn receiver_coercion(&self) -> Option<ReceiverCoercion> {
+        match self {
+            Self::InstanceMethod {
+                receiver_coercion, ..
+            } => *receiver_coercion,
+            _ => None,
+        }
+    }
+
+    pub fn definition(&self) -> Option<&str> {
+        match self {
+            Self::PackageMember { definition }
+            | Self::InstanceMethod { definition, .. }
+            | Self::InstanceMethodValue { definition, .. } => {
+                definition.as_ref().map(Symbol::as_str)
+            }
+            Self::EnumVariant { definition } | Self::StaticMethod { definition, .. } => {
+                Some(definition)
+            }
+            Self::Unresolved
+            | Self::StructField { .. }
+            | Self::TupleStructField { .. }
+            | Self::TupleElement => None,
+        }
+    }
+}
+
+/// What kind of native built-in type (Slice, Map, Channel, etc.) a call targets.
+/// Defined here so semantics can classify calls without depending on
+/// emit-specific types. The emitter maps this to its internal `NativeGoType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeTypeKind {
+    Slice,
+    EnumeratedSlice,
+    Map,
+    Channel,
+    Sender,
+    Receiver,
+    String,
+    Array,
+}
+
+impl NativeTypeKind {
+    pub fn from_type(ty: &Type) -> Option<Self> {
+        Some(match ty.strip_refs() {
+            Type::Compound { kind, .. } => match kind {
+                CompoundKind::Slice => Self::Slice,
+                CompoundKind::EnumeratedSlice => Self::EnumeratedSlice,
+                CompoundKind::Map => Self::Map,
+                CompoundKind::Channel => Self::Channel,
+                CompoundKind::Sender => Self::Sender,
+                CompoundKind::Receiver => Self::Receiver,
+                CompoundKind::Ref | CompoundKind::VarArgs => return None,
+            },
+            Type::Simple(SimpleKind::String) => Self::String,
+            Type::Array { .. } => Self::Array,
+            _ => return None,
+        })
+    }
+
+    pub fn from_constructor_path(path: &str) -> Option<Self> {
+        match path {
+            "Channel.new" | "Channel.buffered" => Some(Self::Channel),
+            "Map.new" => Some(Self::Map),
+            "Slice.new" | "Slice.make" => Some(Self::Slice),
+            "Array.new" | "Array.from" => Some(Self::Array),
+            _ => None,
+        }
+    }
+
+    pub fn is_constructor_method(name: &str) -> bool {
+        matches!(name, "new" | "buffered" | "make")
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Slice" => Some(Self::Slice),
+            "EnumeratedSlice" => Some(Self::EnumeratedSlice),
+            "Map" => Some(Self::Map),
+            "Channel" => Some(Self::Channel),
+            "Sender" => Some(Self::Sender),
+            "Receiver" => Some(Self::Receiver),
+            "string" => Some(Self::String),
+            "Array" => Some(Self::Array),
+            _ => None,
+        }
+    }
+}
+
+/// What a call expression resolved to during type checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    /// The call has not reached semantic classification yet.
+    Unresolved,
+    /// Regular function or method call
+    Regular,
+    /// Tuple struct constructor (e.g., `Point(1, 2)`)
+    TupleStructConstructor,
+    /// Type assertion (`assert_type`)
+    AssertType,
+    /// UFCS method call: `receiver.method()` where method is a free function
+    UfcsMethod,
+    /// Native type constructor (e.g., `Channel.new`, `Map.new`, `Slice.new`)
+    NativeConstructor(NativeTypeKind),
+    /// Native type instance method via dot access (e.g., `slice.append(x)`)
+    NativeMethod(NativeTypeKind),
+    /// Native type method via identifier (e.g., `Slice.contains(s, x)`)
+    NativeMethodIdentifier(NativeTypeKind),
+    /// Receiver method in UFCS syntax: `Type.method(receiver, args)`
+    ReceiverMethodUfcs { is_public: bool },
+}

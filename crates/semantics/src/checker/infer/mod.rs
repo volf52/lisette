@@ -1,68 +1,127 @@
-pub mod checks;
-mod expressions;
-mod interface;
+pub(crate) mod addressability;
+mod context;
+pub(crate) mod expressions;
+mod generic_obligations;
+pub(crate) mod interface;
 mod unify;
 mod validation;
 
+pub use context::InferCtx;
+pub(crate) use unify::BuiltinBound;
+
 use rustc_hash::FxHashMap as HashMap;
 
-use super::Checker;
-use syntax::ast::Expression;
-use syntax::program::{File, FileImport};
+use super::freeze::FreezeFolder;
+use super::registration::{RegisteredPackage, RegistrationFile};
+use super::state::InferredFile;
+use super::{FileContext, TaskState};
+use crate::loader;
+use crate::prelude;
+use crate::store::Store;
+use syntax::ast::{Expression, Span};
+use syntax::program::FileImport;
 
-impl Checker<'_, '_> {
-    pub fn infer_module(&mut self, module_id: &str) {
-        self.cursor.module_id = module_id.to_string();
-
-        let files: Vec<File> = {
-            let module = self
-                .store
-                .get_module_mut(module_id)
-                .expect("module must exist for inference");
-            std::mem::take(&mut module.files).into_values().collect()
-        };
-
-        for file in files {
-            let imports = file.imports();
-
-            self.reset_scopes();
-            self.cursor.file_id = Some(file.id);
-            self.put_prelude_in_scope();
-            self.put_unprefixed_module_in_scope(module_id);
-            self.put_imported_modules_in_scope(&imports);
-            self.check_definition_module_collisions(&file.items, &imports);
-
-            let inferred_items: Vec<_> = file
-                .items
-                .into_iter()
-                .map(|item| {
-                    let type_var = self.new_type_var();
-                    self.infer_expression(item, &type_var)
-                })
-                .collect();
-
-            self.run_post_inference_checks();
-            self.check_reference_sibling_aliasing(&inferred_items);
-
-            let typed_file = File {
-                id: file.id,
-                module_id: file.module_id,
-                name: file.name,
-                source: file.source,
-                items: inferred_items,
-            };
-
-            self.store.store_file(module_id, typed_file);
+impl TaskState {
+    pub(crate) fn install_inferred_files(store: &mut Store, inferred_files: Vec<InferredFile>) {
+        for inferred_file in inferred_files {
+            store
+                .get_file_mut(inferred_file.id)
+                .expect("inferred file must remain in the store")
+                .items = inferred_file.items;
         }
-
-        self.cursor.file_id = None;
     }
 
-    fn check_definition_module_collisions(&mut self, items: &[Expression], imports: &[FileImport]) {
+    /// Infer one registered package and install its typed ASTs.
+    pub fn infer_package(&mut self, store: &mut Store, package: RegisteredPackage) {
+        let inferred_files = self.infer_registered_package(store, package);
+        Self::install_inferred_files(store, inferred_files);
+    }
+
+    pub(crate) fn infer_registered_package(
+        &mut self,
+        store: &Store,
+        package: RegisteredPackage,
+    ) -> Vec<InferredFile> {
+        let package_id = package.id;
+        let (files, typedefs): (Vec<_>, Vec<_>) = package.files.into_iter().partition(|file| {
+            !store
+                .get_file(file.id)
+                .expect("registered file must remain in the store")
+                .is_d_lis()
+        });
+        let items_per_file: Vec<&[Expression]> = files.iter().map(|f| f.items.as_slice()).collect();
+        self.check_const_cycles(&items_per_file);
+
+        let mut inferred: Vec<_> = files
+            .into_iter()
+            .map(|file| InferCtx::new(self, store).infer_file(&package_id, file))
+            .collect();
+        inferred.extend(
+            typedefs
+                .into_iter()
+                .map(|file: RegistrationFile| InferredFile {
+                    id: file.id,
+                    items: file.items,
+                }),
+        );
+        inferred
+    }
+}
+
+impl InferCtx<'_> {
+    fn infer_file(mut self, package_id: &str, file: RegistrationFile) -> InferredFile {
+        let file_id = file.id;
+        let imports = file.imports;
+
+        self.with_file_context(
+            FileContext::Standard {
+                package_id,
+                file_id,
+                imports: &imports,
+            },
+            |ctx| {
+                ctx.check_definition_package_collisions(&file.items, &imports);
+
+                let inferred_items: Vec<_> = file
+                    .items
+                    .into_iter()
+                    .map(|item| {
+                        let type_var = ctx.new_type_var();
+                        ctx.infer_root_expression(item, &type_var)
+                    })
+                    .collect();
+
+                ctx.check_reference_sibling_aliasing(&inferred_items);
+                ctx.check_map_bracket_reads(&inferred_items);
+                ctx.resolve_branch_subsumptions();
+                ctx.resolve_select_exhaustiveness();
+
+                let frozen_items = {
+                    let store = ctx.store;
+                    let state = &mut *ctx.state;
+                    let folder = FreezeFolder::new(&state.env, store);
+                    folder.freeze_facts(&mut state.facts);
+                    FreezeFolder::new(&state.env, store).freeze_items(inferred_items)
+                };
+
+                InferredFile {
+                    id: file_id,
+                    items: frozen_items,
+                }
+            },
+        )
+    }
+
+    fn check_definition_package_collisions(
+        &mut self,
+        items: &[Expression],
+        imports: &[FileImport],
+    ) {
+        let store = self.store;
         let alias_to_path: HashMap<String, String> = imports
             .iter()
             .filter_map(|imp| {
-                imp.effective_alias(&self.store.go_package_names)
+                imp.effective_alias(&store.go_package_names)
                     .map(|alias| (alias, imp.name.to_string()))
             })
             .collect();
@@ -76,9 +135,6 @@ impl Checker<'_, '_> {
                     name, name_span, ..
                 } => (name.as_str(), *name_span),
                 Expression::Enum {
-                    name, name_span, ..
-                } => (name.as_str(), *name_span),
-                Expression::ValueEnum {
                     name, name_span, ..
                 } => (name.as_str(), *name_span),
                 Expression::TypeAlias {
@@ -96,13 +152,101 @@ impl Checker<'_, '_> {
             };
 
             if let Some(import_path) = alias_to_path.get(definition_name) {
-                self.sink
-                    .push(diagnostics::infer::definition_shadows_import(
-                        definition_name,
-                        import_path,
-                        name_span,
-                    ));
+                self.sink.push(diagnostics::infer::name_shadows_import(
+                    definition_name,
+                    loader::import_display_name(import_path),
+                    name_span,
+                ));
             }
         }
+    }
+
+    fn check_binding_shadows_import(&mut self, name: &str, span: Span, is_typedef: bool) {
+        if !is_typedef
+            && name != prelude::PRELUDE_PACKAGE_ID
+            && let Some(import_path) = self.imports.package_id(name)
+        {
+            self.sink.push(diagnostics::infer::name_shadows_import(
+                name,
+                loader::import_display_name(import_path),
+                span,
+            ));
+        }
+    }
+
+    fn register_block_local_items(&mut self, items: &[Expression]) {
+        for item in items {
+            match item {
+                Expression::Const { .. } => self.register_block_local_const(item),
+                Expression::Function { .. } => self.register_block_local_fn(item),
+                _ => {}
+            }
+        }
+    }
+
+    fn register_block_local_const(&mut self, item: &Expression) {
+        let store = self.store;
+        let Expression::Const {
+            identifier,
+            identifier_span,
+            annotation,
+            expression,
+            span,
+            ..
+        } = item
+        else {
+            return;
+        };
+
+        self.check_binding_shadows_import(identifier, *identifier_span, self.is_d_lis(store));
+
+        let qualified_name = self.qualify_name(identifier);
+        let is_duplicate = self.scopes.lookup_const(identifier)
+            || self.is_const_name(store, qualified_name.as_str());
+        if is_duplicate && self.is_lis(store) {
+            self.sink.push(diagnostics::infer::duplicate_definition(
+                "constant",
+                identifier,
+                *identifier_span,
+            ));
+            return;
+        }
+
+        let const_ty = self.without_diagnostics(|this| {
+            if let Some(annotation) = annotation {
+                this.convert_to_type(store, annotation, span)
+            } else {
+                expression
+                    .value()
+                    .and_then(|value| this.type_from_literal_expression(value))
+                    .unwrap_or_else(|| this.new_type_var())
+            }
+        });
+
+        let scope = self.scopes.current_mut();
+        scope.insert_const(identifier.to_string(), const_ty);
+    }
+
+    fn register_block_local_fn(&mut self, item: &Expression) {
+        let Expression::Function {
+            name,
+            generics,
+            params,
+            return_annotation,
+            span,
+            ..
+        } = item
+        else {
+            return;
+        };
+
+        let store = self.store;
+        let fn_ty = self.without_diagnostics(|this| {
+            let mut generics = generics.clone();
+            this.extract_signature_parts(store, &mut generics, params, return_annotation, span)
+        });
+
+        let scope = self.scopes.current_mut();
+        scope.insert_value(name.to_string(), fn_ty);
     }
 }

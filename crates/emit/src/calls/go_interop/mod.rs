@@ -1,225 +1,252 @@
 mod nullable;
 mod wrappers;
 
-use crate::Emitter;
-use crate::names::go_name;
-use crate::write_line;
+pub(crate) use wrappers::{NilGuard, WrapperTarget};
+
+use crate::Planner;
+use crate::abi::callable::{CallableAbi, CallableReturnAbi, OptionReturnAbi};
+use crate::abi::coercion::{CoercionPlan, LayoutBridge, resolve_layout_bridge};
+use crate::abi::layout::{SlotOrigin, ValueLayout};
+use crate::context::expression::ExpressionContext;
+use crate::plan::bodies::LoweredStatement;
+use crate::plan::calls::CallableOrigin;
+use crate::plan::values::{GoExpression, ValuePlan};
 use syntax::ast::Expression;
 use syntax::types::Type;
 
-#[derive(Debug, Clone)]
-pub(crate) enum GoCallStrategy {
-    /// (T1, T2, ...) → Tuple struct. Arity ≥ 2, no error/bool suffix.
-    Tuple { arity: usize },
-    /// (T, error) → Result<T, Error>.
-    Result,
-    /// (T, bool) → Option<T>. Comma-ok pattern (non-nullable or `#[go(comma_ok)]`).
-    CommaOk,
-    /// Single return of pointer/interface type → Option<Ref<T>> via nil check.
-    NullableReturn,
-    /// (T, error) → Partial<T, error>. Non-exclusive returns where both value and error
-    /// may be simultaneously meaningful (e.g. io.Reader.Read).
-    Partial,
-}
+impl Planner<'_> {
+    /// Lower a raw callable result through its canonical physical ABI.
+    pub(crate) fn lower_go_abi_wrapped_call(
+        &mut self,
+        call_expression: &Expression,
+        abi: &CallableAbi,
+        result_ty: &Type,
+    ) -> ValuePlan {
+        if let Some(bridges) = self.go_tuple_result_bridges(abi, result_ty) {
+            let call = self.lower_call(call_expression, None, ExpressionContext::value());
+            return call.map_rendered_as_observable_computed(|setup, call_string, _| {
+                let values = self.create_temp_vars("ret", bridges.len());
+                setup.push(LoweredStatement::RawGo(format!(
+                    "{} := {}\n",
+                    values.join(", "),
+                    call_string
+                )));
+                let values = values
+                    .into_iter()
+                    .zip(&bridges)
+                    .map(|(value, bridge)| self.plan_layout_bridge(setup, &value, bridge))
+                    .collect::<Vec<_>>();
+                let tuple = self.plan_tuple_from_vars(setup, &values, result_ty);
+                GoExpression::opaque(tuple)
+            });
+        }
 
-impl GoCallStrategy {
-    pub(crate) fn is_multi_return(&self) -> bool {
-        !matches!(self, GoCallStrategy::NullableReturn)
+        if let Some(bridge) = self.go_result_layout_bridge(abi, result_ty) {
+            let call = self.lower_call(call_expression, None, ExpressionContext::value());
+            return call.map_rendered_as_observable_computed(
+                |setup, call_string, _contains_deferred_evaluation| {
+                    let (bridge_setup, value) = bridge.lower(self, call_string);
+                    setup.extend(bridge_setup);
+                    GoExpression::opaque(value)
+                },
+            );
+        }
+
+        let payload_bridge = self.go_return_payload_bridge(abi, result_ty);
+        let call_plan = self.lower_call(call_expression, None, ExpressionContext::value());
+        call_plan.map_rendered_as_observable_computed(
+            |setup, call_string, _contains_deferred_evaluation| {
+                let (wrap, value) = if payload_bridge.is_some() {
+                    let (wrap, outcome) = self.lower_abi_wrapping_with_payload_bridge(
+                        &call_string,
+                        &abi.result,
+                        result_ty,
+                        payload_bridge.as_ref(),
+                        WrapperTarget::FreshSlot,
+                    );
+                    (wrap, outcome.expect("wrapper produced no slot"))
+                } else {
+                    self.lower_abi_to_tagged(&call_string, &abi.result, result_ty)
+                };
+                setup.extend(wrap);
+                GoExpression::opaque(value)
+            },
+        )
     }
-}
 
-impl Emitter<'_> {
-    pub(crate) fn classify_go_return_type(
+    pub(crate) fn go_result_layout_bridge(
         &self,
-        return_ty: &Type,
-        go_hints: &[String],
-    ) -> Option<GoCallStrategy> {
-        if return_ty.is_partial() {
-            return Some(GoCallStrategy::Partial);
-        }
-
-        if return_ty.is_result() {
-            return Some(GoCallStrategy::Result);
-        }
-
-        if return_ty.is_option() {
-            if !self.is_nullable_option(return_ty) {
-                return Some(GoCallStrategy::CommaOk);
+        abi: &CallableAbi,
+        result_ty: &Type,
+    ) -> Option<CoercionPlan> {
+        let target = self.value_layout(result_ty, SlotOrigin::Lisette);
+        match abi.result {
+            CallableReturnAbi::Direct => {}
+            CallableReturnAbi::Option(OptionReturnAbi::Nullable) => {
+                let source_payload = abi.return_layout.option_payload()?;
+                let target_payload = target.option_payload()?;
+                if source_payload.same_representation(target_payload) {
+                    return None;
+                }
             }
-            if go_hints.iter().any(|s| s == "comma_ok") {
-                return Some(GoCallStrategy::CommaOk);
-            }
-            return Some(GoCallStrategy::NullableReturn);
+            _ => return None,
         }
-
-        if let Some(arity) = return_ty.tuple_arity()
-            && arity >= 2
-        {
-            return Some(GoCallStrategy::Tuple { arity });
-        }
-
-        None
+        let bridge = CoercionPlan::bridge(self, &abi.return_layout, &target);
+        (!bridge.is_identity()).then_some(bridge)
     }
 
-    pub(crate) fn resolve_go_call_strategy(
+    pub(crate) fn go_tuple_result_bridges(
         &self,
-        expression: &Expression,
-    ) -> Option<GoCallStrategy> {
-        let Expression::Call {
-            expression: callee,
-            ty,
-            ..
-        } = expression
+        abi: &CallableAbi,
+        result_ty: &Type,
+    ) -> Option<Vec<LayoutBridge>> {
+        if !matches!(abi.result, CallableReturnAbi::Tuple { .. }) {
+            return None;
+        }
+        let ValueLayout::Tuple {
+            elements: source, ..
+        } = &abi.return_layout
         else {
             return None;
         };
-
-        let inner = callee.unwrap_parens();
-
-        if let Expression::DotAccess {
-            expression: receiver_expression,
-            member,
-            ..
-        } = inner
-            && Self::is_go_receiver(receiver_expression)
-        {
-            if let Some(qualified_name) = self.go_qualified_name(receiver_expression, member)
-                && let Some(strategy) = self.module.go_call_strategies.get(&qualified_name)
-            {
-                return Some(strategy.clone());
-            }
-            let go_hints = self
-                .go_qualified_name(receiver_expression, member)
-                .and_then(|name| self.ctx.definitions.get(name.as_str()))
-                .map(|d| d.go_hints())
-                .unwrap_or_default();
-            return self.classify_go_return_type(ty, go_hints);
-        }
-
-        None
-    }
-
-    pub(crate) fn emit_go_wrapped_call(
-        &mut self,
-        output: &mut String,
-        expression: &Expression,
-        strategy: &GoCallStrategy,
-        result_ty: &Type,
-    ) -> String {
-        match strategy {
-            GoCallStrategy::Tuple { arity } => {
-                self.emit_go_tuple_call_wrapped(output, expression, *arity)
-            }
-            GoCallStrategy::Result => {
-                self.emit_go_result_call_wrapped(output, expression, result_ty)
-            }
-            GoCallStrategy::CommaOk => {
-                self.emit_go_option_call_wrapped(output, expression, result_ty)
-            }
-            GoCallStrategy::NullableReturn => {
-                self.emit_go_single_return_option_wrapped(output, expression, result_ty)
-            }
-            GoCallStrategy::Partial => {
-                self.emit_go_partial_call_wrapped(output, expression, result_ty)
-            }
-        }
-    }
-
-    fn has_go_hint(&self, receiver_expression: &Expression, member: &str, hint: &str) -> bool {
-        let Some(qualified_name) = self.go_qualified_name(receiver_expression, member) else {
-            return false;
+        let ValueLayout::Tuple {
+            elements: target, ..
+        } = self.value_layout(result_ty, SlotOrigin::Lisette)
+        else {
+            return None;
         };
-
-        self.ctx
-            .definitions
-            .get(qualified_name.as_str())
-            .map(|definition| definition.go_hints().iter().any(|s| s == hint))
-            .unwrap_or(false)
+        if source.len() != target.len() {
+            return None;
+        }
+        let bridges = source
+            .iter()
+            .zip(&target)
+            .map(|(source, target)| resolve_layout_bridge(self, source, target))
+            .collect::<Vec<_>>();
+        bridges
+            .iter()
+            .any(|bridge| !bridge.is_identity())
+            .then_some(bridges)
     }
 
-    pub(crate) fn has_go_array_return(
+    pub(crate) fn lower_abi_wrapping(
+        &mut self,
+        call_str: &str,
+        abi: &CallableReturnAbi,
+        result_ty: &Type,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, Option<String>) {
+        self.lower_abi_wrapping_with_payload_bridge(call_str, abi, result_ty, None, target)
+    }
+
+    pub(crate) fn lower_abi_wrapping_with_payload_bridge(
+        &mut self,
+        call_str: &str,
+        abi: &CallableReturnAbi,
+        result_ty: &Type,
+        payload_bridge: Option<&LayoutBridge>,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, Option<String>) {
+        let result_ty = &self.facts.peel_alias(result_ty);
+        match abi {
+            CallableReturnAbi::Tagged
+            | CallableReturnAbi::Direct
+            | CallableReturnAbi::Tuple { .. } => {
+                unreachable!("direct and tuple results do not use a scalar wrapper")
+            }
+            CallableReturnAbi::BareError => {
+                self.require_stdlib();
+                self.lower_bare_error_wrapping(call_str, result_ty, target)
+            }
+            CallableReturnAbi::Result { payload } => {
+                self.require_stdlib();
+                self.lower_result_wrapping(call_str, result_ty, *payload, payload_bridge, target)
+            }
+            CallableReturnAbi::Partial { payload } => {
+                self.require_stdlib();
+                self.lower_partial_wrapping(call_str, result_ty, *payload, payload_bridge, target)
+            }
+            CallableReturnAbi::Option(OptionReturnAbi::CommaOk { payload }) => {
+                self.lower_comma_ok_wrapping(call_str, result_ty, *payload, payload_bridge, target)
+            }
+            CallableReturnAbi::Option(OptionReturnAbi::Nullable) => {
+                let mut statements = Vec::new();
+                let raw_var = self.hoist_tmp_value_statement(&mut statements, "raw", call_str);
+                let (wrap, outcome) = self.lower_nil_check_option_wrap(&raw_var, result_ty, target);
+                statements.extend(wrap);
+                (statements, outcome)
+            }
+            CallableReturnAbi::Option(OptionReturnAbi::Sentinel(value)) => {
+                self.lower_sentinel_wrapping(call_str, result_ty, *value, target)
+            }
+        }
+    }
+
+    pub(crate) fn lower_abi_wrapped_call_to(
+        &mut self,
+        expression: &Expression,
+        abi: &CallableAbi,
+        result_ty: &Type,
+        target: WrapperTarget<'_>,
+    ) -> Option<Vec<LoweredStatement>> {
+        if matches!(
+            abi.result,
+            CallableReturnAbi::Tagged | CallableReturnAbi::Direct | CallableReturnAbi::Tuple { .. }
+        ) {
+            return None;
+        }
+        let payload_bridge = self.go_return_payload_bridge(abi, result_ty);
+        let (mut statements, call_str) = self
+            .lower_call(expression, None, ExpressionContext::value())
+            .into_parts();
+        let (wrap, _) = self.lower_abi_wrapping_with_payload_bridge(
+            &call_str,
+            &abi.result,
+            result_ty,
+            payload_bridge.as_ref(),
+            target,
+        );
+        statements.extend(wrap);
+        Some(statements)
+    }
+
+    pub(crate) fn go_return_payload_bridge(
         &self,
-        receiver_expression: &Expression,
-        member: &str,
-    ) -> bool {
-        self.has_go_hint(receiver_expression, member, "array_return")
-    }
-
-    fn go_qualified_name(&self, receiver_expression: &Expression, member: &str) -> Option<String> {
-        let ty = receiver_expression.get_type();
-
-        if let Type::Constructor { ref id, .. } = ty
-            && let Some(module_path) = id.strip_prefix(go_name::IMPORT_PREFIX)
-        {
-            return Some(format!("{}.{}", module_path, member));
-        }
-
-        if let Type::Constructor { id, .. } = ty.resolve().strip_refs()
-            && go_name::is_go_import(&id)
-        {
-            return Some(format!("{}.{}", id, member));
-        }
-
-        None
-    }
-
-    pub(crate) fn is_go_receiver(expression: &Expression) -> bool {
-        let ty = expression.get_type();
-
-        if let Type::Constructor { ref id, .. } = ty
-            && id.starts_with(go_name::IMPORT_GO_PREFIX)
-        {
-            return true;
-        }
-
-        // Check for Go object pattern: type is go:* (possibly wrapped in Ref<>)
-        if let Type::Constructor { id, .. } = ty.resolve().strip_refs()
-            && go_name::is_go_import(&id)
-        {
-            return true;
-        }
-
-        false
+        abi: &CallableAbi,
+        result_ty: &Type,
+    ) -> Option<LayoutBridge> {
+        let source = abi.return_payload_layout.as_ref()?;
+        let target_type = self.facts.peel_alias(result_ty).ok_type();
+        let target = self.value_layout(&target_type, SlotOrigin::Lisette);
+        let bridge = resolve_layout_bridge(self, source, &target);
+        (!bridge.is_identity()).then_some(bridge)
     }
 
     pub(crate) fn emit_go_call_discarded(
         &mut self,
-        output: &mut String,
+        setup: &mut Vec<LoweredStatement>,
         call_expression: &Expression,
     ) -> Option<String> {
-        let Expression::Call {
-            expression: callee, ..
-        } = call_expression
-        else {
-            return None;
-        };
-
-        let has_strategy = self.resolve_go_call_strategy(call_expression).is_some();
-
-        let has_array_return = if let Expression::DotAccess {
-            expression: receiver_expression,
-            member,
-            ..
-        } = callee.unwrap_parens()
-            && Self::is_go_receiver(receiver_expression)
-        {
-            self.has_go_array_return(receiver_expression, member)
-        } else {
-            false
-        };
-
-        if !has_strategy && !has_array_return {
-            return None;
+        let plan = self.plan_call(call_expression)?;
+        if plan.resolved.abi.result.is_passthrough() {
+            match plan.resolved.origin {
+                CallableOrigin::GoInterop
+                    if self
+                        .go_result_layout_bridge(&plan.resolved.abi, &call_expression.get_type())
+                        .is_some() => {}
+                _ => return None,
+            }
         }
 
-        self.skip_array_return_wrap = has_array_return;
-        let call_str = self.emit_call(output, call_expression, None);
-        self.skip_array_return_wrap = false;
+        let (call_setup, call_str) = self
+            .lower_call(call_expression, None, ExpressionContext::value())
+            .into_parts();
+        setup.extend(call_setup);
 
         Some(call_str)
     }
 
-    pub(super) fn create_temp_vars(&mut self, hint: &str, count: usize) -> Vec<String> {
+    pub(crate) fn create_temp_vars(&mut self, hint: &str, count: usize) -> Vec<String> {
         (0..count)
             .map(|_| {
                 let v = self.fresh_var(Some(hint));
@@ -229,21 +256,33 @@ impl Emitter<'_> {
             .collect()
     }
 
-    pub(super) fn build_tuple_literal(&mut self, vars: &[String], _tuple_ty: &Type) -> String {
-        self.flags.needs_stdlib = true;
-        format!("lisette.MakeTuple{}({})", vars.len(), vars.join(", "))
-    }
-
-    pub(super) fn emit_tuple_from_vars(
+    fn emit_tuple_from_vars(
         &mut self,
         output: &mut String,
         vars: &[String],
         tuple_ty: &Type,
     ) -> String {
-        let constructor = self.build_tuple_literal(vars, tuple_ty);
-        let tuple_var = self.fresh_var(Some("tup"));
-        self.declare(&tuple_var);
-        write_line!(output, "{} := {}", tuple_var, constructor);
-        tuple_var
+        let constructor = build_tuple_literal(self, vars, tuple_ty);
+        self.hoist_tmp_value(output, "tup", &constructor)
     }
+
+    /// Structured counterpart of `emit_tuple_from_vars`.
+    pub(crate) fn plan_tuple_from_vars(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        vars: &[String],
+        tuple_ty: &Type,
+    ) -> String {
+        let constructor = build_tuple_literal(self, vars, tuple_ty);
+        self.hoist_tmp_value_statement(statements, "tup", &constructor)
+    }
+}
+
+pub(super) fn build_tuple_literal(
+    planner: &mut Planner,
+    vars: &[String],
+    _tuple_ty: &Type,
+) -> String {
+    planner.require_stdlib();
+    format!("lisette.MakeTuple{}({})", vars.len(), vars.join(", "))
 }

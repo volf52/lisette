@@ -1,417 +1,480 @@
-use rustc_hash::FxHashSet as HashSet;
+use crate::abi::is_tagged_shape_fn_value;
+use crate::expressions::access::struct_call::emit_struct_literal;
+use syntax::program::DefinitionBody;
 
-use syntax::program::Definition;
-
-use crate::Emitter;
+use crate::Planner;
+use crate::abi::callable::{AbiTransition, CallableReturnAbi, OptionReturnAbi, PayloadLayout};
+use crate::abi::coercion::CoercionPlan;
+use crate::abi::layout::{SlotOrigin, ValueLayout};
+use crate::abi::transition::emit_lisette_callback_wrapper;
+use crate::context::expression::ExpressionContext;
 use crate::is_order_sensitive;
-use crate::types::emitter::Position;
-use crate::utils::Staged;
-use crate::write_line;
-use syntax::ast::{Expression, Visibility};
+use crate::plan::bodies::{ExpressionStatementForm, LoweredBlock, LoweredStatement};
+use crate::plan::calls::{CallPlan, CallableOrigin};
+use crate::plan::values::{
+    CaptureBoundary, EvaluationEffect, GoExpression, OperandForm, ValuePlan,
+};
+use crate::state::bindings::BindingValue;
+use syntax::ast::Expression;
+use syntax::program::CallKind;
 use syntax::types::Type;
 
-impl Emitter<'_> {
-    pub(crate) fn emit_doc(&self, doc: &Option<String>) -> String {
-        match doc {
-            Some(text) => {
-                let lines: Vec<String> = text
-                    .lines()
-                    .map(|line| {
-                        if line.is_empty() {
-                            "//".to_string()
-                        } else {
-                            format!("// {}", line)
-                        }
-                    })
-                    .collect();
-                if lines.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}\n", lines.join("\n"))
-                }
-            }
-            None => String::new(),
-        }
-    }
-
-    pub(crate) fn emit_top_item(&mut self, item: &Expression) -> String {
-        match item {
-            Expression::Function {
-                doc,
-                visibility,
-                name_span,
-                ..
-            } => {
-                if self.ctx.unused.is_unused_definition(name_span) {
-                    return String::new();
-                }
-                let is_public = matches!(visibility, Visibility::Public);
-                let function = item.to_function_definition();
-                let doc_comment = self.emit_doc(doc);
-
-                let code = self.emit_function(&function, None, is_public);
-                format!("{}{}", doc_comment, code)
-            }
-            Expression::Struct {
-                doc,
-                attributes,
-                name,
-                generics,
-                fields,
-                kind,
-                ..
-            } => {
-                let doc_comment = self.emit_doc(doc);
-                let code = self.emit_struct_definition(name, generics, fields, kind, attributes);
-                format!("{}{}", doc_comment, code)
-            }
-            Expression::Enum {
-                doc,
-                attributes,
-                name,
-                generics,
-                ..
-            } => {
-                let doc_comment = self.emit_doc(doc);
-                let code = self
-                    .emit_enum(name, generics, attributes)
-                    .unwrap_or_default();
-                format!("{}{}", doc_comment, code)
-            }
-            Expression::ValueEnum { .. } => String::new(),
-            Expression::TypeAlias {
-                doc,
-                name,
-                generics,
-                ty,
-                ..
-            } => {
-                let doc_comment = self.emit_doc(doc);
-                let code = self.emit_type_alias(name, generics, ty);
-                format!("{}{}", doc_comment, code)
-            }
-            Expression::Interface {
-                doc,
-                name,
-                method_signatures,
-                parents,
-                generics,
-                visibility,
-                ..
-            } => {
-                let doc_comment = self.emit_doc(doc);
-                let is_public = matches!(visibility, Visibility::Public);
-                let code =
-                    self.emit_interface(name, method_signatures, parents, generics, is_public);
-                format!("{}{}", doc_comment, code)
-            }
-            Expression::ImplBlock {
-                receiver_name,
-                ty,
-                methods,
-                generics,
-                ..
-            } => self.emit_impl_block(receiver_name, ty, methods, generics),
-            Expression::Const {
-                doc,
-                identifier,
-                expression,
-                ty,
-                ..
-            } => {
-                let doc_comment = self.emit_doc(doc);
-                let code = self.emit_const(identifier, expression, ty);
-                format!("{}{}", doc_comment, code)
-            }
-            _ => String::new(),
-        }
-    }
-
-    pub(crate) fn declare_result_var(&mut self, output: &mut String, ty: &Type) -> String {
-        let result_var = self.fresh_var(None);
-        write_line!(output, "var {} {}", result_var, self.go_type_as_string(ty));
-        self.declare(&result_var);
-        result_var
-    }
-
-    pub(crate) fn emit_value(&mut self, output: &mut String, expression: &Expression) -> String {
-        if let Some(strategy) = self.classify_go_fn_value(expression) {
-            return self.emit_go_fn_wrapper(output, expression, &strategy);
-        }
-
-        if self.is_go_array_return_value(expression) {
-            return self.emit_array_return_wrapper(output, expression);
-        }
-
-        self.emit_operand(output, expression)
-    }
-
-    pub(crate) fn emit_composite_value(
+impl Planner<'_> {
+    pub(crate) fn lower_value(
         &mut self,
-        output: &mut String,
         expression: &Expression,
-    ) -> String {
-        if expression.get_type().resolve().is_unit()
-            && matches!(expression.unwrap_parens(), Expression::Call { .. })
+        ctx: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        if self.is_go_callable(expression)
+            && let Some(callee) = self.resolve_callable_value(expression)
+            && matches!(callee.origin, CallableOrigin::GoInterop)
         {
-            let call_str = self.emit_value(output, expression);
-            if !call_str.is_empty() {
-                write_line!(output, "{call_str}");
-            }
-            return "struct{}{}".to_string();
-        }
-        self.emit_value(output, expression)
-    }
-
-    pub(crate) fn emit_operand(&mut self, output: &mut String, expression: &Expression) -> String {
-        match expression {
-            Expression::Literal { literal, ty, .. } => self.emit_literal(output, literal, ty),
-            Expression::Identifier { value, ty, .. } => self.emit_identifier(value, ty),
-            Expression::Binary {
-                operator,
-                left,
-                right,
-                ..
-            } => self.emit_binary_expression(output, operator, left, right),
-            Expression::Unary {
-                operator,
-                expression,
-                ..
-            } => self.emit_unary_expression(output, operator, expression),
-            Expression::Call { ty, .. } => {
-                if let Some(strategy) = self.resolve_go_call_strategy(expression) {
-                    self.emit_go_wrapped_call(output, expression, &strategy, ty)
-                } else {
-                    self.emit_call(output, expression, Some(ty))
+            let abi = &callee.abi.result;
+            let matches_slot = self.go_fn_slot_abi(expression, ctx).as_ref() == Some(abi);
+            let target_layout = self.value_layout(&expression.get_type(), SlotOrigin::Lisette);
+            let same_abi = matches_slot
+                && matches!(
+                    &target_layout,
+                    ValueLayout::Function { layout, .. } if layout.return_abi == *abi
+                );
+            if !ctx.is_callee() && same_abi {
+                let source_layout = ValueLayout::Function {
+                    function_type: expression.get_type(),
+                    layout: callee.abi.function_layout(),
+                };
+                let layout_coercion = CoercionPlan::bridge(self, &source_layout, &target_layout);
+                if !layout_coercion.is_identity() {
+                    let value = self.plan_operand(expression, ctx);
+                    return value.map_rendered_as_computed(|setup, value, _| {
+                        let (bridge_setup, value) = layout_coercion.lower(self, value);
+                        setup.extend(bridge_setup);
+                        GoExpression::opaque_with_deferred_evaluation(value, true)
+                    });
                 }
             }
-            Expression::DotAccess {
-                expression,
-                member,
+            if !matches_slot {
+                let mut setup = Vec::new();
+                let value = if self.go_fn_needs_lowered_tuple_adapter(expression, abi, ctx) {
+                    self.emit_go_fn_lowered_tuple_adapter(&mut setup, expression)
+                } else if let CallableReturnAbi::Option(OptionReturnAbi::Sentinel(value)) = abi
+                    && !ctx.forces_tagged_go_function()
+                {
+                    self.emit_go_fn_sentinel_adapter(&mut setup, expression, *value)
+                } else {
+                    self.emit_go_fn_wrapper(&mut setup, expression, &callee.abi)
+                };
+                return ValuePlan::computed(
+                    setup,
+                    GoExpression::opaque(value),
+                    EvaluationEffect::Pure,
+                )
+                .stable_across_calls_if(
+                    self.identifier_immune_to_calls(expression.unwrap_parens()),
+                );
+            }
+        }
+
+        self.plan_operand(expression, ctx)
+    }
+
+    pub(crate) fn lower_composite_value(
+        &mut self,
+        expression: &Expression,
+        ctx: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        if expression.get_type().is_unit()
+            && matches!(
+                expression.unwrap_parens(),
+                Expression::Call { .. } | Expression::Block { .. }
+            )
+        {
+            return self
+                .lower_value(expression, ctx)
+                .map_rendered_as_observable_computed(|setup, call_string, _| {
+                    if !call_string.is_empty() {
+                        setup.push(LoweredStatement::RawGo(format!("{call_string}\n")));
+                    }
+                    GoExpression::composite_literal("struct{}{}".to_string(), false)
+                });
+        }
+        self.lower_value(expression, ctx)
+    }
+
+    pub(crate) fn lower_call_value(
+        &mut self,
+        expression: &Expression,
+        result_type: &Type,
+        context: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        let plan = self
+            .plan_call(expression)
+            .expect("plan_call yields Some for a Call expression");
+        let layout_bridge = self.call_result_layout_bridge(&plan, result_type);
+        let result_transition = plan.result_transition;
+
+        if let Some(bridge) = layout_bridge {
+            let call_type =
+                matches!(result_transition, AbiTransition::Identity).then_some(result_type);
+            let call = self.lower_call_with_plan(expression, call_type, context, plan);
+            return call.map_rendered_as_observable_computed(
+                |setup, call_string, _contains_deferred_evaluation| {
+                    let (bridge_setup, value) = bridge.lower(self, call_string);
+                    setup.extend(bridge_setup);
+                    GoExpression::opaque(value)
+                },
+            );
+        }
+
+        match result_transition {
+            AbiTransition::Identity => {
+                self.lower_call_with_plan(expression, Some(result_type), context, plan)
+            }
+            AbiTransition::WrapToTagged => {
+                self.lower_go_abi_wrapped_call(expression, &plan.resolved.abi, result_type)
+            }
+            AbiTransition::LowerFromTagged
+            | AbiTransition::Reencode
+            | AbiTransition::Incompatible => {
+                unreachable!("call results target their Lisette value representation")
+            }
+        }
+    }
+
+    pub(crate) fn call_result_layout_bridge(
+        &self,
+        plan: &CallPlan<'_>,
+        result_type: &Type,
+    ) -> Option<CoercionPlan> {
+        if !matches!(plan.resolved.origin, CallableOrigin::GoInterop) {
+            return None;
+        }
+        self.go_result_layout_bridge(&plan.resolved.abi, result_type)
+    }
+
+    /// Wrap a captured tagged-shape prelude fn ref into a lowered-ABI closure
+    /// so its Go type matches what the rest of the pipeline expects.
+    fn maybe_lower_tagged_fn_ref(
+        &mut self,
+        setup: &mut Vec<LoweredStatement>,
+        expression: &Expression,
+        ty: &Type,
+        raw: String,
+        ctx: ExpressionContext<'_>,
+    ) -> String {
+        if ctx.is_callee() || ctx.forces_tagged_go_function() {
+            return raw;
+        }
+        if !is_tagged_shape_fn_value(expression) {
+            return raw;
+        }
+        let fn_ty = ty.unwrap_forall();
+        let Type::Function(f) = fn_ty else {
+            return raw;
+        };
+        if self.classify_direct_emission(&f.return_type).is_none() {
+            return raw;
+        }
+        emit_lisette_callback_wrapper(self, setup, &raw, fn_ty)
+    }
+
+    /// Result ABI the slot expects from a Go function value, or `None` when
+    /// the value is not a function. A forced-tagged slot calls through a
+    /// Lisette-shaped callback, so it wants the tagged ABI, not the lowered one.
+    fn go_fn_slot_abi(
+        &self,
+        expression: &Expression,
+        ctx: ExpressionContext<'_>,
+    ) -> Option<CallableReturnAbi> {
+        let fn_ty = expression.get_type();
+        let f = fn_ty.as_function_type()?;
+        Some(if ctx.forces_tagged_go_function() {
+            self.value_return_abi(&f.return_type)
+        } else {
+            self.callable_return_abi(&f.return_type)
+        })
+    }
+
+    /// True when a tuple-ok fallible Go function value must be wrapped to match a lowered slot.
+    fn go_fn_needs_lowered_tuple_adapter(
+        &self,
+        expression: &Expression,
+        source: &CallableReturnAbi,
+        ctx: ExpressionContext<'_>,
+    ) -> bool {
+        matches!(
+            (source, self.go_fn_slot_abi(expression, ctx)),
+            (
+                CallableReturnAbi::Result {
+                    payload: PayloadLayout::Flattened,
+                } | CallableReturnAbi::Partial {
+                    payload: PayloadLayout::Flattened,
+                },
+                Some(
+                    CallableReturnAbi::Result {
+                        payload: PayloadLayout::Packed,
+                    } | CallableReturnAbi::Partial {
+                        payload: PayloadLayout::Packed,
+                    }
+                )
+            )
+        )
+    }
+
+    /// Plan a value-position leaf expression (one `plan_operand` does not lower
+    /// structurally) into a `ValuePlan`.
+    pub(crate) fn plan_operand_leaf(
+        &mut self,
+        expression: &Expression,
+        ctx: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        match expression {
+            Expression::Literal { literal, ty, .. } => self.emit_literal(literal, ty),
+            Expression::Identifier {
+                value,
                 ty,
-                span,
-            } => self.emit_dot_access(output, expression, member, ty, *span),
-            Expression::IndexedAccess {
-                expression, index, ..
-            } => self.emit_index_access(output, expression, index),
-            Expression::StructCall {
-                name,
-                field_assignments,
-                spread,
-                ty,
+                resolution,
                 ..
-            } => self.emit_struct_call(output, name, field_assignments, spread, ty),
-            Expression::Paren { expression, .. } => {
-                let inner = self.emit_operand(output, expression);
-                format!("({})", inner)
+            } => {
+                let go_expression = self.emit_identifier(value, resolution.definition(), ty, ctx);
+                let stability = self.identifier_read_stability(expression);
+                let plan = ValuePlan::from_identifier_expression(go_expression, stability);
+                let mut adapter_setup = Vec::new();
+                let value = self.maybe_lower_tagged_fn_ref(
+                    &mut adapter_setup,
+                    expression,
+                    ty,
+                    plan.rendered(),
+                    ctx,
+                );
+                if adapter_setup.is_empty() {
+                    plan
+                } else {
+                    plan.map_rendered_as_computed(|setup, _, contains_deferred_evaluation| {
+                        setup.extend(adapter_setup);
+                        GoExpression::opaque_with_deferred_evaluation(
+                            value,
+                            contains_deferred_evaluation,
+                        )
+                    })
+                }
             }
-            Expression::Reference {
-                expression: inner,
-                ty,
-                ..
-            } => self.emit_reference(output, inner, ty),
-            Expression::Task { expression, .. } => {
-                self.emit_async_wrapper(output, "go", expression)
-            }
-            Expression::Defer { expression, .. } => {
-                self.emit_async_wrapper(output, "defer", expression)
-            }
-            Expression::RawGo { text } => text.clone(),
-            Expression::Unit { .. } => "struct{}{}".to_string(),
-            Expression::NoOp => String::new(),
+            Expression::Call { ty, .. } => self.lower_call_value(expression, ty, ctx),
+            Expression::RawGo { text } => ValuePlan::opaque(text.clone()),
+            Expression::Unit { .. } => ValuePlan::computed(
+                Vec::new(),
+                GoExpression::composite_literal("struct{}{}".to_string(), false),
+                EvaluationEffect::Pure,
+            ),
             Expression::Lambda {
                 params, body, ty, ..
-            } => self.emit_lambda(params, body, ty),
+            } => ValuePlan::opaque(self.emit_lambda(params, body, ty, ctx)),
             Expression::Function {
                 params, body, ty, ..
-            } => self.emit_lambda(params, body, ty),
-            Expression::Propagate { expression, .. } => {
-                self.emit_propagate(output, expression, None)
-            }
-            Expression::TryBlock { items, ty, .. } => self.emit_try_block(output, items, ty),
-            Expression::RecoverBlock { items, ty, .. } => {
-                self.emit_recover_block(output, items, ty)
-            }
-            Expression::Tuple { elements, ty, .. } => self.emit_tuple_value(output, elements, ty),
-            Expression::If { ty, .. }
+            } => match body.definition() {
+                Some(body) => ValuePlan::opaque(self.emit_lambda(params, body, ty, ctx)),
+                None => ValuePlan::opaque(String::new()),
+            },
+            Expression::IfLet { ty, .. }
             | Expression::Match { ty, .. }
-            | Expression::Select { ty, .. } => {
-                self.emit_branching_as_operand(output, expression, ty)
-            }
-            Expression::IfLet { .. } => {
-                unreachable!("IfLet should be desugared to Match before emit")
-            }
-            Expression::Block { ty, items, .. } => {
-                self.emit_block_as_operand(output, expression, ty, items)
-            }
-            Expression::Loop {
-                body,
-                ty,
-                needs_label,
-                ..
-            } => {
-                let result_var = self.declare_result_var(output, ty);
-                self.push_loop(result_var.clone());
-                self.emit_labeled_loop(output, "for {\n", body, *needs_label);
-                self.pop_loop();
-                result_var
-            }
+            | Expression::Select { ty, .. }
+            | Expression::Block { ty, .. } => self.lower_to_operand_temp(expression, ty),
             Expression::Return {
                 expression: return_expression,
                 ..
             } => {
-                self.emit_return(output, return_expression);
-                String::new()
+                let plan = self.build_return_plan(return_expression);
+                ValuePlan::computed(
+                    vec![LoweredStatement::Return(plan)],
+                    GoExpression::opaque(String::new()),
+                    EvaluationEffect::Pure,
+                )
             }
-            Expression::Range {
-                start,
-                end,
-                inclusive,
-                ty,
-                ..
-            } => self.emit_range_value(output, start, end, *inclusive, ty),
-            Expression::Cast {
-                expression,
-                target_type,
-                ty,
-                ..
-            } => self.emit_cast(output, expression, target_type, ty),
             Expression::Assignment { target, value, .. } => {
-                self.emit_assignment_operand(output, target, value);
-                "struct{}{}".to_string()
+                let setup = self.lower_assignment_operand(target, value);
+                ValuePlan::computed(
+                    setup,
+                    GoExpression::opaque("struct{}{}".to_string()),
+                    EvaluationEffect::Pure,
+                )
             }
-            _ => unreachable!("unexpected expression in emit: {:?}", expression),
+            Expression::Assert { .. } => ValuePlan::computed(
+                vec![self.lower_assert_statement(expression)],
+                GoExpression::opaque("struct{}{}".to_string()),
+                EvaluationEffect::Pure,
+            ),
+            _ => unreachable!(
+                "unexpected leaf expression in plan_operand: {:?}",
+                expression
+            ),
         }
     }
 
-    fn emit_tuple_value(
+    pub(crate) fn coerce_elements_to_slots(
         &mut self,
-        output: &mut String,
+        setup: &mut Vec<LoweredStatement>,
+        elements: &[Expression],
+        rendered: Vec<String>,
+        slot_types: &[Type],
+    ) -> Vec<String> {
+        let mut coerced_elements = Vec::with_capacity(rendered.len());
+        for (index, (element, rendered)) in elements.iter().zip(rendered).enumerate() {
+            let Some(slot) = slot_types.get(index) else {
+                coerced_elements.push(rendered);
+                continue;
+            };
+            let coercion = CoercionPlan::internal(self, &element.get_type(), slot);
+            let (coercion_setup, coerced) = coercion.lower(self, rendered);
+            setup.extend(coercion_setup);
+            coerced_elements.push(coerced);
+        }
+        coerced_elements
+    }
+
+    pub(crate) fn make_tuple_callee(&mut self, slot_types: &[Type], arity: usize) -> String {
+        self.require_stdlib();
+        if slot_types.len() != arity {
+            return format!("lisette.MakeTuple{}", arity);
+        }
+        let rendered: Vec<String> = slot_types
+            .iter()
+            .map(|slot| self.use_go_type(slot))
+            .collect();
+        format!("lisette.MakeTuple{}[{}]", arity, rendered.join(", "))
+    }
+
+    pub(crate) fn plan_tuple_value(
+        &mut self,
         elements: &[Expression],
         ty: &Type,
-    ) -> String {
-        let inferred_slot_types: Vec<Type> = match ty.resolve() {
-            Type::Tuple(slots) => slots,
+        in_tail: bool,
+    ) -> ValuePlan {
+        let inferred_slot_types: Vec<Type> = match ty {
+            Type::Tuple(slots) => slots.clone(),
             _ => Vec::new(),
         };
-        let slot_types = self.resolve_tuple_slot_types(inferred_slot_types);
+        let slot_types = match in_tail.then(|| tail_return_slots(self, &inferred_slot_types)) {
+            Some(Some(return_slots)) => return_slots,
+            _ => inferred_slot_types,
+        };
 
-        let stages: Vec<Staged> = elements
+        let stages: Vec<ValuePlan> = elements
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let prev = std::mem::replace(
-                    &mut self.current_slot_expected_ty,
-                    slot_types.get(i).cloned(),
-                );
-                let staged = self.stage_composite(e);
-                self.current_slot_expected_ty = prev;
-                staged
+                let element_ctx =
+                    ExpressionContext::value().with_expected_slot_type(slot_types.get(i));
+                self.lower_composite_value(e, element_ctx)
             })
             .collect();
-        let elem_expressions = self.sequence(output, stages, "_v");
+        let sequenced = self.sequence_values(stages, CaptureBoundary::SiblingSequence, "v");
+        let effect = sequenced.effect;
+        let (mut setup, element_expressions) = sequenced.into_rendered();
 
-        let elem_expressions: Vec<String> = elements
-            .iter()
-            .zip(elem_expressions)
-            .enumerate()
-            .map(|(i, (expr, emitted))| match slot_types.get(i) {
-                Some(slot) => self.maybe_wrap_as_go_interface(emitted, &expr.get_type(), slot),
-                None => emitted,
-            })
-            .collect();
-
-        self.flags.needs_stdlib = true;
-        let arity = elem_expressions.len();
-
-        let needs_explicit_type_args =
-            !slot_types.is_empty() && slot_types.iter().any(|t| self.as_interface(t).is_some());
-
-        if !needs_explicit_type_args {
-            return format!(
-                "lisette.MakeTuple{}({})",
-                arity,
-                elem_expressions.join(", ")
-            );
-        }
-        let slot_ty_strs: Vec<String> = slot_types
-            .iter()
-            .map(|t| self.go_type_as_string(t))
-            .collect();
-        format!(
-            "lisette.MakeTuple{}[{}]({})",
-            arity,
-            slot_ty_strs.join(", "),
-            elem_expressions.join(", ")
+        let element_expressions =
+            self.coerce_elements_to_slots(&mut setup, elements, element_expressions, &slot_types);
+        let callee = self.make_tuple_callee(&slot_types, element_expressions.len());
+        ValuePlan::observable_call(
+            setup,
+            GoExpression::call(
+                GoExpression::opaque(callee),
+                element_expressions
+                    .into_iter()
+                    .map(GoExpression::opaque)
+                    .collect(),
+            ),
+            effect,
         )
     }
 
-    fn emit_branching_as_operand(
+    /// Plan a `cast` expression. The interface-target path resolves through
+    /// a coercion (may emit setup); the primitive/named path becomes a
+    /// structured `ValuePlan::Cast { go_type, inner }`. The inner value is
+    /// planned first to preserve the original mutation order (inner emitted
+    /// before the target type is formatted).
+    pub(crate) fn plan_cast(
         &mut self,
-        output: &mut String,
         expression: &Expression,
         ty: &Type,
-    ) -> String {
-        let result_var = self.declare_result_var(output, ty);
-        let saved_target_ty = self.assign_target_ty.replace(ty.clone());
-        self.with_position(Position::Assign(result_var.clone()), |this| {
-            this.emit_branching_directly(output, expression);
-        });
-        self.assign_target_ty = saved_target_ty;
-        result_var
-    }
+        ctx: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        let inner = self.plan_operand(expression, ctx);
 
-    fn emit_cast(
-        &mut self,
-        output: &mut String,
-        expression: &Expression,
-        target_type: &syntax::ast::Annotation,
-        ty: &Type,
-    ) -> String {
-        let inner = self.emit_operand(output, expression);
-
-        if let Type::Constructor { id, .. } = &self.peel_alias(ty)
-            && matches!(
-                self.ctx.definitions.get(id.as_str()),
-                Some(Definition::Interface { .. })
-            )
-        {
+        if self.facts.is_interface(ty) {
             let source_ty = expression.get_type();
-            return self.maybe_wrap_as_go_interface(inner, &source_ty, ty);
+            let coercion = CoercionPlan::internal(self, &source_ty, ty);
+            let mut converted =
+                inner.map_rendered_as_computed(|setup, value, _contains_deferred_evaluation| {
+                    let (coercion_setup, coerced) = coercion.lower(self, value);
+                    setup.extend(coercion_setup);
+                    GoExpression::opaque_with_deferred_evaluation(coerced, true)
+                });
+            if !converted.evaluation.stability.is_stable_across_calls() {
+                converted.make_observable();
+            }
+            return converted;
         }
 
-        let go_type = self.annotation_to_go_type(target_type);
+        let go_type = self.use_go_type(ty);
 
-        format!("{}({})", go_type, inner)
+        if let Some(source_go_type) = self.shift_pin_go_type(expression, ty) {
+            return inner.conversion(source_go_type).conversion(go_type);
+        }
+
+        inner.conversion(go_type)
     }
 
-    fn emit_reference(&mut self, output: &mut String, inner: &Expression, ty: &Type) -> String {
-        if inner.get_type().resolve().is_unit()
-            && matches!(inner.unwrap_parens(), Expression::Call { .. })
-        {
-            let emitted = self.emit_operand(output, inner.unwrap_parens());
-            if !emitted.is_empty() {
-                write_line!(output, "{}", emitted);
-            }
-            let tmp = self.fresh_var(Some("ref"));
-            self.declare(&tmp);
-            write_line!(output, "{} := struct{{}}{{}}", tmp);
-            return format!("&{}", tmp);
+    fn shift_pin_go_type(&mut self, expression: &Expression, target_ty: &Type) -> Option<String> {
+        let target_is_float = self
+            .facts
+            .underlying_simple_kind(target_ty)
+            .is_some_and(|kind| kind.is_float());
+        if !target_is_float || !self.contains_untyped_constant_shift(expression) {
+            return None;
+        }
+        let source_ty = expression.get_type();
+        self.facts
+            .underlying_simple_kind(&source_ty)
+            .is_some_and(|kind| kind.integer_range().is_some())
+            .then(|| self.use_go_type(&source_ty))
+    }
+
+    /// Plan a `&inner` reference, hoisting to a temp when the inner is
+    /// Go-unaddressable.
+    pub(crate) fn plan_reference(&mut self, inner: &Expression, ty: &Type) -> ValuePlan {
+        if inner.get_type().is_unit() && matches!(inner.unwrap_parens(), Expression::Call { .. }) {
+            let staged = self.plan_operand(inner.unwrap_parens(), ExpressionContext::value());
+            return staged.map_rendered_as_observable_computed(
+                |setup, staged_value, _contains_deferred_evaluation| {
+                    if !staged_value.is_empty() {
+                        setup.push(LoweredStatement::Expression(
+                            ExpressionStatementForm::Async {
+                                value: ValuePlan::opaque(staged_value),
+                            },
+                        ));
+                    }
+                    let tmp = self.hoist_tmp_value_statement(setup, "ref", "struct{}{}");
+                    GoExpression::opaque(format!("&{}", tmp))
+                },
+            );
         }
 
-        let emitted = self.emit_value(output, inner);
-        if inner.get_type().resolve() == ty.resolve() {
-            emitted
-        } else if self.is_go_unaddressable(inner)
-            || matches!(inner.get_type().resolve(), Type::Function { .. })
-        {
-            let tmp = self.fresh_var(Some("ref"));
-            self.declare(&tmp);
-            write_line!(output, "{} := {}", tmp, emitted);
-            format!("&{}", tmp)
-        } else {
-            format!("&{}", emitted)
-        }
+        let inner_plan = self.lower_value(inner, ExpressionContext::value());
+        inner_plan.map_rendered_as_observable_computed(
+            |setup, emitted, mut contains_deferred_evaluation| {
+                let value = if inner.get_type() == *ty {
+                    emitted
+                } else if self.is_go_unaddressable(inner)
+                    || matches!(inner.get_type(), Type::Function(_))
+                {
+                    contains_deferred_evaluation = false;
+                    let tmp = self.hoist_tmp_value_statement(setup, "ref", &emitted);
+                    format!("&{}", tmp)
+                } else {
+                    format!("&{}", emitted)
+                };
+                GoExpression::opaque_with_deferred_evaluation(value, contains_deferred_evaluation)
+            },
+        )
     }
 
     pub(crate) fn contains_newtype_access(&self, expression: &Expression) -> bool {
@@ -423,7 +486,7 @@ impl Emitter<'_> {
         } = current
         {
             if member.parse::<usize>().is_ok()
-                && self.is_newtype_struct(&inner.get_type().resolve().strip_refs())
+                && self.is_newtype_struct(&inner.get_type().strip_refs())
             {
                 return true;
             }
@@ -432,64 +495,84 @@ impl Emitter<'_> {
         false
     }
 
-    fn emit_assignment_operand(
+    fn lower_assignment_operand(
         &mut self,
-        output: &mut String,
         target: &Expression,
         value: &Expression,
-    ) {
-        let rhs_staged = self.stage_composite(value);
-
+    ) -> Vec<LoweredStatement> {
+        let right_hand_side = self.lower_composite_value(value, ExpressionContext::value());
+        let mut setup: Vec<LoweredStatement> = Vec::new();
         let target_str = if is_order_sensitive(target) {
-            self.emit_left_value_capturing(output, target, !rhs_staged.setup.is_empty())
+            self.emit_left_value_capturing(&mut setup, target, Some(&right_hand_side))
         } else {
-            self.emit_left_value(output, target)
+            self.emit_left_value(&mut setup, target)
         };
-        output.push_str(&rhs_staged.setup);
+        let (rhs_setup, rhs_value) = right_hand_side.into_parts();
+        setup.extend(rhs_setup);
 
         if let Expression::DotAccess {
             expression: receiver,
+            member,
             ty,
+            resolution,
             ..
         } = target
-            && Self::is_go_imported_type(&receiver.get_type())
-            && self.is_go_nullable(ty)
+            && let Some(target_layout) = self.field_slot_layout(
+                &receiver.get_type(),
+                resolution.declaring_type(),
+                member,
+                ty,
+            )
         {
-            let unwrapped = self.maybe_unwrap_go_nullable(
-                output,
-                &rhs_staged.value,
-                &value.get_type().resolve(),
-            );
-            write_line!(output, "{} = {}", target_str, unwrapped);
-        } else {
-            write_line!(output, "{} = {}", target_str, rhs_staged.value);
+            let source_layout = self.value_layout(&value.get_type(), SlotOrigin::Lisette);
+            let coercion = CoercionPlan::bridge(self, &source_layout, &target_layout);
+            if !coercion.is_identity() {
+                let (coercion_setup, unwrapped) = coercion.lower(self, rhs_value);
+                setup.extend(coercion_setup);
+                setup.push(LoweredStatement::RawGo(format!(
+                    "{} = {}\n",
+                    target_str, unwrapped
+                )));
+                return setup;
+            }
         }
+        setup.push(LoweredStatement::RawGo(format!(
+            "{} = {}\n",
+            target_str, rhs_value
+        )));
+        setup
     }
 
-    fn emit_range_value(
+    pub(crate) fn plan_range_value(
         &mut self,
-        output: &mut String,
         start: &Option<Box<Expression>>,
         end: &Option<Box<Expression>>,
         _inclusive: bool,
         ty: &Type,
-    ) -> String {
-        let type_string = self.go_type_as_string(ty);
+    ) -> ValuePlan {
+        let type_string = self.use_go_type(ty);
 
-        let mut stages: Vec<Staged> = Vec::new();
+        let mut stages: Vec<ValuePlan> = Vec::new();
         let has_start = start.is_some();
         if let Some(s) = start {
-            stages.push(self.stage_operand(s));
+            stages.push(self.plan_operand(s, ExpressionContext::value()));
         }
         if let Some(e) = end {
-            stages.push(self.stage_operand(e));
+            stages.push(self.plan_operand(e, ExpressionContext::value()));
         }
 
         if stages.is_empty() {
-            return "struct{}{}".to_string();
+            return ValuePlan::computed(
+                Vec::new(),
+                GoExpression::composite_literal("struct{}{}".to_string(), false),
+                EvaluationEffect::Pure,
+            );
         }
 
-        let values = self.sequence(output, stages, "_range");
+        let sequenced = self.sequence_values(stages, CaptureBoundary::SiblingSequence, "range");
+        let effect = sequenced.effect;
+        let contains_deferred_evaluation = sequenced.contains_deferred_evaluation();
+        let (setup, values) = sequenced.into_rendered();
         let mut fields = Vec::new();
         if has_start {
             fields.push(("Start".to_string(), values[0].clone()));
@@ -500,125 +583,169 @@ impl Emitter<'_> {
             fields.push(("End".to_string(), values[0].clone()));
         }
 
-        self.emit_struct_literal(&type_string, &fields)
+        let value = emit_struct_literal(&type_string, &fields, ExpressionContext::value());
+        ValuePlan::computed(
+            setup,
+            GoExpression::composite_literal(value, contains_deferred_evaluation),
+            effect,
+        )
     }
 
-    /// Emit a block expression as an operand, returning the result variable name.
-    /// Never-typed blocks diverge and produce no value.
-    fn emit_block_as_operand(
+    /// Plan a `Task`/`Defer` operand.
+    pub(crate) fn plan_async_wrapper(
         &mut self,
-        output: &mut String,
-        expression: &Expression,
-        ty: &Type,
-        items: &[Expression],
-    ) -> String {
-        if ty.is_never() {
-            self.emit_block(output, expression);
-            return String::new();
-        }
-        let resolved = ty.resolve();
-        if resolved.is_unit() || matches!(resolved, Type::Variable(_) | Type::Forall { .. }) {
-            self.emit_block(output, expression);
-            return String::new();
-        }
-        let result_var = self.declare_result_var(output, ty);
-        let needs_braces = items.len() > 1;
-        if needs_braces {
-            output.push_str("{\n");
-        }
-        self.emit_block_to_var_with_braces(output, expression, &result_var, needs_braces);
-        if needs_braces {
-            output.push_str("}\n");
-        }
-        result_var
-    }
-
-    pub(crate) fn with_fresh_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let saved_declared = std::mem::take(&mut self.scope.declared);
-        self.scope.declared = vec![HashSet::default()];
-        let saved_scope_depth = self.scope.scope_depth;
-        self.scope.scope_depth = 0;
-        self.scope.bindings.save();
-
-        let result = f(self);
-
-        self.scope.bindings.restore();
-        self.scope.declared = saved_declared;
-        self.scope.scope_depth = saved_scope_depth;
-        result
-    }
-
-    fn emit_async_wrapper(
-        &mut self,
-        output: &mut String,
         keyword: &str,
         expression: &Expression,
-    ) -> String {
+    ) -> ValuePlan {
         if let Expression::Block { .. } = expression {
-            self.with_fresh_scope(|emitter| {
-                write_line!(output, "{} func() {{", keyword);
-                emitter.emit_block(output, expression);
-                output.push_str("}()\n");
-            });
-            String::new()
-        } else if let Some(call_str) = self.emit_go_call_discarded(output, expression) {
-            format!("{} {}", keyword, call_str)
-        } else {
-            let inner = self.emit_value(output, expression);
-            format!("{} {}", keyword, inner)
+            let body =
+                self.with_isolated_function(|planner| planner.lower_block_as_body(expression));
+            let setup = vec![LoweredStatement::Expression(
+                ExpressionStatementForm::AsyncBlock {
+                    keyword: keyword.to_string(),
+                    body,
+                },
+            )];
+            return ValuePlan::computed(
+                setup,
+                GoExpression::opaque(String::new()),
+                EvaluationEffect::Pure,
+            );
         }
+
+        let mut setup: Vec<LoweredStatement> = Vec::new();
+        if let Some(call_str) = self.emit_go_call_discarded(&mut setup, expression) {
+            return ValuePlan::computed(
+                setup,
+                GoExpression::opaque(format!("{} {}", keyword, call_str)),
+                EvaluationEffect::Pure,
+            );
+        }
+
+        let plan = self.lower_value(
+            expression,
+            ExpressionContext::value().with_capture_boundary(CaptureBoundary::DirectDelayedCall),
+        );
+        if needs_iife_for_async(expression, plan.evaluation.form) {
+            let capture_boundary = if keyword == "defer" {
+                CaptureBoundary::DeferSite
+            } else {
+                CaptureBoundary::TaskSite
+            };
+            let (mut setup, inner) = self
+                .lower_value(
+                    expression,
+                    ExpressionContext::value().with_capture_boundary(capture_boundary),
+                )
+                .into_parts();
+            let mut body_statements = Vec::new();
+            if !inner.is_empty() {
+                let line = if expression.get_type().is_unit() {
+                    format!("{}\n", inner)
+                } else {
+                    format!("_ = {}\n", inner)
+                };
+                body_statements.push(LoweredStatement::RawGo(line));
+            }
+            let body = LoweredBlock {
+                statements: body_statements,
+            };
+            setup.push(LoweredStatement::Expression(
+                ExpressionStatementForm::AsyncBlock {
+                    keyword: keyword.to_string(),
+                    body,
+                },
+            ));
+            return ValuePlan::computed(
+                setup,
+                GoExpression::opaque(String::new()),
+                EvaluationEffect::Pure,
+            );
+        }
+        let (setup, inner) = plan.into_parts();
+        ValuePlan::computed(
+            setup,
+            GoExpression::opaque(format!("{} {}", keyword, inner)),
+            EvaluationEffect::Pure,
+        )
     }
 }
 
-impl Emitter<'_> {
+impl Planner<'_> {
     fn is_go_unaddressable(&self, expression: &Expression) -> bool {
         match expression.unwrap_parens() {
             Expression::Call { .. } => true,
-
             Expression::Identifier { value, ty, .. }
-                if !matches!(ty.resolve(), Type::Function { .. }) =>
+                if !matches!(ty.unwrap_forall(), Type::Function(_)) =>
             {
-                if self.scope.bindings.get(value).is_some() {
-                    return false;
-                }
-                if let Type::Constructor { id, .. } = ty.resolve() {
-                    matches!(
-                        self.ctx.definitions.get(id.as_str()),
-                        Some(Definition::Enum { .. })
-                    )
-                } else {
-                    false
-                }
+                self.identifier_is_unaddressable(value, ty)
             }
-
             Expression::DotAccess { expression, ty, .. }
-                if !matches!(ty.resolve(), Type::Function { .. }) =>
+                if !matches!(ty.unwrap_forall(), Type::Function(_)) =>
             {
-                if let Type::Constructor { id, .. } = ty.resolve() {
-                    if !matches!(
-                        self.ctx.definitions.get(id.as_str()),
-                        Some(Definition::Enum { .. })
-                    ) {
-                        return false;
-                    }
-                    let receiver_ty = expression.get_type().resolve();
-                    if let Type::Constructor {
-                        id: receiver_id, ..
-                    } = &receiver_ty
-                    {
-                        matches!(
-                            self.ctx.definitions.get(receiver_id.as_str()),
-                            Some(Definition::Enum { .. } | Definition::TypeAlias { .. })
-                        )
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+                self.dot_access_is_unaddressable(expression, ty)
             }
-
             _ => false,
         }
     }
+
+    fn identifier_is_unaddressable(&self, value: &str, ty: &Type) -> bool {
+        match self.scope.resolve_identifier_binding(value) {
+            Some(BindingValue::GoName(_) | BindingValue::GoConst(_)) => false,
+            Some(BindingValue::InlineExpr(_)) => true,
+            None => self.ty_is_enum(ty),
+        }
+    }
+
+    fn dot_access_is_unaddressable(&self, receiver: &Expression, ty: &Type) -> bool {
+        if !self.ty_is_enum(ty) {
+            return false;
+        }
+        let Type::Nominal {
+            id: receiver_id, ..
+        } = &receiver.get_type()
+        else {
+            return false;
+        };
+        matches!(
+            self.facts.definition(receiver_id.as_str()).map(|d| &d.body),
+            Some(DefinitionBody::Enum { .. } | DefinitionBody::TypeAlias { .. })
+        )
+    }
+
+    /// Whether `ty` is a nominal type whose definition is an `enum`.
+    fn ty_is_enum(&self, ty: &Type) -> bool {
+        let Type::Nominal { id, .. } = ty else {
+            return false;
+        };
+        matches!(
+            self.facts.definition(id.as_str()).map(|d| &d.body),
+            Some(DefinitionBody::Enum { .. })
+        )
+    }
+}
+
+fn tail_return_slots(planner: &Planner<'_>, inferred: &[Type]) -> Option<Vec<Type>> {
+    let return_ctx = planner.return_ctx();
+    let Some(Type::Tuple(slots)) = return_ctx.ty() else {
+        return None;
+    };
+    (slots.len() == inferred.len()).then(|| slots.clone())
+}
+
+fn is_native_method_call(expression: &Expression) -> bool {
+    matches!(
+        expression.unwrap_parens(),
+        Expression::Call {
+            call_kind: CallKind::NativeMethod(_) | CallKind::NativeMethodIdentifier(_),
+            ..
+        }
+    )
+}
+
+fn needs_iife_for_async(expression: &Expression, form: OperandForm) -> bool {
+    if !is_native_method_call(expression) {
+        return false;
+    }
+    !matches!(form, OperandForm::Call)
 }

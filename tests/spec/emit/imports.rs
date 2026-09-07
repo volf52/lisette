@@ -1,4 +1,29 @@
+use crate::_harness::emit::emit_with_go_typedefs;
 use crate::{assert_emit_snapshot, assert_emit_snapshot_with_go_typedefs};
+
+#[test]
+fn embedded_imported_non_stringer_string_method_blocks_shadow() {
+    let input = r#"
+import "go:example.com/lib"
+
+#[display]
+struct D { pub x: int }
+
+struct C {
+  embed lib.N,
+  embed D,
+  pub value: int,
+}
+"#;
+    let typedef = r#"
+pub struct N {}
+
+impl N {
+  pub fn String(self) -> int
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/lib", typedef)]);
+}
 
 #[test]
 fn import_single() {
@@ -131,7 +156,7 @@ import h "utils/helpers"
 import "go:fmt"
 
 fn test() {
-  fmt.Print("Local module with alias")
+  fmt.Print("Local package with alias")
 }
 "#;
     assert_emit_snapshot!(input);
@@ -152,6 +177,21 @@ fn main() {}
 }
 
 #[test]
+fn aliased_go_import_used_by_enum_layout() {
+    let input = r#"
+import t "go:time"
+
+enum Event {
+  At(t.Time),
+  After { delay: t.Duration },
+}
+
+fn main() {}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn go_opaque_type_struct_literal() {
     let input = r#"
 import "go:sync"
@@ -163,6 +203,272 @@ fn test() {
 }
 "#;
     assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_opaque_type_with_internal_pointer_field_struct_literal() {
+    let input = r#"
+import "go:time"
+
+fn test() -> bool {
+  let t = time.Time{}
+  t.IsZero()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_partially_hidden_struct_autofill_struct_literal() {
+    let input = r#"
+import "go:container/ring"
+
+fn test() -> int {
+  let r = ring.Ring { Value: 1, .. }
+  match assert_type<int>(r.Value) {
+    Some(n) => n,
+    None => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_partially_hidden_struct_spread_update_needs_no_curation() {
+    let input = r#"
+import "go:archive/zip"
+
+fn test(base: zip.File) -> zip.File {
+  zip.File { FileHeader: base.FileHeader, ..base }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_struct_with_unexported_embed_autofills() {
+    let input = r#"
+import "go:runtime"
+
+fn test() {
+  let mut p = runtime.Pinner { .. }
+  p.Unpin()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_struct_autofill_leaves_omitted_map_field_nil() {
+    let input = r#"
+import "go:encoding/pem"
+
+fn test() -> string {
+  let b = pem.Block { Type: "X", .. }
+  match b.Headers {
+    Some(headers) => headers["key"],
+    None => "",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_struct_map_field_written_through_some() {
+    let input = r#"
+import "go:encoding/pem"
+
+fn test() -> string {
+  let mut headers = Map.new<string, string>()
+  headers["key"] = "value"
+  let b = pem.Block { Type: "X", Headers: Some(headers), .. }
+  match b.Headers {
+    Some(h) => h["key"],
+    None => "",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_struct_autofill_writes_omitted_named_map_field() {
+    let input = r#"
+import "go:net/url"
+
+struct Wrapper { values: mut url.Values }
+
+fn test() -> string {
+  let mut w = Wrapper { .. }
+  w.values.Add("key", "value")
+  w.values.Get("key")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_named_map_type_autofill_emits_empty_go_literal() {
+    let input = r#"
+import "go:net/url"
+
+fn test() -> string {
+  let mut v = url.Values{..}
+  v.Add("key", "value")
+  v.Get("key")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_named_scalar_type_autofill_emits_conversion() {
+    let input = r#"
+import "go:time"
+
+fn test() -> string {
+  time.Duration{..}.String()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_named_slice_type_autofill_emits_nil_conversion() {
+    let input = r#"
+import "go:sort"
+
+fn test() -> int {
+  sort.StringSlice{..}.Len()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_chained_named_type_autofill_peels_to_its_go_underlying() {
+    let input = r#"
+import "go:example.com/lib"
+
+fn index() -> lib.Index {
+  lib.Index{..}
+}
+
+fn tally() -> lib.Tally {
+  lib.Tally{..}
+}
+
+fn roster() -> lib.Roster {
+  lib.Roster{..}
+}
+"#;
+    let typedef = r#"
+pub struct Table(mut Map<string, int>)
+
+pub struct Index(mut Table)
+
+pub struct Count(int64)
+
+pub struct Tally(Count)
+
+pub struct Names(mut Slice<string>)
+
+pub struct Roster(mut Names)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/lib", typedef)]);
+}
+
+#[test]
+fn go_opaque_type_autofill_spread() {
+    let input = r#"
+import "go:sync"
+
+fn test() {
+  let mut wg = sync.WaitGroup { .. }
+  wg.Add(1)
+  wg.Wait()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lisette_struct_with_go_imported_field_autofills() {
+    let input = r#"
+import "go:net/http"
+
+struct Wrapper { srv: http.Server }
+
+fn test() -> Wrapper {
+  Wrapper { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lisette_struct_with_go_named_scalar_autofills() {
+    let input = r#"
+import "go:time"
+
+struct Wrapper { d: time.Duration }
+
+fn test() -> Wrapper {
+  Wrapper { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lisette_struct_with_go_named_slice_autofills_to_nil() {
+    let input = r#"
+import "go:sort"
+
+struct Wrapper { s: mut sort.StringSlice }
+
+fn test() -> Wrapper {
+  Wrapper { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lisette_struct_with_go_interface_field_emits() {
+    let input = r#"
+import "go:context"
+
+struct Wrapper { ctx: context.Context }
+
+fn test() -> Wrapper {
+  Wrapper { ctx: context.Background() }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_underscored_type_and_field_names_stay_verbatim() {
+    let input = r#"
+import "go:example.com/lib"
+
+fn test() -> int {
+  let mut s = lib.Stat_t{..}
+  s.Pad_cgo_0 = 1
+  let t = lib.Stat_t{ Pad_cgo_0: s.Pad_cgo_0, .. }
+  t.Pad_cgo_0
+}
+"#;
+    let typedef = r#"
+pub struct Stat_t {
+  pub Pad_cgo_0: int,
+  pub Size: int,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/lib", typedef)]);
 }
 
 #[test]
@@ -213,7 +519,7 @@ pub struct Program {}
 }
 
 #[test]
-fn two_versioned_modules_with_distinct_package_names_coexist() {
+fn two_versioned_packages_with_distinct_package_names_coexist() {
     let input = r#"
 import "go:example.com/bubbletea/v2"
 import "go:example.com/lipgloss/v2"
@@ -237,6 +543,36 @@ pub struct Style {}
             ("go:example.com/bubbletea/v2", tea_typedef),
             ("go:example.com/lipgloss/v2", lipgloss_typedef),
         ]
+    );
+}
+
+#[test]
+fn distinct_versioned_packages_do_not_falsely_collide() {
+    let sdp = r#"
+pub struct SessionDescription {}
+"#;
+    let dtls = r#"
+pub struct Config {}
+"#;
+    let input = r#"
+import "go:example.com/sdp/v3"
+import "go:example.com/dtls/v3"
+
+fn make() {
+  let _ = sdp.SessionDescription {}
+  let _ = dtls.Config {}
+}
+"#;
+    let result = emit_with_go_typedefs(
+        input,
+        &[
+            ("go:example.com/sdp/v3", sdp),
+            ("go:example.com/dtls/v3", dtls),
+        ],
+    );
+    assert!(
+        !result.files.is_empty(),
+        "distinct `/v3` packages must emit successfully"
     );
 }
 
@@ -288,6 +624,21 @@ pub interface Event {}
 }
 
 #[test]
+fn go_imported_const_underscore_preserved() {
+    let input = r#"
+import "go:example.com/grpc_health_v1"
+
+fn main() {
+  let _ = grpc_health_v1.HealthCheckResponse_SERVING
+}
+"#;
+    let typedef = r#"
+pub const HealthCheckResponse_SERVING: int = 1
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/grpc_health_v1", typedef)]);
+}
+
+#[test]
 fn package_local_option_alias_does_not_collide_with_prelude_option() {
     // Regression: a Go module that declares its own `type Option = ...`
     // (e.g. the functional-options pattern) would trip `Type::is_option`
@@ -308,4 +659,138 @@ pub type Option = fn(Ref<Validate>) -> ()
 pub fn WithOption() -> Option
 "#;
     assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/validator", typedef)]);
+}
+
+#[test]
+fn import_filter_ignores_package_alias_in_string_literal() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/lib"
+
+fn test() {
+  let s: lib.IntSlice = [1]
+  fmt.Println("lib.", s[0])
+}
+"#;
+    let typedef = r#"
+pub type IntSlice = Slice<int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/lib", typedef)]);
+}
+
+#[test]
+fn import_filter_handles_apostrophe_in_doc_comments() {
+    let input = r#"
+import "go:fmt"
+import "go:example.com/lib"
+
+/// Doesn't do much.
+pub fn first() {
+  fmt.Println(lib.Value)
+}
+
+/// Doesn't do much either.
+pub fn second() {
+  fmt.Println("done")
+}
+"#;
+    let typedef = r#"
+pub const Value: int = 1
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/lib", typedef)]);
+}
+
+#[test]
+fn gopkg_in_dotted_version_path_resolves_package() {
+    let input = r#"
+import "go:gopkg.in/yaml.v3"
+
+fn test() {
+  let _ = yaml.Decoder{}
+}
+"#;
+    let typedef = r#"// Package: yaml
+
+pub struct Decoder {}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:gopkg.in/yaml.v3", typedef)]);
+}
+
+#[test]
+fn gopkg_in_package_const_access_emits_correct_qualifier() {
+    let input = r#"
+import "go:gopkg.in/yaml.v3"
+
+fn test() {
+  let _ = yaml.ScalarNode
+}
+"#;
+    let typedef = r#"// Package: yaml
+
+pub struct Kind(uint32)
+pub const ScalarNode: Kind = 8
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:gopkg.in/yaml.v3", typedef)]);
+}
+
+#[test]
+fn gopkg_in_instance_method_emits_correct_qualifier() {
+    let input = r#"
+import "go:gopkg.in/yaml.v3"
+
+fn test() {
+  let mut d = yaml.Decoder{}
+  d.KnownFields(true)
+}
+"#;
+    let typedef = r#"// Package: yaml
+
+pub struct Decoder {}
+
+impl Decoder {
+  pub fn KnownFields(self: Ref<Decoder>, enable: bool)
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:gopkg.in/yaml.v3", typedef)]);
+}
+
+#[test]
+fn gopkg_in_struct_pattern_match_emits_correct_qualifier() {
+    let input = r#"
+import "go:gopkg.in/yaml.v3"
+
+fn describe(e: yaml.TypeError) -> int {
+  match e {
+    yaml.TypeError { Errors: errs } => errs.length(),
+  }
+}
+"#;
+    let typedef = r#"// Package: yaml
+
+pub struct TypeError {
+  pub Errors: Slice<string>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:gopkg.in/yaml.v3", typedef)]);
+}
+
+#[test]
+fn cross_package_non_generic_alias_call_emits_without_type_args() {
+    let input = r#"
+import "go:example.com/cli"
+
+fn make() -> Ref<cli.StringFlag> {
+  &cli.StringFlag { Name: "n", Value: "v", .. }
+}
+"#;
+    let typedef = r#"
+pub struct FlagBase<T, C> {
+  pub Name: string,
+  pub Value: T,
+  pub Config: C,
+}
+
+pub type StringFlag = FlagBase<string, int>
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/cli", typedef)]);
 }

@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Empty {}\n"
+description: |
+  
+  struct Empty {}
 ---
 [
     Struct {
@@ -13,8 +15,9 @@ description: "input: \nstruct Empty {}\n"
             byte_length: 5,
         },
         generics: [],
-        fields: [],
-        kind: Record,
+        fields: Record(
+            [],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,

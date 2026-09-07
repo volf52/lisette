@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nconst PI: float64 = 3.14159;\n"
+description: |
+  
+  const PI: float64 = 3.14159;
 ---
 [
     Const {
@@ -22,24 +24,26 @@ description: "input: \nconst PI: float64 = 3.14159;\n"
                 },
             },
         ),
-        expression: Literal {
-            literal: Float {
-                value: 3.14159,
-                text: None,
+        expression: Value(
+            Literal {
+                literal: Float {
+                    value: 3.14159,
+                    text: None,
+                },
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 21,
+                    byte_length: 7,
+                },
             },
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 21,
-                byte_length: 7,
-            },
-        },
-        visibility: Private,
-        ty: Variable(
-            -1,
         ),
+        visibility: Private,
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

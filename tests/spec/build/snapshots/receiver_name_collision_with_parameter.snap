@@ -4,14 +4,8 @@ source: tests/spec/build/mod.rs
 // === builder/mod.go ===
 package builder
 
-import "fmt"
-
 type StringBuilder struct {
 	Content string
-}
-
-func (s StringBuilder) String() string {
-	return fmt.Sprintf("StringBuilder { content: %v }", s.Content)
 }
 
 func (ss StringBuilder) Append(s string) StringBuilder {
@@ -26,5 +20,6 @@ import "github.com/user/myproject/builder"
 
 func main() {
 	sb := builder.StringBuilder{Content: "hello"}
-	_ = sb.Append(" world")
+	sb2 := sb.Append(" world")
+	_ = sb2
 }

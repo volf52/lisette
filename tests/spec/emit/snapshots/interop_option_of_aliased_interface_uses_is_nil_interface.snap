@@ -1,6 +1,16 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:example.com/evts\"\nimport \"go:fmt\"\n\nfn main() {\n  match evts.Peek() {\n    Some(e) => fmt.Println(e),\n    None => fmt.Println(\"none\"),\n  }\n}\n"
+description: |
+  
+  import "go:example.com/evts"
+  import "go:fmt"
+  
+  fn main() {
+    match evts.Peek() {
+      Some(e) => fmt.Println(e),
+      None => fmt.Println("none"),
+    }
+  }
 ---
 package main
 
@@ -11,15 +21,9 @@ import (
 )
 
 func main() {
-	raw_2 := evts.Peek()
-	var subject_1 lisette.Option[evts.Msg]
-	if !lisette.IsNilInterface(raw_2) {
-		subject_1 = lisette.MakeOptionSome[evts.Msg](raw_2)
-	} else {
-		subject_1 = lisette.MakeOptionNone[evts.Msg]()
-	}
-	if subject_1.Tag == lisette.OptionSome {
-		e := subject_1.SomeVal
+	ret_1 := evts.Peek()
+	if !lisette.IsNilInterface(ret_1) {
+		e := ret_1
 		fmt.Println(e)
 	} else {
 		fmt.Println("none")

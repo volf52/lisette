@@ -5,11 +5,14 @@ use syntax::ParseError;
 use crate::LisetteDiagnostic;
 
 #[derive(Debug, Default)]
-pub struct DiagnosticSink {
+pub struct LocalSink {
     diagnostics: RefCell<Vec<LisetteDiagnostic>>,
 }
 
-impl DiagnosticSink {
+#[derive(Debug)]
+pub struct DiagnosticCheckpoint(usize);
+
+impl LocalSink {
     pub fn new() -> Self {
         Self::default()
     }
@@ -22,24 +25,42 @@ impl DiagnosticSink {
         self.diagnostics.borrow().iter().any(|d| d.is_error())
     }
 
-    pub fn len(&self) -> usize {
-        self.diagnostics.borrow().len()
+    pub fn any(&self, predicate: impl FnMut(&LisetteDiagnostic) -> bool) -> bool {
+        self.diagnostics.borrow().iter().any(predicate)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.diagnostics.borrow().is_empty()
+    pub fn error_label_points(&self) -> Vec<(u32, usize)> {
+        self.diagnostics
+            .borrow()
+            .iter()
+            .filter(|d| d.is_error())
+            .flat_map(LisetteDiagnostic::label_points)
+            .collect()
     }
 
-    pub fn to_vec(&self) -> Vec<LisetteDiagnostic> {
-        self.diagnostics.borrow().clone()
+    pub fn checkpoint(&self) -> DiagnosticCheckpoint {
+        DiagnosticCheckpoint(self.diagnostics.borrow().len())
     }
 
-    pub fn take(&self) -> Vec<LisetteDiagnostic> {
-        self.diagnostics.take()
+    pub fn into_diagnostics(self) -> Vec<LisetteDiagnostic> {
+        self.diagnostics.into_inner()
     }
 
-    pub fn truncate(&self, len: usize) {
-        self.diagnostics.borrow_mut().truncate(len);
+    pub fn into_diagnostics_since(
+        self,
+        checkpoint: DiagnosticCheckpoint,
+    ) -> (Vec<LisetteDiagnostic>, Vec<LisetteDiagnostic>) {
+        let mut before = self.into_diagnostics();
+        let since = before.split_off(checkpoint.0);
+        (before, since)
+    }
+
+    pub fn rollback(&self, checkpoint: DiagnosticCheckpoint) {
+        self.diagnostics.borrow_mut().truncate(checkpoint.0);
+    }
+
+    pub fn has_changed_since(&self, checkpoint: DiagnosticCheckpoint) -> bool {
+        self.diagnostics.borrow().len() != checkpoint.0
     }
 
     pub fn extend(&self, diagnostics: impl IntoIterator<Item = LisetteDiagnostic>) {
@@ -49,5 +70,14 @@ impl DiagnosticSink {
     pub fn extend_parse_errors(&self, errors: Vec<ParseError>) {
         let diagnostics = errors.into_iter().map(LisetteDiagnostic::from);
         self.diagnostics.borrow_mut().extend(diagnostics);
+    }
+
+    pub fn merge(sinks: Vec<LocalSink>) -> Vec<LisetteDiagnostic> {
+        let mut all: Vec<LisetteDiagnostic> = sinks
+            .into_iter()
+            .flat_map(LocalSink::into_diagnostics)
+            .collect();
+        all.sort_by(LisetteDiagnostic::sort_key);
+        all
     }
 }

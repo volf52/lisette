@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"go/types"
 	"strings"
+
+	"github.com/ivov/lisette/bindgen/internal/extract"
 )
 
 type SkipReason struct {
@@ -16,28 +18,60 @@ type TypeResult struct {
 	LisetteType          string
 	SkipReason           *SkipReason
 	CommaOk              bool // true when return type comes from a (T, bool) comma-ok pattern
-	ArrayReturn          bool // true when Go type is [N]T but Lisette type is Slice<T>
 	IsDirectError        bool // true when *T where T implements error was auto-detected as error value
 	NilableReturnApplied bool // set when per-element wrapping already occurred; callers must skip whole-return wrap to avoid double-wrapping
 }
 
 func ToLisette(t types.Type, conv *Converter) TypeResult {
-	return toLisetteRecursive(t, make(map[types.Type]bool), conv)
+	return toLisetteRecursive(t, make(map[types.Type]bool), conv, nil)
+}
+
+func toLisetteWithSubstitutions(t types.Type, conv *Converter, substitutions map[string]string) TypeResult {
+	return toLisetteRecursive(t, make(map[types.Type]bool), conv, substitutions)
 }
 
 // ToLisetteNilable converts a Go type to Lisette, wrapping pointer and
 // interface types in Option<>. Used for struct fields and collection elements
 // where Go pointers/interfaces can be nil.
 func ToLisetteNilable(t types.Type, conv *Converter) TypeResult {
-	return toLisetteNilableRecursive(t, make(map[types.Type]bool), conv)
+	return toLisetteNilableRecursive(t, make(map[types.Type]bool), conv, nil)
 }
 
-// isNilableGoType returns true if the Go type is a pointer or a named
-// non-error interface — types that can be nil in Go.
+// convertParamType wraps a `*T` parameter in `Option<>` when it was proven to
+// accept nil, for Go APIs where nil means "use the default".
+func convertParamType(t types.Type, optional bool, conv *Converter, substitutions map[string]string) TypeResult {
+	if optional {
+		return toLisetteNilableRecursive(t, make(map[types.Type]bool), conv, substitutions)
+	}
+	return toLisetteWithSubstitutions(t, conv, substitutions)
+}
+
+// isDemotableGoType reports whether a proven nil path demotes t to Option.
+func isDemotableGoType(t types.Type) bool {
+	if isNilableGoType(t) {
+		return true
+	}
+	switch types.Unalias(t).Underlying().(type) {
+	case *types.Map, *types.Chan:
+		return true
+	}
+	return false
+}
+
+// isNamedMap reports whether t is a named map type, such as url.Values.
+func isNamedMap(t *types.Named) bool {
+	_, ok := t.Underlying().(*types.Map)
+	return ok
+}
+
+// isNilableGoType reports whether t is a Go-nilable type (pointer or non-empty non-error interface).
 func isNilableGoType(t types.Type) bool {
+	t = types.Unalias(t)
 	switch t := t.(type) {
 	case *types.Pointer:
 		return true
+	case *types.Interface:
+		return !t.Empty() && !isErrorInterface(t)
 	case *types.Named:
 		switch u := t.Underlying().(type) {
 		case *types.Pointer:
@@ -48,7 +82,7 @@ func isNilableGoType(t types.Type) bool {
 	}
 	return false
 }
-func toLisetteRecursive(t types.Type, seen map[types.Type]bool, conv *Converter) TypeResult {
+func toLisetteRecursive(t types.Type, seen map[types.Type]bool, conv *Converter, substitutions map[string]string) TypeResult {
 	if seen[t] {
 		return TypeResult{LisetteType: "Unknown"}
 	}
@@ -60,56 +94,53 @@ func toLisetteRecursive(t types.Type, seen map[types.Type]bool, conv *Converter)
 		return TypeResult{LisetteType: basicToLisette(t)}
 
 	case *types.Slice:
-		elem := toLisetteRecursive(t.Elem(), seen, conv)
+		elem := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
 		if elem.SkipReason != nil {
 			return elem
 		}
-		return TypeResult{LisetteType: fmt.Sprintf("Slice<%s>", elem.LisetteType)}
+		return TypeResult{LisetteType: sliceOf(elem.LisetteType)}
 
 	case *types.Array:
-		element := toLisetteRecursive(t.Elem(), seen, conv)
-		if element.SkipReason != nil {
-			return element
+		elem := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
+		if elem.SkipReason != nil {
+			return elem
 		}
-		return TypeResult{
-			LisetteType: fmt.Sprintf("Slice<%s>", element.LisetteType),
-			ArrayReturn: true,
-		}
+		return TypeResult{LisetteType: arrayOf(elem.LisetteType, t.Len())}
 
 	case *types.Map:
-		key := toLisetteRecursive(t.Key(), seen, conv)
+		key := toLisetteRecursive(t.Key(), seen, conv, substitutions)
 		if key.SkipReason != nil {
 			return key
 		}
-		val := toLisetteRecursive(t.Elem(), seen, conv)
+		val := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
 		if val.SkipReason != nil {
 			return val
 		}
-		return TypeResult{LisetteType: fmt.Sprintf("Map<%s, %s>", key.LisetteType, val.LisetteType)}
+		return TypeResult{LisetteType: mapOf(key.LisetteType, val.LisetteType)}
 
 	case *types.Pointer:
-		elem := toLisetteRecursive(t.Elem(), seen, conv)
+		elem := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
 		if elem.SkipReason != nil {
 			return elem
 		}
-		return TypeResult{LisetteType: fmt.Sprintf("Ref<%s>", elem.LisetteType)}
+		return TypeResult{LisetteType: refOf(elem.LisetteType)}
 
 	case *types.Chan:
-		elem := toLisetteRecursive(t.Elem(), seen, conv)
+		elem := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
 		if elem.SkipReason != nil {
 			return elem
 		}
 		switch t.Dir() {
 		case types.SendRecv:
-			return TypeResult{LisetteType: fmt.Sprintf("Channel<%s>", elem.LisetteType)}
+			return TypeResult{LisetteType: channelOf(elem.LisetteType)}
 		case types.RecvOnly:
-			return TypeResult{LisetteType: fmt.Sprintf("Receiver<%s>", elem.LisetteType)}
+			return TypeResult{LisetteType: receiverOf(elem.LisetteType)}
 		default: // types.SendOnly
-			return TypeResult{LisetteType: fmt.Sprintf("Sender<%s>", elem.LisetteType)}
+			return TypeResult{LisetteType: senderOf(elem.LisetteType)}
 		}
 
 	case *types.Signature:
-		return signatureToLisette(t, seen, conv)
+		return signatureToLisette(t, seen, conv, substitutions)
 
 	case *types.Interface:
 		if t.Empty() {
@@ -121,22 +152,26 @@ func toLisetteRecursive(t types.Type, seen map[types.Type]bool, conv *Converter)
 		return TypeResult{LisetteType: "Unknown"}
 
 	case *types.Named:
-		return namedToLisette(t, seen, conv)
+		return namedToLisette(t, seen, conv, substitutions)
 
 	case *types.TypeParam:
-		return TypeResult{LisetteType: t.Obj().Name()}
+		name := t.Obj().Name()
+		if substituted, ok := substitutions[name]; ok {
+			return TypeResult{LisetteType: substituted}
+		}
+		return TypeResult{LisetteType: name}
 
 	case *types.Struct:
 		if t.NumFields() == 0 {
 			return TypeResult{LisetteType: "()"}
 		}
-		return TypeResult{SkipReason: &SkipReason{
-			Code:    "anonymous-struct",
-			Message: "anonymous struct types are not supported",
-		}}
+		if conv == nil {
+			return TypeResult{SkipReason: anonStructSkip()}
+		}
+		return conv.internAnonStruct(t)
 
 	case *types.Alias:
-		return toLisetteRecursive(t.Rhs(), seen, conv)
+		return toLisetteRecursive(t.Rhs(), seen, conv, substitutions)
 
 	default:
 		return TypeResult{SkipReason: &SkipReason{
@@ -172,12 +207,18 @@ func basicToLisette(t *types.Basic) string {
 	case types.Int16:
 		return "int16"
 	case types.Int32:
+		if t.Name() == "rune" {
+			return "rune"
+		}
 		return "int32"
 	case types.Int64:
 		return "int64"
 	case types.Uint:
 		return "uint"
 	case types.Uint8:
+		if t.Name() == "byte" {
+			return "byte"
+		}
 		return "uint8"
 	case types.Uint16:
 		return "uint16"
@@ -186,7 +227,7 @@ func basicToLisette(t *types.Basic) string {
 	case types.Uint64:
 		return "uint64"
 	case types.Uintptr:
-		return "uint"
+		return "uintptr"
 	case types.Float32:
 		return "float32"
 	case types.Float64:
@@ -197,17 +238,19 @@ func basicToLisette(t *types.Basic) string {
 		return "complex128"
 	case types.String:
 		return "string"
+	case types.UnsafePointer:
+		return "Unknown"
 	default:
 		return "Unknown"
 	}
 }
 
-func signatureToLisette(signature *types.Signature, seen map[types.Type]bool, conv *Converter) TypeResult {
+func signatureToLisette(signature *types.Signature, seen map[types.Type]bool, conv *Converter, substitutions map[string]string) TypeResult {
 	var params []string
 
 	param := signature.Params()
 	for param := range param.Variables() {
-		paramType := toLisetteRecursive(param.Type(), seen, conv)
+		paramType := writableRecursive(param.Type(), seen, conv, substitutions, false)
 		if paramType.SkipReason != nil {
 			return paramType
 		}
@@ -221,7 +264,7 @@ func signatureToLisette(signature *types.Signature, seen map[types.Type]bool, co
 
 	returnType := "()"
 	if signature.Results().Len() > 0 {
-		ret := returnsToLisetteRecursive(signature, seen, conv, "")
+		ret := returnsToLisetteRecursive(signature, seen, conv, nil, "", substitutions)
 		if ret.SkipReason != nil {
 			return ret
 		}
@@ -231,16 +274,9 @@ func signatureToLisette(signature *types.Signature, seen map[types.Type]bool, co
 	return TypeResult{LisetteType: fmt.Sprintf("fn(%s) -> %s", strings.Join(params, ", "), returnType)}
 }
 
-func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter) TypeResult {
+func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter, substitutions map[string]string) TypeResult {
 	obj := t.Obj()
 	pkg := obj.Pkg()
-
-	if pkg != nil && pkg.Path() == "unsafe" && obj.Name() == "Pointer" {
-		return TypeResult{SkipReason: &SkipReason{
-			Code:    "unsafe.Pointer",
-			Message: "unsafe.Pointer cannot be represented",
-		}}
-	}
 
 	if obj.Name() == "error" && pkg == nil {
 		return TypeResult{LisetteType: "error"}
@@ -249,19 +285,37 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter) T
 	isExternal := false
 	pkgPrefix := ""
 	if pkg != nil && conv != nil && pkg.Path() != conv.currentPkgPath {
-		if isInternalPackagePath(pkg.Path()) {
+		if extract.IsInternalPackagePath(pkg.Path()) {
 			return TypeResult{SkipReason: &SkipReason{
 				Code:    "internal-package-ref",
 				Message: fmt.Sprintf("references type from internal package %q", pkg.Path()),
 			}}
 		}
 		isExternal = true
-		pkgPrefix = pkg.Name()
+		// Sentinel-wrapped path; the emitter resolves it after collision detection.
+		pkgPrefix = PkgRef(pkg.Path())
 		conv.trackExternalPkg(pkg.Path(), pkg.Name())
 	}
 
 	if !isExternal && !obj.Exported() {
-		return toLisetteRecursive(t.Underlying(), seen, conv)
+		if conv != nil && !conv.hasReachableUnexportedType(t) {
+			return TypeResult{LisetteType: "Unknown"}
+		}
+		if namedImplementsError(t) {
+			return TypeResult{LisetteType: "error"}
+		}
+		if conv != nil {
+			if iface := conv.bestImplementedInterface(t); iface != nil {
+				return toLisetteRecursive(iface, seen, conv, substitutions)
+			}
+		}
+		if s, ok := t.Underlying().(*types.Struct); ok && s.NumFields() > 0 {
+			return TypeResult{SkipReason: &SkipReason{
+				Code:    "opaque-unexported-struct",
+				Message: fmt.Sprintf("underlying type %q is unexported", obj.Name()),
+			}}
+		}
+		return toLisetteRecursive(t.Underlying(), seen, conv, substitutions)
 	}
 
 	typeName := obj.Name()
@@ -270,7 +324,7 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter) T
 	if typeArgs != nil && typeArgs.Len() > 0 {
 		var args []string
 		for arg := range typeArgs.Types() {
-			result := toLisetteRecursive(arg, seen, conv)
+			result := toLisetteRecursive(arg, seen, conv, substitutions)
 			if result.SkipReason != nil {
 				return result
 			}
@@ -278,6 +332,8 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter) T
 		}
 		if isExternal {
 			typeName = pkgPrefix + "." + obj.Name()
+		} else if pkg != nil {
+			typeName = SelfQualify(pkg.Name(), obj.Name(), t.Origin().TypeParams().Len())
 		}
 		return TypeResult{LisetteType: fmt.Sprintf("%s<%s>", typeName, strings.Join(args, ", "))}
 	}
@@ -290,81 +346,243 @@ func namedToLisette(t *types.Named, seen map[types.Type]bool, conv *Converter) T
 		return TypeResult{LisetteType: pkgPrefix + "." + obj.Name()}
 	}
 
-	return TypeResult{LisetteType: typeName}
+	return TypeResult{LisetteType: SelfQualify(pkg.Name(), obj.Name(), 0)}
+}
+
+var preludeGenericArity = map[string]int{"Option": 1, "Result": 2, "Partial": 2}
+
+// builtinNameCollisions bind at every arity, so a package's own type of that name
+// always needs qualifying. Only `Array` (the checker's fixed-size `Array<T, N>`).
+var builtinNameCollisions = map[string]bool{"Array": true}
+
+// CollidesWithBuiltinType reports whether a bare `name` at `arity` binds to a built-in.
+func CollidesWithBuiltinType(typeName string, arity int) bool {
+	if builtinNameCollisions[typeName] {
+		return true
+	}
+	a, ok := preludeGenericArity[typeName]
+	return ok && a == arity
+}
+
+// SelfQualify qualifies a colliding type name with its package (declarations stay bare).
+func SelfQualify(pkgName, typeName string, arity int) string {
+	if CollidesWithBuiltinType(typeName, arity) {
+		return pkgName + "." + typeName
+	}
+	return typeName
+}
+
+// wrapOption wraps a converted type in `Option<...>`, propagating SkipReason.
+func wrapOption(r TypeResult) TypeResult {
+	if r.SkipReason != nil {
+		return r
+	}
+	return TypeResult{LisetteType: optionOf(r.LisetteType)}
+}
+
+// WritableFieldType renders a struct-field or newtype-underlying type with `mut` at every writable layer.
+func WritableFieldType(t types.Type, conv *Converter) TypeResult {
+	return writableRecursive(t, make(map[types.Type]bool), conv, nil, true)
+}
+
+// writableParamType renders a mutated parameter's type with `mut` at every writable layer.
+func writableParamType(t types.Type, optional bool, conv *Converter, substitutions map[string]string) TypeResult {
+	if iface, ok := t.Underlying().(*types.Interface); ok && iface.Empty() {
+		rendered := writableBase(t, make(map[types.Type]bool), conv, substitutions, optional)
+		if rendered.SkipReason == nil {
+			rendered.LisetteType = "mut " + rendered.LisetteType
+		}
+		return rendered
+	}
+	return writableRecursive(t, make(map[types.Type]bool), conv, substitutions, optional)
+}
+
+// outerWritableType carries `mut` on the outermost layer only. A named type
+// is left alone, since its qualifier unlocks the whole declaration rather
+// than one layer, and the shared storage sits inside.
+func outerWritableType(t types.Type, seen map[types.Type]bool, conv *Converter, substitutions map[string]string) TypeResult {
+	rendered := toLisetteRecursive(t, seen, conv, substitutions)
+	concrete := concreteResultType(t)
+	if rendered.SkipReason != nil || !goWritableCapability(concrete) {
+		return rendered
+	}
+	if _, named := types.Unalias(concrete).(*types.Named); named {
+		return rendered
+	}
+	return TypeResult{LisetteType: "mut " + rendered.LisetteType}
+}
+
+// writableBase is the read-only rendering the writable one decorates.
+func writableBase(t types.Type, seen map[types.Type]bool, conv *Converter, substitutions map[string]string, nilable bool) TypeResult {
+	if nilable {
+		return toLisetteNilableRecursive(t, seen, conv, substitutions)
+	}
+	return toLisetteRecursive(t, seen, conv, substitutions)
+}
+
+func writableRecursive(t types.Type, seen map[types.Type]bool, conv *Converter, substitutions map[string]string, nilable bool) TypeResult {
+	switch u := t.(type) {
+	case *types.Pointer:
+		if nilable && isScalarType(u.Elem()) {
+			return toLisetteNilableRecursive(t, seen, conv, substitutions)
+		}
+		var elem TypeResult
+		if _, isNamed := types.Unalias(u.Elem()).(*types.Named); isNamed {
+			elem = writableBase(u.Elem(), seen, conv, substitutions, false)
+		} else {
+			elem = writableRecursive(u.Elem(), seen, conv, substitutions, false)
+		}
+		if elem.SkipReason != nil {
+			return elem
+		}
+		rendered := "mut " + refOf(elem.LisetteType)
+		if nilable {
+			rendered = optionOf(rendered)
+		}
+		return TypeResult{LisetteType: rendered}
+
+	case *types.Slice:
+		elem := writableRecursive(u.Elem(), seen, conv, substitutions, nilable)
+		if elem.SkipReason != nil {
+			return elem
+		}
+		return TypeResult{LisetteType: "mut " + sliceOf(elem.LisetteType)}
+
+	case *types.Map:
+		key := writableRecursive(u.Key(), seen, conv, substitutions, false)
+		if key.SkipReason != nil {
+			return key
+		}
+		val := writableRecursive(u.Elem(), seen, conv, substitutions, nilable)
+		if val.SkipReason != nil {
+			return val
+		}
+		rendered := "mut " + mapOf(key.LisetteType, val.LisetteType)
+		if nilable {
+			rendered = optionOf(rendered)
+		}
+		return TypeResult{LisetteType: rendered}
+
+	case *types.Array:
+		elem := writableRecursive(u.Elem(), seen, conv, substitutions, nilable)
+		if elem.SkipReason != nil {
+			return elem
+		}
+		return TypeResult{LisetteType: arrayOf(elem.LisetteType, u.Len())}
+
+	case *types.Named:
+		if goWritableCapability(u) {
+			// Option goes outside `mut`: Option<mut url.Values>.
+			wrapNil := nilable && isNamedMap(u)
+			rendered := writableBase(t, seen, conv, substitutions, nilable && !wrapNil)
+			if rendered.SkipReason != nil {
+				return rendered
+			}
+			rendered.LisetteType = "mut " + rendered.LisetteType
+			if wrapNil {
+				rendered.LisetteType = optionOf(rendered.LisetteType)
+			}
+			return rendered
+		}
+		return writableBase(t, seen, conv, substitutions, nilable)
+
+	case *types.TypeParam:
+		rendered := writableBase(t, seen, conv, substitutions, nilable)
+		if rendered.SkipReason != nil {
+			return rendered
+		}
+		if core := coreType(u); core != nil && goWritableCapability(core) {
+			rendered.LisetteType = "mut " + rendered.LisetteType
+		}
+		return rendered
+
+	case *types.Struct:
+		rendered := writableBase(t, seen, conv, substitutions, nilable)
+		if rendered.SkipReason == nil && goWritableCapability(u) {
+			rendered.LisetteType = "mut " + rendered.LisetteType
+		}
+		return rendered
+
+	case *types.Alias:
+		return writableRecursive(u.Rhs(), seen, conv, substitutions, nilable)
+
+	default:
+		return writableBase(t, seen, conv, substitutions, nilable)
+	}
 }
 
 // toLisetteNilableRecursive converts a Go type to Lisette in a nilable context.
-// Pointers become Option<Ref<T>> and named non-error interfaces become Option<Name>.
+// Pointers become Option<Ref<T>>, named non-error interfaces become Option<Name>,
+// function types (including named func aliases) become Option<fn(...)> /
+// Option<Name>, and maps (including named map types) become Option<Map<K,V>> /
+// Option<Name>. Those Go values are nilable, and zero-value (nil) is meaningful
+// in struct literals.
 // The nilable flag propagates into collection element types (Slice, Map values).
-func toLisetteNilableRecursive(t types.Type, seen map[types.Type]bool, conv *Converter) TypeResult {
+func toLisetteNilableRecursive(t types.Type, seen map[types.Type]bool, conv *Converter, substitutions map[string]string) TypeResult {
 	switch t := t.(type) {
 	case *types.Pointer:
-		elem := toLisetteRecursive(t.Elem(), seen, conv)
+		elem := toLisetteRecursive(t.Elem(), seen, conv, substitutions)
 		if elem.SkipReason != nil {
 			return elem
 		}
 		if isScalarType(t.Elem()) {
-			return TypeResult{LisetteType: fmt.Sprintf("Option<%s>", elem.LisetteType)}
+			return TypeResult{LisetteType: optionOf(elem.LisetteType)}
 		}
-		return TypeResult{LisetteType: fmt.Sprintf("Option<Ref<%s>>", elem.LisetteType)}
+		return TypeResult{LisetteType: optionOf(refOf(elem.LisetteType))}
+
+	case *types.Signature:
+		return wrapOption(toLisetteRecursive(t, seen, conv, substitutions))
 
 	case *types.Named:
-		if iface, ok := t.Underlying().(*types.Interface); ok {
-			if !iface.Empty() && !isErrorInterface(iface) {
-				result := namedToLisette(t, seen, conv)
-				if result.SkipReason != nil {
-					return result
-				}
-				return TypeResult{LisetteType: fmt.Sprintf("Option<%s>", result.LisetteType)}
+		switch u := t.Underlying().(type) {
+		case *types.Interface:
+			if !u.Empty() && !isErrorInterface(u) {
+				return wrapOption(namedToLisette(t, seen, conv, substitutions))
 			}
+		case *types.Signature, *types.Map:
+			return wrapOption(namedToLisette(t, seen, conv, substitutions))
 		}
-		return namedToLisette(t, seen, conv)
+		return namedToLisette(t, seen, conv, substitutions)
 
 	case *types.Slice:
-		elem := toLisetteNilableRecursive(t.Elem(), seen, conv)
+		elem := toLisetteNilableRecursive(t.Elem(), seen, conv, substitutions)
 		if elem.SkipReason != nil {
 			return elem
 		}
-		return TypeResult{LisetteType: fmt.Sprintf("Slice<%s>", elem.LisetteType)}
+		return TypeResult{LisetteType: sliceOf(elem.LisetteType)}
 
 	case *types.Array:
-		elem := toLisetteNilableRecursive(t.Elem(), seen, conv)
+		elem := toLisetteNilableRecursive(t.Elem(), seen, conv, substitutions)
 		if elem.SkipReason != nil {
 			return elem
 		}
-		return TypeResult{
-			LisetteType: fmt.Sprintf("Slice<%s>", elem.LisetteType),
-			ArrayReturn: true,
-		}
+		return TypeResult{LisetteType: arrayOf(elem.LisetteType, t.Len())}
 
 	case *types.Map:
-		key := toLisetteRecursive(t.Key(), seen, conv)
+		key := toLisetteRecursive(t.Key(), seen, conv, substitutions)
 		if key.SkipReason != nil {
 			return key
 		}
-		val := toLisetteNilableRecursive(t.Elem(), seen, conv)
+		val := toLisetteNilableRecursive(t.Elem(), seen, conv, substitutions)
 		if val.SkipReason != nil {
 			return val
 		}
-		return TypeResult{LisetteType: fmt.Sprintf("Map<%s, %s>", key.LisetteType, val.LisetteType)}
+		return TypeResult{LisetteType: mapOf(key.LisetteType, val.LisetteType)}
+
+	case *types.Alias:
+		return toLisetteNilableRecursive(t.Rhs(), seen, conv, substitutions)
 
 	default:
-		return toLisetteRecursive(t, seen, conv)
+		return toLisetteRecursive(t, seen, conv, substitutions)
 	}
 }
 
-func isInternalPackagePath(path string) bool {
-	if path == "internal" {
-		return true
+func namedImplementsError(t *types.Named) bool {
+	errorIface := universeErrorInterface()
+	if errorIface == nil {
+		return false
 	}
-	if strings.HasPrefix(path, "internal/") {
-		return true
-	}
-	if strings.HasSuffix(path, "/internal") {
-		return true
-	}
-
-	return strings.Contains(path, "/internal/")
+	return types.Implements(t, errorIface) || types.Implements(types.NewPointer(t), errorIface)
 }
 
 func isErrorInterface(_interface *types.Interface) bool {

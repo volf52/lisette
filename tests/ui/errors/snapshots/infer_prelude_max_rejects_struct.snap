@@ -1,0 +1,12 @@
+---
+source: tests/ui/errors/mod.rs
+---
+  ✕ Bound not satisfied
+   ╭─[test.lis:5:7]
+ 4 │ fn test(a: Point, b: Point) -> Point {
+ 5 │   max(a, b)
+   ·       ┬
+   ·       ╰── does not satisfy `cmp.Ordered`
+ 6 │ }
+   ╰────
+  help: The type parameter must be `cmp.Ordered` but the argument is not orderable. Relax the bound or pass an argument that satisfies it · code: [infer.not_orderable_bound]

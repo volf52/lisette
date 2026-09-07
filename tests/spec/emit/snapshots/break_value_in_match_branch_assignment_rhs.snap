@@ -1,23 +1,30 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test() {\n  let _ = loop {\n    let mut x = 0\n    x = match 1 { 1 => break 1, _ => 1, }\n    let _ = x\n    2\n  }\n}\n"
+description: |
+  
+  fn test() {
+    let _ = loop {
+      let mut x = 0
+      x = match 1 { 1 => break 1, _ => 1, }
+      let _ = x
+      2
+    }
+  }
 ---
 package main
 
 func test() {
 	var tmp_1 int
-loop_2:
 	for {
 		x := 0
-		var tmp_3 int
+		var tmp_2 int
 		if 1 == 1 {
 			tmp_1 = 1
-			break loop_2
+			break
 		}
-		tmp_3 = 1
-		x = tmp_3
+		tmp_2 = 1
+		x = tmp_2
 		_ = x
-		_ = 2
 	}
 	_ = tmp_1
 }

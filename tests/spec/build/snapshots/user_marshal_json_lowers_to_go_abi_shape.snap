@@ -1,0 +1,30 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type Widget struct {
+	id int
+}
+
+func (w Widget) MarshalJSON() ([]uint8, error) {
+	return ([]uint8)("\"custom\""), nil
+}
+
+func main() {
+	w := Widget{id: 7}
+	ret_1, err_2 := json.Marshal(w)
+	if err_2 == nil {
+		b := ret_1
+		fmt.Println(string(b))
+	} else {
+		e := err_2
+		fmt.Println(e)
+	}
+}

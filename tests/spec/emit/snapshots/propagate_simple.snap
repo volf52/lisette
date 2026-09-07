@@ -1,17 +1,26 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn might_fail() -> Result<int, string> {\n  Ok(42)\n}\n\nfn get_value() -> Result<int, string> {\n  let result = might_fail()?;\n  Ok(result)\n}\n"
+description: |
+  
+  fn might_fail() -> Result<int, string> {
+    Ok(42)
+  }
+  
+  fn get_value() -> Result<int, string> {
+    let result = might_fail()?;
+    Ok(result)
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func might_fail() lisette.Result[int, string] {
+func mightFail() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](42)
 }
 
-func get_value() lisette.Result[int, string] {
-	check_1 := might_fail()
+func getValue() lisette.Result[int, string] {
+	check_1 := mightFail()
 	if check_1.Tag != lisette.ResultOk {
 		return lisette.MakeResultErr[int, string](check_1.ErrVal)
 	}

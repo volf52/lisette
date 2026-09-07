@@ -1,0 +1,17 @@
+---
+source: tests/spec/emit/prelude.rs
+description: |
+  
+  fn test(s: Slice<int>) -> Slice<int> {
+    s.map(|x| x * 2)
+  }
+---
+package main
+
+func test(s []int) []int {
+	result_1 := make([]int, len(s))
+	for i_2, x := range s {
+		result_1[i_2] = x * 2
+	}
+	return result_1
+}

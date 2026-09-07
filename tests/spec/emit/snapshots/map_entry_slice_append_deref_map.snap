@@ -1,25 +1,33 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Box {\n  items: Slice<int>,\n}\n\nfn main() {\n  let mut m = Map.new<string, Box>()\n  m[\"a\"] = Box { items: [] }\n  let r = &m\n  let mut entry = r.*[\"a\"]\n  entry.items = entry.items.append(1)\n  r.*[\"a\"] = entry\n}\n"
+description: |
+  
+  struct Box {
+    items: Slice<int>,
+  }
+  
+  fn main() {
+    let mut m = Map.new<string, Box>()
+    m["a"] = Box { items: [] }
+    let mut r = &m
+    let mut entry = Box { items: r.*["a"].items.clone() }
+    entry.items = entry.items.append(1)
+    r.*["a"] = entry
+  }
 ---
 package main
 
-import "fmt"
+import "slices"
 
 type Box struct {
 	items []int
-}
-
-func (b Box) String() string {
-	return fmt.Sprintf("Box { items: %v }", b.items)
 }
 
 func main() {
 	m := make(map[string]Box)
 	m["a"] = Box{items: []int{}}
 	r := &m
-	entry := (*r)["a"]
+	entry := Box{items: slices.Clone((*r)["a"].items)}
 	entry.items = append(entry.items, 1)
-	base_1 := r
-	(*base_1)["a"] = entry
+	(*r)["a"] = entry
 }

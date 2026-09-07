@@ -1,0 +1,330 @@
+import "go:bytes"
+import "go:math"
+import httpx "go:net/http"
+import "go:net/http/httptest"
+import "go:net/url"
+import "go:os"
+import "go:path"
+import "go:strconv"
+import "go:strings"
+import "go:sync"
+import "go:time"
+import "go:unicode"
+
+#[test]
+fn go_tuple_destructure() {
+  let (dir, file) = path.Split("/foo/bar.txt")
+  assert dir == "/foo/" && file == "bar.txt"
+}
+
+#[test]
+fn go_tuple_destructure_wildcard() {
+  let (_, file) = path.Split("/foo/bar.txt")
+  assert file == "bar.txt"
+}
+
+#[test]
+fn go_tuple_discard() {
+  let (dir, _) = path.Split("/foo/bar.txt")
+  assert dir == "/foo/"
+}
+
+#[test]
+fn go_tuple_store() {
+  let pair = path.Split("/foo/bar.txt")
+  assert pair.0 == "/foo/" && pair.1 == "bar.txt"
+}
+
+#[test]
+fn go_tuple_field_inline() {
+  assert path.Split("/foo/bar.txt").0 == "/foo/"
+}
+
+#[test]
+fn strings_to_upper() {
+  let s = "hello"
+  assert strings.ToUpper(s) == "HELLO"
+}
+
+#[test]
+fn strings_to_lower() {
+  let s = "WORLD"
+  assert strings.ToLower(s) == "world"
+}
+
+#[test]
+fn strings_to_title() {
+  let s = "hello world"
+  assert strings.ToTitle(s) == "HELLO WORLD"
+}
+
+#[test]
+fn pipeline_go_stdlib() {
+  let result = 42 |> strconv.Itoa
+  assert result == "42"
+}
+
+#[test]
+fn pipeline_go_stdlib_chained() {
+  let result = 42 |> strconv.Itoa |> strings.ToUpper
+  assert result == "42"
+}
+
+#[test]
+fn pipeline_go_stdlib_with_args() {
+  let result = "hello" |> strings.Repeat(3)
+  assert result == "hellohellohello"
+}
+
+#[test]
+fn go_fn_value_as_prelude_map_arg() {
+  let ys = ["a", "b"].map(strings.ToUpper)
+  assert ys.equals(["A", "B"])
+}
+
+#[test]
+fn go_fn_value_as_prelude_filter_arg() {
+  let letters = "a1b".runes().filter(unicode.IsLetter)
+  assert letters.equals(['a', 'b'])
+}
+
+#[test]
+#[allow(float_cmp)]
+fn go_fn_value_as_prelude_fold_arg() {
+  let biggest = [1.0, 5.0, 3.0].fold(0.0, math.Max)
+  assert biggest == 5.0
+}
+
+#[test]
+fn go_fn_value_as_option_map_arg() {
+  let greeting: Option<string> = Some("hi")
+  assert greeting.map(strings.ToUpper) == Some("HI")
+}
+
+#[test]
+fn go_fallible_fn_value_as_prelude_map_arg() {
+  let parsed = ["1", "2"].map(strconv.Atoi)
+  let sum = parsed.fold(0, |acc, r| acc + r.unwrap_or(0))
+  assert sum == 3
+}
+
+#[test]
+fn go_style_access() {
+  let d = time.Second
+  assert d == 1000000000
+}
+
+#[test]
+fn go_style_times_literal() {
+  let d = time.Second * 5
+  assert d == 5000000000
+}
+
+#[test]
+fn go_style_arithmetic() {
+  let sum = time.Second + time.Millisecond
+  assert sum == 1001000000
+}
+
+#[test]
+fn both_styles_equal() {
+  let go_style = time.Second
+  let lis_style = time.Second
+  assert go_style == lis_style
+}
+
+#[test]
+fn mixed_styles_arithmetic() {
+  let result = time.Second + time.Millisecond
+  assert result == 1001000000
+}
+
+#[test]
+fn go_style_times_variable() {
+  let n = 5
+  let d = time.Second * (n as time.Duration)
+  assert d == 5000000000
+}
+
+#[test]
+fn go_style_times_function() {
+  let d = time.Second * (get_duration_multiplier() as time.Duration)
+  assert d == 3000000000
+}
+
+#[test]
+fn lis_style_times_function() {
+  let d = time.Second * (get_duration_multiplier() as time.Duration)
+  assert d == 3000000000
+}
+
+#[test]
+fn go_stdlib_constant_math_pi() {
+  let pi = math.Pi
+  let quarter_pi = pi / 4.0
+  assert quarter_pi > 0.7 && quarter_pi < 0.8
+}
+
+#[test]
+fn go_import_not_shadowed_by_transitive() {
+  let c: Option<Ref<httpx.Client>> = None
+  assert c.is_none()
+}
+
+#[test]
+fn handlerfunc_conversion() {
+  let h = httpx.HandlerFunc(|w: httpx.ResponseWriter, _r: Ref<httpx.Request>| {
+    w.WriteHeader(httpx.StatusNoContent)
+  })
+  assert serve(h) == httpx.StatusNoContent
+}
+
+#[test]
+fn handlerfunc_closure_calls_pointer_receiver() {
+  let h = httpx.HandlerFunc(|w, r| {
+    match r.ParseForm() {
+      Ok(_) => w.WriteHeader(httpx.StatusAccepted),
+      Err(_) => w.WriteHeader(httpx.StatusBadRequest),
+    }
+  })
+  assert serve(h) == httpx.StatusAccepted
+}
+
+#[test]
+fn pointer_receiver_struct_literal() {
+  let mut wg = sync.WaitGroup {}
+  wg.Add(1)
+  wg.Done()
+  wg.Wait()
+}
+
+#[test]
+fn pointer_receiver_constructor() {
+  let mut buf = bytes.NewBufferString("hello")
+  let result = match buf.ReadString(111) {
+    Partial.Ok(s) => if s == "hello" { 100 } else { 0 },
+    Partial.Both(s, _) => if s == "hello" { 100 } else { 0 },
+    Partial.Err(_) => 100,
+  }
+  assert result == 100
+}
+
+#[test]
+fn pointer_receiver_method_expr() {
+  let f = bytes.Buffer.WriteString
+  let mut buf = bytes.Buffer {}
+  let result = match f(&buf, "hello") {
+    Partial.Ok(n) => if n == 5 { 100 } else { 0 },
+    Partial.Both(n, _) => if n == 5 { 100 } else { 0 },
+    Partial.Err(_) => 0,
+  }
+  assert result == 100
+}
+
+fn get_duration_multiplier() -> int {
+  3
+}
+
+fn serve(h: httpx.Handler) -> int {
+  let mut rec = httptest.NewRecorder()
+  let mut req = httptest.NewRequest("GET", "/", bytes.NewBufferString(""))
+  h.ServeHTTP(rec, req)
+  rec.Code
+}
+
+fn classify_path(path_name: string) -> string {
+  let Ok(info) = os.Stat(path_name) else {
+    return "missing"
+  }
+  if info.IsDir() { "dir" } else { "file" }
+}
+
+fn open_via_match(name: string) -> string {
+  let file = match os.Open(name) {
+    Ok(f) => f,
+    Err(e) => {
+      return "missing"
+    },
+  }
+  defer file.Close()
+  file.Name()
+}
+
+fn parse_scheme(text: string) -> string {
+  let Ok(parsed) = url.Parse(text) else {
+    return "bad"
+  }
+  parsed.Scheme
+}
+
+#[test]
+fn go_if_let_err_inverts_condition() {
+  let mut seen = "none"
+  if let Err(e) = strconv.Atoi("nope") {
+    seen = "err"
+  }
+  assert seen == "err"
+
+  let mut ok_seen = "none"
+  if let Err(e) = strconv.Atoi("42") {
+    ok_seen = "err"
+  }
+  assert ok_seen == "none"
+}
+
+#[test]
+fn go_if_let_err_inverts_nil_interface_guard() {
+  let mut missing = false
+  if let Err(e) = os.Stat("./__lisette_missing__") {
+    missing = true
+  }
+  assert missing
+
+  let mut here = false
+  if let Err(e) = os.Stat(".") {
+    here = true
+  }
+  assert !here
+}
+
+#[test]
+fn go_if_let_err_reads_payload() {
+  let mut message = ""
+  if let Err(e) = strconv.Atoi("nope") {
+    message = e.Error()
+  }
+  assert strings.Contains(message, "nope")
+}
+
+#[test]
+fn go_if_let_ok_binds_payload() {
+  let mut value = 0
+  if let Ok(parsed) = strconv.Atoi("42") {
+    value = parsed
+  }
+  assert value == 42
+
+  let mut missed = -1
+  if let Ok(parsed) = strconv.Atoi("nope") {
+    missed = parsed
+  }
+  assert missed == -1
+}
+
+#[test]
+fn go_let_else_result_pointer_return() {
+  assert parse_scheme("https://example.com/a") == "https"
+  assert parse_scheme("://missing-scheme") == "bad"
+}
+
+#[test]
+fn go_let_else_result_interface_return() {
+  assert classify_path(".") == "dir"
+  assert classify_path("./__lisette_missing__") == "missing"
+}
+
+#[test]
+fn go_let_match_result_binds_call_slot() {
+  assert open_via_match("./__lisette_missing__") == "missing"
+  assert strings.HasSuffix(open_via_match("."), ".")
+}

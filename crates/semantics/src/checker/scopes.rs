@@ -1,89 +1,151 @@
+use ecow::EcoString;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::Cell;
+use std::mem;
 use syntax::ast::BindingId;
 use syntax::ast::Span;
 use syntax::types::Type;
 
-#[derive(Debug, Clone, Default)]
-pub struct DepthCounter(Cell<usize>);
-
-impl DepthCounter {
-    pub fn new() -> Self {
-        Self(Cell::new(0))
-    }
-    pub fn with_value(n: usize) -> Self {
-        Self(Cell::new(n))
-    }
-    pub fn get(&self) -> usize {
-        self.0.get()
-    }
-    pub fn increment(&self) {
-        self.0.set(self.0.get() + 1);
-    }
-    pub fn decrement(&self) {
-        self.0.set(self.0.get().saturating_sub(1));
-    }
-    pub fn is_active(&self) -> bool {
-        self.0.get() > 0
-    }
-    pub fn reset(&self) -> usize {
-        let prev = self.0.get();
-        self.0.set(0);
-        prev
-    }
-    pub fn restore(&self, depth: usize) {
-        self.0.set(depth);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UseContext {
-    #[default]
-    Statement,
-    Value,
-    Callee,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CarrierKind {
+pub enum TryCarrier {
     Result,
     Option,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TryUsage {
+    #[default]
+    Unused,
+    Unknown,
+    Carrier(TryCarrier),
+}
+
+impl TryUsage {
+    /// Record one `?` operand and report whether it conflicts with a carrier
+    /// already established by an earlier operand.
+    pub(crate) fn observe(&mut self, observed: Option<TryCarrier>) -> bool {
+        match (*self, observed) {
+            (Self::Unused, None) => *self = Self::Unknown,
+            (Self::Unused | Self::Unknown, Some(carrier)) => *self = Self::Carrier(carrier),
+            (Self::Carrier(TryCarrier::Result), Some(TryCarrier::Option))
+            | (Self::Carrier(TryCarrier::Option), Some(TryCarrier::Result)) => return true,
+            _ => {}
+        }
+        false
+    }
+
+    pub(crate) fn was_used(self) -> bool {
+        self != Self::Unused
+    }
+}
+
+#[derive(Debug)]
 pub struct TryBlockContext {
-    pub ok_ty: Type,
-    pub err_ty: Type,
-    pub carrier: Cell<Option<CarrierKind>>,
-    pub has_question_mark: Cell<bool>,
-    pub try_span: Span,
-    pub loop_depth: DepthCounter,
+    pub(crate) ok_ty: Type,
+    pub(crate) err_ty: Type,
+    pub(crate) usage: TryUsage,
+    pub(crate) entry_loop_depth: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RecoverBlockContext {
-    pub inner_ty: Type,
-    pub recover_span: Span,
-    pub loop_depth: DepthCounter,
+    pub(crate) entry_loop_depth: usize,
+}
+
+#[derive(Debug, Default)]
+enum PropagationContext {
+    #[default]
+    None,
+    Try(TryBlockContext),
+    Recover(RecoverBlockContext),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallibleBlockKind {
+    Try,
+    Recover,
+}
+
+#[derive(Debug)]
+pub(crate) enum DeferredMapKeyCheck {
+    Comparable { key: Type, span: Span },
+    Bounds { key: Type, span: Span },
+}
+
+#[derive(Debug)]
+enum TestContext {
+    Handle,
+    Function(EcoString),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScopedValueKind {
+    Value,
+    Binding { id: BindingId, mutable: bool },
+    Const,
 }
 
 #[derive(Debug, Clone)]
+struct ScopedValue {
+    ty: Type,
+    kind: ScopedValueKind,
+}
+
+#[derive(Debug, Clone)]
+struct GenericParameter {
+    index: usize,
+    bounds: Vec<Type>,
+}
+
+#[derive(Debug)]
+enum FunctionContext {
+    LambdaPendingReturn,
+    Lambda(FunctionBodyContext),
+    Named(FunctionBodyContext),
+}
+
+#[derive(Debug)]
+struct FunctionBodyContext {
+    return_type: Type,
+    deferred_map_key_checks: Vec<DeferredMapKeyCheck>,
+}
+
+impl FunctionBodyContext {
+    fn new(return_type: Type) -> Self {
+        Self {
+            return_type,
+            deferred_map_key_checks: Vec::new(),
+        }
+    }
+}
+
+impl FunctionContext {
+    fn return_type(&self) -> Option<&Type> {
+        match self {
+            Self::LambdaPendingReturn => None,
+            Self::Lambda(body) | Self::Named(body) => Some(&body.return_type),
+        }
+    }
+
+    fn body_mut(&mut self) -> Option<&mut FunctionBodyContext> {
+        match self {
+            Self::LambdaPendingReturn => None,
+            Self::Lambda(body) | Self::Named(body) => Some(body),
+        }
+    }
+
+    fn is_lambda(&self) -> bool {
+        matches!(self, Self::LambdaPendingReturn | Self::Lambda(_))
+    }
+}
+
+#[derive(Debug)]
 pub struct Scope {
-    /// variable name -> type
-    pub values: HashMap<String, Type>,
-    pub mutables: Option<HashSet<String>>,
-    pub type_params: Option<HashMap<String, usize>>,
-    pub trait_bounds: Option<HashMap<String, Vec<Type>>>,
-    pub fn_return_type: Option<Type>,
-    pub try_block_context: Option<TryBlockContext>,
-    pub recover_block_context: Option<RecoverBlockContext>,
-    pub loop_break_type: Option<Type>,
-    pub loop_depth: DepthCounter,
-    pub defer_block_depth: DepthCounter,
-    pub negation_depth: DepthCounter,
-    pub use_context: Cell<UseContext>,
-    /// variable name -> binding ID (for linting)
-    pub name_to_binding: HashMap<String, BindingId>,
+    values: HashMap<String, ScopedValue>,
+    generic_parameters: HashMap<String, GenericParameter>,
+    function: Option<FunctionContext>,
+    propagation_context: PropagationContext,
+    impl_receiver_type: Option<Type>,
+    test_context: Option<TestContext>,
 }
 
 impl Default for Scope {
@@ -93,22 +155,68 @@ impl Default for Scope {
 }
 
 impl Scope {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Scope {
             values: HashMap::default(),
-            mutables: None,
-            type_params: None,
-            trait_bounds: None,
-            fn_return_type: None,
-            try_block_context: None,
-            recover_block_context: None,
-            loop_break_type: None,
-            loop_depth: DepthCounter::new(),
-            defer_block_depth: DepthCounter::new(),
-            negation_depth: DepthCounter::new(),
-            use_context: Cell::new(UseContext::Statement),
-            name_to_binding: HashMap::default(),
+            generic_parameters: HashMap::default(),
+            function: None,
+            propagation_context: PropagationContext::None,
+            impl_receiver_type: None,
+            test_context: None,
         }
+    }
+
+    pub(crate) fn insert_value(&mut self, name: String, ty: Type) {
+        self.values.insert(
+            name,
+            ScopedValue {
+                ty,
+                kind: ScopedValueKind::Value,
+            },
+        );
+    }
+
+    pub(crate) fn insert_value_if_absent(&mut self, name: String, ty: Type) {
+        self.values.entry(name).or_insert(ScopedValue {
+            ty,
+            kind: ScopedValueKind::Value,
+        });
+    }
+
+    pub(crate) fn insert_binding(&mut self, name: String, ty: Type, id: BindingId, mutable: bool) {
+        self.values.insert(
+            name,
+            ScopedValue {
+                ty,
+                kind: ScopedValueKind::Binding { id, mutable },
+            },
+        );
+    }
+
+    pub(crate) fn insert_const(&mut self, name: String, ty: Type) {
+        self.values.insert(
+            name,
+            ScopedValue {
+                ty,
+                kind: ScopedValueKind::Const,
+            },
+        );
+    }
+
+    fn fn_return_type(&self) -> Option<&Type> {
+        self.function
+            .as_ref()
+            .and_then(FunctionContext::return_type)
+    }
+
+    fn is_function_boundary(&self) -> bool {
+        self.fn_return_type().is_some()
+    }
+
+    fn is_lambda(&self) -> bool {
+        self.function
+            .as_ref()
+            .is_some_and(FunctionContext::is_lambda)
     }
 }
 
@@ -123,112 +231,195 @@ impl Default for Scopes {
 }
 
 impl Scopes {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Scopes {
             stack: vec![Scope::new()],
         }
     }
 
-    pub fn current(&self) -> &Scope {
+    pub(crate) fn current(&self) -> &Scope {
         self.stack.last().expect("scope stack must not be empty")
     }
 
-    pub fn current_mut(&mut self) -> &mut Scope {
+    pub(crate) fn current_mut(&mut self) -> &mut Scope {
         self.stack
             .last_mut()
             .expect("scope stack must not be empty")
     }
 
-    pub fn push(&mut self) {
-        let current = self.current();
-        let loop_depth = current.loop_depth.get();
-        let defer_block_depth = current.defer_block_depth.get();
-        let negation_depth = current.negation_depth.get();
-        let use_context = current.use_context.get();
-        let loop_break_type = current.loop_break_type.clone();
-        self.stack.push(Scope {
-            values: HashMap::default(),
-            mutables: None,
-            type_params: None,
-            trait_bounds: None,
-            fn_return_type: None,
-            try_block_context: None,
-            recover_block_context: None,
-            loop_break_type,
-            loop_depth: DepthCounter::with_value(loop_depth),
-            defer_block_depth: DepthCounter::with_value(defer_block_depth),
-            negation_depth: DepthCounter::with_value(negation_depth),
-            use_context: Cell::new(use_context),
-            name_to_binding: HashMap::default(),
-        });
-    }
-
-    pub fn pop(&mut self) {
-        if self.stack.len() > 1 {
-            self.stack.pop();
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.stack.clear();
+    pub(crate) fn push(&mut self) {
         self.stack.push(Scope::new());
     }
 
-    /// Look up a value by walking the scope stack from top to bottom.
-    pub fn lookup_value(&self, name: &str) -> Option<&Type> {
-        for scope in self.stack.iter().rev() {
-            if let Some(ty) = scope.values.get(name) {
-                return Some(ty);
-            }
-        }
-        None
+    pub(crate) fn pop(&mut self) {
+        assert!(self.stack.len() > 1, "root scope cannot be popped");
+        self.stack.pop();
     }
 
-    /// Check if a variable is marked mutable in any enclosing scope.
-    pub fn lookup_mutable(&self, name: &str) -> bool {
-        self.stack
-            .iter()
-            .rev()
-            .any(|s| s.mutables.as_ref().is_some_and(|m| m.contains(name)))
+    /// Look up a value by walking the scope stack from top to bottom.
+    pub(crate) fn lookup_value(&self, name: &str) -> Option<&Type> {
+        self.lookup_scoped_value(name).map(|value| &value.ty)
+    }
+
+    /// Check whether the visible value is a mutable binding.
+    pub(crate) fn lookup_mutable(&self, name: &str) -> bool {
+        matches!(
+            self.lookup_scoped_value(name).map(|value| value.kind),
+            Some(ScopedValueKind::Binding { mutable: true, .. })
+        )
+    }
+
+    /// Whether the visible value is a block-local `const`.
+    pub(crate) fn lookup_const(&self, name: &str) -> bool {
+        matches!(
+            self.lookup_scoped_value(name).map(|value| value.kind),
+            Some(ScopedValueKind::Const)
+        )
     }
 
     /// Look up a binding ID by walking the scope stack from top to bottom.
-    pub fn lookup_binding_id(&self, name: &str) -> Option<BindingId> {
-        for scope in self.stack.iter().rev() {
-            if let Some(id) = scope.name_to_binding.get(name) {
-                return Some(*id);
+    pub(crate) fn lookup_binding_id(&self, name: &str) -> Option<BindingId> {
+        match self.lookup_scoped_value(name)?.kind {
+            ScopedValueKind::Binding { id, .. } => Some(id),
+            ScopedValueKind::Value | ScopedValueKind::Const => None,
+        }
+    }
+
+    pub(crate) fn mark_lambda_scope(&mut self) {
+        let function = &mut self.current_mut().function;
+        assert!(function.is_none(), "a scope can contain only one function");
+        *function = Some(FunctionContext::LambdaPendingReturn);
+    }
+
+    pub(crate) fn set_fn_return_type(&mut self, ty: Type) {
+        let function = &mut self.current_mut().function;
+        *function = Some(match function.take() {
+            None => FunctionContext::Named(FunctionBodyContext::new(ty)),
+            Some(FunctionContext::LambdaPendingReturn) => {
+                FunctionContext::Lambda(FunctionBodyContext::new(ty))
             }
+            Some(FunctionContext::Lambda(_) | FunctionContext::Named(_)) => {
+                panic!("a function return type can be set only once")
+            }
+        });
+    }
+
+    pub(crate) fn shadowed_capturable_binding(&self, name: &str) -> Option<BindingId> {
+        let mut crossed_lambda = false;
+        for scope in self.stack.iter().rev() {
+            if let Some(value) = scope.values.get(name) {
+                return match value.kind {
+                    ScopedValueKind::Binding { id, .. } if crossed_lambda => Some(id),
+                    _ => None,
+                };
+            }
+            crossed_lambda |= scope.is_lambda();
         }
         None
+    }
+
+    /// Whether resolving `name` crosses a function scope, meaning captured.
+    pub(crate) fn binding_crosses_function_boundary(&self, name: &str) -> bool {
+        let mut crossed = false;
+        for scope in self.stack.iter().rev() {
+            if let Some(value) = scope.values.get(name) {
+                return crossed && matches!(value.kind, ScopedValueKind::Binding { .. });
+            }
+            if scope.is_function_boundary() {
+                crossed = true;
+            }
+        }
+        false
+    }
+
+    fn lookup_scoped_value(&self, name: &str) -> Option<&ScopedValue> {
+        self.stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.values.get(name))
     }
 
     /// Look up a type parameter by walking the scope stack from top to bottom.
-    pub fn lookup_type_param(&self, name: &str) -> Option<usize> {
-        for scope in self.stack.iter().rev() {
-            if let Some(idx) = scope.type_params.as_ref().and_then(|tp| tp.get(name)) {
-                return Some(*idx);
-            }
+    pub(crate) fn lookup_type_param(&self, name: &str) -> Option<usize> {
+        self.stack.iter().rev().find_map(|scope| {
+            scope
+                .generic_parameters
+                .get(name)
+                .map(|parameter| parameter.index)
+        })
+    }
+
+    pub(crate) fn insert_type_param(&mut self, name: &str, index: usize) {
+        self.current_mut().generic_parameters.insert(
+            name.to_string(),
+            GenericParameter {
+                index,
+                bounds: Vec::new(),
+            },
+        );
+    }
+
+    pub(crate) fn insert_trait_bound(&mut self, parameter: &str, bound: Type) {
+        let parameter = self
+            .current_mut()
+            .generic_parameters
+            .get_mut(parameter)
+            .expect("a generic parameter must be in scope before recording its bounds");
+        if !parameter.bounds.contains(&bound) {
+            parameter.bounds.push(bound);
         }
-        None
     }
 
     /// Look up the enclosing function's return type.
-    pub fn lookup_fn_return_type(&self) -> Option<&Type> {
+    pub(crate) fn lookup_fn_return_type(&self) -> Option<&Type> {
         for scope in self.stack.iter().rev() {
-            if let Some(ref ty) = scope.fn_return_type {
+            if let Some(ty) = scope.fn_return_type() {
                 return Some(ty);
             }
         }
         None
     }
 
+    pub(crate) fn defer_map_key_check(&mut self, check: DeferredMapKeyCheck) {
+        if let Some(body) = self
+            .stack
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.function.as_mut()?.body_mut())
+        {
+            body.deferred_map_key_checks.push(check);
+        }
+    }
+
+    pub(crate) fn take_deferred_map_key_checks(&mut self) -> Vec<DeferredMapKeyCheck> {
+        self.current_mut()
+            .function
+            .as_mut()
+            .and_then(FunctionContext::body_mut)
+            .map(|body| mem::take(&mut body.deferred_map_key_checks))
+            .unwrap_or_default()
+    }
+
     /// Look up the enclosing try block context, stopping at function boundaries.
-    pub fn lookup_try_block_context(&self) -> Option<&TryBlockContext> {
+    pub(crate) fn lookup_try_block_context(&self) -> Option<&TryBlockContext> {
         for scope in self.stack.iter().rev() {
-            if scope.try_block_context.is_some() {
-                return scope.try_block_context.as_ref();
+            if let PropagationContext::Try(context) = &scope.propagation_context {
+                return Some(context);
             }
-            if scope.fn_return_type.is_some() {
+            if scope.is_function_boundary() {
+                return None;
+            }
+        }
+        None
+    }
+
+    pub(crate) fn lookup_try_block_context_mut(&mut self) -> Option<&mut TryBlockContext> {
+        for scope in self.stack.iter_mut().rev() {
+            let is_function_boundary = scope.is_function_boundary();
+            if let PropagationContext::Try(context) = &mut scope.propagation_context {
+                return Some(context);
+            }
+            if is_function_boundary {
                 return None;
             }
         }
@@ -236,19 +427,49 @@ impl Scopes {
     }
 
     /// Look up the enclosing recover block context, stopping at function boundaries.
-    pub fn lookup_recover_block_context(&self) -> Option<&RecoverBlockContext> {
+    pub(crate) fn lookup_recover_block_context(&self) -> Option<&RecoverBlockContext> {
         for scope in self.stack.iter().rev() {
-            if scope.recover_block_context.is_some() {
-                return scope.recover_block_context.as_ref();
+            if let PropagationContext::Recover(context) = &scope.propagation_context {
+                return Some(context);
             }
-            if scope.fn_return_type.is_some() {
+            if scope.is_function_boundary() {
                 return None;
             }
         }
         None
     }
 
-    pub fn collect_all_value_names(&self) -> Vec<String> {
+    /// Look up the innermost `try` or `recover` block, stopping at function boundaries.
+    pub(crate) fn lookup_fallible_block_kind(&self) -> Option<FallibleBlockKind> {
+        for scope in self.stack.iter().rev() {
+            match &scope.propagation_context {
+                PropagationContext::Try(_) => return Some(FallibleBlockKind::Try),
+                PropagationContext::Recover(_) => return Some(FallibleBlockKind::Recover),
+                PropagationContext::None => {}
+            }
+            if scope.is_function_boundary() {
+                return None;
+            }
+        }
+        None
+    }
+
+    pub(crate) fn set_try_block_context(&mut self, context: TryBlockContext) {
+        self.current_mut().propagation_context = PropagationContext::Try(context);
+    }
+
+    pub(crate) fn current_try_block_context(&self) -> Option<&TryBlockContext> {
+        match &self.current().propagation_context {
+            PropagationContext::Try(context) => Some(context),
+            PropagationContext::None | PropagationContext::Recover(_) => None,
+        }
+    }
+
+    pub(crate) fn set_recover_block_context(&mut self, context: RecoverBlockContext) {
+        self.current_mut().propagation_context = PropagationContext::Recover(context);
+    }
+
+    pub(crate) fn collect_all_value_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for scope in &self.stack {
             names.extend(scope.values.keys().cloned());
@@ -256,106 +477,257 @@ impl Scopes {
         names
     }
 
-    pub fn collect_all_trait_bounds(&self) -> HashMap<String, Vec<Type>> {
-        let mut all_bounds = HashMap::default();
-        // Walk from bottom to top so inner scopes override outer
-        for scope in &self.stack {
-            if let Some(ref bounds) = scope.trait_bounds {
-                for (key, value) in bounds {
-                    all_bounds.insert(key.clone(), value.clone());
-                }
-            }
+    pub(crate) fn visible_parameter_bounds(&self) -> impl Iterator<Item = (&str, &[Type])> {
+        let mut seen = HashSet::default();
+        self.stack
+            .iter()
+            .rev()
+            .flat_map(|scope| &scope.generic_parameters)
+            .filter(move |(name, _)| seen.insert(name.as_str()))
+            .filter(|(_, parameter)| !parameter.bounds.is_empty())
+            .map(|(name, parameter)| (name.as_str(), parameter.bounds.as_slice()))
+    }
+
+    pub(crate) fn bounds_on_param(&self, name: &str) -> &[Type] {
+        self.stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.generic_parameters.get(name))
+            .map_or(&[], |parameter| parameter.bounds.as_slice())
+    }
+
+    pub(crate) fn mark_test_handle(&mut self) {
+        if !self.has_test_handle() {
+            self.current_mut().test_context = Some(TestContext::Handle);
         }
-        all_bounds
     }
 
-    pub fn increment_loop_depth(&self) {
-        self.current().loop_depth.increment();
+    pub(crate) fn has_test_handle(&self) -> bool {
+        self.stack
+            .iter()
+            .rev()
+            .any(|scope| scope.test_context.is_some())
     }
 
-    pub fn decrement_loop_depth(&self) {
-        self.current().loop_depth.decrement();
+    pub(crate) fn set_test_fn_name(&mut self, name: EcoString) {
+        self.current_mut().test_context = Some(TestContext::Function(name));
     }
 
-    pub fn is_inside_loop(&self) -> bool {
-        self.current().loop_depth.is_active()
+    pub(crate) fn test_fn_name(&self) -> Option<&str> {
+        self.stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.test_context.as_ref())
+            .and_then(|context| match context {
+                TestContext::Function(name) => Some(name.as_str()),
+                TestContext::Handle => None,
+            })
     }
 
-    pub fn set_loop_break_type(&mut self, ty: Type) {
-        self.current_mut().loop_break_type = Some(ty);
+    pub(crate) fn set_impl_receiver_type(&mut self, ty: Type) {
+        self.current_mut().impl_receiver_type = Some(ty);
     }
 
-    pub fn clear_loop_break_type(&mut self) {
-        self.current_mut().loop_break_type = None;
+    pub(crate) fn impl_receiver_type(&self) -> Option<&Type> {
+        self.stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.impl_receiver_type.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadowing_replaces_all_value_metadata() {
+        let mut scopes = Scopes::new();
+        scopes
+            .current_mut()
+            .insert_binding("value".into(), Type::Error, BindingId::new(1), true);
+
+        scopes.push();
+        scopes
+            .current_mut()
+            .insert_binding("value".into(), Type::Error, BindingId::new(2), false);
+
+        assert_eq!(scopes.lookup_binding_id("value"), Some(BindingId::new(2)));
+        assert!(!scopes.lookup_mutable("value"));
+        assert!(!scopes.lookup_const("value"));
+
+        scopes
+            .current_mut()
+            .insert_const("value".into(), Type::Error);
+
+        assert_eq!(scopes.lookup_binding_id("value"), None);
+        assert!(!scopes.lookup_mutable("value"));
+        assert!(scopes.lookup_const("value"));
     }
 
-    pub fn loop_break_type(&self) -> Option<&Type> {
-        self.current().loop_break_type.as_ref()
+    #[test]
+    fn non_binding_shadow_stops_capture_lookup() {
+        let mut scopes = Scopes::new();
+        scopes
+            .current_mut()
+            .insert_binding("value".into(), Type::Error, BindingId::new(1), true);
+
+        scopes.push();
+        scopes.set_fn_return_type(Type::Error);
+        scopes
+            .current_mut()
+            .insert_value("value".into(), Type::Error);
+
+        assert_eq!(scopes.lookup_binding_id("value"), None);
+        assert!(!scopes.binding_crosses_function_boundary("value"));
     }
 
-    pub fn increment_defer_block_depth(&self) {
-        self.current().defer_block_depth.increment();
+    #[test]
+    fn named_test_context_always_provides_a_handle() {
+        let mut scopes = Scopes::new();
+
+        scopes.set_test_fn_name("example".into());
+
+        assert!(scopes.has_test_handle());
+        assert_eq!(scopes.test_fn_name(), Some("example"));
     }
 
-    pub fn decrement_defer_block_depth(&self) {
-        self.current().defer_block_depth.decrement();
+    #[test]
+    fn popping_a_scope_reveals_the_enclosing_test_context() {
+        let mut scopes = Scopes::new();
+        scopes.set_test_fn_name("outer".into());
+        scopes.push();
+        scopes.set_test_fn_name("inner".into());
+
+        scopes.pop();
+
+        assert_eq!(scopes.test_fn_name(), Some("outer"));
     }
 
-    pub fn is_inside_defer_block(&self) -> bool {
-        self.current().defer_block_depth.is_active()
+    #[test]
+    fn known_try_carrier_replaces_an_unknown_observation() {
+        let mut usage = TryUsage::default();
+        usage.observe(None);
+
+        let mismatched = usage.observe(Some(TryCarrier::Result));
+
+        assert_eq!(
+            (usage, mismatched),
+            (TryUsage::Carrier(TryCarrier::Result), false)
+        );
     }
 
-    pub fn defer_block_loop_depth(&self) -> usize {
-        self.current().loop_depth.get()
+    #[test]
+    fn conflicting_try_carrier_does_not_replace_the_first_carrier() {
+        let mut usage = TryUsage::Carrier(TryCarrier::Result);
+
+        let mismatched = usage.observe(Some(TryCarrier::Option));
+
+        assert_eq!(
+            (usage, mismatched),
+            (TryUsage::Carrier(TryCarrier::Result), true)
+        );
     }
 
-    pub fn increment_negation_depth(&self) {
-        self.current().negation_depth.increment();
+    #[test]
+    fn impl_receiver_lifetime_is_tied_to_its_scope() {
+        let mut scopes = Scopes::new();
+        scopes.push();
+        scopes.set_impl_receiver_type(Type::Error);
+        scopes.push();
+
+        assert!(scopes.impl_receiver_type().is_some());
+
+        scopes.pop();
+        scopes.pop();
+        assert!(scopes.impl_receiver_type().is_none());
     }
 
-    pub fn decrement_negation_depth(&self) {
-        self.current().negation_depth.decrement();
+    #[test]
+    fn nested_recover_preserves_enclosing_try_context() {
+        let mut scopes = Scopes::new();
+        scopes.set_try_block_context(TryBlockContext {
+            ok_ty: Type::Error,
+            err_ty: Type::Error,
+            usage: TryUsage::Unused,
+            entry_loop_depth: 1,
+        });
+        scopes.push();
+        scopes.set_recover_block_context(RecoverBlockContext {
+            entry_loop_depth: 2,
+        });
+
+        assert_eq!(
+            scopes
+                .lookup_try_block_context()
+                .map(|ctx| ctx.entry_loop_depth),
+            Some(1)
+        );
+        assert_eq!(
+            scopes
+                .lookup_recover_block_context()
+                .map(|ctx| ctx.entry_loop_depth),
+            Some(2)
+        );
     }
 
-    pub fn is_inside_negation(&self) -> bool {
-        self.current().negation_depth.is_active()
+    #[test]
+    fn inner_type_parameter_shadows_outer_bounds_without_declaring_its_own() {
+        let mut scopes = Scopes::new();
+        scopes.insert_type_param("T", 0);
+        scopes.insert_trait_bound("T", Type::Error);
+        scopes.push();
+        scopes.insert_type_param("T", 0);
+
+        assert_eq!(scopes.visible_parameter_bounds().count(), 0);
+        assert!(scopes.bounds_on_param("T").is_empty());
     }
 
-    pub fn reset_loop_depth(&self) -> usize {
-        self.current().loop_depth.reset()
+    #[test]
+    fn popping_type_parameter_scope_restores_outer_bounds() {
+        let mut scopes = Scopes::new();
+        scopes.insert_type_param("T", 0);
+        scopes.insert_trait_bound("T", Type::Error);
+        scopes.push();
+        scopes.insert_type_param("T", 0);
+
+        scopes.pop();
+
+        assert_eq!(scopes.bounds_on_param("T"), [Type::Error]);
     }
 
-    pub fn restore_loop_depth(&self, depth: usize) {
-        self.current().loop_depth.restore(depth);
+    #[test]
+    fn redeclaring_a_parameter_does_not_resurrect_its_bounds_after_pop() {
+        let mut scopes = Scopes::new();
+        scopes.insert_type_param("T", 0);
+        scopes.insert_trait_bound("T", Type::int());
+        scopes.push();
+        scopes.insert_type_param("T", 1);
+        scopes.insert_trait_bound("T", Type::string());
+        scopes.insert_type_param("T", 2);
+        scopes.insert_trait_bound("T", Type::bool());
+
+        scopes.pop();
+
+        assert_eq!(scopes.bounds_on_param("T"), [Type::int()]);
+        assert_eq!(scopes.lookup_type_param("T"), Some(0));
     }
 
-    pub fn set_value_context(&self) -> UseContext {
-        let prev = self.current().use_context.get();
-        self.current().use_context.set(UseContext::Value);
-        prev
-    }
+    #[test]
+    fn visible_bounds_use_the_nearest_parameter_and_keep_unshadowed_parameters() {
+        let mut scopes = Scopes::new();
+        scopes.insert_type_param("T", 0);
+        scopes.insert_trait_bound("T", Type::int());
+        scopes.insert_type_param("U", 1);
+        scopes.insert_trait_bound("U", Type::string());
+        scopes.push();
+        scopes.insert_type_param("T", 0);
+        scopes.insert_trait_bound("T", Type::bool());
+        scopes.insert_trait_bound("T", Type::bool());
 
-    pub fn set_statement_context(&self) -> UseContext {
-        let prev = self.current().use_context.get();
-        self.current().use_context.set(UseContext::Statement);
-        prev
-    }
+        let bounds: HashMap<_, _> = scopes.visible_parameter_bounds().collect();
 
-    pub fn restore_use_context(&self, ctx: UseContext) {
-        self.current().use_context.set(ctx);
-    }
-
-    pub fn is_value_context(&self) -> bool {
-        self.current().use_context.get() == UseContext::Value
-    }
-
-    pub fn set_callee_context(&self) -> UseContext {
-        let prev = self.current().use_context.get();
-        self.current().use_context.set(UseContext::Callee);
-        prev
-    }
-
-    pub fn is_callee_context(&self) -> bool {
-        self.current().use_context.get() == UseContext::Callee
+        assert_eq!(bounds["T"], [Type::bool()]);
+        assert_eq!(bounds["U"], [Type::string()]);
     }
 }

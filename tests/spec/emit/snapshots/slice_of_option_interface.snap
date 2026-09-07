@@ -1,39 +1,50 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \ninterface Printable {\n  fn to_string(self) -> string\n}\n\nstruct Text { content: string }\nstruct Number { value: int }\n\nimpl Text {\n  fn to_string(self) -> string { self.content }\n}\n\nimpl Number {\n  fn to_string(self) -> string { \"number\" }\n}\n\nfn test() {\n  let items: Slice<Option<Printable>> = [\n    Some(Text { content: \"hello\" }),\n    Some(Number { value: 42 }),\n  ]\n}\n"
+description: |
+  
+  interface Printable {
+    fn to_string() -> string
+  }
+  
+  struct Text { content: string }
+  struct Number { value: int }
+  
+  impl Text {
+    fn to_string(self) -> string { self.content }
+  }
+  
+  impl Number {
+    fn to_string(self) -> string { "number" }
+  }
+  
+  fn test() {
+    let items: Slice<Option<Printable>> = [
+      Some(Text { content: "hello" }),
+      Some(Number { value: 42 }),
+    ]
+  }
 ---
 package main
 
-import (
-	"fmt"
-	lisette "github.com/ivov/lisette/prelude"
-)
+import lisette "github.com/ivov/lisette/prelude"
 
 type Printable interface {
-	to_string() string
+	toString() string
 }
 
 type Text struct {
 	content string
 }
 
-func (t Text) String() string {
-	return fmt.Sprintf("Text { content: %v }", t.content)
-}
-
 type Number struct {
 	value int
 }
 
-func (n Number) String() string {
-	return fmt.Sprintf("Number { value: %v }", n.value)
-}
-
-func (t Text) to_string() string {
+func (t Text) toString() string {
 	return t.content
 }
 
-func (n Number) to_string() string {
+func (n Number) toString() string {
 	return "number"
 }
 

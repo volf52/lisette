@@ -1,18 +1,24 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn test(n: int) -> Option<int> {\n  match n {\n    1 => Some(10),\n    2 => Some(20),\n    _ => None,\n  }\n}\n"
+description: |
+  
+  fn test(n: int) -> Option<int> {
+    match n {
+      1 => Some(10),
+      2 => Some(20),
+      _ => None,
+    }
+  }
 ---
 package main
 
-import lisette "github.com/ivov/lisette/prelude"
-
-func test(n int) lisette.Option[int] {
+func test(n int) (int, bool) {
 	switch n {
 	case 1:
-		return lisette.MakeOptionSome[int](10)
+		return 10, true
 	case 2:
-		return lisette.MakeOptionSome[int](20)
+		return 20, true
 	default:
-		return lisette.MakeOptionNone[int]()
+		return 0, false
 	}
 }

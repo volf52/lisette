@@ -1,0 +1,32 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+import "github.com/user/myproject/shapes"
+
+func main() {
+	p := shapes.Point_New(3, 4)
+	_ = p.SquaredDistance()
+}
+
+
+// === shapes/lib.go ===
+package shapes
+
+type Point struct {
+	X int
+	Y int
+}
+
+func Point_New(x, y int) Point {
+	return Point{
+		X: x,
+		Y: y,
+	}
+}
+
+func (p Point) SquaredDistance() int {
+	return p.X*p.X + p.Y*p.Y
+}

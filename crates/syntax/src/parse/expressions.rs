@@ -1,41 +1,65 @@
 use ecow::EcoString;
 
-use super::{MAX_TUPLE_ARITY, ParseError, Parser};
+use super::pratt::ExpressionContext;
+use super::strings::cook_string_contents;
+use super::{MAX_TUPLE_ARITY, ParamMode, ParseError, Parser};
 use crate::ast::{
-    Annotation, Attribute, BinaryOperator, Binding, Expression, FormatStringPart, ImportAlias,
-    Literal, SelectArm, SelectArmPattern, Span, StructFieldAssignment, UnaryOperator, Visibility,
+    Annotation, Attribute, BinaryOperator, Binding, CallTypeArguments, Expression,
+    FormatStringPart, FunctionBody, IdentifierResolution, ImportAlias, LetMode, Literal, SelectArm,
+    Span, StructFieldAssignment, StructSpread, UnaryOperator, Visibility,
 };
+use crate::lex::Token;
 use crate::lex::TokenKind::{self, *};
+use crate::program::{CallKind, DotAccessResolution};
 use crate::types::Type;
+use std::string;
+
+#[derive(Clone, Copy)]
+enum GoMakeKind {
+    Slice,
+    Channel,
+    Map,
+}
 
 impl<'source> Parser<'source> {
-    pub fn parse_expression(&mut self) -> Expression {
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            self.resync_on_error();
-            return Expression::Unit {
-                ty: Type::uninferred(),
-                span,
-            };
-        }
-        let result = self.pratt_parse(0);
-        self.leave_recursion();
-        result
+    pub(crate) fn parse_expression(&mut self) -> Expression {
+        self.parse_expression_in(ExpressionContext::Normal)
     }
 
-    pub fn parse_atomic_expression(&mut self) -> Expression {
+    pub(crate) fn parse_control_flow_header(&mut self) -> Expression {
+        self.parse_expression_in(ExpressionContext::ControlFlowHeader)
+    }
+
+    fn parse_expression_in(&mut self, context: ExpressionContext) -> Expression {
+        if let Some(result) = self.with_recursion(|parser| parser.pratt_parse(0, context)) {
+            return result;
+        }
+        let span = self.span_from_token(self.current_token());
+        self.resync_on_error();
+        Expression::Unit {
+            ty: Type::uninferred(),
+            span,
+        }
+    }
+
+    pub(super) fn parse_atomic_expression(&mut self, context: ExpressionContext) -> Expression {
         if self.keyword_in_value_position() {
             return self.recover_keyword_as_identifier();
         }
 
         match self.current_token().kind {
-            Integer | Imaginary | Boolean | Char | String | Float => self.parse_literal(),
+            Integer | Imaginary | Boolean | Char | String | RawString | Float => {
+                self.parse_literal()
+            }
             FormatStringStart => self.parse_format_string(),
             LeftParen => self.parse_parenthesized_expression(),
             LeftCurlyBrace => self.parse_block_expression(),
             LeftSquareBracket => self.parse_slice_literal(),
             Identifier => self.parse_identifier(),
-            Function => self.parse_function(None, vec![]),
+            Function if self.stream.peek_ahead(1).kind == LeftParen => {
+                self.parse_fn_as_lambda_recovery()
+            }
+            Function => self.parse_function(None, vec![], ParamMode::Strict),
             Match => self.parse_match(),
             If => self.parse_if(),
             Pipe | PipeDouble => self.parse_lambda(),
@@ -45,10 +69,10 @@ impl<'source> Parser<'source> {
             Recover => self.parse_recover_block(),
             Select => self.parse_select(),
             Loop => self.parse_loop(),
-            Return => self.parse_return(),
+            Return => self.parse_return(false),
             Break => self.parse_break(),
             Continue => self.parse_continue(),
-            DotDot | DotDotEqual => self.parse_range(None, self.current_token()),
+            DotDot | DotDotEqual => self.parse_range(None, self.current_token(), context),
 
             LeftAngleBracket
                 if self.stream.peek_ahead(1).kind == Minus
@@ -69,14 +93,17 @@ impl<'source> Parser<'source> {
                 }
             }
 
+            Backtick => self.recover_unexpected_backtick(),
+
             _ => self.unexpected_token("expr"),
         }
     }
 
-    pub fn parse_range(
+    pub(super) fn parse_range(
         &mut self,
         start: Option<Box<Expression>>,
-        span_start: crate::lex::Token<'source>,
+        span_start: Token<'source>,
+        context: ExpressionContext,
     ) -> Expression {
         if matches!(start.as_deref(), Some(Expression::Range { .. })) {
             self.track_error("not allowed", "Chained range operators are not supported");
@@ -105,7 +132,7 @@ impl<'source> Parser<'source> {
         }
 
         let end = if has_end {
-            Some(Box::new(self.parse_range_end()))
+            Some(Box::new(self.parse_range_end(context)))
         } else {
             None
         };
@@ -115,7 +142,7 @@ impl<'source> Parser<'source> {
             end,
             inclusive,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(span_start),
+            span: self.span_from_offset(span_start.byte_offset),
         }
     }
 
@@ -176,7 +203,31 @@ impl<'source> Parser<'source> {
                     debug_assert!(false, "lexer produced String token without quotes: {:?}", s);
                     s
                 };
-                Literal::String(s_stripped.to_string())
+                Literal::String {
+                    value: cook_string_contents(s_stripped),
+                    raw: false,
+                }
+            }
+            RawString => {
+                let s = self.current_token().text;
+                self.next();
+                let s_stripped = if s.len() >= 3 && s.starts_with("r\"") && s.ends_with('"') {
+                    &s[2..s.len() - 1]
+                } else if s.len() >= 2 && s.starts_with("r\"") {
+                    // unterminated raw string, strip prefix only
+                    &s[2..]
+                } else {
+                    debug_assert!(
+                        false,
+                        "lexer produced RawString token without prefix: {:?}",
+                        s
+                    );
+                    s
+                };
+                Literal::String {
+                    value: cook_string_contents(s_stripped),
+                    raw: true,
+                }
             }
             Char => {
                 let c = self.current_token().text;
@@ -195,7 +246,7 @@ impl<'source> Parser<'source> {
         Expression::Literal {
             literal,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -207,7 +258,7 @@ impl<'source> Parser<'source> {
         Expression::Literal {
             literal: Literal::Slice(expressions),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -230,13 +281,12 @@ impl<'source> Parser<'source> {
         Expression::Identifier {
             value: text.into(),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
-            binding_id: None,
-            qualified: None,
+            span: self.span_from_offset(start.byte_offset),
+            resolution: IdentifierResolution::Unresolved,
         }
     }
 
-    pub fn parse_struct_call(&mut self, expression: Expression) -> Expression {
+    pub(crate) fn parse_struct_call(&mut self, expression: Expression) -> Expression {
         let name = self.make_expression_name(&expression);
         let name_span = expression.get_span();
         let start_offset = name_span.byte_offset; // Start from the name, not the brace
@@ -244,7 +294,7 @@ impl<'source> Parser<'source> {
         self.ensure(LeftCurlyBrace);
 
         let mut field_assignments = vec![];
-        let mut spread = None;
+        let mut spread = StructSpread::None;
         let mut seen_fields: Vec<(EcoString, Span)> = vec![];
 
         while self.is_not(RightCurlyBrace) {
@@ -257,15 +307,14 @@ impl<'source> Parser<'source> {
                     break;
                 }
 
+                let dotdot_token = self.current_token();
+                let dotdot_span = self.span_from_token(dotdot_token);
                 self.ensure(DotDot);
 
                 if self.is(RightCurlyBrace) || self.is(Comma) {
-                    self.track_error(
-                        "not allowed",
-                        "Use `..struct` to spread the fields of one struct into another",
-                    );
+                    spread = StructSpread::Autofill { span: dotdot_span };
                 } else {
-                    spread = Some(self.parse_expression());
+                    spread = StructSpread::From(Box::new(self.parse_expression()));
                 }
 
                 self.expect_comma_or(RightCurlyBrace);
@@ -296,9 +345,8 @@ impl<'source> Parser<'source> {
                 Expression::Identifier {
                     value: field_name.clone(),
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(field_name_token),
-                    binding_id: None,
-                    qualified: None,
+                    span: self.span_from_offset(field_name_token.byte_offset),
+                    resolution: IdentifierResolution::Unresolved,
                 }
             };
 
@@ -317,17 +365,42 @@ impl<'source> Parser<'source> {
             ty: Type::uninferred(),
             name,
             field_assignments,
-            spread: spread.into(),
+            spread,
             span: self.span_from_offset(start_offset),
         }
     }
 
-    pub fn parse_index_expression(&mut self, expression: Expression) -> Expression {
+    pub(crate) fn parse_index_expression(&mut self, expression: Expression) -> Expression {
         let start = self.current_token();
 
         self.ensure(LeftSquareBracket);
 
-        let index = self.parse_expression();
+        let index_start = self.current_token();
+        let lower = if self.is(Colon) {
+            None
+        } else {
+            Some(Box::new(self.parse_expression()))
+        };
+
+        let mut from_colon_syntax = false;
+        let index = if self.is(Colon) {
+            from_colon_syntax = true;
+            self.next();
+            let upper = if self.is(RightSquareBracket) {
+                None
+            } else {
+                Some(Box::new(self.parse_expression()))
+            };
+            Expression::Range {
+                start: lower,
+                end: upper,
+                inclusive: false,
+                ty: Type::uninferred(),
+                span: self.span_from_offset(index_start.byte_offset),
+            }
+        } else {
+            *lower.expect("non-colon index must have a lower expression")
+        };
 
         self.ensure(RightSquareBracket);
 
@@ -335,25 +408,189 @@ impl<'source> Parser<'source> {
             ty: Type::uninferred(),
             expression: expression.into(),
             index: index.into(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
+            from_colon_syntax,
         }
     }
 
-    pub fn parse_function_call(
+    pub(crate) fn parse_function_call(
         &mut self,
         expression: Expression,
-        type_args: Vec<Annotation>,
+        raw_type_args: Vec<Annotation>,
     ) -> Expression {
         let start_offset = expression.get_span().byte_offset;
+
+        if raw_type_args.is_empty()
+            && matches!(&expression, Expression::Identifier { value, resolution: IdentifierResolution::Unresolved, .. } if value == "make")
+            && let Some(recovered) = self.try_go_make_shim(&expression)
+        {
+            return recovered;
+        }
+
         let (args, spread) = self.collect_call_args();
 
         Expression::Call {
             ty: Type::uninferred(),
             expression: expression.into(),
             args,
-            spread: spread.into(),
-            type_args,
+            spread: spread.map(Box::new),
+            type_arguments: CallTypeArguments::unresolved(raw_type_args),
             span: self.span_from_offset(start_offset),
+            call_kind: CallKind::Unresolved,
+        }
+    }
+
+    pub(crate) fn recover_call_missing_parens(
+        &mut self,
+        expression: Expression,
+        raw_type_args: Vec<Annotation>,
+    ) -> Expression {
+        let start_offset = expression.get_span().byte_offset;
+        let span = self.span_from_offset(start_offset);
+        let called = self.source
+            [span.byte_offset as usize..(span.byte_offset + span.byte_length) as usize]
+            .trim_end();
+
+        if !self.too_many_errors() {
+            let label = if raw_type_args.len() == 1 {
+                "expected `()` after type argument"
+            } else {
+                "expected `()` after type arguments"
+            };
+
+            self.errors.push(
+                ParseError::new("Missing call parens", span, label)
+                    .with_parse_code("call_missing_parens")
+                    .with_help(format!("Add parens to call it: `{called}()`")),
+            );
+        }
+
+        Expression::Call {
+            ty: Type::uninferred(),
+            expression: expression.into(),
+            args: vec![],
+            spread: None,
+            type_arguments: CallTypeArguments::unresolved(raw_type_args),
+            span,
+            call_kind: CallKind::Unresolved,
+        }
+    }
+
+    fn try_go_make_shim(&mut self, callee: &Expression) -> Option<Expression> {
+        let kind = self.classify_go_make()?;
+        let help = match (kind, self.scan_go_make_args()) {
+            (GoMakeKind::Slice, 0) => "Use `Slice.new<T>()` for an empty slice.",
+            (GoMakeKind::Slice, 1) => "Use `Slice.make<T>(n)` for a zero-filled slice.",
+            (GoMakeKind::Slice, _) => {
+                "For `make([]T, 0, c)` use `Slice.new<T>().reserve(c)`. For a nonzero length, use `Slice.make<T>(n)` and `reserve` the extra capacity."
+            }
+            (GoMakeKind::Channel, 0) => "Use `Channel.new<T>()`.",
+            (GoMakeKind::Channel, _) => "Use `Channel.buffered<T>(n)`.",
+            (GoMakeKind::Map, _) => "Use `Map.new<K, V>()`.",
+        };
+
+        let span = callee.get_span();
+        if !self.too_many_errors() {
+            self.errors.push(
+                ParseError::new("Syntax error", span, "Lisette has no `make` builtin")
+                    .with_parse_code("go_make_builtin")
+                    .with_help(help),
+            );
+        }
+
+        self.consume_balanced_parens();
+
+        Some(Expression::Unit {
+            ty: Type::uninferred(),
+            span: self.span_from_offset(span.byte_offset),
+        })
+    }
+
+    fn classify_go_make(&self) -> Option<GoMakeKind> {
+        let first = self.stream.peek_ahead(1);
+        let second = self.stream.peek_ahead(2);
+
+        if first.kind == LeftSquareBracket
+            && second.kind == RightSquareBracket
+            && self.stream.peek_ahead(3).kind == Identifier
+        {
+            return Some(GoMakeKind::Slice);
+        }
+
+        if first.kind == Identifier && first.text == "chan" && second.kind == Identifier {
+            return Some(GoMakeKind::Channel);
+        }
+
+        if first.kind == Identifier
+            && first.text == "map"
+            && second.kind == LeftSquareBracket
+            && self.go_map_type_has_value()
+        {
+            return Some(GoMakeKind::Map);
+        }
+
+        None
+    }
+
+    fn go_map_type_has_value(&self) -> bool {
+        let mut offset = 2;
+        let mut depth = 0usize;
+        loop {
+            match self.stream.peek_ahead(offset).kind {
+                EOF => return false,
+                LeftSquareBracket => depth += 1,
+                RightSquareBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.stream.peek_ahead(offset + 1).kind == Identifier;
+                    }
+                }
+                _ => {}
+            }
+            offset += 1;
+        }
+    }
+
+    fn scan_go_make_args(&self) -> usize {
+        let mut offset = 1;
+        let mut paren = 1usize;
+        let mut bracket = 0usize;
+        let mut commas = 0usize;
+        loop {
+            match self.stream.peek_ahead(offset).kind {
+                EOF => break,
+                LeftParen => paren += 1,
+                RightParen => {
+                    paren -= 1;
+                    if paren == 0 {
+                        break;
+                    }
+                }
+                LeftSquareBracket => bracket += 1,
+                RightSquareBracket => bracket = bracket.saturating_sub(1),
+                Comma if paren == 1 && bracket == 0 => commas += 1,
+                _ => {}
+            }
+            offset += 1;
+        }
+        commas
+    }
+
+    fn consume_balanced_parens(&mut self) {
+        let mut depth = 0usize;
+        while !self.at_eof() {
+            let kind = self.current_token().kind;
+            self.next();
+            match kind {
+                LeftParen => depth += 1,
+                RightParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -370,10 +607,23 @@ impl<'source> Parser<'source> {
             {
                 break;
             }
-            if self.is(DotDot) {
-                return (args, Some(self.parse_spread_arg()));
+            let arg = self.parse_expression();
+            if self.is(Ellipsis) {
+                self.next();
+                self.expect_comma_or(RightParen);
+                if !self.is(RightParen) && !self.at_eof() {
+                    self.track_error(
+                        "argument after spread",
+                        "The `spread...` must be the last argument in the call.",
+                    );
+                    while !self.at_eof() && !self.is(RightParen) {
+                        self.next();
+                    }
+                }
+                self.advance_if(RightParen);
+                return (args, Some(arg));
             }
-            args.push(self.parse_expression());
+            args.push(arg);
             self.expect_comma_or(RightParen);
         }
 
@@ -385,12 +635,7 @@ impl<'source> Parser<'source> {
         if !(self.is(Function) && self.stream.peek_ahead(1).kind == LeftParen) {
             return false;
         }
-        let start = self.current_token();
-        let span = Span::new(self.file_id, start.byte_offset, start.byte_length + 1);
-        let error = ParseError::new("Syntax error", span, "expected a lambda")
-            .with_parse_code("fn_as_lambda")
-            .with_help("Use a lambda instead: `|x| x * 2`");
-        self.errors.push(error);
+        let span = self.track_fn_as_lambda_error();
         self.resync_on_error();
         args.push(Expression::Unit {
             ty: Type::uninferred(),
@@ -399,24 +644,43 @@ impl<'source> Parser<'source> {
         true
     }
 
-    fn parse_spread_arg(&mut self) -> Expression {
-        self.ensure(DotDot);
-        let spread = self.parse_expression();
-        self.expect_comma_or(RightParen);
-        if !self.is(RightParen) && !self.at_eof() {
-            self.track_error(
-                "argument after spread",
-                "The `..spread` must be the last argument in the call.",
-            );
-            while !self.at_eof() && !self.is(RightParen) {
-                self.next();
+    fn parse_fn_as_lambda_recovery(&mut self) -> Expression {
+        let start = self.current_token();
+        self.track_fn_as_lambda_error();
+
+        self.ensure(Function);
+        let params = self.parse_function_params(ParamMode::Strict);
+        let return_annotation = self.parse_function_return_annotation();
+
+        let body = if self.is(LeftCurlyBrace) {
+            self.parse_block_expression()
+        } else {
+            Expression::Unit {
+                ty: Type::uninferred(),
+                span: self.span_from_offset(start.byte_offset),
             }
+        };
+
+        Expression::Lambda {
+            params,
+            return_annotation,
+            body: body.into(),
+            ty: Type::uninferred(),
+            span: self.span_from_offset(start.byte_offset),
         }
-        self.advance_if(RightParen);
-        spread
     }
 
-    pub fn parse_type_args(&mut self) -> Vec<Annotation> {
+    fn track_fn_as_lambda_error(&mut self) -> Span {
+        let start = self.current_token();
+        let span = Span::new(self.file_id, start.byte_offset, start.byte_length + 1);
+        let error = ParseError::new("Syntax error", span, "expected a lambda")
+            .with_parse_code("fn_as_lambda")
+            .with_help("Use a lambda instead: `|x| x * 2`");
+        self.errors.push(error);
+        span
+    }
+
+    pub(crate) fn parse_type_args(&mut self) -> Vec<Annotation> {
         self.ensure(LeftAngleBracket);
 
         let mut type_args = vec![];
@@ -426,26 +690,39 @@ impl<'source> Parser<'source> {
                 break;
             }
 
-            type_args.push(self.parse_annotation());
+            // A turbofish arg is a type or an integer size (the `N` in `Array.new<T, N>()`).
+            if self.at_size_position_value() {
+                type_args.push(self.parse_size_type_arg());
+            } else {
+                type_args.push(self.parse_annotation());
+            }
 
-            if self.is(RightAngleBracket) {
+            if self.is_right_angle_like() {
                 break;
             }
 
             self.ensure(Comma);
         }
 
-        self.ensure(RightAngleBracket);
+        if !self.advance_if_right_angle() {
+            self.ensure(RightAngleBracket);
+        }
 
         type_args
     }
 
-    pub fn parse_binary_operator(&mut self) -> BinaryOperator {
+    pub(crate) fn parse_binary_operator(&mut self) -> BinaryOperator {
         let operator = match self.current_token().kind {
             Plus => BinaryOperator::Addition,
             Minus => BinaryOperator::Subtraction,
             Star => BinaryOperator::Multiplication,
             Slash => BinaryOperator::Division,
+            Ampersand => BinaryOperator::BitwiseAnd,
+            Pipe => BinaryOperator::BitwiseOr,
+            Caret => BinaryOperator::BitwiseXor,
+            AndNot => BinaryOperator::BitwiseAndNot,
+            ShiftLeft => BinaryOperator::ShiftLeft,
+            ShiftRight => BinaryOperator::ShiftRight,
             LeftAngleBracket => BinaryOperator::LessThan,
             LessThanOrEqual => BinaryOperator::LessThanOrEqual,
             RightAngleBracket => BinaryOperator::GreaterThan,
@@ -461,7 +738,7 @@ impl<'source> Parser<'source> {
                 self.track_error(format!(
                     "expected binary operator, found {}",
                     self.current_token().kind
-                ), "Binary operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`.");
+                ), "Binary operators: `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `&^`, `<<`, `>>`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`.");
                 BinaryOperator::Addition // meaningless fallback
             }
         };
@@ -476,7 +753,7 @@ impl<'source> Parser<'source> {
 
         let (expressions, has_trailing_comma) =
             self.collect_delimited_expressions(LeftParen, RightParen);
-        let span = self.span_from_tokens(start);
+        let span = self.span_from_offset(start.byte_offset);
 
         match expressions.len() {
             0 => Expression::Unit {
@@ -507,7 +784,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_try(&mut self, expression: Expression) -> Expression {
+    pub(crate) fn parse_try(&mut self, expression: Expression) -> Expression {
         let start_offset = expression.get_span().byte_offset;
 
         self.ensure(QuestionMark);
@@ -551,53 +828,27 @@ impl<'source> Parser<'source> {
             return_annotation,
             body: body.into(),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_block_expression(&mut self) -> Expression {
+    pub(crate) fn parse_block_expression(&mut self) -> Expression {
         let start = self.current_token();
 
         self.ensure(LeftCurlyBrace);
 
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            let mut brace_depth = 1u32;
-            while brace_depth > 0 && !self.at_eof() {
-                match self.current_token().kind {
-                    LeftCurlyBrace => brace_depth += 1,
-                    RightCurlyBrace => brace_depth -= 1,
-                    _ => {}
-                }
-                if brace_depth > 0 {
-                    self.next();
-                }
-            }
-            self.advance_if(RightCurlyBrace);
+        if self.looks_like_map_literal() {
+            let key_span = self.span_from_token(self.current_token());
+            self.consume_to_matching_close_brace();
+            self.error_map_literal_not_supported(key_span);
             return Expression::Block {
                 ty: Type::uninferred(),
                 items: vec![],
-                span,
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
-        let mut items = vec![];
-
-        while self.is_not(RightCurlyBrace) && !self.too_many_errors() {
-            let position = self.position();
-            let item = self.parse_block_item();
-
-            self.advance_if(Semicolon);
-
-            items.push(item);
-            if self.position() == position {
-                self.next();
-            }
-        }
-
-        let span = self.close_brace_span(start, start);
-
-        self.leave_recursion();
+        let (items, span) = self.parse_braced_items(start, start);
 
         Expression::Block {
             ty: Type::uninferred(),
@@ -606,28 +857,61 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_function_params(&mut self) -> Vec<Binding> {
+    fn parse_braced_items(
+        &mut self,
+        span_start: Token<'source>,
+        opening_brace: Token<'source>,
+    ) -> (Vec<Expression>, Span) {
+        if let Some(result) = self.with_recursion(|parser| {
+            let mut items = vec![];
+            while parser.is_not(RightCurlyBrace) && !parser.too_many_errors() {
+                let position = parser.position();
+                let item = parser.parse_block_item();
+                parser.advance_if(Semicolon);
+                items.push(item);
+                if parser.position() == position {
+                    parser.next();
+                }
+            }
+            let span = parser.close_brace_span(span_start, opening_brace);
+            (items, span)
+        }) {
+            return result;
+        }
+
+        let span = self.span_from_token(self.current_token());
+        self.consume_to_matching_close_brace();
+        (vec![], span)
+    }
+
+    pub(crate) fn parse_function_params(&mut self, mode: ParamMode) -> Vec<Binding> {
         self.ensure(LeftParen);
 
         let mut params = vec![];
 
-        while self.is_not(RightParen) {
-            params.push(self.parse_binding_with_type());
+        while self.is_not(RightParen) && !self.at_parameter_recovery_boundary() {
+            params.push(self.parse_binding_with_type(mode, params.is_empty()));
+            if self.at_parameter_recovery_boundary() {
+                break;
+            }
             self.expect_comma_or(RightParen);
         }
 
-        self.ensure(RightParen);
+        self.ensure_in_place(RightParen);
 
         params
     }
 
-    pub fn parse_lambda_params(&mut self) -> Vec<Binding> {
+    fn parse_lambda_params(&mut self) -> Vec<Binding> {
         self.ensure(Pipe);
 
         let mut params = vec![];
 
         while self.is_not(Pipe) {
-            params.push(self.parse_binding());
+            let mut_span = self.parse_mut_span();
+            let mut binding = self.parse_binding();
+            binding.mut_span = mut_span;
+            params.push(binding);
             self.expect_comma_or(Pipe);
         }
 
@@ -636,10 +920,11 @@ impl<'source> Parser<'source> {
         params
     }
 
-    pub fn parse_function(
+    pub(crate) fn parse_function(
         &mut self,
-        doc: Option<std::string::String>,
+        doc: Option<string::String>,
         attributes: Vec<Attribute>,
+        param_mode: ParamMode,
     ) -> Expression {
         let start = self.current_token();
 
@@ -653,13 +938,13 @@ impl<'source> Parser<'source> {
         let name_span = Span::new(name_span.file_id, name_span.byte_offset, name.len() as u32);
 
         let generics = self.parse_generics();
-        let params = self.parse_function_params();
+        let params = self.parse_function_params(param_mode);
         let return_annotation = self.parse_function_return_annotation();
 
         let body = if self.is(LeftCurlyBrace) {
-            self.parse_block_expression()
+            FunctionBody::Definition(Box::new(self.parse_block_expression()))
         } else {
-            Expression::NoOp
+            FunctionBody::Declaration
         };
 
         Expression::Function {
@@ -672,13 +957,13 @@ impl<'source> Parser<'source> {
             return_annotation,
             return_type: Type::uninferred(),
             visibility: Visibility::Private,
-            body: body.into(),
+            body,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_field_access(&mut self, expression: Expression) -> Expression {
+    pub(crate) fn parse_field_access(&mut self, expression: Expression) -> Expression {
         self.ensure(Dot);
 
         let expression_start = expression.get_span().byte_offset;
@@ -689,7 +974,7 @@ impl<'source> Parser<'source> {
                 ty: Type::uninferred(),
                 operator: UnaryOperator::Deref,
                 expression: expression.into(),
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
@@ -710,6 +995,7 @@ impl<'source> Parser<'source> {
                 expression: expression.into(),
                 member: index.to_string().into(),
                 span: self.span_from_offset(expression_start),
+                resolution: DotAccessResolution::Unresolved,
             };
         }
 
@@ -722,10 +1008,11 @@ impl<'source> Parser<'source> {
             expression: expression.into(),
             member: field.into(),
             span: self.span_from_offset(expression_start),
+            resolution: DotAccessResolution::Unresolved,
         }
     }
 
-    pub fn collect_delimited_expressions(
+    pub(crate) fn collect_delimited_expressions(
         &mut self,
         open: TokenKind,
         close: TokenKind,
@@ -740,12 +1027,7 @@ impl<'source> Parser<'source> {
             }
 
             if self.is(Function) && self.stream.peek_ahead(1).kind == LeftParen {
-                let start = self.current_token();
-                let span = Span::new(self.file_id, start.byte_offset, start.byte_length + 1);
-                let error = ParseError::new("Syntax error", span, "expected a lambda")
-                    .with_parse_code("fn_as_lambda")
-                    .with_help("Use a lambda instead: `|x| x * 2`");
-                self.errors.push(error);
+                let span = self.track_fn_as_lambda_error();
                 self.resync_on_error();
                 expressions.push(Expression::Unit {
                     ty: Type::uninferred(),
@@ -800,49 +1082,88 @@ impl<'source> Parser<'source> {
         parts.join(".").into()
     }
 
-    pub fn parse_let(&mut self) -> Expression {
+    pub(crate) fn parse_let(&mut self) -> Expression {
         let start = self.current_token();
 
         self.ensure(Let);
 
-        let (mutable, mut_span) = if self.is(Mut) {
-            let mut_token = self.current_token();
-            let span = Span::new(self.file_id, mut_token.byte_offset, mut_token.byte_length);
-            self.next(); // consume `mut`
-            (true, Some(span))
-        } else {
-            (false, None)
-        };
+        let assert = self.is(Assert);
+        if assert {
+            self.next(); // consume `assert`
+        }
 
-        let binding = self.parse_binding_allowing_or();
+        let mut_span = self.parse_mut_span();
+
+        if assert && let Some(span) = mut_span {
+            self.track_error_at(
+                span,
+                "`let assert` cannot be combined with `mut`",
+                "`let assert` binds a refutable pattern. Remove `mut`",
+            );
+        }
+
+        let mut binding = self.parse_binding_allowing_or();
+        binding.mut_span = mut_span;
+
+        if !self.is(Equal)
+            && let Some(Annotation::Constructor { span, .. }) = binding.annotation.as_ref()
+        {
+            self.error_missing_initializer(*span);
+            let stub_span = self.span_from_offset(start.byte_offset);
+            return Expression::Let {
+                binding: Box::new(binding),
+                value: Box::new(Expression::Block {
+                    ty: Type::uninferred(),
+                    items: vec![],
+                    span: stub_span,
+                }),
+                mode: if assert {
+                    LetMode::Assert
+                } else {
+                    LetMode::Plain
+                },
+                ty: Type::uninferred(),
+                span: stub_span,
+            };
+        }
 
         self.ensure(Equal);
 
         let expression = self.parse_expression();
 
-        let (else_block, else_span) = if self.is(Else) {
+        let else_clause = if self.is(Else) {
             let else_token = self.current_token();
             let span = Span::new(self.file_id, else_token.byte_offset, else_token.byte_length);
             self.next(); // consume `else`
-            (Some(Box::new(self.parse_block_expression())), Some(span))
+            Some((Box::new(self.parse_block_expression()), span))
         } else {
-            (None, None)
+            None
+        };
+
+        let mode = match (assert, else_clause) {
+            (false, None) => LetMode::Plain,
+            (true, None) => LetMode::Assert,
+            (false, Some((block, else_span))) => LetMode::Else { block, else_span },
+            (true, Some((block, else_span))) => {
+                self.track_error_at(
+                    else_span,
+                    "`let assert` cannot have an `else` block",
+                    "`let assert` already fails the test on mismatch. Remove the `else`",
+                );
+                LetMode::InvalidAssertElse { block, else_span }
+            }
         };
 
         Expression::Let {
             binding: Box::new(binding),
             value: expression.into(),
-            mutable,
-            mut_span,
-            else_block,
-            else_span,
-            typed_pattern: None,
+            mode,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_import(&mut self) -> Expression {
+    pub(crate) fn parse_import(&mut self) -> Expression {
         let start = self.current_token();
 
         self.ensure(Import);
@@ -875,26 +1196,26 @@ impl<'source> Parser<'source> {
             let (label, help) = if name_token.kind == Identifier
                 && self.stream.peek_ahead(1).kind == Colon
             {
-                let module_name = name_token.text;
+                let package_name = name_token.text;
                 (
                     "expected double quotes".to_string(),
                     format!(
                         "Wrap the import path in double quotes: `import \"{0}:...\"`",
-                        module_name
+                        package_name
                     ),
                 )
             } else if name_token.kind == Identifier {
-                let module_name = name_token.text;
+                let package_name = name_token.text;
                 (
                     "expected double quotes".to_string(),
                     format!(
                         "Wrap the import path in double quotes: `import \"{}\"`",
-                        module_name
+                        package_name
                     ),
                 )
             } else {
                 (
-                    "expected module path".to_string(),
+                    "expected package path".to_string(),
                     "Wrap the import path in double quotes, e.g. `import \"go:os\"`".to_string(),
                 )
             };
@@ -903,34 +1224,48 @@ impl<'source> Parser<'source> {
             self.resync_on_error();
             return Expression::Unit {
                 ty: Type::uninferred(),
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
         self.next();
 
         let raw = name_token.text;
-        let name: EcoString = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-            raw[1..raw.len() - 1].into()
+        let unquoted: &str = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+            &raw[1..raw.len() - 1]
         } else {
             debug_assert!(
                 false,
                 "lexer produced String token without quotes: {:?}",
                 raw
             );
-            raw.into()
+            raw
         };
+
+        if alias.is_none() && self.is(As) && self.stream.peek_ahead(1).kind == Identifier {
+            let as_token = self.current_token();
+            let alias_identifier = self.stream.peek_ahead(1);
+            self.next();
+            self.next();
+            self.error_import_alias_after_path(
+                self.span_from_offset(as_token.byte_offset),
+                alias_identifier.text,
+                unquoted,
+            );
+        }
+
+        let name: EcoString = unquoted.into();
         let name_span = Span::new(self.file_id, name_token.byte_offset, name_token.byte_length);
 
-        Expression::ModuleImport {
+        Expression::PackageImport {
             name,
             name_span,
             alias,
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_assignment(&mut self) -> Expression {
+    pub(crate) fn parse_assignment(&mut self) -> Expression {
         let start = self.current_token();
 
         let lhs = self.parse_expression();
@@ -941,6 +1276,12 @@ impl<'source> Parser<'source> {
             StarEqual => Some(BinaryOperator::Multiplication),
             SlashEqual => Some(BinaryOperator::Division),
             PercentEqual => Some(BinaryOperator::Remainder),
+            AmpersandEqual => Some(BinaryOperator::BitwiseAnd),
+            PipeEqual => Some(BinaryOperator::BitwiseOr),
+            CaretEqual => Some(BinaryOperator::BitwiseXor),
+            AndNotEqual => Some(BinaryOperator::BitwiseAndNot),
+            ShiftLeftEqual => Some(BinaryOperator::ShiftLeft),
+            ShiftRightEqual => Some(BinaryOperator::ShiftRight),
             _ => None,
         };
 
@@ -950,21 +1291,17 @@ impl<'source> Parser<'source> {
                     "invalid assignment target",
                     "Only variables, fields, and indices can be assigned to.",
                 );
+                self.next();
+                let _rhs = self.parse_expression();
+                return lhs;
             }
             self.next();
             let rhs = self.parse_expression();
             return Expression::Assignment {
-                target: lhs.clone().into(),
-                value: Expression::Binary {
-                    left: lhs.into(),
-                    operator,
-                    right: rhs.into(),
-                    ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
-                }
-                .into(),
+                target: lhs.into(),
+                value: rhs.into(),
                 compound_operator: Some(operator),
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
@@ -998,11 +1335,11 @@ impl<'source> Parser<'source> {
             target: lhs.into(),
             value: self.parse_expression().into(),
             compound_operator: None,
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    fn is_valid_assignment_target(&self, expression: &Expression) -> bool {
+    pub(super) fn is_valid_assignment_target(&self, expression: &Expression) -> bool {
         use Expression::*;
 
         matches!(
@@ -1031,7 +1368,7 @@ impl<'source> Parser<'source> {
                 FormatStringText => {
                     let text = self.current_token().text;
                     self.next();
-                    parts.push(FormatStringPart::Text(text.to_string()));
+                    parts.push(FormatStringPart::Text(cook_string_contents(text)));
                 }
                 FormatStringInterpolationStart => {
                     self.ensure(FormatStringInterpolationStart);
@@ -1072,11 +1409,11 @@ impl<'source> Parser<'source> {
         Expression::Literal {
             literal: Literal::FormatString(parts),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_task(&mut self) -> Expression {
+    fn parse_task(&mut self) -> Expression {
         let start = self.current_token();
 
         self.ensure(Task);
@@ -1102,11 +1439,11 @@ impl<'source> Parser<'source> {
         Expression::Task {
             expression: Box::new(expression),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_defer(&mut self) -> Expression {
+    pub(crate) fn parse_defer(&mut self) -> Expression {
         let start = self.current_token();
 
         self.ensure(Defer);
@@ -1132,18 +1469,18 @@ impl<'source> Parser<'source> {
         Expression::Defer {
             expression: Box::new(expression),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_try_block(&mut self) -> Expression {
+    fn parse_try_block(&mut self) -> Expression {
         let start = self.current_token();
         let try_keyword_span = Span::new(self.file_id, start.byte_offset, start.byte_length);
 
         self.ensure(Try);
 
         if !self.is(LeftCurlyBrace) {
-            let span = self.span_from_tokens(start);
+            let span = self.span_from_offset(start.byte_offset);
             let error = ParseError::new("Invalid `try`", span, "requires a block")
                 .with_parse_code("syntax_error")
                 .with_help("Use `try { expression }` instead of `try expression`");
@@ -1153,52 +1490,13 @@ impl<'source> Parser<'source> {
                 items: vec![expression],
                 ty: Type::uninferred(),
                 try_keyword_span,
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
         let brace_token = self.current_token();
         self.ensure(LeftCurlyBrace);
-
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            let mut brace_depth = 1u32;
-            while brace_depth > 0 && !self.at_eof() {
-                match self.current_token().kind {
-                    LeftCurlyBrace => brace_depth += 1,
-                    RightCurlyBrace => brace_depth -= 1,
-                    _ => {}
-                }
-                if brace_depth > 0 {
-                    self.next();
-                }
-            }
-            self.advance_if(RightCurlyBrace);
-            return Expression::TryBlock {
-                items: vec![],
-                ty: Type::uninferred(),
-                try_keyword_span,
-                span,
-            };
-        }
-
-        let mut items = vec![];
-
-        while self.is_not(RightCurlyBrace) && !self.too_many_errors() {
-            let position = self.position();
-            let item = self.parse_block_item();
-
-            self.advance_if(Semicolon);
-
-            items.push(item);
-            if self.position() == position {
-                self.next();
-            }
-        }
-
-        let span = self.close_brace_span(start, brace_token);
-
-        self.leave_recursion();
+        let (items, span) = self.parse_braced_items(start, brace_token);
 
         Expression::TryBlock {
             items,
@@ -1208,14 +1506,14 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_recover_block(&mut self) -> Expression {
+    fn parse_recover_block(&mut self) -> Expression {
         let start = self.current_token();
         let recover_keyword_span = Span::new(self.file_id, start.byte_offset, start.byte_length);
 
         self.ensure(Recover);
 
         if !self.is(LeftCurlyBrace) {
-            let span = self.span_from_tokens(start);
+            let span = self.span_from_offset(start.byte_offset);
             let error = ParseError::new("Invalid `recover`", span, "requires a block")
                 .with_parse_code("syntax_error")
                 .with_help("Use `recover { expression }` instead of `recover expression`");
@@ -1225,52 +1523,13 @@ impl<'source> Parser<'source> {
                 items: vec![expression],
                 ty: Type::uninferred(),
                 recover_keyword_span,
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
         let brace_token = self.current_token();
         self.ensure(LeftCurlyBrace);
-
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            let mut brace_depth = 1u32;
-            while brace_depth > 0 && !self.at_eof() {
-                match self.current_token().kind {
-                    LeftCurlyBrace => brace_depth += 1,
-                    RightCurlyBrace => brace_depth -= 1,
-                    _ => {}
-                }
-                if brace_depth > 0 {
-                    self.next();
-                }
-            }
-            self.advance_if(RightCurlyBrace);
-            return Expression::RecoverBlock {
-                items: vec![],
-                ty: Type::uninferred(),
-                recover_keyword_span,
-                span,
-            };
-        }
-
-        let mut items = vec![];
-
-        while self.is_not(RightCurlyBrace) && !self.too_many_errors() {
-            let position = self.position();
-            let item = self.parse_block_item();
-
-            self.advance_if(Semicolon);
-
-            items.push(item);
-            if self.position() == position {
-                self.next();
-            }
-        }
-
-        let span = self.close_brace_span(start, brace_token);
-
-        self.leave_recursion();
+        let (items, span) = self.parse_braced_items(start, brace_token);
 
         Expression::RecoverBlock {
             items,
@@ -1280,7 +1539,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_select(&mut self) -> Expression {
+    fn parse_select(&mut self) -> Expression {
         let start = self.current_token();
 
         self.ensure(Select);
@@ -1304,7 +1563,7 @@ impl<'source> Parser<'source> {
         Expression::Select {
             arms,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -1317,32 +1576,25 @@ impl<'source> Parser<'source> {
                 let receive_expression = Box::new(self.parse_expression());
                 self.ensure(ArrowDouble);
                 let body = Box::new(self.parse_expression());
-                SelectArm {
-                    pattern: SelectArmPattern::Receive {
-                        binding: Box::new(binding),
-                        typed_pattern: None,
-                        receive_expression,
-                        body,
-                    },
+                SelectArm::Receive {
+                    binding: Box::new(binding),
+                    receive_expression,
+                    body,
                 }
             }
             Match => {
                 let match_expression = self.parse_match();
                 if let Expression::Match { subject, arms, .. } = match_expression {
-                    SelectArm {
-                        pattern: SelectArmPattern::MatchReceive {
-                            receive_expression: subject,
-                            arms,
-                        },
+                    SelectArm::MatchReceive {
+                        receive_expression: subject,
+                        arms,
                     }
                 } else {
                     self.ensure(ArrowDouble);
                     let body = Box::new(self.parse_expression());
-                    SelectArm {
-                        pattern: SelectArmPattern::Send {
-                            send_expression: Box::new(match_expression),
-                            body,
-                        },
+                    SelectArm::Send {
+                        send_expression: Box::new(match_expression),
+                        body,
                     }
                 }
             }
@@ -1350,33 +1602,18 @@ impl<'source> Parser<'source> {
                 self.next();
                 self.ensure(ArrowDouble);
                 let body = Box::new(self.parse_expression());
-                SelectArm {
-                    pattern: SelectArmPattern::WildCard { body },
-                }
+                SelectArm::WildCard { body }
             }
             _ => {
                 let send_expression = Box::new(self.parse_expression());
                 self.ensure(ArrowDouble);
                 let body = Box::new(self.parse_expression());
-                SelectArm {
-                    pattern: SelectArmPattern::Send {
-                        send_expression,
-                        body,
-                    },
+                SelectArm::Send {
+                    send_expression,
+                    body,
                 }
             }
         }
-    }
-
-    pub fn with_control_flow_header<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut Self) -> R,
-    {
-        let old = self.in_control_flow_header;
-        self.in_control_flow_header = true;
-        let result = f(self);
-        self.in_control_flow_header = old;
-        result
     }
 
     fn keyword_in_value_position(&self) -> bool {
@@ -1409,6 +1646,12 @@ impl<'source> Parser<'source> {
                     | LessThanOrEqual
                     | GreaterThanOrEqual
                     | AmpersandDouble
+                    | Ampersand
+                    | Pipe
+                    | Caret
+                    | AndNot
+                    | ShiftLeft
+                    | ShiftRight
                     | Pipeline
                     | Equal
                     | PlusEqual
@@ -1416,6 +1659,12 @@ impl<'source> Parser<'source> {
                     | StarEqual
                     | SlashEqual
                     | PercentEqual
+                    | AmpersandEqual
+                    | PipeEqual
+                    | CaretEqual
+                    | AndNotEqual
+                    | ShiftLeftEqual
+                    | ShiftRightEqual
                     | DotDot
                     | DotDotEqual
                     | As
@@ -1429,17 +1678,188 @@ impl<'source> Parser<'source> {
         let token = self.current_token();
         let keyword = token.text.to_string();
         let span = self.span_from_token(token);
-        let error = ParseError::new("Reserved keyword", span, "reserved keyword")
-            .with_parse_code("keyword_as_identifier")
-            .with_help(format!("Rename `{}`", keyword));
+        let error = if token.kind == Var {
+            ParseError::new("Syntax error", span, "expected `let`")
+                .with_parse_code("expected_let")
+                .with_help("Use `let` to declare a variable: `let x = 0`")
+        } else {
+            ParseError::new("Reserved keyword", span, "cannot be used as an identifier")
+                .with_parse_code("keyword_as_identifier")
+                .with_help(format!("Rename `{}`", keyword))
+        };
         self.errors.push(error);
         self.next();
         Expression::Identifier {
             value: keyword.into(),
             ty: Type::uninferred(),
             span,
-            binding_id: None,
-            qualified: None,
+            resolution: IdentifierResolution::Unresolved,
         }
+    }
+
+    fn looks_like_map_literal(&self) -> bool {
+        let first = self.current_token().kind;
+        let second = self.stream.peek_ahead(1).kind;
+        matches!(first, String | RawString | Integer | Float) && second == Colon
+    }
+
+    fn consume_to_matching_close_brace(&mut self) {
+        let mut brace_depth = 1u32;
+        while brace_depth > 0 && !self.at_eof() {
+            match self.current_token().kind {
+                LeftCurlyBrace => brace_depth += 1,
+                RightCurlyBrace => brace_depth -= 1,
+                _ => {}
+            }
+            if brace_depth > 0 {
+                self.next();
+            }
+        }
+        self.advance_if(RightCurlyBrace);
+    }
+
+    fn recover_unexpected_backtick(&mut self) -> Expression {
+        let token = self.current_token();
+        let token_span = self.span_from_token(token);
+        let opening_span = Span::new(self.file_id, token.byte_offset, 1);
+        let error = ParseError::new("Unexpected backtick", opening_span, "not allowed here")
+            .with_parse_code("unexpected_backtick")
+            .with_help(
+                "Use a regular string `\"...\"` or a raw string `r\"...\"` for single- or multi-line strings. Backticks in Lisette are reserved for struct-tag attributes.",
+            );
+        self.errors.push(error);
+        self.next();
+        Expression::Literal {
+            literal: Literal::String {
+                value: string::String::new(),
+                raw: true,
+            },
+            ty: Type::uninferred(),
+            span: token_span,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::{Annotation, BinaryOperator, Expression};
+    use crate::build_ast;
+
+    fn count_nodes(expression: &Expression) -> usize {
+        1 + expression
+            .children()
+            .into_iter()
+            .map(count_nodes)
+            .sum::<usize>()
+    }
+
+    fn first_assignment(expression: &Expression) -> Option<&Expression> {
+        if matches!(expression, Expression::Assignment { .. }) {
+            return Some(expression);
+        }
+        expression.children().into_iter().find_map(first_assignment)
+    }
+
+    #[test]
+    fn compound_assignment_stores_only_the_rhs() {
+        let result = build_ast("fn f() {\n let mut x = 0\n x += 5\n}", 0);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let assignment = result
+            .ast
+            .iter()
+            .find_map(first_assignment)
+            .expect("an assignment");
+        let Expression::Assignment {
+            value,
+            compound_operator,
+            ..
+        } = assignment
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(*compound_operator, Some(BinaryOperator::Addition));
+        assert!(
+            matches!(value.as_ref(), Expression::Literal { .. }),
+            "value should hold only the rhs, not a duplicated `x + 5`: {value:?}"
+        );
+    }
+
+    #[test]
+    fn function_type_annotation_captures_per_param_writability() {
+        let result = build_ast("fn run(action: fn(mut Bar, Baz) -> ()) {}", 0);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let Some(Expression::Function { params, .. }) = result
+            .ast
+            .iter()
+            .find(|item| matches!(item, Expression::Function { .. }))
+        else {
+            unreachable!("expected a top-level function")
+        };
+        let Some(Annotation::Function {
+            params: type_params,
+            ..
+        }) = &params[0].annotation
+        else {
+            panic!(
+                "expected a function-type annotation, got {:?}",
+                params[0].annotation
+            )
+        };
+
+        assert_eq!(
+            type_params
+                .iter()
+                .map(|param| matches!(param, Annotation::Constructor { writable: true, .. }))
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn lambda_parameter_can_be_mut() {
+        let result = build_ast("fn f() {\n  let g = |mut x: int| x\n  let _ = g\n}", 0);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        fn find_lambda(expression: &Expression) -> Option<&Expression> {
+            if matches!(expression, Expression::Lambda { .. }) {
+                return Some(expression);
+            }
+            expression
+                .children()
+                .iter()
+                .find_map(|child| find_lambda(child))
+        }
+
+        let Some(Expression::Lambda { params, .. }) = result.ast.iter().find_map(find_lambda)
+        else {
+            unreachable!("expected a lambda")
+        };
+
+        assert_eq!(params.len(), 1);
+        assert!(
+            params[0].is_mutable(),
+            "`mut x` lambda parameter should be mutable"
+        );
+    }
+
+    #[test]
+    fn nested_compound_assignments_stay_linear() {
+        let depth = 14;
+        let source = format!(
+            "fn f() {{ {}x{} }}",
+            "{".repeat(depth),
+            "}.f += 1".repeat(depth),
+        );
+        let result = build_ast(&source, 0);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let nodes: usize = result.ast.iter().map(count_nodes).sum();
+        assert!(
+            nodes < 20 * depth,
+            "nested compound assignments grew super-linearly: {nodes} nodes at depth {depth}",
+        );
     }
 }

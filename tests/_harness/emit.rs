@@ -1,9 +1,10 @@
-use emit::{Emitter, OutputFile, TestEmitConfig};
+use emit::{OutputFile, Planner, TestEmitConfig};
 use syntax::program::File;
 
 use super::pipeline::TestPipeline;
+use syntax::program::TestIndex;
 
-pub fn emit_with_debug_info(raw_source: &str) -> EmitResult {
+pub fn emit_with_sourcemap(raw_source: &str) -> EmitResult {
     emit_inner(raw_source, Some(raw_source), &[])
 }
 
@@ -17,7 +18,7 @@ pub fn emit_with_go_typedefs(raw_source: &str, typedefs: &[(&str, &str)]) -> Emi
 
 fn emit_inner(
     raw_source: &str,
-    source_for_debug: Option<&str>,
+    source_for_sourcemap: Option<&str>,
     extra_go_typedefs: &[(&str, &str)],
 ) -> EmitResult {
     let mut pipeline = TestPipeline::new(raw_source).wrapped();
@@ -34,25 +35,30 @@ fn emit_inner(
 
     let file = File {
         id: 0,
-        module_id: result.module_id.clone(),
+        package_id: result.package_id.clone(),
+        parse_status: syntax::FileParseStatus::Clean,
         name: "test.lis".to_string(),
-        source: source_for_debug.unwrap_or("").to_string(),
+        display_path: "src/test.lis".to_string(),
+        source_path: None,
+        source: source_for_sourcemap.unwrap_or("").to_string(),
         items: result.ast,
+        file_comment: None,
     };
 
+    let test_index = TestIndex::default();
     let config = TestEmitConfig {
         definitions: &result.definitions,
-        module_id: &result.module_id,
+        package_id: &result.package_id,
         go_module: "myproject",
         unused: &result.unused,
         mutations: &result.mutations,
-        coercions: &result.coercions,
-        resolutions: &result.resolutions,
-        ufcs_methods: &result.ufcs_methods,
+        equality_index: &result.equality_index,
+        test_index: &test_index,
         go_package_names: &result.go_package_names,
+        go_package_ids: &result.go_package_ids,
     };
-    let mut emitter = Emitter::new_for_tests(&config, source_for_debug);
-    let emitted_files = emitter.emit_files(&[&file], &result.module_id);
+    let emitted_files = Planner::emit_files_for_tests(&config, source_for_sourcemap, &[&file])
+        .unwrap_or_else(|diagnostics| panic!("Emission failed: {diagnostics:?}"));
 
     EmitResult {
         files: emitted_files,

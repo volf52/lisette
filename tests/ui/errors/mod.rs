@@ -1,19 +1,44 @@
 use crate::_harness::build::compile_check;
 use crate::_harness::filesystem::MockFileSystem;
-use crate::_harness::formatting::{format_diagnostic_for_snapshot, format_diagnostic_standalone};
-use crate::_harness::infer::infer_module;
-use crate::{
-    assert_desugar_error_snapshot, assert_infer_error_snapshot, assert_lex_error_snapshot,
-    assert_multimodule_infer_error_snapshot, assert_parse_error_snapshot,
+use crate::_harness::formatting::{
+    format_diagnostic_for_snapshot, format_project_diagnostic_for_snapshot,
 };
+use crate::_harness::infer::{InferResult, checker_errors, infer, infer_package};
+use crate::{
+    assert_infer_error_snapshot, assert_lex_error_snapshot,
+    assert_multipackage_infer_error_snapshot, assert_parse_error_snapshot,
+};
+use syntax::ast::Expression;
+use syntax::ast::StructFields;
+use syntax::ast::Visibility;
+use syntax::parse::ParseResult;
 
-use diagnostics::module_graph::import_cycle;
-use semantics::store::ENTRY_MODULE_ID;
+use semantics::store::ENTRY_PACKAGE_ID;
 
 #[test]
 fn infer_nil_not_supported() {
     let input = r#"
 fn test() -> Option<int> {
+  nil
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_nil_not_supported_for_slice() {
+    let input = r#"
+fn test() -> Slice<int> {
+  nil
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_nil_not_supported_for_map() {
+    let input = r#"
+fn test() -> Map<string, int> {
   nil
 }
 "#;
@@ -48,6 +73,127 @@ fn test() {
 }
 "#;
     assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn parse_go_make_sized_slice() {
+    let input = r#"
+fn test() {
+  let buffer = make([]byte, 1024)
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_go_make_empty_slice() {
+    let input = r#"
+fn test() {
+  let xs = make([]int)
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_go_make_slice_with_capacity() {
+    let input = r#"
+fn test() {
+  let xs = make([]int, 0, 16)
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_call_missing_parens_array_new() {
+    let input = r#"
+fn test() {
+  let buffer = Array.new<byte, 0x80>
+  buffer.length()
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_call_missing_parens_single_type_arg() {
+    let input = r#"
+fn test() {
+  let xs = Slice.new<int>
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_call_missing_parens_nested_type_arg() {
+    let input = r#"
+fn test() {
+  let m = Map.new<string, Slice<int>>
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_call_missing_parens_fn_type_arg() {
+    let input = r#"
+fn test() {
+  let m = Map.new<string, fn(int, int) -> int>
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_call_missing_parens_tuple_type_arg() {
+    let input = r#"
+fn test() {
+  let m = Map.new<string, (int, int)>
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_call_missing_parens_trailing_comment() {
+    let input = r#"
+fn test() {
+  let xs = Slice.new<int> // make a slice
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_go_make_unbuffered_channel() {
+    let input = r#"
+fn test() {
+  let ch = make(chan int)
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_go_make_buffered_channel() {
+    let input = r#"
+fn test() {
+  let ch = make(chan int, 5)
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_go_make_map() {
+    let input = r#"
+fn test() {
+  let m = make(map[string]int)
+}
+"#;
+    assert_parse_error_snapshot!(input);
 }
 
 #[test]
@@ -196,7 +342,7 @@ fn infer_mutate_match_arm_binding() {
 struct Counter { n: int }
 
 impl Counter {
-  fn bump(self: Ref<Counter>) {
+  fn bump(self: mut Ref<Counter>) {
     self.n = self.n + 1
   }
 }
@@ -325,6 +471,90 @@ fn lex_octal_escape_out_of_range() {
 }
 
 #[test]
+fn lex_hex_escape_missing_digit_in_char() {
+    let input = r#"let x = '\x4'"#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_hex_escape_non_hex_digits_in_char() {
+    let input = r#"let x = '\xZZ'"#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_hex_escape_missing_digit_in_string() {
+    let input = r#"let x = "\x4""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_hex_escape_non_hex_digits_in_string() {
+    let input = r#"let x = "\xZZ""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_capital_unicode_escape_non_hex_digits() {
+    let input = r#"let x = "\UZZZZZZZZ""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_capital_unicode_escape_above_max() {
+    let input = r#"let x = "\U0011FFFF""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_single_quote_escape_in_string() {
+    let input = r#"let x = "a\'b""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_double_quote_escape_in_char() {
+    let input = r#"let x = '\"'"#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_unicode_escape_empty_in_char() {
+    let input = r#"let x = '\u{}'"#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_unicode_escape_above_max_in_char() {
+    let input = r#"let x = '\u{110000}'"#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_unicode_escape_unterminated_in_char() {
+    let input = r#"let x = '\u{e9'"#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_invalid_escape_in_format_string() {
+    let input = r#"let x = f"a\qb""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_single_quote_escape_in_format_string() {
+    let input = r#"let x = f"a\'b""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn lex_hex_escape_non_hex_digits_in_format_string() {
+    let input = r#"let x = f"\xZZ""#;
+    assert_lex_error_snapshot!(input);
+}
+
+#[test]
 fn lex_unicode_escape_missing_braces() {
     let input = r#"let x = "\u1F600""#;
     assert_lex_error_snapshot!(input);
@@ -400,6 +630,47 @@ fn lex_octal_missing_digits() {
 fn lex_octal_invalid_digit() {
     let input = r#"let x = 0o789"#;
     assert_lex_error_snapshot!(input);
+}
+
+#[test]
+fn parse_legacy_octal_leading_zero() {
+    let input = r#"
+fn test() {
+  let x = 0644
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_leading_zero_non_octal_digit() {
+    let input = r#"
+fn test() {
+  let x = 08
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_embed_bare_function_target() {
+    let input = r#"
+struct S {
+  embed fn() -> int,
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_embed_field_with_attribute() {
+    let input = r#"
+#[json]
+struct S {
+  #[json("base")] embed Base,
+}
+"#;
+    assert_parse_error_snapshot!(input);
 }
 
 #[test]
@@ -499,6 +770,59 @@ fn main() {
 }
 
 #[test]
+fn parse_attribute_on_unsupported_declaration() {
+    let input = r#"
+#[iterate]
+interface Service {
+  fn run() -> int
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_attribute_on_interface_parent() {
+    let input = r#"
+interface Parent {
+  fn base() -> int
+}
+
+interface Child {
+  #[iterate]
+  embed Parent
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_attribute_inside_function_body() {
+    let input = r#"
+fn main() {
+  let command = "add"
+
+  #[iterate]
+  let result = match command {
+    "add" => 1,
+    _ => 0,
+  }
+
+  let _ = result
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_attribute_non_string_argument_recovers() {
+    let input = r#"
+#[test(123)]
+fn bad_title_arg() { }
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_missing_closing_brace() {
     let input = r#"
 fn main() {
@@ -515,6 +839,26 @@ fn main() {
 }
 "#;
     assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn infer_colon_in_subscript_string() {
+    let input = r#"
+fn test(s: string) {
+  let _ = s[1:3]
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_colon_in_subscript_slice() {
+    let input = r#"
+fn test(items: Slice<int>) {
+  let _ = items[1:3]
+}
+"#;
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
@@ -570,6 +914,81 @@ struct Foo {
 }
 
 #[test]
+fn parse_struct_field_pub_mut() {
+    let input = r#"
+struct Foo {
+  pub mut diffs: Slice<string>,
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_struct_field_mut() {
+    let input = r#"
+struct Foo {
+  mut diffs: Slice<string>,
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_parameter_mut() {
+    let input = r#"
+fn sort(mut items: Slice<int>) {
+  items[0] = 1
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_parameter_mut_scalar() {
+    let input = r#"
+fn shrink(mut n: int) -> int {
+  n
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_parameter_mut_on_a_type_that_refuses_permission() {
+    let result = syntax::build_ast(
+        "fn a(mut value: Array<int, 3>) -> int { value[0] }\n\
+         fn b(mut c: Channel<int>) -> int { 1 }\n\
+         fn c(mut pair: (int, int)) -> int { pair.0 }\n\
+         fn d(mut callback: fn()) -> int { 1 }",
+        0,
+    );
+    let diagnostics: Vec<diagnostics::LisetteDiagnostic> =
+        result.errors.into_iter().map(Into::into).collect();
+    assert_eq!(diagnostics.len(), 4, "each marker must report once");
+    for diagnostic in &diagnostics {
+        let help = diagnostic.plain_help().unwrap_or_default();
+        assert!(
+            help.starts_with("Rebind with"),
+            "a type that refuses permission must not be told to move `mut`, got: {help:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_receiver_mut_marker_rejected() {
+    let input = r#"
+struct Counter { n: int }
+
+impl Counter {
+  fn bump(mut self) {
+    let _ = self
+  }
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_enum_variant_invalid_token() {
     let input = r#"
 enum Foo {
@@ -594,6 +1013,36 @@ fn parse_array_literal_missing_comma() {
     let input = r#"
 fn test() {
   let arr = [1 2 3];
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_map_literal_string_keys() {
+    let input = r#"
+fn test() {
+  let m: Map<string, int> = { "a": 1, "b": 2 }
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_map_literal_int_keys() {
+    let input = r#"
+fn test() {
+  let m: Map<int, string> = { 1: "a", 2: "b" }
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_typed_binding_missing_initializer() {
+    let input = r#"
+fn test() {
+  let mut x: atomic.Int64
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -691,7 +1140,7 @@ fn parse_chained_range() {
 fn parse_detached_doc_comment() {
     let input = r#"
 /// Provides utilities for working with strings.
-import "some_module"
+import "some_package"
 "#;
     assert_parse_error_snapshot!(input);
 }
@@ -720,6 +1169,109 @@ impl Foo {
 }
 
 #[test]
+fn parse_import_after_item() {
+    let input = r#"
+import "go:os"
+
+fn main() {}
+
+import "go:fmt"
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_import_after_item_with_line_comment() {
+    let input = "fn main() {}\n\nimport \"go:fmt\" // why";
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_public_import() {
+    let input = r#"
+pub import "go:fmt"
+
+fn main() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_misplaced_file_comment_after_import() {
+    let input = r#"
+import "some_package"
+
+//! Provides utilities for working with strings.
+
+fn foo() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_misplaced_file_comment_after_items() {
+    let input = r#"
+fn foo() {}
+
+//! Trailing file header.
+//! Second line.
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_misplaced_file_comment_in_block() {
+    let input = r#"
+fn foo() {
+  //! Not a file header.
+  1
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_misplaced_file_comment_after_leading_comment() {
+    let input = r#"
+// a regular comment first
+//! Too late for a file header.
+
+fn main() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_split_file_comment() {
+    let input = r#"//! First run.
+
+//! Second run.
+
+fn main() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_file_comment_build_constraint() {
+    let input = r#"//! +build ignore
+
+fn main() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_misplaced_file_comment_after_blank_line() {
+    let input = r#"
+//! Not at the very top.
+
+fn main() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_error_single_element_tuple() {
     let input = r#"
 fn test() {
@@ -733,6 +1285,57 @@ fn test() {
 fn parse_error_single_element_tuple_type() {
     let input = r#"
 fn f() -> (int,) {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_bare_multi_value_return() {
+    let input = r#"
+fn divmod(a: int, b: int) -> (int, int) {
+  return a / b, a % b
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_bare_multi_value_return_identifiers() {
+    let input = r#"
+fn pair(a: int, b: int) -> (int, int) {
+  return a, b
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_return_trailing_comma() {
+    let input = r#"
+fn f() -> int {
+  return 1,
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_bare_multi_value_return_too_many() {
+    let input = r#"
+fn f() -> int {
+  return 1, 2, 3, 4, 5, 6
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_return_trailing_comma_does_not_consume_next_statement() {
+    let input = r#"
+fn f() -> int {
+  return 1,
+  return 2
+}
 "#;
     assert_parse_error_snapshot!(input);
 }
@@ -772,6 +1375,30 @@ fn f<T: Display +>() {}
 }
 
 #[test]
+fn parse_error_function_unclosed_generic_at_eof() {
+    let input = "fn f<";
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_error_struct_unclosed_generic_at_eof() {
+    let input = "struct S<";
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_error_type_alias_unclosed_generic_at_eof() {
+    let input = "type T<";
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_error_impl_unclosed_generic_at_eof() {
+    let input = "impl<";
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_error_local_enum_in_function() {
     let input = r#"
 fn test() {
@@ -792,27 +1419,27 @@ fn test() {
 }
 
 #[test]
-fn desugar_propagate_in_pipeline() {
+fn infer_propagate_in_pipeline() {
     let input = "fn test() { x |> validate? |> transform; }";
-    assert_desugar_error_snapshot!(input);
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
-fn desugar_pipeline_with_literal() {
+fn infer_pipeline_with_literal() {
     let input = "fn test() { x |> 5; }";
-    assert_desugar_error_snapshot!(input);
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
-fn desugar_pipeline_with_lambda() {
+fn infer_pipeline_with_lambda() {
     let input = "fn test() { x |> |y| y * 2; }";
-    assert_desugar_error_snapshot!(input);
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
-fn desugar_pipeline_with_binary() {
+fn infer_pipeline_with_binary() {
     let input = "fn test() { x |> 1 + 2; }";
-    assert_desugar_error_snapshot!(input);
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
@@ -823,6 +1450,168 @@ fn test() {
 }
 "#;
     assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_enum_variant_as_bare_value() {
+    let input = r#"
+enum A {
+  Test { test: string },
+}
+
+fn main() {
+  let a = A.Test
+  let _ = a
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_phantom_type_param_imported_function_call_rejected() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "util",
+        "util.lis",
+        r#"
+pub fn weird<T>() -> int { 1 }
+"#,
+    );
+
+    let source = r#"
+import "util"
+
+fn main() {
+  let _ = util.weird()
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_phantom_type_param_function_passed_as_argument_rejected() {
+    let input = r#"
+fn bar(f: fn() -> ()) {}
+
+fn foo_f<T>() {}
+
+fn main() {
+  let _ = bar(foo_f)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_phantom_type_param_imported_function_passed_as_argument_rejected() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "util",
+        "util.lis",
+        r#"
+pub fn weird<T>() {}
+"#,
+    );
+
+    let source = r#"
+import "util"
+
+fn bar(f: fn() -> ()) {}
+
+fn main() {
+  let _ = bar(util.weird)
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_imported_function_shortened_type_args_rejected() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "util",
+        "util.lis",
+        r#"
+pub fn choose<T, U>(x: T) -> U { panic("boom") }
+"#,
+    );
+
+    let source = r#"
+import "util"
+
+fn main() {
+  let y: string = util.choose<string>(1)
+  let _ = y
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_cross_package_static_method_shortened_type_args_rejected() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "util",
+        "util.lis",
+        r#"
+pub struct Box {}
+impl Box { pub fn choose<T, U>(x: T) -> U { panic("boom") } }
+"#,
+    );
+
+    let source = r#"
+import "util"
+
+fn main() {
+  let y: string = util.Box.choose<string>(1)
+  let _ = y
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_struct_enum_variant_as_bare_value_cross_package() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "shapes",
+        "lib.lis",
+        r#"
+pub enum Shape {
+  Rect { w: float64, h: float64 },
+}
+"#,
+    );
+
+    let source = r#"
+import "shapes"
+
+fn main() {
+  let r = shapes.Shape.Rect
+  let _ = r
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -841,7 +1630,7 @@ fn infer_enum_variant_not_found_in_pattern() {
 enum Status { Active, Inactive }
 
 fn test() {
-  let s: Status = Active;
+  let s: Status = Status.Active;
   match s {
     Nope => {}
   }
@@ -851,7 +1640,237 @@ fn test() {
 }
 
 #[test]
-fn infer_enum_variant_not_found_in_pattern_unqualified() {
+fn infer_never_type_as_match_pattern() {
+    let input = r#"
+enum Status { Active, Inactive }
+
+fn test(s: Status) {
+  match s {
+    Never => {}
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_never_type_as_if_let_pattern() {
+    let input = r#"
+enum Status { Active, Inactive }
+
+fn test(s: Status) {
+  if let Never = s {}
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_never_type_as_let_pattern() {
+    let input = r#"
+enum Status { Active, Inactive }
+
+fn test(s: Status) {
+  let Never = s
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_never_type_alias_as_match_pattern() {
+    let input = r#"
+type Impossible = Never
+
+enum Status { Active, Inactive }
+
+fn test(s: Status) {
+  match s {
+    Impossible => {}
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_never_type_as_pattern_on_never_scrutinee() {
+    let input = r#"
+fn diverge() -> Never {
+  panic("boom")
+}
+
+fn test() {
+  match diverge() {
+    Never => {}
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_never_type_as_pattern_on_interface_scrutinee() {
+    let input = r#"
+interface Event {}
+
+fn test(e: Event) {
+  match e {
+    Never => {}
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_name_as_match_pattern() {
+    let input = r#"
+struct Point { x: int }
+
+fn test(p: Point) -> int {
+  match p {
+    Point => 0,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_name_as_match_pattern() {
+    let input = r#"
+enum Color { Red, Blue }
+
+fn test(c: Color) -> int {
+  match c {
+    Color => 0,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_alias_as_match_pattern() {
+    let input = r#"
+type Ints = Slice<int>
+
+fn test(xs: Ints) -> int {
+  match xs {
+    Ints => 0,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_type_alias_as_match_pattern() {
+    let input = r#"
+type Callback = fn() -> int
+
+fn test(f: Callback) -> int {
+  match f {
+    Callback => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_as_match_pattern() {
+    let input = r#"
+enum Status { Active, Inactive }
+
+pub fn Pretend() -> Status {
+  Status.Active
+}
+
+fn test(s: Status) -> int {
+  match s {
+    Pretend => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_returning_enum_as_pattern() {
+    let input = r#"
+enum Status { Active, Inactive }
+
+pub fn Make(x: int) -> Status {
+  Status.Active
+}
+
+fn test(s: Status) -> int {
+  match s {
+    Make(x) => x,
+    _ => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_name_as_pattern_on_interface_scrutinee() {
+    let input = r#"
+interface Event {}
+
+enum Color { Red, Blue }
+
+fn test(e: Event) -> int {
+  match e {
+    Color => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_alias_as_pattern_on_interface_scrutinee() {
+    let input = r#"
+interface Event {}
+
+type Ints = Slice<int>
+
+fn test(e: Event) -> int {
+  match e {
+    Ints => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_type_alias_as_pattern_on_interface_scrutinee() {
+    let input = r#"
+interface Event {}
+
+type Callback = fn() -> int
+
+fn test(e: Event) -> int {
+  match e {
+    Callback => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_variant_misqualified_in_pattern() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -868,14 +1887,14 @@ import "shapes"
 fn test() {
   let s = shapes.Shape.Circle(1.0);
   match s {
-    Circle(r) => {}
+    Shape.Circle(r) => {}
   }
 }
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -902,8 +1921,71 @@ fn test() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_enum_variant_typo_through_alias_suggests_variants() {
+    let input = r#"
+enum Color { Red, Green, Blue }
+type Palette = Color
+
+fn f(p: Palette) -> int {
+  match p {
+    Red => 1,
+    Green => 2,
+    Bluu => 3,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_variant_typo_through_cross_package_alias_suggests_reachable_qualifier() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "events",
+        "lib.lis",
+        r#"
+pub enum Event { Click, Hover }
+"#,
+    );
+    fs.add_file(
+        "api",
+        "lib.lis",
+        r#"
+import "events"
+
+pub type UIEvent = events.Event
+"#,
+    );
+    let source = r#"
+import "api"
+
+fn handle(e: api.UIEvent) -> int {
+  let api.UIEvent.Hovr = e else { return 0 }
+  1
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_enum_variant_not_found_outside_match_suggests_qualified_only() {
+    let input = r#"
+enum Color { Red, Green, Blue }
+
+fn test(c: Color) -> int {
+  let Color.Gren = c else { return 0 }
+  1
+}
+"#;
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
@@ -936,6 +2018,379 @@ fn test() {
 
   let two_param_fn = |a: int, b: int| a + b;
   apply(two_param_fn, 5)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_param_function_type_mismatch() {
+    let input = r#"
+fn advance(data: mut Slice<byte>) -> int {
+  data[0] = 0
+  data.length()
+}
+
+fn apply(f: fn(Slice<byte>) -> int, v: Slice<byte>) -> int {
+  return f(v)
+}
+
+fn test() {
+  let buf = Slice.make<byte>(3)
+  let _ = apply(advance, buf)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_opposing_mut_params_function_type_mismatch() {
+    let input = r#"
+fn advance(head: mut Slice<int>, tail: Slice<int>) -> int {
+  head[0] = 0
+  head.length() + tail.length()
+}
+
+fn apply(f: fn(Slice<int>, mut Slice<int>) -> int, a: Slice<int>, b: mut Slice<int>) -> int {
+  f(a, b)
+}
+
+fn test() {
+  let a = [1]
+  let mut b = [2]
+  let _ = apply(advance, a, b)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_value_with_concrete_param_where_interface_param_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+struct Bar {
+  map_foo_err: fn(FooError) -> string,
+}
+
+fn build(mapper: fn(error) -> string) -> string {
+  mapper(FooError {})
+}
+
+fn test() {
+  let bar = Bar { map_foo_err: |foo| foo.Error() }
+  let _result = build(bar.map_foo_err)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_value_with_interface_param_where_concrete_param_expected() {
+    let input = r#"
+enum Bar {
+  Wrap(error),
+}
+
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+fn run(make_bar: fn(FooError) -> Bar) -> Bar {
+  make_bar(FooError {})
+}
+
+fn test() -> Bar {
+  run(Bar.Wrap)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_value_with_concrete_return_where_interface_return_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+fn make_foo_err() -> FooError {
+  FooError {}
+}
+
+fn run(make: fn() -> error) -> string {
+  make().Error()
+}
+
+fn test() -> string {
+  run(make_foo_err)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_function_value_with_concrete_param_where_unknown_param_expected() {
+    let input = r#"
+fn apply(f: fn(Unknown) -> int) -> int {
+  f(1)
+}
+
+fn double(value: int) -> int {
+  value * 2
+}
+
+fn test() -> int {
+  apply(double)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_concrete_type_argument_where_unknown_type_argument_expected() {
+    let input = r#"
+struct Box<T> {
+  pub value: T,
+}
+
+fn take(b: Box<Unknown>) -> int {
+  assert_type<int>(b.value).unwrap_or(0)
+}
+
+fn test() -> int {
+  let b: Box<int> = Box { value: 1 }
+  take(b)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_value_where_concrete_param_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+fn take(f: FooError) -> string { f.Error() }
+
+fn test() -> string {
+  let e: error = FooError {}
+  take(e)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_value_where_concrete_annotation_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+fn test() -> string {
+  let e: error = FooError {}
+  let concrete: FooError = e
+  concrete.Error()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_value_where_concrete_field_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+struct Holder {
+  pub inner: FooError,
+}
+
+fn test() -> string {
+  let e: error = FooError {}
+  let held = Holder { inner: e }
+  held.inner.Error()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_value_where_concrete_return_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+fn unwrap(e: error) -> FooError { e }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_slice_of_concrete_where_slice_of_interface_expected() {
+    let input = r#"
+interface Animal {
+  fn speak() -> string
+}
+
+struct Cat {}
+
+impl Cat {
+  fn speak(self) -> string { "meow" }
+}
+
+fn take(animals: Slice<Animal>) -> int { animals.length() }
+
+fn test() -> int {
+  let cats: Slice<Cat> = [Cat {}]
+  take(cats)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_option_of_concrete_where_option_of_interface_expected() {
+    let input = r#"
+interface Animal {
+  fn speak() -> string
+}
+
+struct Cat {}
+
+impl Cat {
+  fn speak(self) -> string { "meow" }
+}
+
+fn take(animal: Option<Animal>) -> bool { animal.is_some() }
+
+fn test() -> bool {
+  let cat: Option<Cat> = Some(Cat {})
+  take(cat)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_result_with_concrete_error_where_error_interface_expected() {
+    let input = r#"
+struct FooError {}
+
+impl FooError {
+  fn Error(self) -> string { "foo failed" }
+}
+
+fn take(outcome: Result<int, error>) -> bool { outcome.is_ok() }
+
+fn test() -> bool {
+  let outcome: Result<int, FooError> = Ok(1)
+  take(outcome)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_of_concrete_values_where_map_of_interface_values_expected() {
+    let input = r#"
+interface Animal {
+  fn speak() -> string
+}
+
+struct Cat {}
+
+impl Cat {
+  fn speak(self) -> string { "meow" }
+}
+
+fn take(animals: Map<string, Animal>) -> int { animals.length() }
+
+fn test() -> int {
+  let cats: Map<string, Cat> = Map.new()
+  take(cats)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_slice_of_interface_where_slice_of_concrete_expected() {
+    let input = r#"
+interface Animal {
+  fn speak() -> string
+}
+
+struct Cat {}
+
+impl Cat {
+  fn speak(self) -> string { "meow" }
+}
+
+fn take(cats: Slice<Cat>) -> int { cats.length() }
+
+fn test() -> int {
+  let animals: Slice<Animal> = [Cat {}]
+  take(animals)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_called_function_when_function_alias_expected() {
+    let input = r#"
+type Cmd = fn() -> int
+
+fn quit() -> int { 0 }
+
+fn test() {
+  let _x: Cmd = quit()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_called_function_when_bare_function_type_expected() {
+    let input = r#"
+fn quit() -> int { 0 }
+
+fn test() {
+  let _x: fn() -> int = quit()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_called_function_when_multi_arg_function_type_expected() {
+    let input = r#"
+fn add(a: int, b: int) -> int { a + b }
+
+fn test() {
+  let _x: fn(int, int) -> int = add(1, 2)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -993,7 +2448,7 @@ fn parse_misplaced_interface_in_function() {
     let input = r#"
 fn main() {
   interface Greeter {
-    fn greet(self) -> string
+    fn greet() -> string
   }
 }
 "#;
@@ -1137,6 +2592,28 @@ fn test(a: complex64, b: complex64) -> bool {
 }
 
 #[test]
+fn infer_named_complex_not_orderable() {
+    let input = r#"
+struct Z(complex64)
+
+fn test(a: Z, b: Z) -> bool {
+  a < b
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_compare_unbounded_param_suggests_ordered_bound() {
+    let input = r#"
+fn largest<T>(a: T, b: T) -> T {
+  if a > b { a } else { b }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_unindexable_type() {
     let input = r#"
 fn test() {
@@ -1153,6 +2630,16 @@ fn infer_not_callable() {
 fn test() {
   let x = 42;
   x(1, 2)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_callable_suggests_as_cast_for_primitive_type_name() {
+    let input = r#"
+fn test(contents: Slice<byte>) {
+  let _ = string(contents)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1215,6 +2702,122 @@ fn test(s: Slice<int>) -> int {
 }
 
 #[test]
+fn infer_member_not_found_unwrap_option() {
+    let input = r#"
+fn test(opt: Option<string>) -> int {
+  opt.contains("h")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_unwrap_result() {
+    let input = r#"
+fn test(res: Result<string, error>) -> int {
+  res.contains("h")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_unwrap_option_ref_struct() {
+    let input = r#"
+struct Url { Path: string }
+
+fn test(u: Option<Ref<Url>>) -> string {
+  u.Path
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_unwrap_option_no_inner_match() {
+    let input = r#"
+fn test(opt: Option<string>) {
+  opt.bogus
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_unwrap_method_on_option() {
+    let input = r#"
+fn test(opt: Option<int>) -> int {
+  opt.unwrap()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_unwrap_method_on_result() {
+    let input = r#"
+fn test(res: Result<int, error>) -> int {
+  res.unwrap()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_expect_method_on_option() {
+    let input = r#"
+fn test(opt: Option<int>) -> int {
+  opt.expect("must be set")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_unwrap_method_on_partial() {
+    let input = r#"
+fn test(p: Partial<int, error>) -> int {
+  p.unwrap()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_member_not_found_expect_method_on_partial() {
+    let input = r#"
+fn test(p: Partial<int, error>) -> int {
+  p.expect("must be ok")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unresolved_receiver_in_lambda_to_unknown_varargs() {
+    let input = r#"
+import "go:fmt"
+
+fn main() {
+  fmt.Println(|c| c.foo)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unresolved_receiver_in_lambda_method_call() {
+    let input = r#"
+import "go:fmt"
+
+fn main() {
+  fmt.Println(|c| c.Next())
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_struct_missing_fields() {
     let input = r#"
 struct Person {
@@ -1227,6 +2830,611 @@ fn test() {
   let p = Person {
     name: "Alice",
   };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_autofill_no_zero_for_field() {
+    let input = r#"
+struct Bad {
+  ok: int,
+  bad: Channel<int>,
+}
+
+fn test() {
+  let p = Bad { ok: 1, .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_autofill_no_zero_for_ref_field() {
+    let input = r#"
+struct Bad {
+  ok: int,
+  bad: Ref<int>,
+}
+
+fn test() {
+  let p = Bad { ok: 1, .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_autofill_no_zero_for_go_interface_field() {
+    let input = r#"
+import "go:context"
+
+struct Wrapper { ctx: context.Context }
+
+fn test() {
+  let w = Wrapper { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_go_struct_autofill_no_zero_for_field() {
+    let input = r#"
+import "go:time"
+
+fn test() {
+  let t = time.Timer { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_go_opaque_type_no_zero_for_unverified_type() {
+    let input = r#"
+import "go:hash/maphash"
+
+fn test() {
+  let s = maphash.Seed {};
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_go_partially_hidden_struct_no_zero_even_with_visible_field_set() {
+    let input = r#"
+import "go:archive/zip"
+
+fn test() {
+  let f = zip.File {
+    FileHeader: zip.FileHeader { .. },
+  };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_field_no_zero_names_hidden_go_state() {
+    let input = r#"
+import "go:archive/zip"
+
+struct Wrapper { f: zip.File }
+
+fn test() {
+  let w = Wrapper { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_uncurated_struct_with_unexported_embed_no_zero() {
+    let input = r#"
+import "go:os"
+
+fn test() {
+  let f = os.File { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_hidden_fields_struct_still_checks_visible_field_zero() {
+    let input = r#"
+import "go:net"
+
+struct Wrapper { dialer: net.Dialer }
+
+fn test() {
+  let w = Wrapper { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_autofill_tuple_chain() {
+    let input = r#"
+struct Outer { t: (int, Channel<int>) }
+
+fn test() {
+  let _o = Outer { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_autofill_struct_chain() {
+    let input = r#"
+struct Inner { bad: Channel<int> }
+struct Outer { inner: Inner }
+
+fn test() {
+  let _o = Outer { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_read_no_zero_for_ref_value() {
+    let input = r#"
+fn test() {
+  let m = Map.new<string, Ref<int>>()
+  let _r = m["missing"]
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_read_no_zero_for_generic_value() {
+    let input = r#"
+fn pick<K: Comparable, V>(m: Map<K, V>, k: K) -> V {
+  m[k]
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_read_no_zero_through_alias() {
+    let input = r#"
+type Registry = Map<string, Ref<int>>
+
+fn test(regs: Registry) {
+  let _r = regs["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "a bracket read through a map alias must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_for_struct_with_ref_field() {
+    let input = r#"
+struct Holder { pub r: Ref<int> }
+
+fn test(holders: Map<string, Holder>) {
+  let _h = holders["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "a bracket read yielding a struct with a Ref field must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_for_map_value() {
+    let input = r#"
+fn test() {
+  let mut outer = Map.new<string, mut Map<string, int>>()
+  let mut inner = outer["missing"]
+  inner["k"] = 1
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_read_no_zero_for_map_value_through_alias() {
+    let input = r#"
+type Counts = Map<string, int>
+
+fn test(outer: Map<string, Counts>) {
+  let _c = outer["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "a bracket read yielding a map behind an alias must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_for_chained_map_read() {
+    let input = r#"
+fn test(outer: Map<string, Map<string, int>>) {
+  let _n = outer["x"]["y"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "the outer read of a chained map read must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_for_struct_with_map_field() {
+    let input = r#"
+struct Bag { pub items: mut Map<string, int> }
+
+fn test(outer: Map<string, Bag>) {
+  let _b = outer["x"]
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_read_no_zero_for_tuple_with_map_element() {
+    let input = r#"
+fn test(outer: Map<string, (mut Map<string, int>, int)>) {
+  let _p = outer["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "a bracket read yielding a tuple that holds a map must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_for_array_of_maps() {
+    let input = r#"
+fn test(outer: Map<string, Array<mut Map<string, int>, 2>>) {
+  let _a = outer["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "a bracket read yielding an array of maps must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_allows_empty_array_of_maps() {
+    let input = r#"
+fn test(outer: Map<string, Array<mut Map<string, int>, 0>>) {
+  let _a = outer["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        !has_code(&result, "map_read_no_zero"),
+        "an empty array holds no map, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_allows_struct_without_map_field() {
+    let input = r#"
+struct Bag { pub count: int, pub tags: Slice<string> }
+
+fn test(outer: Map<string, Bag>) {
+  let _b = outer["x"]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        !has_code(&result, "map_read_no_zero"),
+        "a struct of int and slice fields has a usable zero, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_struct_autofill_allows_map_field() {
+    let input = r#"
+struct Bag { pub items: mut Map<string, int>, pub count: int }
+
+fn test() {
+  let _b = Bag { count: 1, .. }
+}
+"#;
+    let result = infer(input);
+    assert!(
+        !has_code(&result, "field_no_zero"),
+        "a struct literal builds an empty map for a map field, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_bracket_write_of_map_value_allowed() {
+    let input = r#"
+fn test() {
+  let inner = Map.new<string, int>()
+  let mut outer = Map.new<string, Map<string, int>>()
+  outer["k"] = inner
+}
+"#;
+    let result = infer(input);
+    assert!(
+        !has_code(&result, "map_read_no_zero"),
+        "storing a map under a key never reads the entry, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_no_make_constructor_map() {
+    let input = r#"
+fn test() {
+  let m = Map.make<string, int>(8)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_no_make_constructor_channel() {
+    let input = r#"
+fn test() {
+  let c = Channel.make<int>(5)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ref_slice_reserve() {
+    let input = r#"
+fn test(r: Ref<Slice<int>>) {
+  let _ = r.reserve(10)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_negative_size_literal_make() {
+    let input = r#"
+fn test() {
+  let a = Slice.make<byte>(-1)
+  let _ = a
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_slice_make_no_zero() {
+    let input = r#"
+fn test() {
+  let refs = Slice.make<Ref<int>>(4)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_slice_make_no_zero_for_hidden_go_state() {
+    let input = r#"
+import "go:archive/zip"
+
+fn test() {
+  let files = Slice.make<zip.File>(4)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_read_no_zero_in_deref_write() {
+    let input = r#"
+fn test() {
+  let mut m = Map.new<string, Ref<int>>()
+  m["k"].* = 5
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "writing through a bracket-read entry still reads the entry, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_no_zero_nested_in_write_target() {
+    let input = r#"
+fn test() {
+  let m = Map.new<string, Ref<int>>()
+  let mut counts = Map.new<int, string>()
+  counts[m["j"].*] = "x"
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "map_read_no_zero"),
+        "a bracket read inside an assignment target index must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_bracket_write_of_no_zero_value_allowed() {
+    let input = r#"
+fn test() {
+  let x = 5
+  let mut m = Map.new<string, Ref<int>>()
+  m["k"] = &x
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "a bracket write never reads the entry, so it must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_map_read_with_zero_value_allowed() {
+    let input = r#"
+fn test(ages: Map<string, int>, opts: Map<string, Option<Ref<int>>>, rows: Slice<Ref<int>>) {
+  let _age = ages["missing"]
+  let _opt = opts["missing"]
+  let _row = rows[0]
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "reads of zero-valued map entries and slice indexing must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_struct_autofill_function_alias_field() {
+    let input = r#"
+type F = fn() -> int
+struct A { g: F, x: int }
+
+fn test() {
+  let _a = A { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_autofill_generic_function_alias_field() {
+    let input = r#"
+type F<T> = fn(T) -> T
+struct A { g: F<int>, x: int }
+
+fn test() {
+  let _a = A { .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_struct_variant_autofill_no_zero_for_field() {
+    let input = r#"
+enum Action {
+  Move { x: int, dst: Channel<int> },
+  Stop,
+}
+
+fn test() {
+  let m = Action.Move { x: 5, .. };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_spread_missing_field() {
+    let input = r#"
+enum E {
+  A { x: int, z: int },
+  B { x: int, y: int },
+}
+
+fn test() {
+  let e = E.A { x: 1, z: 2 }
+  let _f = E.B { x: 9, ..e }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_spread_missing_fields_plural() {
+    let input = r#"
+enum E {
+  A { x: int },
+  B { x: int, y: int, z: int },
+}
+
+fn test() {
+  let a = E.A { x: 1 }
+  let _b = E.B { ..a }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_spread_shared_field_slot_mismatch() {
+    let input = r#"
+enum E {
+  A { tag: int, x: int },
+  B { tag: int, y: int },
+}
+
+fn test() {
+  let a = E.A { tag: 1, x: 2 }
+  let _b = E.B { y: 3, ..a }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_spread_contested_field_slot_mismatch() {
+    let input = r#"
+enum E {
+  A { w: int, keep: string },
+  B { w: string, keep: string },
+}
+
+fn test() {
+  let a = E.A { w: 1, keep: "k" }
+  let _b = E.B { ..a }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_enum_spread_mixed_field_slot_mismatch() {
+    let input = r#"
+enum E {
+  A { tag: int, w: int, keep: string },
+  B { tag: int, w: string, keep: string },
+}
+
+fn test() {
+  let a = E.A { tag: 1, w: 2, keep: "k" }
+  let _b = E.B { ..a }
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1263,10 +3471,40 @@ fn test(s: string) -> byte {
 }
 
 #[test]
+fn infer_string_not_sliceable() {
+    let input = r#"
+fn test(s: string) {
+  let _ = s[0..3]
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_string_not_iterable() {
+    let input = r#"
+fn test(s: string) {
+  for _c in s {}
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_type_mismatch_int_string() {
     let input = r#"
 fn test() {
   let x: int = "hello";
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_mismatch_span_stops_before_trailing_comment() {
+    let input = r#"
+fn test() {
+  let xs: string = Slice.new<int>() // trailing note
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1286,10 +3524,152 @@ fn get_number() -> int {
 }
 
 #[test]
+fn infer_type_mismatch_names_go_package() {
+    let input = r#"
+import "go:time"
+
+fn test() {
+  let d: time.Duration = 5
+  let n: int = d
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_mismatch_go_type_named_after_a_builtin() {
+    let input = r#"
+import "go:go/types"
+
+fn take(t: types.Tuple) -> int { 1 }
+
+fn test() {
+  let _ = take(5)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_mismatch_go_and_project_type_share_a_leaf_name() {
+    let input = r#"
+import "go:bytes"
+
+struct Buffer { n: int }
+
+fn take_go(b: bytes.Buffer) -> int { b.Len() }
+
+fn test() {
+  let mine = Buffer { n: 1 }
+  let _ = take_go(mine)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_mismatch_two_packages_share_a_leaf_name() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file("alpha", "alpha.lis", "pub struct Config { pub n: int }\n");
+    fs.add_file("beta", "beta.lis", "pub struct Config { pub n: int }\n");
+
+    let source = r#"
+import "alpha"
+import "beta"
+
+fn take(c: alpha.Config) -> int { c.n }
+
+fn main() {
+  let b = beta.Config { n: 1 }
+  let _ = take(b)
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+
+    let result = infer_package(ENTRY_PACKAGE_ID, fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_binary_operator_operands_share_a_leaf_name() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file("alpha", "alpha.lis", "pub struct Config { pub n: int }\n");
+    fs.add_file("beta", "beta.lis", "pub struct Config { pub n: int }\n");
+
+    let source = r#"
+import "alpha"
+import "beta"
+
+fn main() {
+  let a: Option<alpha.Config> = Some(alpha.Config { n: 1 })
+  let b: Option<beta.Config> = Some(beta.Config { n: 2 })
+  let _ = a == b
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+
+    let result = infer_package(ENTRY_PACKAGE_ID, fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_type_mismatch_entry_package_shares_a_leaf_name() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file("alpha", "alpha.lis", "pub struct Config { pub n: int }\n");
+
+    let source = r#"
+import "alpha"
+
+struct Config { n: int }
+
+fn take(c: alpha.Config) -> int { c.n }
+
+fn main() {
+  let mine = Config { n: 1 }
+  let _ = take(mine)
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+
+    let result = infer_package(ENTRY_PACKAGE_ID, fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
 fn infer_type_not_found() {
     let input = r#"
 fn test() {
   let x: UnknownType = 42;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_not_found_nested_in_generic_annotation() {
+    let input = r#"
+fn test(items: Slice<Option<UnknownType>>) {
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_not_found_float_suggests_float64() {
+    let input = r#"
+struct Circle { radius: float }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_not_found_vec_suggests_slice() {
+    let input = r#"
+fn test(items: Vec<int>) -> int {
+  0
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1317,7 +3697,7 @@ enum Foo<T: Undefined> {
 fn infer_type_not_found_interface_bound() {
     let input = r#"
 interface Foo<T: Undefined> {
-  fn get(self) -> T
+  fn get() -> T
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1327,6 +3707,100 @@ interface Foo<T: Undefined> {
 fn infer_type_not_found_type_alias_bound() {
     let input = r#"
 type Foo<T: Undefined> = T
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_unit_variant_local() {
+    let input = r#"
+enum Kind {
+  Int,
+  String,
+}
+
+enum Column {
+  PrimaryKey { name: string, kind: Kind },
+  String { name: string, kind: Kind.String },
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_unit_variant_prelude() {
+    let input = r#"
+fn nothing() -> None {
+  return None
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_constructor_variant() {
+    let input = r#"
+fn test() {
+  let x: Some = Some(1)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_err_variant_suggests_error() {
+    let input = r#"
+fn write(value: byte) -> Option<Err> {
+  None
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_err_variant_user_enum_no_error_hint() {
+    let input = r#"
+enum Outcome {
+  Fine,
+  Err(string),
+}
+
+fn check(x: Outcome.Err) -> bool {
+  true
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_function_name() {
+    let input = r#"
+fn helper(x: int) -> int {
+  return x * 2
+}
+
+fn run(f: helper) -> int {
+  return f(21)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_a_type_function_returning_enum() {
+    let input = r#"
+enum Kind {
+  Int,
+  String,
+}
+
+fn make() -> Kind {
+  Kind.Int
+}
+
+fn run(f: make) -> int {
+  return f(0)
+}
 "#;
     assert_infer_error_snapshot!(input);
 }
@@ -1364,6 +3838,257 @@ fn test() {
 }
 
 #[test]
+fn infer_param_not_mutable() {
+    let input = r#"
+fn test(count: int) {
+  count = 20;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_param_not_mutable_for_ref_receiver_method() {
+    let input = r#"
+struct Counter { count: int }
+
+impl Counter {
+  fn increment(self: mut Ref<Counter>) {
+    self.count = self.count + 1;
+  }
+}
+
+fn test(counter: Counter) {
+  counter.increment()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_destructured_param_not_mutable() {
+    let input = r#"
+fn test((x, y): (int, int)) -> int {
+  x = 1
+  x + y
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_destructured_struct_param_not_mutable() {
+    let input = r#"
+struct Point { x: int, y: int }
+
+fn test(Point { x, y }: Point) -> int {
+  x = 1
+  x + y
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_param_not_mutable_for_map_delete() {
+    let input = r#"
+fn test(scores: Map<string, int>) {
+  scores.delete("a")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_slice() {
+    let input = r#"
+fn test() {
+  let a = [1, 2, 3]
+  let mut b = a
+  b[0] = 99
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_map() {
+    let input = r#"
+fn test() {
+  let m = Map.from([("a", 1)])
+  let mut m2 = m
+  m2["b"] = 2
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_reassignment() {
+    let input = r#"
+fn test(a: Slice<int>) {
+  let mut b = [0]
+  b = a
+  b = b.append(1)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_struct_field() {
+    let input = r#"
+struct Doc { tags: Slice<string> }
+
+fn test(d: Doc) {
+  let mut t = d.tags
+  t[0] = "x"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_map_index() {
+    let input = r#"
+fn test(m: Map<string, Slice<int>>) {
+  let mut s = m["k"]
+  s[0] = 1
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_subslice() {
+    let input = r#"
+fn test() {
+  let a = [1, 2, 3]
+  let mut b = a[1..3]
+  b[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_computed_index() {
+    let input = r#"
+fn key() -> string { "k" }
+
+fn test(m: Map<string, Slice<int>>) {
+  let mut s = m[key()]
+  s[0] = 1
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_struct() {
+    let input = r#"
+struct Doc { tags: Slice<string> }
+
+fn test(d1: Doc) {
+  let mut d2 = d1
+  d2.tags[0] = "y"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_tuple() {
+    let input = r#"
+fn test(t1: (Slice<string>, int)) {
+  let mut t2 = t1
+  t2.0[0] = "y"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_enum() {
+    let input = r#"
+enum Holder { Tags(mut Slice<string>), Empty }
+
+fn test(a: Slice<string>) {
+  let h = Holder.Tags(a)
+  if let Holder.Tags(tags) = h {
+    tags[0] = "y"
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_block_tail() {
+    let input = r#"
+fn test() {
+  let a = [1, 2, 3]
+  let mut b = { a }
+  b[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_constructor_field() {
+    let input = r#"
+struct Box { items: mut Slice<int> }
+
+fn test() {
+  let a = [1, 2, 3]
+  let mut boxed = Box { items: a }
+  boxed.items[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_generic_param_fed() {
+    let input = r#"
+struct Box<T> { items: Slice<T> }
+
+fn test(b1: Box<Slice<int>>) {
+  let mut b2 = b1
+  b2.items[0][0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_binding_aliases_option() {
+    let input = r#"
+fn test(opt: Option<Slice<int>>) {
+  let mut b = match opt {
+    Some(x) => x,
+    None => [0],
+  }
+  b[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_subslice_not_addressable() {
+    let input = r#"
+fn test() {
+  let a = [1, 2, 3]
+  let r = &a[1..3]
+  let _ = r
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_value_receiver_not_mutable() {
     let input = r#"
 struct Counter { count: int }
@@ -1371,6 +4096,20 @@ struct Counter { count: int }
 impl Counter {
   fn increment(self: Counter) {
     self.count = self.count + 1;
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_value_receiver_not_mutable_generic() {
+    let input = r#"
+struct Box<T> { value: T }
+
+impl<T> Box<T> {
+  fn set(self, v: T) {
+    self.value = v;
   }
 }
 "#;
@@ -1421,11 +4160,173 @@ impl Counter {
 }
 
 #[test]
-fn infer_unknown_outside_typedef() {
+fn infer_receiver_type_mismatch_generic() {
     let input = r#"
-fn test() {
-  let x: Unknown = 42;
+struct Box<T> { value: T }
+
+impl<T> Box<T> {
+  fn get(self: T) -> int {
+    0
+  }
 }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_receiver_type_unresolved() {
+    let input = r#"
+struct Counter { count: int }
+
+impl Counter {
+  fn bump(self: Nope) -> int {
+    0
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_stringer_signature_mismatch_returns_int() {
+    let input = r#"
+struct A { a: string }
+
+impl A {
+  fn String(self) -> int {
+    42
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_stringer_signature_mismatch_lowercase_extra_param() {
+    let input = r#"
+struct A { a: string }
+
+impl A {
+  fn string(self, prefix: string) -> string {
+    prefix + self.a
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_go_stringer_signature_mismatch() {
+    let input = r#"
+struct A { a: string }
+
+impl A {
+  fn GoString(self) -> int {
+    0
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_json_marshal_method_override() {
+    let input = r#"
+#[json]
+enum Status {
+  Ready,
+}
+
+impl Status {
+  fn MarshalJSON(self) -> int {
+    1
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_json_unmarshal_method_override() {
+    let input = r#"
+#[json]
+enum Status {
+  Ready,
+}
+
+impl Status {
+  fn UnmarshalJSON(self) -> int {
+    1
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_pub_struct_not_exportable() {
+    let input = r#"
+pub struct widget {
+  pub x: int,
+}
+
+fn main() {
+  let w = widget { x: 1 }
+  let _ = w.x
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_pub_type_alias_not_exportable() {
+    let input = r#"
+pub type widget = int
+
+fn main() {
+  let w: widget = 1
+  let _ = w
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_pub_enum_not_exportable() {
+    let input = r#"
+pub enum status {
+  Ready,
+}
+
+fn main() {
+  let _ = status.Ready
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_pub_interface_not_exportable() {
+    let input = r#"
+pub interface reader {
+  fn read() -> int
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unknown_in_const_annotation() {
+    let input = r#"
+const X: Unknown = 42;
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unknown_in_bound_position() {
+    let input = r#"
+fn f<T: Unknown>(x: T) {}
 "#;
     assert_infer_error_snapshot!(input);
 }
@@ -1443,6 +4344,27 @@ fn test() {
 }
 
 #[test]
+fn infer_unknown_map_invariant() {
+    let input = r#"
+fn test() {
+  takes_unknown_map(Map.from([("k", "v")]))
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unknown_slice_invariant() {
+    let input = r#"
+fn test() {
+  let xs: Slice<int> = [1, 2, 3]
+  takes_unknown_slice(xs)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_match_on_unconstrained_type() {
     let input = r#"
 fn get_something<T>() -> T {
@@ -1454,6 +4376,20 @@ fn main() {
   match x {
     (a, b) => a,
   };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_instantiation_cycle() {
+    let input = r#"
+fn depth<T>(x: T, n: int) -> int {
+  if n > 0 { depth([x], n - 1) } else { 0 }
+}
+
+fn main() {
+  let _ = depth(1, 3)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1521,7 +4457,7 @@ fn match_redundant_pattern() {
 enum Status { Active, Inactive }
 
 fn test() {
-  let s: Status = Active;
+  let s: Status = Status.Active;
   match s {
     Active => 1,
     Inactive => 2,
@@ -1538,7 +4474,7 @@ fn match_redundant_after_wildcard() {
 enum Status { Active, Inactive }
 
 fn test() {
-  let s: Status = Active;
+  let s: Status = Status.Active;
   match s {
     _ => 0,
     Active => 1,
@@ -1554,7 +4490,7 @@ fn match_redundant_or_pattern_duplicate() {
 enum Color { Red, Green, Blue }
 
 fn test() {
-  let c: Color = Red;
+  let c: Color = Color.Red;
   match c {
     Red | Red => 1,
     Green | Blue => 2,
@@ -1627,10 +4563,87 @@ fn test() {
 }
 
 #[test]
+fn match_non_exhaustive_lists_all_missing_cases() {
+    let input = r#"
+enum Color {
+  Red,
+  Green,
+  Blue,
+}
+
+fn test(c: Color) -> int {
+  match c {
+    Color.Red => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn match_non_exhaustive_three_missing_cases_uses_oxford_comma() {
+    let input = r#"
+enum Suit {
+  Hearts,
+  Diamonds,
+  Clubs,
+  Spades,
+}
+
+fn test(s: Suit) -> int {
+  match s {
+    Suit.Hearts => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn match_non_exhaustive_tuple_struct_field_literal() {
+    let input = r#"
+struct MP(int, string)
+
+fn test(p: MP) -> int {
+  match p {
+    MP(0, _) => 1,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn match_non_exhaustive_case_under_matched_constructor() {
+    let input = r#"
+fn test(v: Option<(int, string)>) -> string {
+  match v {
+    Some((42, s)) => s,
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_uninferred_binding_type() {
     let input = r#"
 fn test() {
   let x = [];
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_empty_slice_no_element_type() {
+    let input = r#"
+fn count<T>(items: Slice<T>) -> int {
+  items.length()
+}
+
+fn test() -> int {
+  count([])
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1661,6 +4674,16 @@ fn infer_subtraction_type_mismatch() {
     let input = r#"
 fn test() {
   let x = "hello" - 5;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_division_int_float_mismatch() {
+    let input = r#"
+fn half(n: int) -> float64 {
+  n / 2.0
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -1762,6 +4785,17 @@ fn test(m: Map<string, int>) {
 }
 
 #[test]
+fn infer_array_range_index_suggests_to_slice() {
+    let input = r#"
+fn test() {
+  let items: Array<int, 3> = [1, 2, 3]
+  let _ = items[1..]
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_interface_bound_not_satisfied() {
     let input = r#"
 interface Writer {
@@ -1833,6 +4867,25 @@ fn test() {
 }
 
 #[test]
+fn infer_go_type_cannot_implement_local_interface() {
+    let input = r#"
+import "go:strings"
+
+interface Show {
+  fn show() -> string;
+}
+
+fn use_show(s: Show) {}
+
+fn test() {
+  let builder = strings.Builder {}
+  use_show(builder)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_interface_bound_incompatible_signature() {
     let input = r#"
 interface Writer {
@@ -1862,8 +4915,8 @@ fn test() {
 fn infer_pointer_receiver_interface_mismatch() {
     let input = r#"
 interface Worker {
-  fn name(self) -> string
-  fn work(self) -> int
+  fn name() -> string
+  fn work() -> int
 }
 
 struct MyWorker { label: string, count: int }
@@ -1884,7 +4937,209 @@ fn test() {
 }
 
 #[test]
-fn builtin_generic_type_satisfies_interface_bound() {
+fn infer_result_does_not_implement_interface() {
+    let input = r#"
+struct Ctx {}
+impl Ctx {
+  fn run(self) -> Result<(), error> { Ok(()) }
+  fn fatal(self, e: error) { let _ = e }
+}
+fn test() {
+  let c = Ctx {}
+  c.fatal(c.run())
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_option_does_not_implement_interface() {
+    let input = r#"
+interface Greeter {
+  fn greet() -> string
+}
+struct Hello {}
+impl Hello {
+  fn greet(self) -> string { "hi" }
+}
+fn use_greeter(g: Greeter) -> string { g.greet() }
+fn maybe_hello() -> Option<Hello> { Some(Hello {}) }
+fn test() {
+  let _ = use_greeter(maybe_hello())
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_partial_does_not_implement_interface() {
+    let input = r#"
+struct Ctx {}
+impl Ctx {
+  fn read(self) -> Partial<int, error> { Partial.Ok(0) }
+  fn fatal(self, e: error) { let _ = e }
+}
+fn test() {
+  let c = Ctx {}
+  c.fatal(c.read())
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_not_implemented_ref_argument_resolves() {
+    let input = r#"
+import "go:fmt"
+
+struct Sink {}
+
+fn main() {
+  let mut sink = Sink {}
+  fmt.Fprintf(&sink, "x")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_missing_method_private_candidate_hint() {
+    let input = r#"
+import "go:fmt"
+
+struct Shouter { written: Slice<byte> }
+
+impl Shouter {
+  fn write(self: Ref<Shouter>, p: Slice<byte>) -> Partial<int, error> {
+    Partial.Ok(p.length())
+  }
+}
+
+fn main() {
+  let mut shouter = Shouter { written: [] }
+  fmt.Fprintf(&shouter, "x")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_interface_missing_method_private_candidate_wrong_signature() {
+    let input = r#"
+import "go:fmt"
+
+struct Shouter {}
+
+impl Shouter {
+  fn write(self: Ref<Shouter>, p: string) -> Partial<int, error> {
+    Partial.Ok(p.length())
+  }
+}
+
+fn main() {
+  let mut shouter = Shouter {}
+  fmt.Fprintf(&shouter, "x")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_cast_to_interface() {
+    let input = r#"
+interface Sized { fn length() -> int }
+
+fn f(a: Array<int, 3>) -> Sized {
+  a as Sized
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_slice_cast_to_interface() {
+    let input = r#"
+interface Sized { fn length() -> int }
+
+fn f(s: Slice<int>) -> Sized {
+  s as Sized
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_slice_passed_as_interface() {
+    let input = r#"
+interface Sized { fn length() -> int }
+
+fn takes(s: Sized) -> int {
+  s.length()
+}
+
+fn main() {
+  let _ = takes([1, 2, 3])
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_map_coerced_to_interface_annotation() {
+    let input = r#"
+interface Sized { fn length() -> int }
+
+fn main() {
+  let m = Map.new<string, int>()
+  let s: Sized = m
+  let _ = s
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_comma_ok_abi_mismatch() {
+    let typedef = r#"
+pub interface Lookup {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+
+pub struct Base {}
+impl Base {
+  fn Get(self: Base) -> Option<int>
+}
+"#;
+    let input = r#"import "go:example.com/lib"
+fn as_lookup(b: lib.Base) -> lib.Lookup { b }
+fn main() {}
+"#;
+    assert_infer_error_snapshot!(input, &[("go:example.com/lib", typedef)]);
+}
+
+#[test]
+fn infer_sealed_interface_not_satisfiable() {
+    let typedef = r#"
+pub interface Sealed {
+  fn Do() -> int
+  #[go(unexported)]
+  fn private()
+}
+"#;
+    let input = r#"import "go:example.com/seal"
+struct Mine {}
+impl Mine {
+  fn Do(self: Mine) -> int { 0 }
+}
+fn as_sealed(m: Mine) -> seal.Sealed { m }
+fn main() {}
+"#;
+    assert_infer_error_snapshot!(input, &[("go:example.com/seal", typedef)]);
+}
+
+#[test]
+fn infer_builtin_type_fails_interface_bound() {
     let input = r#"
 interface HasLength {
   fn length() -> int;
@@ -1898,8 +5153,7 @@ fn main() -> int {
   print_length([1, 2, 3])
 }
 "#;
-    let result = crate::_harness::infer::infer(input);
-    result.assert_no_errors();
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
@@ -1910,7 +5164,7 @@ interface Display {
 }
 
 interface Logger {
-  impl Display;
+  embed Display;
   fn log() -> ();
 }
 
@@ -1924,7 +5178,7 @@ fn test() {
   use_logger(File { path: "test.txt" })
 }
 "#;
-    let result = crate::_harness::infer::infer(input);
+    let result = infer(input);
     assert!(!result.errors.is_empty(), "Expected errors");
 
     let mut output = String::new();
@@ -1943,17 +5197,42 @@ fn test() {
     });
 }
 
-#[test]
-fn module_graph_import_cycle() {
-    let cycle = vec![
-        "module_a".to_string(),
-        "module_b".to_string(),
-        "module_c".to_string(),
-        "module_a".to_string(),
-    ];
+fn cycle_diagnostic_snapshot(fs: MockFileSystem) -> String {
+    let result = compile_check(fs);
+    let cycle = result
+        .errors()
+        .iter()
+        .find(|error| error.code_str() == Some("resolve.import_cycle"))
+        .expect("the cycle must be reported");
 
-    let diagnostic = import_cycle(&cycle);
-    let output = format_diagnostic_standalone(&diagnostic);
+    format_project_diagnostic_for_snapshot(&result, cycle)
+}
+
+#[test]
+fn package_graph_import_cycle() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        ENTRY_PACKAGE_ID,
+        "main.lis",
+        "import \"package_a\"\n\nfn main() {}\n",
+    );
+    fs.add_file(
+        "package_a",
+        "package_a.lis",
+        "import \"package_b\"\n\npub fn a() -> int { package_b.b() }\n",
+    );
+    fs.add_file(
+        "package_b",
+        "package_b.lis",
+        "import \"package_c\"\n\npub fn b() -> int { package_c.c() }\n",
+    );
+    fs.add_file(
+        "package_c",
+        "package_c.lis",
+        "import \"package_a\"\n\npub fn c() -> int { package_a.a() }\n",
+    );
+
+    let output = cycle_diagnostic_snapshot(fs);
 
     insta::with_settings!({
         prepend_module_to_snapshot => false,
@@ -1964,11 +5243,20 @@ fn module_graph_import_cycle() {
 }
 
 #[test]
-fn module_graph_import_self_loop() {
-    let cycle = vec!["module_a".to_string(), "module_a".to_string()];
+fn package_graph_import_self_loop() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        ENTRY_PACKAGE_ID,
+        "main.lis",
+        "import \"package_a\"\n\nfn main() {}\n",
+    );
+    fs.add_file(
+        "package_a",
+        "package_a.lis",
+        "import \"package_a\"\n\npub fn a() -> int { 1 }\n",
+    );
 
-    let diagnostic = import_cycle(&cycle);
-    let output = format_diagnostic_standalone(&diagnostic);
+    let output = cycle_diagnostic_snapshot(fs);
 
     insta::with_settings!({
         prepend_module_to_snapshot => false,
@@ -1991,18 +5279,6 @@ fn test(items: Slice<int>) {
 }
 
 #[test]
-fn parse_struct_rest_in_expression() {
-    let input = r#"
-struct Point { x: int, y: int }
-
-fn test() {
-  let p = Point { x: 1, .. };
-}
-"#;
-    assert_parse_error_snapshot!(input);
-}
-
-#[test]
 fn parse_error_recovery_nested_call() {
     let input = r#"
 fn test() {
@@ -2016,7 +5292,7 @@ fn test() {
 fn parse_error_recovery_multi_arg() {
     let input = r#"
 fn test() {
-  foo(a, b^c, d);
+  foo(a, b@c, d);
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -2115,6 +5391,14 @@ fn test(x: i32) -> i32 {
 fn parse_error_import_invalid_path() {
     let input = r#"
 import foo.bar;
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_error_import_alias_after_path() {
+    let input = r#"
+import "go:fmt" as f
 "#;
     assert_parse_error_snapshot!(input);
 }
@@ -2225,19 +5509,139 @@ const MAX_SIZE: int
 }
 
 #[test]
-fn infer_valueless_const_missing_annotation_in_typedef() {
-    let mut fs = MockFileSystem::new();
-    fs.add_file("types", "consts.d.lis", "const MAX_SIZE");
-    infer_module("types", fs).assert_infer_code("valueless_const_missing_annotation");
+fn infer_variable_declaration_outside_typedef() {
+    let input = r#"
+var count: int
+"#;
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
-fn module_graph_module_not_found() {
+fn infer_valueless_const_missing_annotation_in_typedef() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("types", "consts.d.lis", "const MAX_SIZE");
+    infer_package("types", fs).assert_infer_code("valueless_const_missing_annotation");
+}
+
+fn assert_go_hint_error_snapshot(name: &str, input: &str, package: &str, typedef: &str) {
+    let errors = checker_errors(input, &[(package, typedef)]);
+    let error = errors
+        .iter()
+        .find(|e| e.code_str() == Some("attribute.unknown"))
+        .expect("expected an unknown attribute error");
+    let output = format_diagnostic_for_snapshot(error, typedef, "typedef.d.lis");
+    insta::with_settings!({
+        prepend_module_to_snapshot => false,
+        omit_expression => true,
+    }, {
+        insta::assert_snapshot!(name, output);
+    });
+}
+
+#[test]
+fn attribute_removed_go_hint() {
+    let input = r#"
+import "go:example.com/old"
+
+fn main() {
+  let _ = old.Sum([1])
+}
+"#;
+    let typedef = r#"
+#[go(array_return)]
+pub fn Sum(data: Slice<byte>) -> Slice<byte>
+"#;
+    assert_go_hint_error_snapshot(
+        "attribute_removed_go_hint",
+        input,
+        "go:example.com/old",
+        typedef,
+    );
+}
+
+#[test]
+fn attribute_unknown_go_hint() {
+    let input = r#"
+import "go:example.com/odd"
+
+fn main() {
+  let _ = odd.Get()
+}
+"#;
+    let typedef = r#"
+#[go(comma_okay)]
+pub fn Get() -> Option<int>
+"#;
+    assert_go_hint_error_snapshot(
+        "attribute_unknown_go_hint",
+        input,
+        "go:example.com/odd",
+        typedef,
+    );
+}
+
+#[test]
+fn attribute_unknown_go_hint_on_method() {
+    let input = r#"
+import "go:example.com/w"
+
+fn main() {
+  let _ = w.Make()
+}
+"#;
+    let typedef = r#"
+pub struct Widget {
+  pub Size: int,
+}
+
+impl Widget {
+  #[go(array_return)]
+  fn Bytes(self) -> Slice<byte>
+}
+
+pub fn Make() -> Widget
+"#;
+    assert_go_hint_error_snapshot(
+        "attribute_unknown_go_hint_on_method",
+        input,
+        "go:example.com/w",
+        typedef,
+    );
+}
+
+#[test]
+fn attribute_unknown_go_hint_on_type_alias() {
+    let input = r#"
+import "go:example.com/h"
+
+fn main() {
+  let _ = h.Open()
+}
+"#;
+    let typedef = r#"
+#[go(array_return)]
+pub type Handle
+
+pub fn Open() -> Handle
+"#;
+    assert_go_hint_error_snapshot(
+        "attribute_unknown_go_hint_on_type_alias",
+        input,
+        "go:example.com/h",
+        typedef,
+    );
+}
+
+#[test]
+fn package_graph_package_not_found() {
     let mut fs = MockFileSystem::new();
     fs.add_file("main", "main.lis", r#"import "nonexistent""#);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
-    assert!(!result.errors.is_empty(), "Expected module not found error");
+    assert!(
+        !result.errors.is_empty(),
+        "Expected package not found error"
+    );
 
     let output =
         format_diagnostic_for_snapshot(&result.errors[0], r#"import "nonexistent""#, "main.lis");
@@ -2251,13 +5655,16 @@ fn module_graph_module_not_found() {
 }
 
 #[test]
-fn module_graph_go_stdlib_hint() {
+fn package_graph_go_stdlib_hint() {
     let source = r#"import "time""#;
     let mut fs = MockFileSystem::new();
     fs.add_file("main", "main.lis", source);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
-    assert!(!result.errors.is_empty(), "Expected module not found error");
+    assert!(
+        !result.errors.is_empty(),
+        "Expected package not found error"
+    );
 
     let output = format_diagnostic_for_snapshot(&result.errors[0], source, "main.lis");
 
@@ -2270,7 +5677,7 @@ fn module_graph_go_stdlib_hint() {
 }
 
 #[test]
-fn module_graph_src_prefix_hint() {
+fn package_graph_src_prefix_hint() {
     let source = r#"import "src/math""#;
     let mut fs = MockFileSystem::new();
     fs.add_file("main", "main.lis", source);
@@ -2279,9 +5686,12 @@ fn module_graph_src_prefix_hint() {
         "math.lis",
         "pub fn add(a: int, b: int) -> int { a + b }",
     );
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
-    assert!(!result.errors.is_empty(), "Expected module not found error");
+    assert!(
+        !result.errors.is_empty(),
+        "Expected package not found error"
+    );
 
     let output = format_diagnostic_for_snapshot(&result.errors[0], source, "main.lis");
 
@@ -2298,7 +5708,7 @@ fn infer_cannot_import_prelude() {
     let source = r#"import "prelude""#;
     let mut fs = MockFileSystem::new();
     fs.add_file("main", "main.lis", source);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
     assert!(
         !result.errors.is_empty(),
@@ -2316,7 +5726,7 @@ fn infer_cannot_import_prelude() {
 }
 
 #[test]
-fn module_graph_nested_import_error_attribution() {
+fn package_graph_nested_import_error_attribution() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "_entry_",
@@ -2345,7 +5755,7 @@ pub fn outer_fn() -> string {
 }"#,
     );
 
-    let result = infer_module("_entry_", fs);
+    let result = infer_package("_entry_", fs);
 
     assert_eq!(
         result.errors.len(),
@@ -2364,7 +5774,42 @@ pub fn outer_fn() -> string {
 }
 
 #[test]
-fn module_graph_test_file_rejected() {
+fn package_graph_failed_import_suppresses_cascade() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"import "totally_missing"
+
+fn main() {
+  let value = totally_missing.SomeValue
+  match value.method() {
+    Ok((_, data)) => {
+      let _ = data as string
+    },
+    Err(_) => (),
+  }
+}"#,
+    );
+    let result = infer_package("main", fs);
+
+    assert_eq!(
+        result.errors.len(),
+        1,
+        "Expected only the import error, got: {:#?}",
+        result.errors
+    );
+    assert!(
+        result.errors[0]
+            .code_str()
+            .is_some_and(|c| c.contains("package_not_found")),
+        "Expected package_not_found, got: {:?}",
+        result.errors[0].code_str()
+    );
+}
+
+#[test]
+fn underscore_test_file_rejected() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "_entry_",
@@ -2386,13 +5831,1030 @@ fn main() {
         "pub fn sub(a: int, b: int) -> int { a - b }",
     );
 
-    let result = infer_module("_entry_", fs);
+    let result = infer_package("_entry_", fs);
 
     assert_eq!(result.errors.len(), 1);
     assert!(
         result.errors[0]
             .code_str()
-            .is_some_and(|c| c.contains("test_file_not_supported"))
+            .is_some_and(|c| c.contains("wrong_test_file_suffix"))
+    );
+}
+
+#[test]
+fn wrong_test_file_suffix_uses_display_path() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file_with_display(
+        "math",
+        "helpers_test.lis",
+        "src/math/helpers_test.lis",
+        "pub fn sub(a: int, b: int) -> int { a - b }",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert_eq!(result.errors.len(), 1);
+    let msg = format!("{:?}", result.errors[0]);
+    assert!(
+        msg.contains("src/math/helpers_test.lis"),
+        "diagnostic must use the loader's display_path, got: {msg}"
+    );
+    assert!(
+        msg.contains("src/math/helpers.test.lis"),
+        "diagnostic must suggest the `.test.lis` rename, got: {msg}"
+    );
+}
+
+#[test]
+fn unimported_package_test_file_checked() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"fn main() {
+}"#,
+    );
+    fs.add_file("orphan", "orphan.lis", "pub fn helper() -> int { 42 }");
+    fs.add_file(
+        "orphan",
+        "orphan.test.lis",
+        "#[test]\nfn bad() { let _: int = \"x\" }",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d.is_error()),
+        "a type error in a test file of a package the entry never imports must still be reported"
+    );
+}
+
+#[test]
+fn dot_test_file_included_under_check() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file("math", "core.test.lis", "fn bad() -> int { true }");
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d.is_error()),
+        "a type error inside a `.test.lis` file must be reported under check"
+    );
+}
+
+#[test]
+fn production_import_of_test_only_package_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "fixture"
+
+fn main() {
+  let _ = fixture.sample()
+}"#,
+    );
+    fs.add_file(
+        "fixture",
+        "fixture.test.lis",
+        "pub fn sample() -> int { 1 }",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d
+            .code_str()
+            .is_some_and(|c| c.contains("package_not_found"))),
+        "a production import of a package with only test files must not resolve, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn unimported_production_import_of_test_only_package_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("_entry_", "main.lis", "fn main() {\n}");
+    fs.add_file("aaa", "aaa.test.lis", "pub fn sample() -> int { 1 }");
+    fs.add_file(
+        "zzz",
+        "zzz.lis",
+        r#"import "aaa"
+
+pub fn use_it() -> int { aaa.sample() }"#,
+    );
+    fs.add_file(
+        "zzz",
+        "zzz.test.lis",
+        "#[test]\nfn z() { assert use_it() == 1 }",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d
+            .code_str()
+            .is_some_and(|c| c.contains("package_not_found"))),
+        "an orphan package's production import of a test-only package must be rejected regardless of seeding order, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn production_signature_cannot_reference_test_type() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }\n\npub fn first() -> Fixture { Fixture { value: 1 } }",
+    );
+    fs.add_file(
+        "math",
+        "core.test.lis",
+        "struct Fixture {\n  value: int,\n}",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d.is_error()),
+        "a production signature must not resolve a type declared only in a test file, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_file_impl_on_production_type_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub struct Counter {\n  pub value: int,\n}\n\npub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file(
+        "math",
+        "core.test.lis",
+        "impl Counter {\n  fn doubled(self) -> int { self.value + self.value }\n}",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d
+            .code_str()
+            .is_some_and(|c| c.contains("test_impl_on_production_type"))),
+        "a test file must not add methods to a production type, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_file_impl_on_test_type_allowed() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file(
+        "math",
+        "core.test.lis",
+        "struct Fixture {\n  value: int,\n}\n\nimpl Fixture {\n  fn doubled(self) -> int { self.value + self.value }\n}\n\nfn check() -> int {\n  let f = Fixture { value: 2 }\n  f.doubled()\n}",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        !result.errors.iter().any(|d| d.is_error()),
+        "a test file must be able to impl a type it declares, got: {:?}",
+        result.errors
+    );
+}
+
+fn has_code(result: &InferResult, code: &str) -> bool {
+    result
+        .errors
+        .iter()
+        .any(|d| d.code_str().is_some_and(|c| c.contains(code)))
+}
+
+#[test]
+fn import_of_reserved_double_star_package_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "main.lis", "import \"**test_prelude\"");
+    let result = infer_package("main", fs);
+    assert!(
+        has_code(&result, "reserved_package_import"),
+        "a `**`-prefixed import must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_context_in_production_file_gives_test_only_hint() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "main.lis", "pub fn nope(t: TestContext) {}");
+    let result = infer_package("main", fs);
+    let diagnostic = result
+        .errors
+        .iter()
+        .find(|d| d.code_str() == Some("resolve.type_not_found"))
+        .expect("expected a type_not_found for TestContext in a production file");
+    let help = diagnostic.plain_help().unwrap_or_default();
+    assert!(
+        help.contains(".test.lis") && !help.contains("import"),
+        "the hint must point to test files, not encourage importing, got: {help:?}"
+    );
+}
+
+fn test_attribute_fs(math_core: &str, math_test: &str) -> MockFileSystem {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        "import \"math\"\n\nfn main() {\n  let _ = math.add(1, 2)\n}",
+    );
+    fs.add_file("math", "core.lis", math_core);
+    fs.add_file("math", "core.test.lis", math_test);
+    fs
+}
+
+#[test]
+fn test_attribute_on_struct_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nstruct Fixture {\n  value: int,\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_not_on_function"),
+        "`#[test]` on a struct must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_on_method_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "struct Fixture {\n  value: int,\n}\n\nimpl Fixture {\n  #[test]\n  fn check(self) {}\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_not_on_function"),
+        "`#[test]` on a method must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_in_production_file_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }\n\n#[test]\nfn checks() {}",
+        "fn unused() {}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_outside_test_file"),
+        "`#[test]` in a production file must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn assert_non_bool_operand_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks() {\n  assert 42\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "type_mismatch"),
+        "a non-bool `assert` operand must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_flag_argument_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test(snake_case)]\nfn checks() {}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_invalid_argument"),
+        "`#[test]` with a flag argument must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_two_arguments_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test(\"one\", \"two\")]\nfn checks() {}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_invalid_argument"),
+        "`#[test]` with two arguments must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_parameter_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks(x: int) {}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_unsupported_signature"),
+        "a parameterized test must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_test_context_accepted() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks(t: TestContext) { t.parallel() }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "test_unsupported_signature"),
+        "a single TestContext parameter must be accepted, got: {:?}",
+        result.errors
+    );
+    assert!(
+        !has_code(&result, "type_not_found"),
+        "TestContext must resolve in a test file, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_bare_handle_accepted() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks(t) { let _ = t.run(\"c\", |t| { assert true }) }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "test_unsupported_signature"),
+        "a bare handle parameter must be accepted, got: {:?}",
+        result.errors
+    );
+    assert!(
+        result.errors.is_empty(),
+        "a bare handle test must type-check cleanly, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_two_bare_params_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks(t, u) { assert true }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_unsupported_signature"),
+        "more than one parameter must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_on_impl_method_does_not_relax_params() {
+    let fs = test_attribute_fs(
+        "pub struct Foo { n: int }\n\nimpl Foo {\n  #[test]\n  fn check(x) { let _ = x }\n}",
+        "#[test]\nfn ok() { assert true }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "unexpected_token"),
+        "an impl method stays strict-typed even with `#[test]`, so a bare parameter is a parse error, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_bare_handle_resolves_to_prelude_under_shadow() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "struct TestContext { x: int }\n\n#[test]\nfn checks(t) { let _ = t.run(\"c\", |t| { assert true }) }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        result.errors.is_empty(),
+        "a bare handle is positional and resolves to the prelude even when TestContext is shadowed, so `t.run` must resolve cleanly, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_value_named_test_context_does_not_block_param() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "fn TestContext() {}\n\n#[test]\nfn checks(t: TestContext) { t.parallel() }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "test_unsupported_signature"),
+        "a value named TestContext does not occupy the type position, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_shadowed_test_context_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "struct TestContext { x: int }\n\n#[test]\nfn checks(t: TestContext) { let _ = t.x }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_unsupported_signature"),
+        "a locally shadowed TestContext must not be accepted as the context param, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_undeclared_test_handle_hints_at_parameter() {
+    let test_src = "#[test]\nfn forgot_the_handle() {\n  t.skip(\"not ready\")\n}\n";
+    let fs = test_attribute_fs("pub fn add(a: int, b: int) -> int { a + b }", test_src);
+    let result = infer_package("_entry_", fs);
+    assert_multipackage_infer_error_snapshot!(result, test_src);
+}
+
+#[test]
+fn undeclared_t_outside_a_test_keeps_the_generic_hint() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "main.lis", "fn uses() -> int {\n  t\n}");
+    let result = infer_package("main", fs);
+    let diagnostic = result
+        .errors
+        .iter()
+        .find(|d| d.code_str() == Some("resolve.name_not_found"))
+        .expect("expected a name_not_found for `t`");
+    let help = diagnostic.plain_help().unwrap_or_default();
+    assert!(
+        help.contains("Define or import"),
+        "outside a test, `t` must use the generic hint, got: {help:?}"
+    );
+}
+
+#[test]
+fn infer_name_not_found_suggests_the_expected_enum_variant() {
+    let input = r#"
+enum TokenType {
+  EOF, Whitespace
+}
+
+fn next(chr: int) -> TokenType {
+  if chr < 0 {
+    return EOF
+  }
+  TokenType.Whitespace
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_name_not_found_qualifies_an_imported_enum_variant() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("events", "mod.lis", "pub enum Event {\n  Click, Scroll\n}");
+    fs.add_file(
+        "main",
+        "main.lis",
+        "import \"events\"\n\nfn pick(n: int) -> events.Event {\n  if n < 0 {\n    return Click\n  }\n  events.Event.Scroll\n}",
+    );
+    let result = infer_package("main", fs);
+    let diagnostic = result
+        .errors
+        .iter()
+        .find(|d| d.code_str() == Some("resolve.name_not_found"))
+        .expect("expected a name_not_found for `Click`");
+    let help = diagnostic.plain_help().unwrap_or_default();
+    assert!(
+        help.contains("`events.Event.Click`"),
+        "an imported enum must be suggested with its prefix, got: {help:?}"
+    );
+}
+
+#[test]
+fn infer_name_not_found_qualifies_an_aliased_enum_variant() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("events", "mod.lis", "pub enum Event {\n  Click, Scroll\n}");
+    fs.add_file(
+        "api",
+        "mod.lis",
+        "import \"events\"\n\npub type UIEvent = events.Event",
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        "import \"api\"\n\nfn pick(n: int) -> api.UIEvent {\n  if n < 0 {\n    return Click\n  }\n  api.UIEvent.Scroll\n}",
+    );
+    let result = infer_package("main", fs);
+    let diagnostic = result
+        .errors
+        .iter()
+        .find(|d| d.code_str() == Some("resolve.name_not_found"))
+        .expect("expected a name_not_found for `Click`");
+    let help = diagnostic.plain_help().unwrap_or_default();
+    assert!(
+        help.contains("`api.UIEvent.Click`"),
+        "the alias the caller can name must be suggested, got: {help:?}"
+    );
+}
+
+#[test]
+fn infer_name_not_found_skips_a_generic_alias_qualifier() {
+    let result = infer(
+        r#"
+enum Event {
+  Click, Scroll
+}
+
+type Wrapped<T> = Event
+
+fn pick(n: int) -> Wrapped<int> {
+  if n < 0 {
+    return Click
+  }
+  Event.Scroll
+}
+"#,
+    );
+    let diagnostic = result
+        .errors
+        .iter()
+        .find(|d| d.code_str() == Some("resolve.name_not_found"))
+        .expect("expected a name_not_found for `Click`");
+    let help = diagnostic.plain_help().unwrap_or_default();
+    assert!(
+        help.contains("`Event.Click`"),
+        "a generic alias is not a legal qualifier, got: {help:?}"
+    );
+}
+
+#[test]
+fn infer_name_not_found_suggests_the_receiver_field() {
+    let input = r#"
+struct Location {
+  line: int,
+  column: int
+}
+
+impl Location {
+  fn describe(self) -> int {
+    line + column
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn undeclared_handle_in_subtest_suppresses_tail_cascade() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks() {\n  t.run(\"sub\", |_| {\n    assert true\n  })\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "resolve.undeclared_test_handle"),
+        "the undeclared handle must still be reported, got: {:?}",
+        result.errors
+    );
+    assert!(
+        !has_code(&result, "statement_as_tail"),
+        "the assert-tail must not cascade once `t` is unresolved, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_return_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks() -> bool { false }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_unsupported_signature"),
+        "a value-returning test must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_result_unit_error_return_accepted() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "import \"go:errors\"\n\n#[test]\nfn checks() -> Result<(), error> { Err(errors.New(\"x\")) }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "test_unsupported_signature"),
+        "a `Result<(), error>` test must be accepted, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_non_error_result_return_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "struct MyErr {}\n\n#[test]\nfn checks() -> Result<(), MyErr> { Err(MyErr {}) }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_unsupported_signature"),
+        "a non-`error` Result test is deferred and must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn local_error_type_shadow_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "interface error { fn code() -> int }\n\n#[test]\nfn checks() -> Result<(), error> { Ok(()) }",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "prelude_type_shadowed"),
+        "shadowing the prelude `error` type must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn assert_without_test_context_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "fn helper() {\n  assert true\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "assert_without_test_context"),
+        "`assert` with no test handle in scope must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn calling_a_test_function_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn alpha() {}\n\n#[test]\nfn beta() {\n  alpha()\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_function_not_callable"),
+        "calling a `#[test]` function must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn calling_a_test_file_helper_accepted() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "fn helper() {}\n\n#[test]\nfn alpha() {\n  helper()\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "test_function_not_callable"),
+        "calling a non-test helper must be accepted, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn assert_in_wildcard_handle_helper_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "fn helper(_: TestContext) {\n  assert true\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "assert_without_test_context"),
+        "a discarded `_: TestContext` is not a usable handle, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn local_test_context_type_is_not_the_handle() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "struct TestContext {}\n\nfn helper(t: TestContext) {\n  assert true\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "assert_without_test_context"),
+        "a local `TestContext` type must not be treated as the test handle, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn assert_in_test_context_helper_accepted() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "fn helper(t: TestContext) {\n  assert true\n}\n\n#[test]\nfn checks(t: TestContext) {\n  helper(t)\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "assert_without_test_context"),
+        "`assert` in a helper taking `t: TestContext` must be accepted, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn let_assert_refutable_pattern_accepted() {
+    let fs = test_attribute_fs(
+        "pub fn parse(n: int) -> Result<int, int> { Ok(n) }",
+        "#[test]\nfn checks() {\n  let assert Ok(h) = parse(1)\n  assert h == 1\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        !has_code(&result, "literal_in_binding") && !has_code(&result, "or_pattern_in_irrefutable"),
+        "`let assert` must permit a refutable pattern, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn let_assert_immutable_binding_gets_no_mut_fix() {
+    let fs = test_attribute_fs(
+        "pub fn parse(n: int) -> Result<int, int> { Ok(n) }",
+        "#[test]\nfn checks() {\n  let assert n = 1\n  n = 2\n  assert n == 2\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "immutable"),
+        "reassigning the binding must be refused, got: {:?}",
+        result.errors
+    );
+    assert!(
+        result.errors.iter().all(|d| d.fix().is_none()),
+        "`let assert mut` is forbidden, so no fix may be offered"
+    );
+}
+
+#[test]
+fn let_assert_outside_test_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn parse(n: int) -> Result<int, int> { Ok(n) }",
+        "fn helper() {\n  let assert Ok(h) = parse(1)\n  let _ = h\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "assert_without_test_context"),
+        "`let assert` with no test handle in scope must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn let_assert_mut_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks() {\n  let assert mut x = 5\n  let _ = x\n}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "syntax_error"),
+        "`let assert mut` must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_attribute_with_generics_rejected() {
+    let fs = test_attribute_fs(
+        "pub fn add(a: int, b: int) -> int { a + b }",
+        "#[test]\nfn checks<T>() {}",
+    );
+    let result = infer_package("_entry_", fs);
+    assert!(
+        has_code(&result, "test_unsupported_signature"),
+        "a generic test must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn dot_test_file_sees_private_symbols() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "fn secret() -> int { 42 }\n\npub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file("math", "core.test.lis", "fn checks() -> int { secret() }");
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        !result.errors.iter().any(|d| d.is_error()),
+        "an internal `.test.lis` file must reach private symbols in its package, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn production_file_cannot_see_test_definition() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { helper() }",
+    );
+    fs.add_file("math", "core.test.lis", "fn helper() -> int { 0 }");
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d.is_error()),
+        "a production file must not resolve a definition declared only in a test file"
+    );
+}
+
+#[test]
+fn test_file_sees_other_test_files_definition() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file("math", "helpers.test.lis", "fn helper() -> int { 1 }");
+    fs.add_file(
+        "math",
+        "feature.test.lis",
+        "fn checks() -> int { helper() }",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        !result.errors.iter().any(|d| d.is_error()),
+        "a test file must resolve definitions from other test files in its package, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_file_can_use_test_defined_type() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.add(1, 2)
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file(
+        "math",
+        "core.test.lis",
+        "struct Fixture {\n  value: int,\n}\n\nfn make() -> int {\n  let f = Fixture { value: 1 }\n  f.value\n}",
+    );
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        !result.errors.iter().any(|d| d.is_error()),
+        "a test file must be able to use a type it defines, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn importer_cannot_see_exported_test_definition() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "_entry_",
+        "main.lis",
+        r#"import "math"
+
+fn main() {
+  let _ = math.helper()
+}"#,
+    );
+    fs.add_file(
+        "math",
+        "core.lis",
+        "pub fn add(a: int, b: int) -> int { a + b }",
+    );
+    fs.add_file("math", "core.test.lis", "pub fn helper() -> int { 1 }");
+
+    let result = infer_package("_entry_", fs);
+
+    assert!(
+        result.errors.iter().any(|d| d.is_error()),
+        "a `pub` definition in a test file must not be importable from another package"
     );
 }
 
@@ -2608,7 +7070,7 @@ enum MyResult<T, E> {
 }
 
 fn main() {
-  let x: MyResult<Never, int> = MyOk(1);
+  let x: MyResult<Never, int> = MyResult.MyOk(1);
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -2623,7 +7085,8 @@ enum Either<L, R> {
 }
 
 fn main() {
-  let x: Either<int, string> = Left("oops");
+  let x = Either.Left("oops");
+  let _: Either<int, string> = x;
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -2658,6 +7121,130 @@ fn infer_type_param_with_args() {
     let input = r#"
 fn test<T>(x: T<int>) -> T {
   x
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_integer_in_type_position() {
+    let input = r#"
+fn test() {
+  let x: Slice<3> = []
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_too_large() {
+    let input = r#"
+fn f(x: Array<int, 18000000000000000000>) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_unknown_constant() {
+    let input = r#"
+fn f(x: Array<int, NOPE>) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_not_constant() {
+    let input = r#"
+fn size() -> int { 3 }
+fn f(x: Array<int, size>) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_local_constant() {
+    let input = r#"
+fn f() -> int {
+  const N = 3
+  let xs: Array<int, N> = [1, 2, 3]
+  xs.length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_not_integer_constant() {
+    let input = r#"
+const N = "three"
+fn f(x: Array<int, N>) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_computed_constant() {
+    let input = r#"
+const N = 2 + 2
+fn f(x: Array<int, N>) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_size_negative_constant() {
+    let input = r#"
+const N = -2
+fn f(x: Array<int, N>) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_to_slice_type_mismatch_hint() {
+    let input = r#"
+fn consume(items: Slice<int>) {}
+
+fn main() {
+  let items: Array<int, 3> = [1, 2, 3]
+  consume(items)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_pattern_length_mismatch() {
+    let input = r#"
+fn f(arr: Array<int, 3>) -> int {
+  let [a, b] = arr
+  a
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_match_non_exhaustive_witness() {
+    let input = r#"
+fn f(arr: Array<int, 3>) -> int {
+  match arr {
+    [0, ..] => 1
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_array_match_non_exhaustive_full_witness_no_trailing_rest() {
+    let input = r#"
+fn f(arr: Array<bool, 2>) -> int {
+  match arr {
+    [true, true] => 3,
+    [true, false] => 2,
+    [false, true] => 1,
+  }
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -2727,8 +7314,8 @@ fn main() -> int {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -2755,8 +7342,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -2783,8 +7370,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -2818,8 +7405,8 @@ fn main() -> int {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -2851,8 +7438,69 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_private_field_in_struct_autofill_direct() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "shapes",
+        "lib.lis",
+        r#"
+pub struct Point {
+  x: int,
+  pub y: int,
+}
+"#,
+    );
+
+    let source = r#"
+import "shapes"
+
+fn main() {
+  let q = shapes.Point { y: 10, .. };
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_private_field_in_struct_autofill_transitive() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "other",
+        "lib.lis",
+        r#"
+pub struct Inner {
+  pub a: int,
+  b: int,
+}
+"#,
+    );
+
+    let source = r#"
+import "other"
+
+struct Outer {
+  inner: other.Inner,
+}
+
+fn main() {
+  let o = Outer { .. };
+  let _ = o;
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -2940,12 +7588,26 @@ fn test(ch: Receiver<int>) {
 }
 
 #[test]
-fn parse_duplicate_impl_parent() {
+fn parse_duplicate_embed_parent() {
     let input = r#"
 interface A {}
 interface I {
-  impl A;
-  impl A;
+  embed A;
+  embed A;
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_impl_in_interface_rejected() {
+    let input = r#"
+interface Reader {
+  fn read() -> string;
+}
+interface ReadWriter {
+  impl Reader
+  fn write(s: string);
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -3009,7 +7671,7 @@ fn f() {
 fn parse_task_dot_access_without_call() {
     let input = r#"
 fn f() {
-  task module.work
+  task package.work
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -3065,7 +7727,7 @@ fn f() {
 fn parse_defer_dot_access_without_call() {
     let input = r#"
 fn f() {
-  defer module.cleanup
+  defer package.cleanup
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -3117,6 +7779,139 @@ fn f() {
 }
 "#;
     assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_deferred_mutex_lock() {
+    let input = r#"
+import "go:sync"
+
+struct Counter {
+  mu: sync.Mutex,
+}
+
+impl Counter {
+  fn inc(self: mut Ref<Counter>) {
+    self.mu.Lock()
+    defer self.mu.Lock()
+  }
+}
+
+fn main() {
+  let mut c = Counter { mu: sync.Mutex {} }
+  c.inc()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_deferred_rwmutex_rlock() {
+    let input = r#"
+import "go:sync"
+
+struct Cache {
+  rw: sync.RWMutex,
+}
+
+impl Cache {
+  fn read(self: mut Ref<Cache>) {
+    self.rw.RLock()
+    defer self.rw.RLock()
+  }
+}
+
+fn main() {
+  let mut c = Cache { rw: sync.RWMutex {} }
+  c.read()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_deferred_locker_lock() {
+    let input = r#"
+import "go:sync"
+
+fn run(l: sync.Locker) {
+  l.Lock()
+  defer l.Lock()
+}
+
+fn main() {
+  let mu = sync.Mutex {}
+  run(&mu)
+}
+"#;
+    infer(input).assert_infer_code("deferred_lock");
+}
+
+#[test]
+fn infer_deferred_unlock_is_allowed() {
+    let input = r#"
+import "go:sync"
+
+struct Counter {
+  mu: sync.Mutex,
+}
+
+impl Counter {
+  fn inc(self: mut Ref<Counter>) {
+    self.mu.Lock()
+    defer self.mu.Unlock()
+  }
+}
+
+fn main() {
+  let mut c = Counter { mu: sync.Mutex {} }
+  c.inc()
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn infer_deferred_lock_on_user_type_is_allowed() {
+    let input = r#"
+struct Resource {
+  id: int,
+}
+
+impl Resource {
+  fn Lock(self) {}
+}
+
+fn main() {
+  let r = Resource { id: 1 }
+  defer r.Lock()
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn infer_non_deferred_lock_is_allowed() {
+    let input = r#"
+import "go:sync"
+
+struct Counter {
+  mu: sync.Mutex,
+}
+
+impl Counter {
+  fn inc(self: mut Ref<Counter>) {
+    self.mu.Lock()
+    self.mu.Unlock()
+  }
+}
+
+fn main() {
+  let mut c = Counter { mu: sync.Mutex {} }
+  c.inc()
+}
+"#;
+    infer(input).assert_no_errors();
 }
 
 #[test]
@@ -3281,8 +8076,8 @@ fn main() -> int {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -3314,8 +8109,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -3339,8 +8134,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -3364,8 +8159,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -3434,6 +8229,72 @@ fn test() {
       continue;
     }
     Some(42)?
+  };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_try_block_defer() {
+    let input = r#"
+fn cleanup() {}
+
+fn test() {
+  let result = try {
+    defer cleanup()
+    Some(42)?
+  };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_recover_block_defer() {
+    let input = r#"
+fn cleanup() {}
+
+fn test() {
+  let result = recover {
+    defer cleanup()
+    42
+  };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_try_block_defer_inside_recover_names_the_inner_block() {
+    let input = r#"
+fn cleanup() {}
+
+fn test() {
+  let result = recover {
+    let inner = try {
+      defer cleanup()
+      Some(42)?
+    };
+    inner.unwrap_or(0)
+  };
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_recover_block_defer_inside_try_names_the_inner_block() {
+    let input = r#"
+fn cleanup() {}
+
+fn test() {
+  let result = try {
+    let inner = recover {
+      defer cleanup()
+      1
+    };
+    Some(42)? + inner.unwrap_or(0)
   };
 }
 "#;
@@ -3518,11 +8379,45 @@ fn main() {
 }
 
 #[test]
+fn infer_division_by_folded_zero() {
+    let input = r#"
+fn main() {
+  let x = 10 / (2 - 2);
+  x
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_remainder_by_zero() {
     let input = r#"
 fn main() {
   let x = 10 % 0;
   x
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_float_division_by_zero() {
+    let input = r#"
+fn main() {
+  let x = 1.0 / 0.0;
+  x
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_float_division_by_adapted_zero() {
+    let input = r#"
+fn main() {
+  let x = 3.5;
+  let y = x / 0;
+  y
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -3547,6 +8442,56 @@ fn walk_dir(root: string, fn: string) {}
 }
 
 #[test]
+fn parse_keyword_as_binding_task() {
+    let input = r#"
+fn main() {
+  let task = || {}
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_keyword_as_binding_select() {
+    let input = r#"
+fn main() {
+  let select = "SELECT * FROM users"
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_keyword_as_binding_match_kw() {
+    let input = r#"
+fn main() {
+  let match = 1
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_keyword_as_binding_recover() {
+    let input = r#"
+fn main() {
+  let recover = 1
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_keyword_as_binding_defer() {
+    let input = r#"
+fn main() {
+  let defer = 1
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_keyword_as_binding_in_for_loop() {
     let input = r#"
 fn main() {
@@ -3557,8 +8502,8 @@ fn main() {
 }
 "#;
 
-    let lex_result = syntax::lex::Lexer::new(input, 0).lex();
-    let parse_result = syntax::parse::Parser::new(lex_result.tokens, input).parse();
+    let lex_result = Lexer::new(input, 0).lex();
+    let parse_result = Parser::new(lex_result.tokens, input).parse();
 
     assert!(
         parse_result.errors.len() == 1,
@@ -3586,8 +8531,8 @@ fn main() {
 }
 "#;
 
-    let lex_result = syntax::lex::Lexer::new(input, 0).lex();
-    let parse_result = syntax::parse::Parser::new(lex_result.tokens, input).parse();
+    let lex_result = Lexer::new(input, 0).lex();
+    let parse_result = Parser::new(lex_result.tokens, input).parse();
 
     assert!(
         parse_result.errors.len() == 1,
@@ -3618,14 +8563,14 @@ impl Container<T> {
 }
 
 #[test]
-fn infer_value_enum_outside_typedef() {
+fn parse_enum_assigned_variant() {
     let input = r#"
 enum Weekday {
   Sunday = 0,
   Monday = 1,
 }
 "#;
-    assert_infer_error_snapshot!(input);
+    assert_parse_error_snapshot!(input);
 }
 
 #[test]
@@ -3642,6 +8587,63 @@ trait Displayable {
 fn parse_expected_declaration() {
     let input = r#"
 123
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_top_level_var_with_initializer() {
+    let input = r#"
+struct Config {
+  gravity: float,
+  count: int,
+}
+
+var conf = Config {
+  gravity: 0.03,
+  count: 6,
+}
+"#;
+
+    let lex_result = Lexer::new(input, 0).lex();
+    let parse_result = Parser::new(lex_result.tokens, input).parse();
+
+    assert!(
+        parse_result.errors.len() == 1,
+        "Expected exactly 1 error for top-level var with initializer, got {}: {:?}",
+        parse_result.errors.len(),
+        parse_result
+            .errors
+            .iter()
+            .map(|e| &e.message)
+            .collect::<Vec<_>>()
+    );
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_top_level_var_annotated_with_initializer() {
+    let input = r#"
+var count: int = 6
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_top_level_let() {
+    let input = r#"
+let x = 1
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_var_in_function_body() {
+    let input = r#"
+fn test() {
+  var x = 1
+}
 "#;
     assert_parse_error_snapshot!(input);
 }
@@ -3671,77 +8673,71 @@ fn classify(x: int) -> string {
 }
 
 #[test]
-fn parse_value_enum_negative_below_i64_min() {
+fn parse_enum_assigned_variant_string() {
     let input = r#"
-enum Bad: int64 {
-  Way = -9223372036854775809,
+enum HttpMethod {
+  Get = "GET",
+  Post = "POST",
 }
 "#;
     assert_parse_error_snapshot!(input);
 }
 
 #[test]
-fn parse_value_enum_positive_above_u64_max() {
-    let input = r#"
-enum Bad: int64 {
-  Way = 99999999999999999999999,
-}
-"#;
-    assert_parse_error_snapshot!(input);
-}
+fn infer_const_pattern_outside_match_arm() {
+    let typedef_source = "pub struct Weekday(int)\npub const Friday: Weekday = 5\n";
+    let main_source = r#"
+import "weekday"
 
-#[test]
-fn parse_value_enum_negative_below_u64_max() {
-    let input = r#"
-enum Bad: int64 {
-  Way = -18446744073709551616,
-}
-"#;
-    assert_parse_error_snapshot!(input);
-}
-
-#[test]
-fn parse_value_enum_with_generics() {
-    let source = r#"
-enum Status<T> {
-  Active = 0,
-  Inactive = 1,
+fn test(day: weekday.Weekday) {
+  let weekday.Friday = day
 }
 "#;
     let mut fs = MockFileSystem::new();
-    fs.add_file("types", "status.d.lis", source);
-    let result = infer_module("types", fs);
+    fs.add_file("weekday", "weekday.d.lis", typedef_source);
+    fs.add_file("main", "main.lis", main_source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, main_source);
+}
 
-    assert!(!result.errors.is_empty(), "Expected parse error");
+#[test]
+fn infer_const_pattern_not_case_eligible() {
+    let typedef_source = "pub struct Weekday(int)\npub fn Today() -> Weekday\n";
+    let main_source = r#"
+import "lib"
 
-    let output = format_diagnostic_for_snapshot(&result.errors[0], source, "status.d.lis");
-
-    insta::with_settings!({
-        prepend_module_to_snapshot => false,
-        omit_expression => true,
-    }, {
-        insta::assert_snapshot!(output);
-    });
+fn name(day: lib.Weekday) -> string {
+  match day {
+    lib.Today => "today",
+    _ => "other",
+  }
+}
+"#;
+    let mut fs = MockFileSystem::new();
+    fs.add_file("lib", "lib.d.lis", typedef_source);
+    fs.add_file("main", "main.lis", main_source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, main_source);
 }
 
 #[test]
 fn infer_invalid_division_by_numeric_alias() {
     let typedef_source = r#"
-pub enum Duration: int64 {
-  Second = 1000000000,
-}
+pub struct Duration(int64)
+pub const Second: Duration = 1000000000
 "#;
     let main_source = r#"
 import "time"
 
 fn test() {
-  let x = 100 / time.Duration.Second;
+  let n: int = 100;
+  let x = n / time.Second;
 }
 "#;
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", typedef_source);
     fs.add_file("main", "main.lis", main_source);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
     assert!(!result.errors.is_empty(), "Expected type error");
 
@@ -3758,21 +8754,21 @@ fn test() {
 #[test]
 fn infer_invalid_remainder_by_numeric_alias() {
     let typedef_source = r#"
-pub enum Duration: int64 {
-  Second = 1000000000,
-}
+pub struct Duration(int64)
+pub const Second: Duration = 1000000000
 "#;
     let main_source = r#"
 import "time"
 
 fn test() {
-  let x = 100 % time.Duration.Second;
+  let n: int = 100;
+  let x = n % time.Second;
 }
 "#;
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", typedef_source);
     fs.add_file("main", "main.lis", main_source);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
     assert!(!result.errors.is_empty(), "Expected type error");
 
@@ -3789,21 +8785,20 @@ fn test() {
 #[test]
 fn infer_cross_family_numeric_alias() {
     let typedef_source = r#"
-pub enum Duration: int64 {
-  Second = 1000000000,
-}
+pub struct Duration(int64)
+pub const Second: Duration = 1000000000
 "#;
     let main_source = r#"
 import "time"
 
 fn test() {
-  let x = time.Duration.Second * 1.5;
+  let x = time.Second * 1.5;
 }
 "#;
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", typedef_source);
     fs.add_file("main", "main.lis", main_source);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
     assert!(!result.errors.is_empty(), "Expected type error");
 
@@ -3820,25 +8815,22 @@ fn test() {
 #[test]
 fn infer_different_numeric_aliases() {
     let typedef_source = r#"
-pub enum DurationA: int64 {
-  Second = 1000000000,
-}
-
-pub enum DurationB: int64 {
-  Second = 1000000000,
-}
+pub struct DurationA(int64)
+pub struct DurationB(int64)
+pub const SecondA: DurationA = 1000000000
+pub const SecondB: DurationB = 1000000000
 "#;
     let main_source = r#"
 import "time"
 
 fn test() {
-  let x = time.DurationA.Second + time.DurationB.Second;
+  let x = time.SecondA + time.SecondB;
 }
 "#;
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", typedef_source);
     fs.add_file("main", "main.lis", main_source);
-    let result = infer_module("main", fs);
+    let result = infer_package("main", fs);
 
     assert!(!result.errors.is_empty(), "Expected type error");
 
@@ -3853,11 +8845,52 @@ fn test() {
 }
 
 #[test]
+fn infer_named_numeric_expected_suggests_as_cast() {
+    let typedef_source = r#"
+pub struct Duration(int64)
+pub const Second: Duration = 1000000000
+
+pub fn Sleep(d: Duration)
+"#;
+    let main_source = r#"
+import "time"
+
+fn test() {
+  let n: int64 = 0;
+  time.Sleep(n);
+}
+"#;
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", typedef_source);
+    fs.add_file("main", "main.lis", main_source);
+    let result = infer_package("main", fs);
+
+    assert_multipackage_infer_error_snapshot!(result, main_source);
+}
+
+#[test]
 fn infer_taking_value_of_ufcs_method() {
     let input = r#"
 fn test() {
   let opt: Option<int> = Some(42);
   let f = opt.map;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_taking_value_of_partial_impl_method() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn first(self) -> T { self.a }
+}
+
+fn test() {
+  let p: Pair<int, int> = Pair { a: 1, b: 2 };
+  let f = p.first;
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -3884,6 +8917,16 @@ fn parse_interface_method_with_type_parameters() {
     let input = r#"
 interface Mapper {
   fn map<U>(self, f: fn(int) -> U) -> U;
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_self_after_other_parameter_rejected() {
+    let input = r#"
+interface I {
+  fn f(x: int, self) -> int
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -3918,6 +8961,107 @@ fn test(ch: Channel<int>) {
 }
 
 #[test]
+fn parse_postfix_increment() {
+    let input = r#"
+fn main() {
+  let mut foo = 0
+  foo++
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_decrement() {
+    let input = r#"
+fn main() {
+  let mut foo = 0
+  foo--
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_increment_field() {
+    let input = r#"
+struct Counter { value: int }
+
+fn main() {
+  let mut c = Counter { value: 0 }
+  c.value++
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_increment_index() {
+    let input = r#"
+fn main() {
+  let mut a = [1, 2, 3]
+  a[0]++
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_increment_in_if_header() {
+    let input = r#"
+fn main() {
+  let mut foo = 0
+  if foo++ {
+    log()
+  }
+}
+
+fn log() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_increment_in_for_header() {
+    let input = r#"
+fn main() {
+  let mut xs = [1, 2, 3]
+  for x in xs++ {
+    log(x)
+  }
+}
+
+fn log(x: int) {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_increment_trailing_comment() {
+    let input = r#"
+fn main() {
+  let mut foo = 0
+  foo++ // bump it
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_postfix_increment_recovers() {
+    let input = r#"
+fn main() {
+  let mut foo = 0
+  foo++
+  log(foo)
+}
+
+fn log(x: int) {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_fn_as_lambda() {
     let input = r#"
 fn main() {
@@ -3928,9 +9072,45 @@ fn main() {
 }
 
 #[test]
+fn parse_fn_as_lambda_in_let_rhs() {
+    let input = r#"
+fn main() {
+  let op = fn() -> Result<(), error> {
+    Ok(())
+  }
+  match op() {
+    Ok(()) => 0,
+    Err(_) => 1,
+  };
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
 fn parse_go_slice_syntax_in_type() {
     let input = r#"
 fn test(arr: []int) {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_paren_generics_in_return_type() {
+    let input = r#"
+fn foo() -> Result((), Err) {
+  Ok(())
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_bracket_generics_in_type() {
+    let input = r#"
+fn counts(m: Map[string, int]) -> int {
+  0
+}
 "#;
     assert_parse_error_snapshot!(input);
 }
@@ -3969,6 +9149,16 @@ fn identity<T>(x: T) -> T { x }
 
 fn test() {
   let x = identity::<int>(5);
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_rust_turbofish_with_method() {
+    let input = r#"
+fn test() {
+  let xs = Slice::<int>::new()
 }
 "#;
     assert_parse_error_snapshot!(input);
@@ -4017,7 +9207,7 @@ fn test() {
 fn parse_rust_impl_trait_for_type() {
     let input = r#"
 interface Showable {
-  fn show(self) -> string
+  fn show() -> string
 }
 
 struct Item { name: string }
@@ -4092,7 +9282,7 @@ fn main() {
   takes_ref(&x)
 }
 "#;
-    let result = crate::_harness::infer::infer(input);
+    let result = infer(input);
     assert!(
         result.errors.is_empty(),
         "Expected no errors but got: {:?}",
@@ -4112,7 +9302,7 @@ fn main() {
   takes_ref(&Foo { value: 42 })
 }
 "#;
-    let result = crate::_harness::infer::infer(input);
+    let result = infer(input);
     assert!(
         result.errors.is_empty(),
         "Expected no errors but got: {:?}",
@@ -4126,13 +9316,13 @@ fn infer_cannot_auto_address_map_index_receiver() {
 struct Foo { value: int }
 
 impl Foo {
-  fn increment(self: Ref<Foo>) {
+  fn increment(self: mut Ref<Foo>) {
     self.value = self.value + 1
   }
 }
 
 fn main() {
-  let m = Map.new<string, Foo>();
+  let mut m = Map.new<string, Foo>();
   m["key"].increment()
 }
 "#;
@@ -4209,6 +9399,26 @@ fn test() -> int {
 }
 
 #[test]
+fn infer_invalid_cast_string_to_rune() {
+    let input = r#"
+fn test() -> rune {
+  "A" as rune
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_invalid_cast_string_to_byte() {
+    let input = r#"
+fn test() -> byte {
+  "A" as byte
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_invalid_cast_bool_to_int() {
     let input = r#"
 fn test() -> int {
@@ -4226,6 +9436,57 @@ struct MyStruct { x: int }
 fn test() -> int {
   let s = MyStruct { x: 1 };
   s as int
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_cast_fn_reader_to_writer_type() {
+    let input = r#"
+struct Node { value: int }
+
+type Handler = fn(mut Ref<Node>)
+
+fn read_only(n: Ref<Node>) { let _ = n.value }
+
+fn test() {
+  let handler = read_only as Handler
+  let mut node = Node { value: 1 }
+  handler(&node)
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn infer_cast_fn_writer_to_reader_type() {
+    let input = r#"
+struct Node { value: int }
+
+type Handler = fn(Ref<Node>)
+
+fn writer(n: mut Ref<Node>) { n.value = 2 }
+
+fn test() {
+  let handler = writer as Handler
+  let node = Node { value: 1 }
+  handler(&node)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_cast_fn_parameter_count_mismatch() {
+    let input = r#"
+type Handler = fn(int)
+
+fn pair(a: int, b: int) { let _ = a + b }
+
+fn test() {
+  let handler = pair as Handler
+  handler(1)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -4254,6 +9515,67 @@ fn test() -> complex128 {
 }
 
 #[test]
+fn infer_invalid_cast_rune_to_byte() {
+    let input = r#"
+fn test() -> byte {
+  let r: rune = 'A';
+  r as byte
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_invalid_cast_custom_rune_to_byte() {
+    let input = r#"
+type MyRune = rune
+
+fn test() -> byte {
+  let r: MyRune = 'A';
+  r as byte
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_invalid_cast_rune_to_custom_byte() {
+    let input = r#"
+type MyByte = byte
+
+fn test() -> MyByte {
+  let r: rune = 'A';
+  r as MyByte
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_invalid_cast_byte_to_string() {
+    let input = r#"
+fn test() -> string {
+  let b: byte = 65;
+  b as string
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_invalid_cast_custom_byte_to_string() {
+    let input = r#"
+type MyByte = byte
+
+fn test() -> string {
+  let b: MyByte = 65;
+  b as string
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_chained_cast() {
     let input = r#"
 fn test() -> int {
@@ -4273,6 +9595,40 @@ fn test() -> int {
 }
 "#;
     assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn assert_type_interface_narrowing_not_redundant() {
+    let input = r#"
+interface Animal {
+  fn sound() -> string
+}
+
+struct Dog {}
+
+impl Dog {
+  fn sound(self) -> string { "woof" }
+}
+
+fn pick(a: Animal) -> Option<Animal> {
+  assert_type<Dog>(a)
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.code_str() == Some("infer.type_mismatch")),
+        "expected the coercion scenario to produce a type mismatch"
+    );
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| e.code_str() == Some("infer.redundant_assert_type")),
+        "narrowing an interface to a concrete type must not be flagged redundant"
+    );
 }
 
 #[test]
@@ -4306,10 +9662,60 @@ fn test() {
 }
 
 #[test]
+fn infer_octal_char_literal_overflow_int8() {
+    let input = r#"
+fn test() {
+  let x: int8 = '\377';
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_hex_char_literal_overflow_int8() {
+    let input = r#"
+fn test() {
+  let x: int8 = '\xFF';
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unicode_char_literal_overflow_uint8() {
+    let input = r#"
+fn test() {
+  let x: uint8 = '\u{1F600}';
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_integer_literal_overflow_int16() {
     let input = r#"
 fn test() {
   let x: int16 = 40000;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_integer_literal_overflow_int32() {
+    let input = r#"
+fn test() {
+  let x: int32 = 3000000000;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_integer_literal_overflow_int64() {
+    let input = r#"
+fn test() {
+  let x: int64 = 10000000000000000000;
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -4572,6 +9978,215 @@ fn test() {
 }
 
 #[test]
+fn infer_not_comparable_map() {
+    let input = r#"
+fn test(a: Map<string, int>, b: Map<string, int>) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_slice_of_functions() {
+    let input = r#"
+fn test(a: Slice<fn() -> int>, b: Slice<fn() -> int>) -> bool {
+  a == b
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_map_of_functions() {
+    let input = r#"
+fn test(a: Map<string, fn() -> int>, b: Map<string, fn() -> int>) -> bool {
+  a == b
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_slice_of_noncomparable_structs() {
+    let input = r#"
+struct Holder {
+  items: Slice<int>,
+}
+
+fn test(a: Slice<Holder>, b: Slice<Holder>) -> bool {
+  a == b
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_equals_container_fails_interface_bound() {
+    let input = r#"
+interface Equatable<T> {
+  fn equals(other: T) -> bool
+}
+
+fn same<T: Equatable<T>>(x: T, y: T) -> bool {
+  x.equals(y)
+}
+
+fn main() {
+  let x = [1, 2]
+  let _ = same(x, x)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_equals_rejects_function_element() {
+    let input = r#"
+fn test(a: Slice<fn() -> int>, b: Slice<fn() -> int>) {
+  let result = a.equals(b);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_equals_rejects_noncomparable_struct_element() {
+    let input = r#"
+struct Holder {
+  items: Slice<int>,
+}
+
+fn test(a: Slice<Holder>, b: Slice<Holder>) {
+  let result = a.equals(b);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_equals_rejects_unbounded_generic_element() {
+    let input = r#"
+fn compare<T>(a: Slice<T>, b: Slice<T>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_compare_unbounded_container_suggests_bound_then_equals() {
+    let input = r#"
+fn compare<T>(a: Slice<T>, b: Slice<T>) -> bool {
+  a == b
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_compare_names_every_unbounded_param() {
+    let input = r#"
+struct Pair<A, B> { pub a: A, pub b: B }
+
+fn compare<A, B>(x: Pair<A, B>, y: Pair<A, B>) -> bool {
+  x == y
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_compare_struct_with_function_field_suggests_no_bound() {
+    let input = r#"
+struct S<T> { pub f: fn() -> (), pub t: T }
+
+fn compare<T>(x: S<T>, y: S<T>) -> bool {
+  x == y
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_equals_rejects_map_function_value() {
+    let input = r#"
+fn test(a: Map<string, fn() -> int>, b: Map<string, fn() -> int>) {
+  let result = a.equals(b);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_equals_ufcs_rejects_function_element() {
+    let input = r#"
+fn test(a: Slice<fn() -> int>, b: Slice<fn() -> int>) {
+  let result = Slice.equals(a, b);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_contains_rejects_function_element() {
+    let input = r#"
+fn test(a: Slice<fn() -> int>, value: fn() -> int) {
+  let result = a.contains(value);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_contains_rejects_noncomparable_struct_element() {
+    let input = r#"
+struct Holder {
+  items: Slice<int>,
+}
+
+fn test(a: Slice<Holder>, value: Holder) {
+  let result = a.contains(value);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_contains_rejects_unbounded_generic_element() {
+    let input = r#"
+fn has<T>(a: Slice<T>, value: T) -> bool {
+  a.contains(value)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_contains_ufcs_rejects_function_element() {
+    let input = r#"
+fn test(a: Slice<fn() -> int>, value: fn() -> int) {
+  let result = Slice.contains(a, value);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_contains_rejects_interface_element() {
+    let input = r#"
+interface Shape {
+  fn area() -> int
+}
+
+fn test(a: Slice<Shape>, value: Shape) {
+  let result = a.contains(value);
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_not_comparable_function() {
     let input = r#"
 fn test() {
@@ -4617,6 +10232,677 @@ fn test() {
 }
 
 #[test]
+fn infer_not_comparable_recursive_enum_suggests_equality() {
+    let input = r#"
+enum List {
+  Nil,
+  Cons(int, List),
+}
+
+fn test() {
+  let a = List.Cons(1, List.Nil);
+  let b = List.Nil;
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_recursive_enum_with_equality_suggests_equals() {
+    let input = r#"
+#[equality]
+enum List {
+  Nil,
+  Cons(int, List),
+}
+
+fn test() {
+  let a = List.Cons(1, List.Nil);
+  let b = List.Nil;
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_mutually_recursive_enums() {
+    let input = r#"
+enum A {
+  End,
+  X(B),
+}
+
+enum B {
+  Y(A),
+}
+
+fn test() {
+  let a = A.End;
+  let b = A.X(B.Y(A.End));
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_interface() {
+    let input = r#"
+interface Shape {
+  fn area() -> float64
+}
+
+fn test(a: Shape, b: Shape) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_unknown() {
+    let input = r#"
+fn test(a: Unknown, b: Unknown) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_struct_with_interface_field() {
+    let input = r#"
+interface Shape {
+  fn area() -> float64
+}
+
+struct Holder {
+  shape: Shape,
+}
+
+fn test(a: Holder, b: Holder) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_concrete_against_interface() {
+    let input = r#"
+interface Shape {
+  fn area() -> float64
+}
+
+struct Circle { r: int }
+
+impl Circle {
+  fn area(self) -> float64 { 0.0 }
+}
+
+fn test(c: Circle, s: Shape) {
+  let result = c == s;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_interface_through_alias() {
+    let input = r#"
+interface Shape {
+  fn area() -> float64
+}
+
+type ShapeAlias = Shape
+
+fn test(a: ShapeAlias, b: ShapeAlias) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_unknown_through_alias() {
+    let input = r#"
+type Any = Unknown
+
+fn test(a: Any, b: Any) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_slice_through_alias() {
+    let input = r#"
+type Bytes = Slice<int>
+
+fn test(a: Bytes, b: Bytes) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_function_through_alias() {
+    let input = r#"
+type Callback = fn() -> int
+
+fn test(a: Callback, b: Callback) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_not_comparable_struct_with_function_alias_field() {
+    let input = r#"
+type Callback = fn() -> int
+
+struct Holder {
+  on_done: Callback,
+}
+
+fn test(a: Holder, b: Holder) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_comparable_bound_rejects_slice() {
+    let input = r#"
+fn requires_comparable<T: Comparable>(_x: T) {}
+
+fn test() {
+  requires_comparable([1, 2, 3])
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_comparable_bound_on_equatable_struct_suggests_interface() {
+    let input = r#"
+#[equality]
+struct Wrap<T: Comparable> { value: T }
+
+fn test() {
+  let one = Wrap { value: [1] }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ordered_bound_rejects_bool() {
+    let input = r#"
+import "go:cmp"
+
+fn requires_ordered<T: cmp.Ordered>(_x: T) {}
+
+fn test() {
+  requires_ordered(true)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_bound_on_param_for_comparable() {
+    let input = r#"
+fn requires_comparable<T: Comparable>(_x: T) {}
+
+fn wrapper<T>(x: T) {
+  requires_comparable(x)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_bound_on_param_for_ordered() {
+    let input = r#"
+import "go:cmp"
+
+fn requires_ordered<T: cmp.Ordered>(_x: T) {}
+
+fn wrapper<T>(x: T) {
+  requires_ordered(x)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_propagated_bound_no_error() {
+    let input = r#"
+import "go:cmp"
+
+fn requires_ordered<T: cmp.Ordered>(_x: T) {}
+
+fn wrapper<T: cmp.Ordered>(x: T) {
+  requires_ordered(x)
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_ordered_bound_allows_lt_in_body() {
+    let input = r#"
+import "go:cmp"
+
+fn less<T: cmp.Ordered>(a: T, b: T) -> bool { a < b }
+fn user() -> bool { less(1, 2) }
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_comparable_bound_allows_eq_in_body() {
+    let input = r#"
+fn eq<T: Comparable>(a: T, b: T) -> bool { a == b }
+fn user() -> bool { eq(1, 1) }
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_missing_transitive_bound_on_interface() {
+    let input = r#"
+interface Bar<E: error> {}
+
+interface Foo<T: Bar<E>, E> {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_transitive_bound_on_struct() {
+    let input = r#"
+interface Bar<E: error> {}
+
+struct Foo<T: Bar<E>, E> { value: T }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_transitive_bound_user_interface() {
+    let input = r#"
+interface Shower {
+  fn show() -> string
+}
+
+interface Bar<E: Shower> {}
+
+interface Foo<T: Bar<E>, E> {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_transitive_bound_satisfied_no_error() {
+    let input = r#"
+interface Bar<E: error> {}
+
+interface Foo<T: Bar<E>, E: error> {}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_transitive_builtin_bound_declared_after_no_error() {
+    let input = r#"
+interface Wrapper<E: Comparable> {}
+
+interface Foo<T: Wrapper<E>, E: Comparable> {}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_missing_transitive_bound_distinguishes_type_args() {
+    let input = r#"
+interface Parent<T> {
+  fn p() -> T
+}
+
+interface Bar<E: Parent<string>> {}
+
+interface Foo<T: Bar<E>, E: Parent<int>> {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_transitive_bound_matching_type_args_no_error() {
+    let input = r#"
+interface Parent<T> {
+  fn p() -> T
+}
+
+interface Bar<E: Parent<string>> {}
+
+interface Foo<T: Bar<E>, E: Parent<string>> {}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_missing_transitive_bound_substitutes_referenced_params() {
+    let input = r#"
+interface Parent<T> {
+  fn p() -> T
+}
+
+interface Bar<X, E: Parent<X>> {}
+
+interface Foo<T: Bar<string, E>, E: Parent<int>> {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_transitive_bound_substituted_match_no_error() {
+    let input = r#"
+interface Parent<T> {
+  fn p() -> T
+}
+
+interface Bar<X, E: Parent<X>> {}
+
+interface Foo<T: Bar<string, E>, E: Parent<string>> {}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_missing_transitive_bound_function_type_argument() {
+    let input = r#"
+interface Inner<K: Comparable> {}
+
+interface Outer<X> {}
+
+fn foo<T: Outer<fn(Inner<E>)>, E>(x: T) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_transitive_bound_impl_level_param() {
+    let input = r#"
+interface Bar<E: error> {}
+
+struct W<E> {
+  v: E
+}
+
+impl<E> W<E> {
+  fn m<T: Bar<E>>(self, x: T) {}
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_transitive_bound_nested_argument() {
+    let input = r#"
+interface Inner<K: Comparable> {}
+
+interface Outer<X> {}
+
+fn foo<T: Outer<Inner<E>>, E>(x: T) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_transitive_bound_receiver_inherited_no_error() {
+    let input = r#"
+interface Bar<E: error> {}
+
+struct Box<E: error> {
+  value: E
+}
+
+impl<E> Box<E> {
+  fn m<T: Bar<E>>(self, _x: T) {}
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_missing_transitive_bound_impl_without_receiver_bound() {
+    let input = r#"
+interface Bar<E: error> {}
+
+struct W<E> {
+  value: E
+}
+
+impl<E> W<E> {
+  fn m<T: Bar<E>>(self, _x: T) {}
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_missing_transitive_bound_in_slice_argument() {
+    let input = r#"
+interface Inner<K: Comparable> {}
+
+interface Outer<X> {}
+
+fn foo<T: Outer<Slice<Inner<E>>>, E>(_x: T) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_self_referential_transitive_bound_no_error() {
+    let input = r#"
+interface Cloner<T: Cloner<T>> {
+  fn clone() -> T
+}
+
+fn squiggle<A: Cloner<B>, B>(_a: A, _b: B) {}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_shadowed_inner_generic_does_not_inherit_bound() {
+    let input = r#"
+import "go:cmp"
+
+fn requires_ordered<T: cmp.Ordered>(_x: T) {}
+
+struct Box<T: cmp.Ordered> {}
+
+impl<T: cmp.Ordered> Box<T> {
+  fn bad<T>(self, x: T) { requires_ordered(x) }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_comparable_in_param_position_rejected() {
+    let input = r#"
+fn takes(_x: Comparable) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ordered_in_param_position_rejected() {
+    let input = r#"
+import "go:cmp"
+
+fn takes(_x: cmp.Ordered) {}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ordered_satisfies_comparable_in_wrapper() {
+    let input = r#"
+import "go:cmp"
+
+fn requires_comparable<T: Comparable>(_x: T) {}
+
+fn wrapper<T: cmp.Ordered>(x: T) {
+  requires_comparable(x)
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_comparable_does_not_satisfy_ordered_in_wrapper() {
+    let input = r#"
+import "go:cmp"
+
+fn requires_ordered<T: cmp.Ordered>(_x: T) {}
+
+fn wrapper<T: Comparable>(x: T) {
+  requires_ordered(x)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_prelude_min_rejects_bool() {
+    let input = r#"
+fn test() -> bool {
+  min(true, false)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_prelude_max_rejects_struct() {
+    let input = r#"
+struct Point { x: int, y: int }
+
+fn test(a: Point, b: Point) -> Point {
+  max(a, b)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_prelude_min_max_accepts_int_and_string() {
+    let input = r#"
+fn test_int() -> int { min(1, 2, 3) }
+fn test_float() -> float64 { max(1.0, 2.0) }
+fn test_string() -> string { min("a", "b", "c") }
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_prelude_min_max_accepts_user_cmp_ordered_bound() {
+    let input = r#"
+import "go:cmp"
+
+fn pick<T: cmp.Ordered>(a: T, b: T) -> T { min(a, b) }
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "Expected no errors, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_impl_on_type_alias() {
+    let source = r#"
+type UserId = int
+
+impl UserId {
+  fn bump(self) -> int {
+    self + 1
+  }
+}
+
+fn main() {}
+"#;
+    assert_infer_error_snapshot!(source);
+}
+
+#[test]
 fn infer_impl_on_foreign_type() {
     let mut fs = MockFileSystem::new();
 
@@ -4643,8 +10929,48 @@ fn main() {}
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+// A user impl on the built-in `Array` (literal size) must be rejected like a
+// foreign type, not ICE on the bare `Type::Array` receiver.
+#[test]
+fn infer_impl_on_builtin_array() {
+    let mut fs = MockFileSystem::new();
+
+    let source = r#"
+impl<T> Array<T, 3> {
+  fn first(self) -> int {
+    0
+  }
+}
+
+fn main() {}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_impl_on_ref_to_builtin_array() {
+    let mut fs = MockFileSystem::new();
+
+    let source = r#"
+impl Ref<Array<int, 3>> {
+  fn first(self) -> int {
+    0
+  }
+}
+
+fn main() {}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -4653,8 +10979,8 @@ fn infer_non_pub_interface_with_pub_implementations() {
 
     let source = r#"
 interface Shape {
-  fn area(self) -> float64
-  fn name(self) -> string
+  fn area() -> float64
+  fn name() -> string
 }
 
 struct Circle {
@@ -4674,8 +11000,8 @@ fn main() {}
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -4684,7 +11010,7 @@ fn infer_non_pub_interface_with_private_implementations() {
 import "go:fmt"
 
 interface Greeter {
-  fn greet(self) -> string
+  fn greet() -> string
 }
 
 struct Hello { name: string }
@@ -4697,7 +11023,7 @@ fn main() {
   fmt.Println(h.greet())
 }
 "#;
-    let result = crate::_harness::infer::infer(input);
+    let result = infer(input);
     result.assert_no_errors();
 }
 
@@ -4721,22 +11047,6 @@ fn returns_unit() {}
 fn test() {
   let mut x = returns_unit()
   x = 42
-}
-"#;
-    assert_infer_error_snapshot!(input);
-}
-
-#[test]
-fn infer_closure_return_type_mismatch() {
-    let input = r#"
-import "go:fmt"
-
-fn handler(f: fn(string)) {
-  f("test")
-}
-
-fn test() {
-  handler(|e: string| { fmt.Println(e) })
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -4814,10 +11124,10 @@ fn main() {
 fn infer_missing_constraint_on_generic_return_type() {
     let input = r#"
 interface Displayable {
-  fn display(self) -> string
+  fn display() -> string
 }
 
-struct Wrapper<T> {
+struct Wrapper<T: Displayable> {
   pub inner: T,
 }
 
@@ -4842,7 +11152,7 @@ fn main() {
 fn infer_missing_constraint_duplicate_bounds_deduped() {
     let input = r#"
 pub interface Summable {
-  fn value(self) -> int
+  fn value() -> int
 }
 
 struct Box<T: Summable> {
@@ -4920,7 +11230,7 @@ fn check(p: Pt) -> string {
 fn infer_ref_of_interface_type() {
     let input = r#"
 interface Writable {
-  fn write(self, data: string)
+  fn write(data: string)
 }
 
 fn copy_data(dest: Ref<Writable>) {
@@ -4931,10 +11241,157 @@ fn copy_data(dest: Ref<Writable>) {
 }
 
 #[test]
+fn infer_ref_of_interface_value() {
+    let input = r#"
+interface Foo<T> {
+  fn get() -> T
+}
+
+struct Bar {}
+
+impl Bar {
+  fn new() -> Foo<int> {
+    Bar {}
+  }
+
+  fn get(self) -> int {
+    42
+  }
+}
+
+fn foo<T>(_foo: Foo<T>) {}
+
+fn main() {
+  let bar = Bar.new()
+  foo(&bar)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ref_of_interface_alias_value() {
+    let input = r#"
+interface Writable {
+  fn write(data: string)
+}
+
+type Sink = Writable
+
+struct File {}
+
+impl File {
+  fn write(self, data: string) {}
+}
+
+fn main() {
+  let s: Sink = File {}
+  let r = &s
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ref_to_interface_passed_as_interface() {
+    let input = r#"
+interface Foo<T> {
+  fn get() -> T
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> int {
+    42
+  }
+}
+
+fn ref_of<T>(x: T) -> Ref<T> {
+  &x
+}
+
+fn foo<T>(_foo: Foo<T>) {}
+
+fn main() {
+  let bar: Foo<int> = Bar {}
+  let r = ref_of(bar)
+  foo(r)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ref_of_interface_alias_passed_as_interface() {
+    let input = r#"
+interface Foo {
+  fn get() -> int
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> int {
+    42
+  }
+}
+
+type P = Ref<Foo>
+
+fn ref_of<T>(x: T) -> Ref<T> {
+  &x
+}
+
+fn foo(_foo: Foo) {}
+
+fn main() {
+  let bar: Foo = Bar {}
+  let p: P = ref_of(bar)
+  foo(p)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_ref_of_interface_nested_alias_passed_as_interface() {
+    let input = r#"
+interface Foo {
+  fn get() -> int
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> int {
+    42
+  }
+}
+
+type P = Ref<Foo>
+
+fn ref_of<T>(x: T) -> Ref<T> {
+  &x
+}
+
+fn foo(_foo: Foo) {}
+
+fn main() {
+  let bar: Foo = Bar {}
+  let p: P = ref_of(bar)
+  let pp: Ref<P> = ref_of(p)
+  foo(pp)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_specialized_impl_interface_satisfaction_rejected() {
     let input = r#"
 interface Describable {
-  fn describe(self) -> string
+  fn describe() -> string
 }
 
 struct Pair<A, B> { first: A, second: B }
@@ -4983,7 +11440,47 @@ impl Wrapper<string> {
 fn infer_self_type_in_interface() {
     let input = r#"
 interface Comparable {
-  fn compare(self, other: Self) -> int
+  fn compare(other: Self) -> int
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_self_receiver_in_interface() {
+    let input = r#"
+interface Greeter {
+  fn greet(self) -> string
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_self_type_in_impl_block() {
+    let input = r#"
+struct DiffReporter {
+  pub diffs: Slice<string>,
+}
+impl DiffReporter {
+  pub fn PushStep(self: Ref<Self>, step: string) {
+    let _ = step
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_self_type_in_generic_impl_block() {
+    let input = r#"
+struct Stack<T> {
+  pub items: Slice<T>,
+}
+impl<T> Stack<T> {
+  pub fn Peek(self: Ref<Self>) -> T {
+    self.items[0]
+  }
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -5012,8 +11509,8 @@ fn test(s: Slice<int>) -> int {
 #[test]
 fn infer_immutable_arg_to_mut_param() {
     let input = r#"
-fn sort(mut items: Slice<int>) {
-  items = [1, 2, 3]
+fn sort(items: mut Slice<int>) {
+  items[0] = 1
 }
 
 fn main() {
@@ -5059,14 +11556,14 @@ struct Outer { items: Slice<int> }
 fn main() {
   let mut m = Map.new<string, Outer>()
   m["a"] = Outer{ items: [1] }
-  m["a"].items.append(2)
+  m["a"].items = m["a"].items.append(2)
 }
 "#;
     assert_infer_error_snapshot!(input);
 }
 
 #[test]
-fn infer_ref_slice_append() {
+fn infer_ref_slice_growth() {
     let input = r#"
 fn main() {
   let mut s = [1, 2, 3]
@@ -5078,22 +11575,12 @@ fn main() {
 }
 
 #[test]
-fn infer_enum_field_type_conflict() {
-    let input = r#"
-enum Event {
-  Click { target: int },
-  Hover { target: string },
-}
-"#;
-    assert_infer_error_snapshot!(input);
-}
-
-#[test]
-fn infer_enum_field_type_conflict_struct_vs_tuple() {
+fn infer_enum_field_slot_collision_after_prefixing() {
     let input = r#"
 enum Shape {
-  Circle(string),
-  Other { circle: int },
+  Rect { w: float64 },
+  Square { w: int },
+  Third { rect_w: string },
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -5140,6 +11627,57 @@ fn main() {
 }
 
 #[test]
+fn infer_native_method_value_on_struct_field() {
+    let input = r#"
+import "go:fmt"
+
+struct Box { items: Slice<int> }
+
+fn main() {
+  let b = Box { items: [1, 2] }
+  fmt.Printf("count=%d\n", b.items.length)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_native_method_value_reports_once_per_use() {
+    let result = infer(
+        r#"
+fn take(n: int) -> int { n }
+
+fn main() {
+  let a = 1 + "hi".length
+  let b = take("hi".length)
+  let c = if "hi".length == 1 { 1 } else { 2 }
+  let _ = (a, b, c)
+}
+"#,
+    );
+    let codes: Vec<&str> = result.errors.iter().filter_map(|d| d.code_str()).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "infer.native_method_value",
+            "infer.native_method_value",
+            "infer.native_method_value"
+        ],
+        "each use must report once, got: {codes:?}"
+    );
+}
+
+#[test]
+fn infer_native_array_method_value() {
+    let input = r#"
+fn main() {
+  let _ = Array.get
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_private_method_expression() {
     let input = r#"
 struct Box { value: int }
@@ -5174,6 +11712,127 @@ const VALUE = {
   let x = 10
   x + 20
 }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_const_not_screaming_snake_case() {
+    let input = r#"
+const maxRetries = 3
+
+fn main() {
+  let _ = maxRetries
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_const_self_reference_cycle() {
+    let input = r#"
+const SELF = SELF
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_const_mutual_cycle() {
+    let input = r#"
+const A = B
+const B = A
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_reference_to_scalar_const() {
+    let input = r#"
+const N = 42
+
+fn bump(r: mut Ref<int>) {
+  r.* = r.* + 1
+}
+
+fn main() {
+  bump(&N)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_assign_to_imported_pub_var_wrong_type() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "config",
+        "lib.d.lis",
+        r#"
+pub var Threshold: int
+"#,
+    );
+    let source = r#"
+import "config"
+
+fn main() {
+  config.Threshold = "not an int"
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+
+    assert!(
+        result
+            .errors
+            .iter()
+            .all(|e| e.code_str() != Some("infer.immutable")),
+        "import-alias receivers must not trigger infer.immutable; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.code_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !result.errors.is_empty(),
+        "expected a type-mismatch error for wrong-typed RHS"
+    );
+}
+
+#[test]
+fn infer_mutate_const_shows_const_hint() {
+    let input = r#"
+const N = 5
+
+fn main() {
+  N = 10
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_const_disallows_list_literal() {
+    let input = r#"
+const ITEMS = ["a", "b"]
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_const_disallows_tuple_literal() {
+    let input = r#"
+const PAIR = (1, 2)
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_const_disallows_struct_literal() {
+    let input = r#"
+struct Point { x: int, y: int }
+
+const ORIGIN = Point { x: 0, y: 0 }
 "#;
     assert_infer_error_snapshot!(input);
 }
@@ -5296,6 +11955,23 @@ fn main() { let _ = run() }
 }
 
 #[test]
+fn infer_propagate_in_assert_condition() {
+    let input = r#"
+fn check(s: string) -> Result<bool, string> {
+  if s == "bad" { Err("bad") } else { Ok(true) }
+}
+
+fn run() -> Result<(), string> {
+  assert check("x")?
+  Ok(())
+}
+
+fn main() { let _ = run() }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_propagate_in_logical_and_rhs() {
     let input = r#"
 fn check(s: string) -> Result<bool, string> {
@@ -5351,45 +12027,6 @@ fn test() -> Option<int> {
 }
 "#;
     assert_infer_error_snapshot!(input);
-}
-
-#[test]
-fn parse_unsupported_bitwise_and() {
-    let input = r#"
-fn test() {
-  let a = 1
-  let b = 2
-  let c = a & b
-  let _ = c
-}
-"#;
-    assert_parse_error_snapshot!(input);
-}
-
-#[test]
-fn parse_unsupported_bitwise_or() {
-    let input = r#"
-fn test() {
-  let a = 1
-  let b = 2
-  let c = a | b
-  let _ = c
-}
-"#;
-    assert_parse_error_snapshot!(input);
-}
-
-#[test]
-fn parse_unsupported_bitwise_xor() {
-    let input = r#"
-fn test() {
-  let a = 1
-  let b = 2
-  let c = a ^ b
-  let _ = c
-}
-"#;
-    assert_parse_error_snapshot!(input);
 }
 
 #[test]
@@ -5536,6 +12173,91 @@ fn test() {
 }
 
 #[test]
+fn infer_statement_as_tail_result_unit_suggests_ok() {
+    let input = r#"
+fn release() {}
+
+fn create() -> Result<(), error> {
+  defer release()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_statement_as_tail_result_value_suggests_ok_value() {
+    let input = r#"
+fn total() -> Result<int, error> {
+  let mut sum = 0
+  sum = 42
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_statement_as_tail_option_suggests_some_none() {
+    let input = r#"
+fn lookup(id: int) -> Option<int> {
+  let mut x = 0
+  x = id
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_for_loop_in_tail_position() {
+    let input = r#"
+fn test() -> int {
+  let mut total = 0
+  for i in 0..10 {
+    total += i
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_for_open_ended_range_in_tail_position() {
+    let input = r#"
+fn returns_string() -> string {
+  for i in 2.. {
+    let _ = i
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_while_loop_in_tail_position() {
+    let input = r#"
+fn test() -> int {
+  let mut n = 0
+  while n < 10 {
+    n += 1
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_while_let_loop_in_tail_position() {
+    let input = r#"
+fn test() -> int {
+  let mut opt = Some(1)
+  while let Some(_) = opt {
+    opt = None
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_invalid_main_with_return_type() {
     let mut fs = MockFileSystem::new();
     let source = r#"
@@ -5543,19 +12265,19 @@ fn main() -> Result<(), string> {
   Ok(())
 }
 "#;
-    fs.add_file(ENTRY_MODULE_ID, "main.lis", source);
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
     let result = compile_check(fs);
     assert!(
-        !result.errors.is_empty(),
+        !result.errors().is_empty(),
         "Expected error for main with return type"
     );
     assert!(
         result
-            .errors
+            .errors()
             .iter()
             .any(|e| e.code_str() == Some("infer.invalid_main_signature")),
         "Expected invalid_main_signature error, got: {:?}",
-        result.errors
+        result.errors()
     );
 }
 
@@ -5567,19 +12289,19 @@ fn main(x: int) {
   let _ = x
 }
 "#;
-    fs.add_file(ENTRY_MODULE_ID, "main.lis", source);
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
     let result = compile_check(fs);
     assert!(
-        !result.errors.is_empty(),
+        !result.errors().is_empty(),
         "Expected error for main with params"
     );
     assert!(
         result
-            .errors
+            .errors()
             .iter()
             .any(|e| e.code_str() == Some("infer.invalid_main_signature")),
         "Expected invalid_main_signature error, got: {:?}",
-        result.errors
+        result.errors()
     );
 }
 
@@ -5591,19 +12313,19 @@ fn main() -> int {
   42
 }
 "#;
-    fs.add_file(ENTRY_MODULE_ID, "main.lis", source);
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
     let result = compile_check(fs);
     assert!(
-        !result.errors.is_empty(),
+        !result.errors().is_empty(),
         "Expected error for main with int return"
     );
     assert!(
         result
-            .errors
+            .errors()
             .iter()
             .any(|e| e.code_str() == Some("infer.invalid_main_signature")),
         "Expected invalid_main_signature error, got: {:?}",
-        result.errors
+        result.errors()
     );
 }
 
@@ -5619,16 +12341,16 @@ fn main() {
   let _ = fmt.Println("hi")
 }
 "#;
-    fs.add_file(ENTRY_MODULE_ID, "main.lis", source);
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
     let result = compile_check(fs);
-    assert!(!result.errors.is_empty(), "Expected error");
+    assert!(!result.errors().is_empty(), "Expected error");
     assert!(
         result
-            .errors
+            .errors()
             .iter()
-            .any(|e| e.code_str() == Some("resolve.definition_shadows_import")),
-        "Expected definition_shadows_import error, got: {:?}",
-        result.errors
+            .any(|e| e.code_str() == Some("resolve.name_shadows_import")),
+        "Expected name_shadows_import error, got: {:?}",
+        result.errors()
     );
 }
 
@@ -5645,16 +12367,16 @@ fn main() {
   let _ = lib.hello()
 }
 "#;
-    fs.add_file(ENTRY_MODULE_ID, "main.lis", source);
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
     let result = compile_check(fs);
-    assert!(!result.errors.is_empty(), "Expected error");
+    assert!(!result.errors().is_empty(), "Expected error");
     assert!(
         result
-            .errors
+            .errors()
             .iter()
-            .any(|e| e.code_str() == Some("resolve.definition_shadows_import")),
-        "Expected definition_shadows_import error, got: {:?}",
-        result.errors
+            .any(|e| e.code_str() == Some("resolve.name_shadows_import")),
+        "Expected name_shadows_import error, got: {:?}",
+        result.errors()
     );
 }
 
@@ -5671,17 +12393,134 @@ fn main() {
   let _ = util.hello()
 }
 "#;
-    fs.add_file(ENTRY_MODULE_ID, "main.lis", source);
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
     let result = compile_check(fs);
-    assert!(!result.errors.is_empty(), "Expected error");
+    assert!(!result.errors().is_empty(), "Expected error");
     assert!(
         result
-            .errors
+            .errors()
             .iter()
-            .any(|e| e.code_str() == Some("resolve.definition_shadows_import")),
-        "Expected definition_shadows_import error, got: {:?}",
-        result.errors
+            .any(|e| e.code_str() == Some("resolve.name_shadows_import")),
+        "Expected name_shadows_import error, got: {:?}",
+        result.errors()
     );
+}
+
+#[test]
+fn infer_let_binding_shadows_import() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "foo",
+        "bar.lis",
+        "pub struct Bar {}\nimpl Bar {\n  pub fn bar<T>(self: Ref<Bar>, _val: T) {}\n}",
+    );
+    let source = r#"
+import "foo"
+
+fn main() {
+  let foo = &foo.Bar {}
+  foo.bar(5)
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+    let result = compile_check(fs);
+    assert!(
+        result
+            .errors()
+            .iter()
+            .any(|e| e.code_str() == Some("resolve.name_shadows_import")),
+        "Expected name_shadows_import error, got: {:?}",
+        result.errors()
+    );
+}
+
+#[test]
+fn infer_param_shadows_import() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("lib", "mod.lis", "pub fn hello() -> int { 7 }");
+    let source = r#"
+import "lib"
+
+fn take(lib: int) -> int { lib }
+
+fn main() {
+  let _ = take(lib.hello())
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+    let result = compile_check(fs);
+    assert!(
+        result
+            .errors()
+            .iter()
+            .any(|e| e.code_str() == Some("resolve.name_shadows_import")),
+        "Expected name_shadows_import error, got: {:?}",
+        result.errors()
+    );
+}
+
+#[test]
+fn infer_block_local_const_shadows_import() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("lib", "mod.lis", "pub const VALUE: int = 7");
+    let source = r#"
+import LIB "lib"
+
+fn main() {
+  const LIB = 7
+  let _ = LIB
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+    let result = compile_check(fs);
+    assert!(
+        result
+            .errors()
+            .iter()
+            .any(|e| e.code_str() == Some("resolve.name_shadows_import")),
+        "Expected name_shadows_import error, got: {:?}",
+        result.errors()
+    );
+}
+
+#[test]
+fn infer_shadowed_imports_suggest_aliases() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("lib", "mod.lis", "pub fn hello() -> int { 7 }");
+    let source = r#"
+import "go:image/color"
+import "lib"
+
+fn to_gray(color: color.Color) -> uint8 {
+  let (r, g, b, _) = color.RGBA()
+  ((r/256 + g/256 + b/256) / 3) as uint8
+}
+
+fn lib() {}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+    let result = compile_check(fs);
+    let shadowed: Vec<_> = result
+        .errors()
+        .iter()
+        .filter(|error| error.code_str() == Some("resolve.name_shadows_import"))
+        .collect();
+    assert_eq!(shadowed.len(), 2, "got: {:?}", result.errors());
+
+    let mut output = String::new();
+    for (index, error) in shadowed.iter().enumerate() {
+        if index > 0 {
+            output.push_str("\n---\n\n");
+        }
+        output.push_str(&format_project_diagnostic_for_snapshot(&result, error));
+    }
+
+    insta::with_settings!({
+        prepend_module_to_snapshot => false,
+        omit_expression => true,
+    }, {
+        insta::assert_snapshot!(output);
+    });
 }
 
 #[test]
@@ -5736,6 +12575,1681 @@ fn main() {
 }
 
 #[test]
+fn infer_bare_enum_as_value() {
+    let input = r#"
+enum Color { Red, Blue }
+
+fn main() {
+  let c = Color
+  let _ = c
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_alias_of_collection_as_value() {
+    let input = r#"
+type Rows = Slice<Slice<int>>
+
+fn main() {
+  let c = Rows
+  let _ = c
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_instance_method_called_on_type_alias() {
+    let input = r#"
+type Rows = Slice<Slice<int>>
+
+fn main() {
+  let n = Rows.length()
+  let _ = n
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_scalar_alias_as_value() {
+    let input = r#"
+type Id = int
+
+fn main() {
+  let c = Id
+  let _ = c
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "a scalar type alias in value position must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_struct_names_stay_owned_by_native_value_pass() {
+    let input = r#"
+struct Coord { x: int, y: int }
+type Alias = Coord
+
+fn main() {
+  let a = Coord
+  let b = Alias
+  let _ = a
+  let _ = b
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "record_struct_value"),
+        "bare struct and struct-alias names must be rejected by the native_value_usage pass, got: {:?}",
+        result.errors
+    );
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "struct names must not double-fire type_used_as_value from infer_identifier, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_multi_hop_struct_alias_stays_struct_diagnostic() {
+    let input = r#"
+struct Coord { x: int, y: int }
+type A = Coord
+type B = A
+
+fn main() {
+  let b = B
+  let _ = b
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "record_struct_value"),
+        "a multi-hop struct alias must get the struct-literal diagnostic, got: {:?}",
+        result.errors
+    );
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "a multi-hop struct alias must not fall through to the generic type diagnostic, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_struct_alias_stays_struct_diagnostic() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "geo",
+        "lib.lis",
+        r#"
+pub struct Point { pub x: int, pub y: int }
+pub type P = Point
+"#,
+    );
+    let source = r#"
+import "geo"
+
+fn main() {
+  let x = geo.P
+  let _ = x
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        has_code(&result, "record_struct_value"),
+        "an imported struct alias must get the struct-literal diagnostic, got: {:?}",
+        result.errors
+    );
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "an imported struct alias must not fall through to the generic type diagnostic, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_tuple_struct_alias_stays_constructor_diagnostic() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "geo",
+        "lib.lis",
+        r#"
+pub struct Pair(int, int)
+pub type P = Pair
+"#,
+    );
+    let source = r#"
+import "geo"
+
+fn main() {
+  let x = geo.P
+  let _ = x
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        has_code(&result, "native_constructor_value"),
+        "an imported tuple-struct alias must get the constructor diagnostic, got: {:?}",
+        result.errors
+    );
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "an imported tuple-struct alias must not fall through to the generic type diagnostic, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_enum_alias_as_value() {
+    let input = r#"
+enum E { A, B }
+type C = E
+
+fn main() {
+  let c = C
+  let _ = c
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "an enum alias in value position must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_clone_called_on_type_alias() {
+    let input = r#"
+type Rows = Slice<Slice<int>>
+
+fn main() {
+  let k = Rows.clone()
+  let _ = k
+}
+"#;
+    let result = infer(input);
+    assert_eq!(
+        result
+            .errors
+            .iter()
+            .filter(|d| d
+                .code_str()
+                .is_some_and(|c| c.contains("type_used_as_value")))
+            .count(),
+        1,
+        "clone on a type alias must raise exactly one type-in-value error, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_is_empty_called_on_type_alias() {
+    let input = r#"
+type Rows = Slice<Slice<int>>
+
+fn main() {
+  let e = Rows.is_empty()
+  let _ = e
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "is_empty on a type alias must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_static_constructor_and_enum_variant_allowed() {
+    let input = r#"
+enum Color { Red, Blue }
+
+fn main() {
+  let xs = Slice.new<int>()
+  let c = Color.Red
+  let _ = xs
+  let _ = c
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "static constructors and enum variant constructors must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_value_receiver_instance_method_allowed() {
+    let input = r#"
+fn main() {
+  let xs = [1, 2, 3]
+  let n = xs.length()
+  let k = xs.clone()
+  let _ = n
+  let _ = k
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "instance methods on value receivers must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_instance_method_value_allowed() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "geo",
+        "lib.lis",
+        r#"
+pub struct Point { pub x: int, pub y: int }
+
+impl Point {
+  pub fn sum(self) -> int { self.x + self.y }
+}
+"#,
+    );
+
+    let source = r#"
+import "geo"
+
+fn main() {
+  let p = geo.Point { x: 1, y: 2 }
+  let f = geo.Point.sum
+  let _ = f(p)
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "taking a cross-package instance method as a value must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_instance_method_called_on_cross_package_type() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "geo",
+        "lib.lis",
+        r#"
+pub struct Point { pub x: int, pub y: int }
+impl Point { pub fn sum(self) -> int { self.x + self.y } }
+"#,
+    );
+    let source = r#"
+import "geo"
+
+fn main() {
+  let s = geo.Point.sum()
+  let _ = s
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "an instance method called on a cross-package type name must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_struct_literal_via_alias_allowed() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "lib.lis",
+        r#"
+pub struct Foo { pub x: int }
+pub type P = Foo
+"#,
+    );
+    let source = r#"
+import "shapes"
+
+fn main() {
+  let a = shapes.P { x: 1 }
+  let _ = a
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        result.errors.is_empty(),
+        "constructing a struct through a cross-package alias must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_variant_via_alias_allowed() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "palette",
+        "lib.lis",
+        r#"
+pub enum Color { Red, Blue }
+pub type C = Color
+"#,
+    );
+    let source = r#"
+import "palette"
+
+fn main() {
+  let a = palette.C.Red
+  let _ = a
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "constructing an enum variant through a cross-package alias must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_bare_interface_as_value() {
+    let input = r#"
+interface Greeter { fn greet() -> string }
+
+fn main() {
+  let x = Greeter
+  let _ = x
+}
+"#;
+    let result = infer(input);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "a bare interface name in value position must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_imported_value_member_method_call_allowed() {
+    let input = r#"
+import "go:time"
+import "go:fmt"
+
+fn main() {
+  fmt.Println(time.Second.String())
+}
+"#;
+    let result = infer(input);
+    assert!(
+        result.errors.is_empty(),
+        "a method call on an imported value member must stay legal, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_collection_alias_as_value() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "grid",
+        "lib.lis",
+        r#"
+pub type Rows = Slice<Slice<int>>
+"#,
+    );
+    let source = r#"
+import "grid"
+
+fn main() {
+  let x = grid.Rows
+  let _ = x
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "a cross-package collection alias in value position must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_interface_as_value() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "svc",
+        "lib.lis",
+        r#"
+pub interface Greeter { fn greet() -> string }
+"#,
+    );
+    let source = r#"
+import "svc"
+
+fn main() {
+  let x = svc.Greeter
+  let _ = x
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        has_code(&result, "type_used_as_value"),
+        "a cross-package interface in value position must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_cross_package_const_value_allowed() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "conf",
+        "lib.lis",
+        r#"
+pub const LIMIT = 100
+"#,
+    );
+    let source = r#"
+import "conf"
+
+fn main() {
+  let x = conf.LIMIT
+  let _ = x
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    let result = infer_package("main", fs);
+    assert!(
+        !has_code(&result, "type_used_as_value"),
+        "an imported const value must not be rejected as a type, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn iterate_on_payload_variant() {
+    let input = r#"
+#[iterate]
+enum Token {
+  Eof,
+  Ident(string),
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_on_generic_enum() {
+    let input = r#"
+#[iterate]
+enum Cached<T> {
+  Hit,
+  Miss,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_on_struct() {
+    let input = r#"
+#[iterate]
+struct Point { x: int, y: int }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_on_type_alias() {
+    let result = infer("#[iterate]\ntype Count = int");
+    assert!(
+        has_code(&result, "iterate_not_an_enum"),
+        "an iterate attribute on an alias must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn iterate_in_typedef_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "colors",
+        "colors.d.lis",
+        "#[iterate]\npub enum Color { Red, Green }",
+    );
+    let result = infer_package("colors", fs);
+    assert!(
+        has_code(&result, "iterate_in_typedef"),
+        "an iterate attribute in a typedef must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn iterate_variants_method_collision() {
+    let input = r#"
+#[iterate]
+enum Color {
+  Red,
+  Green,
+}
+
+impl Color {
+  fn variants() -> int {
+    0
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_variant_named_variants() {
+    let input = r#"
+#[iterate]
+enum Color {
+  Red,
+  variants,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_on_struct_field() {
+    let input = r#"
+struct Config {
+  #[iterate]
+  value: int,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_on_impl_method() {
+    let input = r#"
+struct Widget {}
+
+impl Widget {
+  #[iterate]
+  fn build() -> int {
+    0
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn iterate_on_interface_method() {
+    let input = r#"
+interface Service {
+  #[iterate]
+  fn run() -> int
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_on_function() {
+    let input = r#"
+#[display]
+fn run() -> int {
+  0
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_on_type_alias() {
+    let result = infer("#[display]\ntype Count = int");
+    assert!(
+        has_code(&result, "display_not_a_struct_or_enum"),
+        "a display attribute on an alias must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn display_in_typedef_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.d.lis",
+        "#[display]\npub struct Point { pub x: int, pub y: int }",
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        has_code(&result, "display_in_typedef"),
+        "a display attribute in a typedef must be rejected, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn display_on_struct_field() {
+    let input = r#"
+struct Config {
+  #[display]
+  value: int,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_on_impl_method() {
+    let input = r#"
+struct Widget {}
+
+impl Widget {
+  #[display]
+  fn build() -> int {
+    0
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_on_interface_method() {
+    let input = r#"
+interface Service {
+  #[display]
+  fn run() -> int
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_with_arguments() {
+    let input = r#"
+#[display(foo)]
+struct Point { x: int, y: int }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_on_pointer_newtype() {
+    let input = r#"
+#[display]
+struct Handle(Ref<int>)
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_with_specialized_to_string() {
+    let input = r#"
+#[display]
+struct Box<T> {
+  value: T,
+}
+
+impl Box<int> {
+  fn to_string(self) -> string {
+    "boxed-int"
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_function_field() {
+    let input = r#"
+#[equality]
+struct Handler {
+  on_done: fn(int) -> int,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_interface_field() {
+    let input = r#"
+interface Drawable {
+  fn draw()
+}
+
+#[equality]
+struct Widget {
+  shape: Drawable,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_unbounded_generic_field() {
+    let input = r#"
+#[equality]
+struct Box<T> {
+  value: T,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_nested_noncomparable_struct() {
+    let input = r#"
+struct Inner {
+  items: Slice<int>,
+}
+
+#[equality]
+struct Outer {
+  inner: Inner,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_recursive_cycle_field_without_equality() {
+    let input = r#"
+#[equality]
+enum Tree {
+  Leaf,
+  Node(Pair),
+}
+
+struct Pair {
+  l: Tree,
+  r: Tree,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_derivation_terminates_on_transforming_interface_cycle() {
+    let input = r#"
+interface A<T> {
+  embed B<Slice<T>>
+}
+
+interface B<T> {
+  embed A<Slice<T>>
+}
+
+#[equality]
+struct Wrap<T: A<T>> {
+  value: T
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_enum_rejects_function_payload() {
+    let input = r#"
+#[equality]
+enum Action {
+  Run(fn(int) -> int),
+  Stop,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_on_function() {
+    let input = r#"
+#[equality]
+fn run() -> int {
+  0
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_on_struct_field() {
+    let input = r#"
+struct Config {
+  #[equality]
+  value: int,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_on_tuple_struct() {
+    let input = r#"
+#[equality]
+struct Pair(int, int)
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_with_arguments() {
+    let input = r#"
+#[equality(foo)]
+struct Point { x: int, y: int }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn compare_noncomparable_struct_suggests_equality() {
+    let input = r#"
+struct Holder {
+  items: Slice<int>,
+}
+
+fn test(a: Holder, b: Holder) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn compare_equality_struct_suggests_equals() {
+    let input = r#"
+#[equality]
+struct Holder {
+  items: Slice<int>,
+}
+
+fn test(a: Holder, b: Holder) {
+  let result = a == b;
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_nested_wrong_signature_equals() {
+    let input = r#"
+struct Bad { items: Slice<int> }
+
+impl Bad {
+  fn equals(self, other: int) -> bool { true }
+}
+
+#[equality]
+struct Outer { bad: Bad }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_conflicting_user_equals() {
+    let input = r#"
+type Flag = bool
+
+#[equality]
+struct Foo { value: int }
+
+impl Foo {
+  fn equals(self, other: Foo) -> Flag { true }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_conflicts_with_unexported_equals() {
+    let input = r#"
+#[equality]
+struct Point { x: int }
+
+impl Point {
+  #[go(unexported)]
+  fn equals(self, other: Point) -> bool { false }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_conflicts_with_unexported_wrong_signature_equals() {
+    let input = r#"
+#[equality]
+struct Point { x: int }
+
+impl Point {
+  #[go(unexported)]
+  fn equals(self, other: int) -> bool { false }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_on_type_alias() {
+    let input = r#"
+#[equality]
+type Foo = int
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_in_typedef_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.d.lis",
+        "#[equality]\npub struct Point { pub x: int, pub y: int }",
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.code_str() == Some("attribute.equality_in_typedef")),
+        "expected `#[equality]` in a typedef to be rejected, got codes: {:?}",
+        result
+            .errors
+            .iter()
+            .filter_map(|e| e.code_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn equality_rejects_cross_package_private_equals() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "models",
+        "item.lis",
+        r#"
+pub struct Item { pub tags: Slice<string> }
+
+impl Item {
+  fn equals(self, other: Item) -> bool {
+    self.tags.equals(other.tags)
+  }
+}
+"#,
+    );
+
+    let source = r#"
+import "models"
+
+#[equality]
+struct Holder { item: models.Item }
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn equality_rejects_specialized_equals() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { value: T }
+
+impl Box<int> {
+  fn equals(self, other: Box<int>) -> bool {
+    self.value == other.value
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_allows_regular_equals_alongside_specialized_method() {
+    let input = r#"
+#[equality]
+struct Pair<T: Comparable> {
+  f: fn() -> T,
+  a: T,
+}
+
+impl<T: Comparable> Pair<T> {
+  fn equals(self, other: Pair<T>) -> bool {
+    self.a == other.a
+  }
+}
+
+impl Pair<int> {
+  fn get(self) -> int {
+    self.a
+  }
+}
+"#;
+    infer(input).assert_no_errors();
+}
+
+#[test]
+fn equality_accepts_field_with_regular_equals_and_specialized_method() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.lis",
+        r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+
+impl Box<int> {
+  fn get(self) -> int {
+    self.value
+  }
+}
+
+#[equality]
+struct Wrap {
+  b: Box<int>,
+}
+"#,
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result.errors.is_empty(),
+        "unexpected errors: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn container_equals_accepts_regular_element_equals_with_specialized_method() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.lis",
+        r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+
+impl Box<int> {
+  fn get(self) -> int {
+    self.value
+  }
+}
+
+fn cmp(a: Slice<Box<int>>, b: Slice<Box<int>>) -> bool {
+  a.equals(b)
+}
+"#,
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result.errors.is_empty(),
+        "unexpected errors: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn container_equals_allowed_for_ufcs_non_equality_method_named_equals() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.lis",
+        r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn equals(self) -> bool {
+    true
+  }
+}
+
+impl Box<int> {
+  fn get(self) -> int {
+    self.value
+  }
+}
+
+fn cmp(a: Slice<Box<int>>, b: Slice<Box<int>>) -> bool {
+  a.equals(b)
+}
+"#,
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result.errors.is_empty(),
+        "`fn equals(self) -> bool` is not custom equality, so a comparable `Box<int>` slice must fall back to `==`, not be rejected: {:?}",
+        result
+            .errors
+            .iter()
+            .filter_map(|e| e.code_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn equality_accepts_enum_payload_with_regular_equals_and_specialized_method() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.lis",
+        r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+
+impl Box<int> {
+  fn get(self) -> int {
+    self.value
+  }
+}
+
+#[equality]
+enum E {
+  V(Box<int>),
+}
+"#,
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result.errors.is_empty(),
+        "unexpected errors: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn container_equals_accepts_regular_map_value_equals_with_specialized_method() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.lis",
+        r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+
+impl Box<int> {
+  fn get(self) -> int {
+    self.value
+  }
+}
+
+fn cmp(a: Map<int, Box<int>>, b: Map<int, Box<int>>) -> bool {
+  a.equals(b)
+}
+"#,
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result.errors.is_empty(),
+        "unexpected errors: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn container_equals_allowed_for_ufcs_lowered_comparable_map_key() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "shapes.lis",
+        r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+
+impl Box<int> {
+  fn get(self) -> int {
+    self.value
+  }
+}
+
+fn cmp(a: Map<Box<int>, int>, b: Map<Box<int>, int>) -> bool {
+  a.equals(b)
+}
+"#,
+    );
+    let result = infer_package("shapes", fs);
+    assert!(
+        result.errors.is_empty(),
+        "a map key is compared with `==`, so a comparable `Box<int>` key must be allowed even though its `equals` is UFCS-lowered, got: {:?}",
+        result
+            .errors
+            .iter()
+            .filter_map(|e| e.code_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn equality_rejects_pointer_receiver_equals() {
+    let input = r#"
+#[equality]
+struct Inner { x: int }
+
+impl Inner {
+  fn equals(self: Ref<Inner>, other: Ref<Inner>) -> bool { true }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_public_type_private_equals_cross_package() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "models",
+        "item.lis",
+        r#"
+#[equality]
+pub struct Item { pub tags: Slice<string> }
+
+impl Item {
+  fn equals(self, other: Item) -> bool {
+    self.tags.equals(other.tags)
+  }
+}
+"#,
+    );
+
+    let source = r#"
+import "models"
+
+#[equality]
+struct Holder { item: models.Item }
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn impl_bound_must_be_declared_on_receiver_type() {
+    let input = r#"
+interface Parent<T> { fn p() -> T }
+
+struct Box<T> { value: T }
+
+impl<T: Parent<string>> Box<T> {
+  fn less(self, _other: Box<T>) -> bool {
+    true
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn impl_stronger_builtin_bound_rejected() {
+    let input = r#"
+struct Box<T: Comparable> { value: T }
+
+impl<T: Ordered> Box<T> {
+  fn less(self, other: Box<T>) -> bool {
+    self.value < other.value
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn impl_conflicting_inherited_bound_rejected() {
+    let input = r#"
+interface Parent<T> { fn p() -> T }
+
+interface Child<T> {
+  embed Parent<T>
+  fn c()
+}
+
+struct Box<T: Child<string>> { value: T }
+
+impl<T: Parent<int>> Box<T> {
+  fn less(self, _other: Box<T>) -> bool {
+    true
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn impl_conflicting_type_variable_bound_rejected() {
+    let input = r#"
+interface Parent<T> { fn p() -> T }
+
+struct Box<T: Parent<T>> { value: T }
+
+impl<T: Parent<string>> Box<T> {
+  fn label(self) -> string {
+    self.value.p()
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn impl_redundant_same_interface_instantiation_accepted() {
+    let input = r#"
+interface Parent<T> { fn p() -> T }
+
+struct Box<T: Parent<int>> { value: T }
+
+impl<T: Parent<int>> Box<T> {
+  fn as_int(self) -> int { self.value.p() }
+}
+
+impl<T: Parent<int>> Box<T> {
+  fn as_int_again(self) -> int { self.value.p() }
+}
+"#;
+    let result = infer(input);
+    result.assert_no_errors();
+}
+
+#[test]
+fn equality_map_non_comparable_key_rejected() {
+    let input = r#"
+#[equality]
+struct Key { tags: Slice<int> }
+
+#[equality]
+struct Index { values: Map<Key, int> }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_map_key_bound_by_custom_equatable_interface_rejected() {
+    let input = r#"
+interface Equatable<T> {
+  fn equals(other: T) -> bool
+}
+
+#[equality]
+struct Index<T: Equatable<T>> { values: Map<T, int> }
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn container_equals_map_non_comparable_key_rejected() {
+    let input = r#"
+struct Key { tags: Slice<int> }
+
+fn test(a: Map<Key, int>, b: Map<Key, int>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_annotation_rejects_noncomparable_struct() {
+    let input = r#"
+struct Holder { items: Slice<int> }
+
+fn count(m: Map<Holder, int>) -> int {
+  m.length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_generic_requires_comparable_bound() {
+    let input = r#"
+fn count<K>(m: Map<K, int>) -> int {
+  m.length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_constructor_rejects_noncomparable_struct() {
+    let input = r#"
+struct Holder { items: Slice<int> }
+
+fn test() -> int {
+  let mut m = Map.new<Holder, int>()
+  m[Holder { items: [1] }] = 1
+  m.length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_constructor_rejects_recursive_enum() {
+    let input = r#"
+enum List {
+  Nil,
+  Cons(int, List),
+}
+
+fn test() -> int {
+  let mut m = Map.new<List, int>()
+  m[List.Nil] = 1
+  m.length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_expression_position_rejects_slice_key() {
+    let input = r#"
+fn test() -> int {
+  Map.new<Slice<int>, int>().length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_inferred_rejects_slice_key() {
+    let input = r#"
+fn test() -> int {
+  let mut m = Map.new()
+  m[[1, 2]] = 1
+  m.length()
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn map_key_alias_body_rejects_noncomparable_struct() {
+    let input = r#"
+struct Holder { items: Slice<int> }
+
+type Index = Map<Holder, int>
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_partial_generic_equals() {
+    let input = r#"
+#[equality]
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn equals(self, other: Pair<T, T>) -> bool {
+    true
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_method_with_extra_generic() {
+    let input = r#"
+#[equality]
+struct Handler { run: fn(int) -> int }
+
+impl Handler {
+  fn equals<U>(self, other: Handler) -> bool {
+    true
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn equality_rejects_impl_with_extra_generic() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { value: T }
+
+impl<T: Comparable, U> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn container_equals_rejected_for_extra_generic_equals() {
+    let input = r#"
+struct Handler { run: fn(int) -> int }
+
+impl Handler {
+  fn equals<U>(self, other: Handler) -> bool {
+    true
+  }
+}
+
+fn test(a: Slice<Handler>, b: Slice<Handler>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn compare_tuple_struct_with_slice() {
+    let input = r#"
+struct Pair(Slice<int>)
+
+fn test(a: Pair, b: Pair) -> bool {
+  a == b
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn interpolate_struct_without_stringer() {
+    let input = r#"
+struct Point { x: int, y: int }
+
+fn show() -> string {
+  let p = Point { x: 1, y: 2 }
+  f"{p}"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn interpolate_pointer_newtype() {
+    let input = r#"
+struct Handle(Ref<int>)
+
+fn show(h: Handle) -> string {
+  f"{h}"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn display_on_alias_pointer_newtype() {
+    let input = r#"
+type R = Ref<int>
+
+#[display]
+struct Handle(R)
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn interpolate_alias_pointer_newtype() {
+    let input = r#"
+type R = Ref<int>
+
+struct Handle(R)
+
+fn show(h: Handle) -> string {
+  f"{h}"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
 fn infer_type_alias_record_struct_as_value() {
     let input = r#"
 struct Coord { x: int, y: int }
@@ -5750,7 +14264,7 @@ fn main() {
 }
 
 #[test]
-fn infer_cross_module_record_struct_as_value() {
+fn infer_cross_package_record_struct_as_value() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5771,8 +14285,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -5788,7 +14302,7 @@ fn main() {
 }
 
 #[test]
-fn infer_type_alias_as_qualifier_cross_module() {
+fn infer_type_alias_as_qualifier_cross_package() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5815,8 +14329,20 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_ref_qualifier() {
+    let input = r#"
+fn main() {
+  let x = 42
+  let r = Ref.new(x)
+  let _ = r
+}
+"#;
+    assert_infer_error_snapshot!(input);
 }
 
 #[test]
@@ -5837,7 +14363,7 @@ fn main() {
 }
 
 #[test]
-fn infer_parenthesized_module_qualifier() {
+fn infer_parenthesized_package_qualifier() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5858,12 +14384,12 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
-fn infer_parenthesized_cross_module_type_qualifier() {
+fn infer_parenthesized_cross_package_type_qualifier() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5888,8 +14414,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -5910,7 +14436,7 @@ fn main() {
 }
 
 #[test]
-fn infer_cross_module_tuple_struct_as_value() {
+fn infer_cross_package_tuple_struct_as_value() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5931,12 +14457,12 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
-fn infer_cross_module_generic_tuple_struct_as_value() {
+fn infer_cross_package_generic_tuple_struct_as_value() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5957,12 +14483,12 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
-fn infer_generic_alias_to_cross_module_tuple_struct_as_value() {
+fn infer_generic_alias_to_cross_package_tuple_struct_as_value() {
     let mut fs = MockFileSystem::new();
 
     fs.add_file(
@@ -5985,8 +14511,8 @@ fn main() {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    let result = infer_module("main", fs);
-    assert_multimodule_infer_error_snapshot!(result, source);
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
 }
 
 #[test]
@@ -6019,7 +14545,84 @@ fn infer_spread_on_non_variadic() {
 fn takes_int(x: int) {}
 
 fn test(args: Slice<int>) {
-  takes_int(..args)
+  takes_int(args...)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn spread_on_unresolved_callee_not_judged_non_variadic() {
+    let input = r#"
+fn test(args: Slice<int>) {
+  nofn(args...)
+}
+"#;
+    let result = infer(input);
+    assert!(
+        !has_code(&result, "spread_on_non_variadic"),
+        "an unresolved callee's variadic-ness is unknowable, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn infer_variadic_param_not_last() {
+    let input = r#"
+fn test(rest: VarArgs<int>, trailing: int) -> int {
+  trailing
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_param_not_last_method() {
+    let input = r#"
+struct Foo { n: int }
+
+impl Foo {
+  fn test(self, rest: VarArgs<int>, trailing: int) -> int {
+    trailing
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_type_not_allowed_struct_field() {
+    let input = r#"
+struct Foo {
+  items: VarArgs<int>
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_type_not_allowed_type_alias() {
+    let input = r#"
+type Args = VarArgs<int>
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_type_not_allowed_return_type() {
+    let input = r#"
+fn test() -> VarArgs<int> {
+  []
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_type_not_allowed_nested() {
+    let input = r#"
+fn test(xs: Slice<VarArgs<int>>) {
+  let _ = xs
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -6031,7 +14634,7 @@ fn infer_spread_missing_required_positional_arg() {
 import url "go:net/url"
 
 fn test(rest: Slice<string>) -> Result<string, error> {
-  url.JoinPath(..rest)
+  url.JoinPath(rest...)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -6043,7 +14646,7 @@ fn infer_spread_on_type_conversion() {
 type Callback = fn(string) -> int
 
 fn test(rest: Slice<fn(string) -> int>) {
-  Callback(..rest)
+  Callback(rest...)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -6052,21 +14655,27 @@ fn test(rest: Slice<fn(string) -> int>) {
 #[test]
 fn parse_spread_not_last_arg() {
     let input = r#"
-fn test() { foo(..xs, y); }
+fn test() { foo(xs..., y); }
 "#;
     assert_parse_error_snapshot!(input);
 }
 
 #[test]
-fn infer_immutable_spread_to_mut_variadic_param() {
-    let input = r#"
-fn touch(mut items: VarArgs<int>) {
-  let _ = items
+fn parse_spread_split_across_newline() {
+    let input = "
+fn test(xs: Slice<int>) { foo(xs
+  ...) }
+";
+    assert_parse_error_snapshot!(input);
 }
 
-fn main() {
-  let data = [3, 1, 2]
-  touch(..data)
+#[test]
+fn infer_legacy_prefix_spread_against_variadic() {
+    let input = r#"
+import "go:fmt"
+
+fn test(parts: Slice<string>) {
+  fmt.Println(..parts)
 }
 "#;
     assert_infer_error_snapshot!(input);
@@ -6075,16 +14684,1105 @@ fn main() {
 #[test]
 fn infer_immutable_args_to_mut_variadic_param() {
     let input = r#"
-fn touch(x: int, mut ys: VarArgs<int>) -> int {
+fn touch(x: int, ys: VarArgs<mut Slice<int>>) -> int {
   let _ = ys
   x
 }
 
 fn main() {
   let a = 1
-  let b = 2
-  let c = 3
+  let b = [1, 2]
+  let c = [3, 4]
   let _ = touch(a, b, c)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unexpected_backtick_simple() {
+    let input = r#"
+fn main() {
+  let x = `hello`
+  let _ = x
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unexpected_backtick_with_embedded_quote() {
+    let input = r#"
+fn main() {
+  let x = `has "quote" inside`
+  let _ = x
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unexpected_backtick_multiline() {
+    let input = "
+fn main() {
+  let x = `{
+    \"a\": 1
+  }`
+  let _ = x
+}
+";
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_compound_assignment_invalid_target() {
+    let input = r#"
+fn main() {
+  { 1 } -= 2;
+}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_tuple_struct_recovers_at_fn_definition() {
+    let input = r#"
+struct Foo(int,
+fn main() {}
+"#;
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn infer_error_type_does_not_cascade_to_unused_value_lint() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+struct Counter { pub n: int }
+
+impl Counter {
+  fn tick(self: Ref<Counter>) { () }
+}
+
+fn make() -> Result<Counter, error> { Ok(Counter { n: 0 }) }
+
+fn main() {
+  let c = make().unwrap()
+  c.tick()
+  ()
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+    let result = compile_check(fs);
+    assert!(
+        !result
+            .lints()
+            .iter()
+            .any(|l| l.code_str() == Some("lint.unused_value")),
+        "Expected no lint.unused_value on c.tick() after .unwrap() poisoned the receiver type, got: {:?}",
+        result.lints()
+    );
+}
+
+#[test]
+fn infer_error_type_does_not_cascade_to_mismatched_return_value() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+struct Counter { pub n: int }
+
+impl Counter {
+  fn tick(self: Ref<Counter>) { () }
+}
+
+fn make() -> Result<Counter, error> { Ok(Counter { n: 0 }) }
+
+fn main() {
+  let c = make().unwrap()
+  c.tick()
+}
+"#;
+    fs.add_file(ENTRY_PACKAGE_ID, "main.lis", source);
+    let result = compile_check(fs);
+    assert!(
+        !result
+            .errors()
+            .iter()
+            .any(|e| e.code_str() == Some("infer.mismatched_return_value")),
+        "Expected no infer.mismatched_return_value on tail c.tick() after .unwrap() poisoned the receiver type, got: {:?}",
+        result.errors()
+    );
+}
+
+#[test]
+fn infer_enum_type_alias_used_as_value() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "utils",
+        "color.lis",
+        r#"
+pub enum Color {
+  RGB,
+}
+"#,
+    );
+
+    let source = r#"
+import "utils"
+
+fn main() {
+  let c = utils.Color
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_enum_type_via_package_alias_used_as_value() {
+    let mut fs = MockFileSystem::new();
+
+    fs.add_file(
+        "utils",
+        "color.lis",
+        r#"
+pub enum Color {
+  RGB,
+}
+"#,
+    );
+
+    let source = r#"
+import "utils"
+
+fn main() {
+  let u = utils
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+#[test]
+fn infer_named_primitive_type_used_as_value() {
+    let input = r#"
+import "go:time"
+
+fn main() {
+  let m = time.Month
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_type_alias_of_enum_used_as_value() {
+    let input = r#"
+import "go:time"
+import "go:fmt"
+
+type Month = time.Month
+
+fn main() {
+  fmt.Println(Month)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_package_name_as_call_argument() {
+    let input = r#"
+import "go:fmt"
+
+fn main() {
+  fmt.Println(fmt)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_package_name_as_bare_expression() {
+    let input = r#"
+import "go:fmt"
+
+fn main() {
+  fmt
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_match_arm_calls_void_function_in_value_position() {
+    let input = r#"
+struct Match {}
+
+fn report(_e: error) {}
+
+fn accept() -> Result<Match, error> {
+  Ok(Match {})
+}
+
+fn run() {
+  let duel = match accept() {
+    Ok(m) => m,
+    Err(e) => report(e),
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_reference_aliases_sibling() {
+    let mut fs = MockFileSystem::new();
+
+    let source = r#"
+fn store(dst: mut Ref<int>, value: int) -> int {
+  dst.* = value
+  value
+}
+
+fn main() {
+  let mut total = 1
+  let pair = (store(&total, 5), total)
+  let _ = pair
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+
+    let result = infer_package("main", fs);
+    assert_multipackage_infer_error_snapshot!(result, source);
+}
+
+fn parse_expecting_errors(input: &str, expected_errors: usize, context: &str) -> ParseResult {
+    let lex_result = syntax::lex::Lexer::new(input, 0).lex();
+    let parse_result = syntax::parse::Parser::new(lex_result.tokens, input).parse();
+    assert!(
+        parse_result.errors.len() == expected_errors,
+        "Expected exactly {} errors for {}, got {}: {:?}",
+        expected_errors,
+        context,
+        parse_result.errors.len(),
+        parse_result
+            .errors
+            .iter()
+            .map(|e| &e.message)
+            .collect::<Vec<_>>()
+    );
+    parse_result
+}
+
+#[test]
+fn parse_missing_param_colon_reports_once() {
+    let input = r#"
+fn id(x) {
+  x
+}
+
+fn main() {
+  let _ = id(42)
+}
+"#;
+
+    parse_expecting_errors(input, 1, "a missing parameter colon");
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_missing_param_colon_recovers_annotation() {
+    let input = r#"
+fn f(x int) -> int {
+  x
+}
+
+fn main() {
+  let _ = f(1)
+}
+"#;
+
+    parse_expecting_errors(input, 1, "the annotation following a missing colon");
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_missing_struct_field_colon_reports_once() {
+    let input = r#"
+struct User {
+  name string,
+  age: int,
+}
+"#;
+
+    parse_expecting_errors(input, 1, "a missing struct field colon");
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_missing_variant_field_colon_reports_once() {
+    let input = r#"
+enum Shape {
+  Rect { width float64, height: float64 },
+}
+"#;
+
+    parse_expecting_errors(input, 1, "a missing variant field colon");
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_params_stop_at_next_declaration() {
+    let input = r#"
+fn id(x:
+
+fn main() {
+  let _ = 1
+}
+"#;
+
+    let parse_result = parse_expecting_errors(input, 2, "unclosed params before a declaration");
+    assert!(
+        parse_result
+            .ast
+            .iter()
+            .any(|item| matches!(item, Expression::Function { name, .. } if name == "main"))
+    );
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_typed_params_preserve_next_declaration() {
+    let input = r#"
+fn id(x: int
+
+fn main() {
+  let _ = 1
+}
+"#;
+
+    let parse_result =
+        parse_expecting_errors(input, 2, "unclosed typed params before a declaration");
+    assert!(
+        parse_result
+            .ast
+            .iter()
+            .any(|item| matches!(item, Expression::Function { name, .. } if name == "main"))
+    );
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_function_type_preserves_next_declaration() {
+    let input = r#"
+fn f(g: fn(int
+
+fn main() {
+  let _ = 1
+}
+"#;
+
+    let parse_result =
+        parse_expecting_errors(input, 3, "an unclosed function type before a declaration");
+    assert!(
+        parse_result
+            .ast
+            .iter()
+            .any(|item| matches!(item, Expression::Function { name, .. } if name == "main"))
+    );
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_tuple_type_preserves_next_declaration() {
+    let input = r#"
+fn f(p: (int,
+
+fn main() {
+  let _ = 1
+}
+"#;
+
+    let parse_result =
+        parse_expecting_errors(input, 3, "an unclosed tuple type before a declaration");
+    assert!(
+        parse_result
+            .ast
+            .iter()
+            .any(|item| matches!(item, Expression::Function { name, .. } if name == "main"))
+    );
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_missing_comma_before_pub_field_reports() {
+    let input = r#"
+struct S {
+  a: int pub b: int,
+}
+"#;
+
+    let parse_result = parse_expecting_errors(input, 1, "a missing comma before a pub field");
+    assert!(parse_result.ast.iter().any(|item| matches!(
+        item,
+        Expression::Struct {
+            fields: StructFields::Record(fields),
+            ..
+        } if fields.len() == 2 && fields[1].visibility.is_public()
+    )));
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_params_preserve_next_struct_declaration() {
+    let input = r#"
+fn id(x:
+
+struct S {
+  a: int,
+}
+"#;
+
+    let parse_result =
+        parse_expecting_errors(input, 2, "unclosed params before a struct declaration");
+    assert!(parse_result.ast.iter().any(|item| matches!(
+        item,
+        Expression::Struct { name, .. } if name == "S"
+    )));
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_params_preserve_pub_declaration() {
+    let input = r#"
+fn id(x:
+
+pub fn helper() -> int {
+  1
+}
+"#;
+
+    let parse_result = parse_expecting_errors(input, 2, "unclosed params before a pub declaration");
+    assert!(parse_result.ast.iter().any(|item| matches!(
+        item,
+        Expression::Function {
+            name,
+            visibility: Visibility::Public,
+            ..
+        } if name == "helper"
+    )));
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_params_preserve_attributed_declaration() {
+    let input = r#"
+fn id(x:
+
+#[test]
+fn checks() {
+  let _ = 1
+}
+"#;
+
+    let parse_result =
+        parse_expecting_errors(input, 2, "unclosed params before an attributed declaration");
+    assert!(parse_result.ast.iter().any(|item| matches!(
+        item,
+        Expression::Function { name, attributes, .. }
+            if name == "checks" && attributes.iter().any(|a| a.name == "test")
+    )));
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_params_preserve_documented_declaration() {
+    let input = r#"
+fn id(x:
+
+/// Documented.
+fn documented() {
+  let _ = 1
+}
+"#;
+
+    let parse_result =
+        parse_expecting_errors(input, 2, "unclosed params before a documented declaration");
+    assert!(parse_result.ast.iter().any(|item| matches!(
+        item,
+        Expression::Function { name, doc: Some(_), .. } if name == "documented"
+    )));
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_function_type_preserve_pub_declaration() {
+    let input = r#"
+fn f(g: fn(int
+
+pub fn helper() -> int {
+  1
+}
+"#;
+
+    let parse_result = parse_expecting_errors(
+        input,
+        3,
+        "an unclosed function type before a pub declaration",
+    );
+    assert!(parse_result.ast.iter().any(|item| matches!(
+        item,
+        Expression::Function {
+            name,
+            visibility: Visibility::Public,
+            ..
+        } if name == "helper"
+    )));
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_malformed_function_type_recovers_in_place() {
+    let input = r#"
+fn f(x: fn -> int) -> int {
+  x()
+}
+
+fn main() {
+  let _ = f(|| 1)
+}
+"#;
+
+    let parse_result = parse_expecting_errors(input, 1, "a function type without parens");
+    for expected_fn in ["f", "main"] {
+        assert!(
+            parse_result.ast.iter().any(
+                |item| matches!(item, Expression::Function { name, .. } if name == expected_fn)
+            )
+        );
+    }
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_keyword_param_keeps_reserved_error() {
+    let input = r#"
+fn f(type: int) -> int {
+  1
+}
+"#;
+
+    parse_expecting_errors(input, 1, "a keyword parameter name");
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn parse_unclosed_struct_pattern_before_declaration_terminates() {
+    let input = r#"
+fn main() {
+  match u {
+    User {
+
+fn other() {}
+"#;
+
+    let lex_result = Lexer::new(input, 0).lex();
+    let parse_result = Parser::new(lex_result.tokens, input).parse();
+    assert!(!parse_result.errors.is_empty());
+
+    assert_parse_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_literal_typo_does_not_claim_sibling_missing_field() {
+    let input = r#"
+struct User {
+  name: string,
+  names: Slice<string>,
+}
+
+fn test() -> string {
+  let u = User { name: "x", nam: "y" }
+  u.name
+}
+"#;
+
+    let result = infer(input);
+    assert_eq!(result.errors.len(), 2);
+    assert!(
+        result.errors[1]
+            .code_str()
+            .is_some_and(|c| c.contains("missing_struct_fields"))
+    );
+
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_literal_field_typo_claims_missing_field() {
+    let input = r#"
+struct User { name: string, age: int }
+
+fn test() -> string {
+  let u = User { nam: "ada", age: 36 }
+  u.name
+}
+"#;
+
+    let result = infer(input);
+    assert_eq!(result.errors.len(), 1);
+
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_literal_typo_of_written_field_keeps_missing_field() {
+    let input = r#"
+struct User { name: string, age: int }
+
+fn test() -> string {
+  let u = User { name: "a", nam: "x" }
+  u.name
+}
+"#;
+
+    let result = infer(input);
+    assert_eq!(result.errors.len(), 2);
+    assert!(
+        result.errors[1]
+            .code_str()
+            .is_some_and(|c| c.contains("missing_struct_fields"))
+    );
+
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_struct_literal_two_typos_claim_one_missing_field() {
+    let input = r#"
+struct User { name: string, age: int }
+
+fn test() -> string {
+  let u = User { nam: "a", naem: "b", age: 1 }
+  u.name
+}
+"#;
+
+    let result = infer(input);
+    assert_eq!(result.errors.len(), 2);
+    assert!(
+        result
+            .errors
+            .iter()
+            .all(|e| { e.code_str().is_some_and(|c| c.contains("member_not_found")) })
+    );
+
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_call_argument_mismatch_names_callee_and_parameter() {
+    let input = r#"
+fn double(n: int) -> int {
+  n * 2
+}
+
+fn test() -> int {
+  double("four")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_call_argument_mismatch_unnamed_parameter() {
+    let input = r#"
+fn test(f: fn(int) -> int) -> int {
+  f("x")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_nested_argument_mismatch_frames_inner_call() {
+    let input = r#"
+fn inner(n: int) -> int {
+  n
+}
+
+fn double(n: int) -> int {
+  n * 2
+}
+
+fn test() -> int {
+  double(inner("x"))
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_tail_return_mismatch_names_function_and_declared_type() {
+    let input = r#"
+fn returns() -> int {
+  "four"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_match_arm_mismatch_names_match_expectation() {
+    let input = r#"
+fn arms(b: bool) -> int {
+  match b {
+    true => 1,
+    false => "two",
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_fixed_argument_mismatch_keeps_role_help() {
+    let input = r#"
+fn join(sep: string, parts: VarArgs<string>) -> string {
+  let _ = parts
+  sep
+}
+
+fn test() -> string {
+  join(1, "a")
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_variadic_tail_argument_mismatch_keeps_generic_help() {
+    let input = r#"
+fn join(sep: string, parts: VarArgs<string>) -> string {
+  let _ = parts
+  sep
+}
+
+fn test() -> string {
+  join(",", 5)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_unary_operand_mismatch_keeps_generic_help() {
+    let input = r#"
+fn f() -> int {
+  !1
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_let_annotation_mismatch_keeps_annotation_help() {
+    let input = r#"
+fn test() {
+  let x: int = "four"
+  let _ = x
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_element_write_names_the_field_declaration() {
+    let input = r#"
+struct Grid { rows: mut Slice<Slice<int>> }
+
+fn main() {
+  let mut g = Grid { rows: [[1]] }
+  g.rows[0] = [7]
+  g.rows[0][0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_field_write_names_the_field() {
+    let input = r#"
+struct Doc { tags: Slice<string> }
+
+fn main() {
+  let mut d = Doc { tags: ["a"] }
+  d.tags[0] = "b"
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_parameter_write_names_the_parameter() {
+    let input = r#"
+fn fill(buf: Slice<int>) {
+  buf[0] = 1
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_loop_element_write_names_the_collection() {
+    let input = r#"
+fn main() {
+  let grid = [[1, 2]]
+  for row in grid {
+    row[0] = 9
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_write_through_call_result_names_the_callee() {
+    let input = r#"
+fn get() -> Slice<int> {
+  [1, 2]
+}
+
+fn main() {
+  get()[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_writable_field_under_read_only_owner() {
+    let input = r#"
+struct Box { items: mut Slice<int> }
+
+fn main() {
+  let source = [1, 2]
+  let mut boxed = Box { items: source }
+  boxed.items[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_field_argument_names_the_field() {
+    let input = r#"
+import "go:sort"
+
+struct Index { order: Slice<string> }
+
+fn main() {
+  let index = Index { order: ["b", "a"] }
+  sort.Strings(index.order)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_argument_from_alias_names_the_source() {
+    let input = r#"
+import "go:sort"
+
+fn main() {
+  let source = ["b", "a"]
+  let copy = source
+  sort.Strings(copy)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_owner_names_its_factory() {
+    let input = r#"
+struct Bag { items: mut Slice<int> }
+
+fn make() -> Bag {
+  Bag { items: [1, 2] }
+}
+
+fn main() {
+  let mut b = make()
+  b.items[0] = 9
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn default_variant_with_payload() {
+    let input = r#"
+enum Payload {
+  #[default]
+  Full(int),
+  Empty,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn duplicate_default_variant() {
+    let input = r#"
+enum Twice {
+  #[default]
+  A,
+  #[default]
+  B,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn default_takes_no_arguments() {
+    let input = r#"
+enum Args {
+  #[default(extra)]
+  A,
+  B,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn duplicate_default_on_one_variant() {
+    let input = r#"
+enum TwiceOnOne {
+  #[default]
+  #[default]
+  A,
+  B,
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_construction_behind_ref_names_the_field() {
+    let input = r#"
+struct Rock { size: int }
+
+struct Beam {
+  rocks: mut Ref<mut Slice<mut Ref<Rock>>>,
+  hits: int,
+}
+
+impl Beam {
+  fn new(rocks: mut Ref<Slice<Ref<Rock>>>) -> mut Ref<Beam> {
+    &Beam {
+      rocks,
+      hits: 0,
+    }
+  }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_construction_names_the_spread_base() {
+    let input = r#"
+struct Holder {
+  items: mut Slice<int>,
+  name: string,
+}
+
+fn rename(base: Holder) -> mut Holder {
+  Holder { name: "x", ..base }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_construction_names_the_immutable_binding() {
+    let input = r#"
+struct Holder { items: mut Slice<int> }
+
+fn make() -> mut Holder {
+  let a = [1, 2, 3]
+  Holder { items: a }
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_read_only_tuple_construction_names_the_component() {
+    let input = r#"
+struct Pair(mut Slice<int>, int)
+
+fn make(view: Slice<int>) -> mut Pair {
+  Pair(view, 0)
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_tuple_component_write_names_the_read_only_owner() {
+    let input = r#"
+struct Pair(mut Slice<int>, int)
+
+fn poke(p: Pair) {
+  p.0[0] = 1
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_under_read_only_ref_names_the_wrapper() {
+    let input = r#"
+fn main() {
+  let xs = [1, 2]
+  let r: Ref<mut Slice<int>> = &xs
+  let _ = r
+}
+"#;
+    assert_infer_error_snapshot!(input);
+}
+
+#[test]
+fn infer_mut_under_read_only_ref_inner_layer_names_the_outer_wrapper() {
+    let input = r#"
+struct P { x: int }
+
+fn take(items: Ref<mut Slice<mut Ref<P>>>) {
+  let _ = items
 }
 "#;
     assert_infer_error_snapshot!(input);

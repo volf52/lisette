@@ -1,0 +1,141 @@
+use syntax::ast::Span;
+use syntax::program::{Definition, DefinitionBody};
+use syntax::types::{FunctionParameter, Symbol, Type};
+
+use super::{TaskState, wrap_with_impl_generics};
+use crate::checker::registration::derived_attributes::{
+    DerivedAttribute, DerivedAttributeContext, DerivedAttributeTarget,
+};
+use crate::store::Store;
+use syntax::ast::Generic;
+use syntax::program::Method;
+use syntax::program::MethodOrigin;
+
+impl TaskState {
+    pub(super) fn process_display_candidate(
+        &mut self,
+        store: &mut Store,
+        context: &DerivedAttributeContext,
+        candidate: &DerivedAttribute,
+    ) {
+        let (name, is_struct) = match &candidate.target {
+            DerivedAttributeTarget::Misplaced => {
+                self.sink
+                    .push(diagnostics::attribute::display_not_a_struct_or_enum(
+                        &candidate.span,
+                    ));
+                return;
+            }
+            DerivedAttributeTarget::Struct { name } => (name, true),
+            DerivedAttributeTarget::Enum { name, .. } => (name, false),
+        };
+
+        if candidate.has_args {
+            self.sink
+                .push(diagnostics::attribute::display_with_arguments(
+                    &candidate.span,
+                ));
+            return;
+        }
+        if context.is_d_lis {
+            self.sink
+                .push(diagnostics::attribute::display_in_typedef(&candidate.span));
+            return;
+        }
+
+        let qualified = Symbol::from_parts(&context.package_id, name);
+        if is_struct
+            && let Some(definition) = store.get_definition(qualified.as_str())
+            && definition.is_pointer_backed_newtype(|id| store.get_definition(id))
+        {
+            self.sink
+                .push(diagnostics::attribute::display_on_pointer_newtype(
+                    &candidate.span,
+                ));
+            return;
+        }
+
+        self.synthesize_to_string(store, &context.package_id, &candidate.span, &qualified);
+    }
+
+    fn synthesize_to_string(
+        &mut self,
+        store: &mut Store,
+        package_id: &str,
+        attribute_span: &Span,
+        qualified: &Symbol,
+    ) {
+        let Some(scheme) = store.get_type(qualified.as_str()).cloned() else {
+            return;
+        };
+        let Some(definition) = store.get_definition(qualified.as_str()) else {
+            return;
+        };
+        let Some(generics) = type_generics(definition) else {
+            return;
+        };
+        let visibility = definition.visibility;
+        let name_span = definition.name_span;
+
+        if let Some(user_ty) = definition
+            .methods()
+            .and_then(|methods| methods.get("to_string"))
+            .cloned()
+        {
+            if definition.is_ufcs_method("to_string") {
+                self.sink
+                    .push(diagnostics::attribute::display_specialized_to_string(
+                        attribute_span,
+                    ));
+                return;
+            }
+            if user_ty.ty.is_stringer_signature() {
+                return;
+            }
+        }
+
+        let receiver_ty = match scheme {
+            Type::Forall { body, .. } => *body,
+            other => other,
+        };
+        let fn_ty = Type::function(
+            vec![FunctionParameter::new(receiver_ty)],
+            Default::default(),
+            Box::new(Type::string()),
+        );
+        let method_ty = wrap_with_impl_generics(&fn_ty, &generics, &[]);
+
+        let package = store
+            .get_package_mut(package_id)
+            .expect("package must exist");
+        if let Some(methods) = package
+            .definitions
+            .get_mut(qualified.as_str())
+            .and_then(Definition::methods_mut)
+        {
+            methods.insert(
+                "to_string".into(),
+                Method {
+                    source_name: "to_string".into(),
+                    ty: method_ty,
+                    visibility,
+                    origin: MethodOrigin::Synthesized,
+                    name_span,
+                    doc: None,
+                    allowed_lints: vec![],
+                    go_hints: vec![],
+                    superseded_by: None,
+                },
+            );
+        }
+    }
+}
+
+fn type_generics(definition: &Definition) -> Option<Vec<Generic>> {
+    match &definition.body {
+        DefinitionBody::Struct { generics, .. } | DefinitionBody::Enum { generics, .. } => {
+            Some(generics.clone())
+        }
+        _ => None,
+    }
+}

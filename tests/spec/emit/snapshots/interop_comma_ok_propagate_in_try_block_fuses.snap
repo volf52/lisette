@@ -1,0 +1,50 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:os"
+  
+  fn lookup(k: string) -> Option<string> {
+    try {
+      let v = os.LookupEnv(k)?
+      v
+    }
+  }
+  
+  fn main() {
+    match lookup("HOME") {
+      Some(v) => { let _ = v },
+      None => { let _ = 0 },
+    }
+  }
+---
+package main
+
+import (
+	lisette "github.com/ivov/lisette/prelude"
+	"os"
+)
+
+func lookup(k string) (string, bool) {
+	tryResult_1 := func() lisette.Option[string] {
+		ret_2, ret_3 := os.LookupEnv(k)
+		if !ret_3 {
+			return lisette.MakeOptionNone[string]()
+		}
+		v := ret_2
+		return lisette.MakeOptionSome[string](v)
+	}()
+	v_4 := tryResult_1
+	if v_4.Tag == lisette.OptionSome {
+		return v_4.SomeVal, true
+	}
+	return "", false
+}
+
+func main() {
+	ret_1, ok_2 := lookup("HOME")
+	if ok_2 {
+		v := ret_1
+		_ = v
+	}
+}

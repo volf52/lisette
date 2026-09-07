@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \npub const MAX: int = 100;\n"
+description: |
+  
+  pub const MAX: int = 100;
 ---
 [
     Const {
@@ -22,24 +24,26 @@ description: "input: \npub const MAX: int = 100;\n"
                 },
             },
         ),
-        expression: Literal {
-            literal: Integer {
-                value: 100,
-                text: None,
+        expression: Value(
+            Literal {
+                literal: Integer {
+                    value: 100,
+                    text: None,
+                },
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 22,
+                    byte_length: 3,
+                },
             },
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 22,
-                byte_length: 3,
-            },
-        },
-        visibility: Public,
-        ty: Variable(
-            -1,
         ),
+        visibility: Public,
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 5,

@@ -1,0 +1,359 @@
+pub(crate) mod attributes;
+pub(crate) mod casing;
+mod checks;
+mod deprecation;
+mod superseded;
+
+use std::sync::Arc;
+
+use crate::passes::PARALLEL_THRESHOLD;
+use crate::passes::walk::{
+    FunctionRole, NodeCtx, PatternRole, apply_expression_checks, apply_pattern_checks,
+    walk_nodes_with_exit,
+};
+use diagnostics::{LisetteDiagnostic, LocalSink};
+use rayon::prelude::*;
+use rustc_hash::FxHashMap as HashMap;
+use semantics::facts::{Facts, Usage};
+use semantics::store::Store;
+use syntax::ast::{Expression, Pattern, Span};
+use syntax::program::{Package, is_internal_package_id};
+
+use attributes::{check_attributes, check_enum_attributes, check_struct_attributes};
+use checks::{
+    FunctionLintFeatures, check_almost_swapped, check_append_to_zero_filled, check_bad_bit_mask,
+    check_bind_instead_of_map, check_bool_literal_comparison, check_collapsible_else_if,
+    check_collapsible_if, check_collapsible_match, check_discarded_unit_binding,
+    check_double_comparison, check_double_negation, check_dup_arg, check_duplicate_cutset,
+    check_duplicate_logical_operand, check_eager_split_in_loop, check_empty_match_arm,
+    check_enum_variant_names, check_equal_operands, check_equatable_if_let,
+    check_excess_parens_on_condition, check_expression_naming, check_float_cmp,
+    check_float_equality_without_abs, check_function_lints, check_goos_goarch_comparison,
+    check_identical_if_branches, check_identical_match_arms, check_ineffective_bit_mask,
+    check_ineffective_omitempty, check_infallible_assertion, check_integer_division_to_zero,
+    check_invisible_in_string_expression, check_invisible_in_string_pattern,
+    check_json_skipped_field, check_let_and_return, check_loop_runs_once, check_lost_cancel,
+    check_lost_query_mutation, check_manual_bytes_equal, check_manual_compound_assignment,
+    check_manual_contains, check_manual_equal_fold, check_manual_extend, check_manual_filter,
+    check_manual_find, check_manual_is_empty, check_manual_map, check_manual_map_or,
+    check_manual_min_max, check_manual_ok_err, check_manual_ok_or, check_manual_option_zip,
+    check_manual_replace_all, check_manual_rotate, check_manual_time_since,
+    check_manual_time_until, check_manual_unwrap_or, check_map_flatten, check_map_identity,
+    check_map_or_none, check_map_unwrap_or, check_match_as_if_let, check_match_literal_collection,
+    check_match_on_bool, check_match_same_arms, check_match_single_binding,
+    check_misrefactored_assign_op, check_needless_bool_assign, check_needless_continue,
+    check_needless_match, check_needless_question_mark, check_needless_splitn,
+    check_needless_update, check_neg_multiply, check_negated_equality,
+    check_negated_logical_operand, check_nested_fstring, check_non_negative_comparison,
+    check_or_fn_call, check_out_of_domain_value, check_pattern_naming, check_printf_verb_mismatch,
+    check_redundant_closure, check_redundant_closure_call, check_redundant_comparison,
+    check_redundant_else, check_redundant_field_names, check_redundant_fstring_conversion,
+    check_redundant_guards, check_redundant_operation, check_redundant_pattern_matching,
+    check_redundant_rebinding, check_redundant_slice_bounds, check_redundant_sprintf,
+    check_redundant_trim_guard, check_regexp_in_loop, check_replace_count_zero,
+    check_replaceable_with_autofill, check_rest_only_pattern, check_self_assignment,
+    check_self_comparison, check_self_named_constructors, check_single_arm_select,
+    check_single_element_loop, check_task_argument_call, check_type_limit_comparison,
+    check_uninterpolated_fstring, check_unnecessary_bool, check_unnecessary_first_then_check,
+    check_unnecessary_lazy_evaluations, check_unnecessary_map_on_constructor,
+    check_unnecessary_min_or_max, check_unnecessary_range_loop,
+    check_unnecessary_raw_string_expression, check_unnecessary_raw_string_pattern,
+    check_unnecessary_return, check_unsigned_comparison, check_verbose_failure_propagation,
+    check_while_let_loop, check_wildcard_in_or_patterns,
+};
+
+fn run_expression_checks(expression: &Expression, ctx: &mut NodeCtx<'_>, role: FunctionRole<'_>) {
+    apply_expression_checks!(
+        expression,
+        ctx,
+        (check_double_negation, &[Unary]),
+        (check_self_comparison, &[Binary]),
+        (check_float_cmp, &[Binary]),
+        (check_float_equality_without_abs, &[Binary]),
+        (check_redundant_comparison, &[Binary]),
+        (check_double_comparison, &[Binary]),
+        (check_bad_bit_mask, &[Binary]),
+        (check_ineffective_bit_mask, &[Binary]),
+        (check_equal_operands, &[Binary]),
+        (check_unsigned_comparison, &[Binary]),
+        (check_type_limit_comparison, &[Binary]),
+        (check_non_negative_comparison, &[Binary]),
+        (check_goos_goarch_comparison, &[Binary]),
+        (check_redundant_operation, &[Binary]),
+        (check_integer_division_to_zero, &[Binary]),
+        (check_self_assignment, &[Assignment]),
+        (check_manual_compound_assignment, &[Assignment]),
+        (check_misrefactored_assign_op, &[Assignment]),
+        (check_neg_multiply, &[Binary]),
+        (check_manual_bytes_equal, &[Binary]),
+        (check_manual_rotate, &[Binary]),
+        (check_manual_replace_all, &[Call]),
+        (check_replace_count_zero, &[Call]),
+        (check_needless_splitn, &[Call]),
+        (check_redundant_sprintf, &[Call]),
+        (check_manual_equal_fold, &[Binary]),
+        (check_manual_find, &[Call]),
+        (check_manual_contains, &[Call]),
+        (check_unnecessary_first_then_check, &[Call]),
+        (check_unnecessary_min_or_max, &[Call]),
+        (check_manual_is_empty, &[Binary]),
+        (check_bool_literal_comparison, &[Binary]),
+        (check_identical_if_branches, &[If]),
+        (check_collapsible_if, &[If]),
+        (check_collapsible_else_if, &[If]),
+        (check_needless_bool_assign, &[If]),
+        // Must precede `match_as_if_let`: it claims the span that one cedes on,
+        // and checks run in listed order per node.
+        (check_collapsible_match, &[Match, IfLet]),
+        (check_identical_match_arms, &[Match]),
+        (check_match_same_arms, &[Match]),
+        (check_redundant_guards, &[Match]),
+        (check_loop_runs_once, &[Loop, While, WhileLet, For]),
+        (check_needless_continue, &[Loop, While, WhileLet, For]),
+        (check_regexp_in_loop, &[Loop, While, WhileLet, For]),
+        (check_single_element_loop, &[For]),
+        (check_eager_split_in_loop, &[For]),
+        (check_while_let_loop, &[Loop]),
+        (check_empty_match_arm, &[Match]),
+        (check_excess_parens_on_condition, &[If, IfLet, While, Match]),
+        (check_match_literal_collection, &[Match]),
+        (check_match_on_bool, &[Match]),
+        (check_match_single_binding, &[Match]),
+        (check_negated_equality, &[Unary]),
+        (check_let_and_return, &[Block]),
+        (check_almost_swapped, &[Block, TryBlock, RecoverBlock]),
+        (check_redundant_trim_guard, &[Block, TryBlock, RecoverBlock]),
+        (check_append_to_zero_filled, &[Block, Call]),
+        (check_manual_extend, &[Block, TryBlock, RecoverBlock]),
+        (check_unnecessary_bool, &[If]),
+        (check_manual_min_max, &[If]),
+        (check_unnecessary_range_loop, &[For]),
+        (check_unnecessary_return, &[Function]),
+        (check_match_as_if_let, &[Match]),
+        (check_single_arm_select, &[Select]),
+        (check_task_argument_call, &[Task]),
+        (check_redundant_slice_bounds, &[IndexedAccess]),
+        (check_redundant_pattern_matching, &[Match]),
+        (check_equatable_if_let, &[IfLet]),
+        (check_manual_map, &[Match]),
+        (check_manual_map_or, &[Match]),
+        (check_manual_filter, &[Match]),
+        (check_manual_ok_or, &[Match]),
+        (check_manual_ok_err, &[Match]),
+        (check_needless_match, &[Match]),
+        (check_manual_time_since, &[Call]),
+        (check_manual_time_until, &[Call]),
+        (check_map_unwrap_or, &[Call]),
+        (check_bind_instead_of_map, &[Call]),
+        (check_map_flatten, &[Call]),
+        (check_map_identity, &[Call]),
+        (check_unnecessary_map_on_constructor, &[Call]),
+        (check_map_or_none, &[Call]),
+        (check_or_fn_call, &[Call]),
+        (check_unnecessary_lazy_evaluations, &[Call]),
+        (check_manual_option_zip, &[Call]),
+        (check_needless_question_mark, &[Function, Return]),
+        (check_manual_unwrap_or, &[Match]),
+        (check_uninterpolated_fstring, &[Literal]),
+        (check_nested_fstring, &[Literal]),
+        (check_redundant_fstring_conversion, &[Literal]),
+        (check_unnecessary_raw_string_expression, &[Literal]),
+        (check_invisible_in_string_expression, &[Literal]),
+        (check_verbose_failure_propagation, &[Match, IfLet]),
+        (check_dup_arg, &[Call]),
+        (check_printf_verb_mismatch, &[Call]),
+        (check_duplicate_cutset, &[Call]),
+        (check_struct_attributes, &[Struct]),
+        (check_ineffective_omitempty, &[Struct]),
+        (check_attributes, &[Function, TypeAlias]),
+        (check_enum_attributes, &[Enum]),
+        (check_duplicate_logical_operand, &[Binary]),
+        (check_negated_logical_operand, &[Binary]),
+    );
+    if matches!(
+        expression,
+        Expression::Struct { .. }
+            | Expression::Enum { .. }
+            | Expression::TypeAlias { .. }
+            | Expression::Interface { .. }
+            | Expression::Function { .. }
+            | Expression::ImplBlock { .. }
+    ) {
+        check_expression_naming(expression, ctx, role);
+    }
+    apply_expression_checks!(
+        expression,
+        ctx,
+        (check_enum_variant_names, &[Enum]),
+        (check_self_named_constructors, &[ImplBlock]),
+        (check_replaceable_with_autofill, &[StructCall]),
+        (check_redundant_field_names, &[StructCall]),
+        (check_needless_update, &[StructCall]),
+        (check_lost_query_mutation, &[Call]),
+        (check_json_skipped_field, &[Call]),
+        (check_lost_cancel, &[Let]),
+        (check_redundant_rebinding, &[Let]),
+        (check_discarded_unit_binding, &[Let]),
+        (check_redundant_closure, &[Lambda]),
+        (check_redundant_closure_call, &[Call]),
+        (check_redundant_else, &[Block]),
+        (check_out_of_domain_value, &[Literal, Unary, Call]),
+        (check_infallible_assertion, &[Function, Lambda]),
+    );
+}
+
+struct LintWalkCtx<'a> {
+    node: NodeCtx<'a>,
+    functions: Vec<FunctionLintFeatures>,
+}
+
+fn enter_expression<'ast>(
+    expression: &'ast Expression,
+    role: FunctionRole<'ast>,
+    ctx: &mut LintWalkCtx<'_>,
+) {
+    if matches!(
+        expression,
+        Expression::Function { .. } | Expression::Lambda { .. }
+    ) {
+        ctx.functions
+            .push(FunctionLintFeatures::new(expression, &ctx.node, role));
+    } else if let Some(features) = ctx.functions.last_mut() {
+        features.observe(expression);
+    }
+    run_expression_checks(expression, &mut ctx.node, role);
+}
+
+fn exit_expression<'ast>(
+    expression: &'ast Expression,
+    role: FunctionRole<'ast>,
+    ctx: &mut LintWalkCtx<'_>,
+) {
+    if matches!(
+        expression,
+        Expression::Function { .. } | Expression::Lambda { .. }
+    ) {
+        debug_assert!(
+            !ctx.functions.is_empty(),
+            "function feature stack must match the AST walk"
+        );
+        let Some(features) = ctx.functions.pop() else {
+            return;
+        };
+        check_function_lints(expression, &ctx.node, role, features);
+    }
+}
+
+fn visit_pattern(pattern: &Pattern, role: PatternRole, ctx: &mut LintWalkCtx<'_>) {
+    run_pattern_checks(pattern, &mut ctx.node, role);
+}
+
+fn run_pattern_checks(pattern: &Pattern, ctx: &mut NodeCtx<'_>, role: PatternRole) {
+    apply_pattern_checks!(
+        pattern,
+        ctx,
+        (check_rest_only_pattern, &[Slice, Or],),
+        (check_wildcard_in_or_patterns, &[Or]),
+        (check_unnecessary_raw_string_pattern, &[Literal],),
+        (check_invisible_in_string_pattern, &[Literal]),
+    );
+    if matches!(
+        pattern,
+        Pattern::Identifier { .. } | Pattern::AsBinding { .. } | Pattern::Slice { .. }
+    ) {
+        check_pattern_naming(pattern, ctx, role);
+    }
+}
+
+struct OlderApis<'a> {
+    deprecated: HashMap<Span, String>,
+    superseded: HashMap<Span, String>,
+    usages_by_file: HashMap<u32, Vec<&'a Usage>>,
+}
+
+impl OlderApis<'_> {
+    fn sweep_file(&self, file_id: u32, sink: &LocalSink) {
+        let Some(usages) = self.usages_by_file.get(&file_id) else {
+            return;
+        };
+        deprecation::sweep(usages, &self.deprecated, sink);
+        superseded::sweep(usages, &self.superseded, sink);
+    }
+}
+
+pub(crate) fn run(store: &Store, facts: &Facts) -> Vec<LisetteDiagnostic> {
+    let deprecated = deprecation::build_index(store);
+    let superseded = superseded::build_index(store);
+    let mut usages_by_file: HashMap<u32, Vec<&Usage>> = HashMap::default();
+    if !deprecated.is_empty() || !superseded.is_empty() {
+        for usage in &facts.usages {
+            usages_by_file
+                .entry(usage.usage_span.file_id)
+                .or_default()
+                .push(usage);
+        }
+    }
+    let older = OlderApis {
+        deprecated,
+        superseded,
+        usages_by_file,
+    };
+
+    let mut packages: Vec<&Package> = store
+        .packages
+        .values()
+        .map(Arc::as_ref)
+        .filter(|m| !is_internal_package_id(&m.id))
+        .collect();
+    packages.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+
+    if packages.len() < PARALLEL_THRESHOLD {
+        let sink = LocalSink::new();
+        for package in &packages {
+            run_package(package, store, facts, &sink, &older);
+        }
+        return sink.into_diagnostics();
+    }
+
+    let worker_sinks: Vec<LocalSink> = packages
+        .par_iter()
+        .map(|package| {
+            let local_sink = LocalSink::new();
+            run_package(package, store, facts, &local_sink, &older);
+            local_sink
+        })
+        .collect();
+    LocalSink::merge(worker_sinks)
+}
+
+fn run_package(
+    package: &Package,
+    store: &Store,
+    facts: &Facts,
+    sink: &LocalSink,
+    older: &OlderApis<'_>,
+) {
+    for (file_id, file) in package.source_file_entries() {
+        let file_sink = LocalSink::new();
+        let mut ctx = LintWalkCtx {
+            node: NodeCtx::new(store, facts, package, file, &file_sink),
+            functions: Vec::new(),
+        };
+        walk_nodes_with_exit(
+            &file.items,
+            &mut ctx,
+            enter_expression,
+            visit_pattern,
+            exit_expression,
+        );
+
+        older.sweep_file(*file_id, &file_sink);
+
+        let produced = file_sink.into_diagnostics();
+        if produced.is_empty() {
+            continue;
+        }
+        let allows = super::suppression::collect_function_allows(&file.items);
+        sink.extend(super::suppression::filter_allowed(produced, &allows));
+    }
+}

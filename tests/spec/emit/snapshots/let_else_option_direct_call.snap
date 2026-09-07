@@ -1,22 +1,29 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn get_value(s: string) -> Option<int> {\n  if s == \"ok\" { Some(42) } else { None }\n}\n\nfn test() -> int {\n  let Some(x) = get_value(\"ok\") else { return 0; };\n  x\n}\n"
+description: |
+  
+  fn get_value(s: string) -> Option<int> {
+    if s == "ok" { Some(42) } else { None }
+  }
+  
+  fn test() -> int {
+    let Some(x) = get_value("ok") else { return 0; };
+    x
+  }
 ---
 package main
 
-import lisette "github.com/ivov/lisette/prelude"
-
-func get_value(s string) lisette.Option[int] {
+func getValue(s string) (int, bool) {
 	if s == "ok" {
-		return lisette.MakeOptionSome[int](42)
+		return 42, true
 	}
-	return lisette.MakeOptionNone[int]()
+	return 0, false
 }
 
 func test() int {
-	subject_1 := get_value("ok")
-	if subject_1.Tag != lisette.OptionSome {
+	x, ok_1 := getValue("ok")
+	if !ok_1 {
 		return 0
 	}
-	return subject_1.SomeVal
+	return x
 }

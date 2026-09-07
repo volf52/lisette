@@ -1,6 +1,12 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn main() {\n  let _ = if true { 1 } else { 2 }\n  let tmp_1 = 3\n  let _ = tmp_1\n}\n"
+description: |
+  
+  fn main() {
+    let _ = if true { 1 } else { 2 }
+    let tmp_1 = 3
+    let _ = tmp_1
+  }
 ---
 package main
 
@@ -12,5 +18,6 @@ func main() {
 		tmp_1 = 2
 	}
 	_ = tmp_1
-	_ = 3
+	tmp_1_2 := 3
+	_ = tmp_1_2
 }

@@ -1,0 +1,19 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import t "go:time"
+  
+  fn main() {
+    let d = t.Second
+    let _ = d
+  }
+---
+package main
+
+import t "time"
+
+func main() {
+	d := t.Second
+	_ = d
+}

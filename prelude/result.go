@@ -2,7 +2,7 @@ package lisette
 
 import "fmt"
 
-type ResultTag int
+type ResultTag uint8
 
 const (
 	ResultOk ResultTag = iota
@@ -66,6 +66,13 @@ func (res Result[T, E]) String() string {
 	return fmt.Sprintf("Err(%v)", res.ErrVal)
 }
 
+func (res Result[T, E]) DebugString() string {
+	if res.Tag == ResultOk {
+		return fmt.Sprintf("Ok(%s)", Debug(res.OkVal))
+	}
+	return fmt.Sprintf("Err(%s)", Debug(res.ErrVal))
+}
+
 func ResultMap[T any, U any, E any](res Result[T, E], f func(T) U) Result[U, E] {
 	if res.Tag == ResultOk {
 		return Result[U, E]{Tag: ResultOk, OkVal: f(res.OkVal)}
@@ -80,11 +87,25 @@ func ResultMapErr[T any, E any, F any](res Result[T, E], f func(E) F) Result[T, 
 	return Result[T, F]{Tag: ResultOk, OkVal: res.OkVal}
 }
 
+func ResultWrapErr[T any](res Result[T, error], msg string) Result[T, error] {
+	if res.Tag == ResultErr {
+		return Result[T, error]{Tag: ResultErr, ErrVal: fmt.Errorf("%s: %w", msg, res.ErrVal)}
+	}
+	return Result[T, error]{Tag: ResultOk, OkVal: res.OkVal}
+}
+
 func ResultMapOr[T any, U any, E any](res Result[T, E], def U, f func(T) U) U {
 	if res.Tag == ResultOk {
 		return f(res.OkVal)
 	}
 	return def
+}
+
+func ResultMapOrElse[T any, U any, E any](res Result[T, E], def func(E) U, f func(T) U) U {
+	if res.Tag == ResultOk {
+		return f(res.OkVal)
+	}
+	return def(res.ErrVal)
 }
 
 func ResultAndThen[T any, U any, E any](res Result[T, E], f func(T) Result[U, E]) Result[U, E] {

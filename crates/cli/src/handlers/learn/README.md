@@ -15,6 +15,8 @@ lis run -- watch
 
 Tasks are saved to `tasks.json` in the working directory.
 
+Run the tests with `lis test`.
+
 ## Project structure
 
 ```bash
@@ -22,16 +24,19 @@ src/
   main.lis              # entry point
   models/
     props.lis           # `Priority` and `Status` enums
+    props.test.lis
     task.lis            # `Task` struct
+    task.test.lis
   store/
     store.lis           # JSON persistence
+    store.test.lis
   commands/
     commands.lis        # CLI commands
   display/
     display.lis         # output formatting
 ```
 
-Each directory under `src/` is a module, imported by its directory name (e.g. `import "models"`). Files within a module share the same namespace, so `props.lis` and `task.lis` both contribute to the `models` module.
+Each directory under `src/` is a package, imported by its directory name (e.g. `import "models"`). Files within a package share the same namespace, so `props.lis` and `task.lis` both contribute to the `models` package. A `.test.lis` file holds the tests for the package it sits in, so its tests can call the package's functions directly.
 
 Language features shown:
 
@@ -40,12 +45,13 @@ Language features shown:
 | Enums, `#[json]` serialization                    | `models/props.lis`                         |
 | Structs, impl blocks, associated functions        | `models/task.lis`                          |
 | Pattern matching (`match`, `let...else`)          | `main.lis`, `store/store.lis`              |
-| Error handling (`Result`, `?`)                    | `commands/commands.lis`                    |
+| Error handling (`Result`, `?`, `wrap_err`)        | `store/store.lis`, `commands/commands.lis` |
 | Closures, slice methods (`filter`, `map`, `fold`) | `store/store.lis`, `commands/commands.lis` |
 | Go interop (`go:` imports, `as` casting)          | `store/store.lis`                          |
 | Mutability (`let mut`, `&`)                       | `commands/commands.lis`                    |
 | Concurrency (`task`, channels)                    | `commands/commands.lis` (`watch`)          |
 | F-strings                                         | throughout                                 |
+| Tests (`#[test]`, `assert`, `let assert`)         | `*.test.lis` files                         |
 
 ## Next steps
 

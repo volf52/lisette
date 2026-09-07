@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test() { let result = f\"hello world\"; }\n"
+description: |
+  
+  fn test() { let result = f"hello world"; }
 ---
 [
     Function {
@@ -15,72 +17,69 @@ description: "input: \nfn test() { let result = f\"hello world\"; }\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Let {
-                    binding: Binding {
-                        pattern: Identifier {
-                            identifier: "result",
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 17,
-                                byte_length: 6,
+        body: Definition(
+            Block {
+                items: [
+                    Let {
+                        binding: Binding {
+                            pattern: Identifier {
+                                identifier: "result",
+                                span: Span {
+                                    file_id: 0,
+                                    byte_offset: 17,
+                                    byte_length: 6,
+                                },
+                            },
+                            annotation: None,
+                            ty: Var {
+                                id: uninferred,
                             },
                         },
-                        annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
-                    },
-                    value: Literal {
-                        literal: FormatString(
-                            [
-                                Text(
-                                    "hello world",
-                                ),
-                            ],
-                        ),
-                        ty: Variable(
-                            -1,
-                        ),
+                        value: Literal {
+                            literal: FormatString(
+                                [
+                                    Text(
+                                        "hello world",
+                                    ),
+                                ],
+                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
+                            span: Span {
+                                file_id: 0,
+                                byte_offset: 26,
+                                byte_length: 14,
+                            },
+                        },
+                        mode: Plain,
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 26,
-                            byte_length: 14,
+                            byte_offset: 13,
+                            byte_length: 27,
                         },
                     },
-                    mutable: false,
-                    mut_span: None,
-                    else_block: None,
-                    else_span: None,
-                    typed_pattern: None,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 13,
-                        byte_length: 27,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 32,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 32,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

@@ -1,17 +1,24 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Counter { count: int }\n\nimpl Counter {\n  fn increment(self: Ref<Counter>) {\n    self.*.count += 1\n  }\n}\n\nfn test(m: Map<string, Ref<Counter>>) {\n  m[\"a\"].*.increment()\n}\n"
+description: |
+  
+  struct Counter { count: int }
+  
+  impl Counter {
+    fn increment(self: mut Ref<Counter>) {
+      self.*.count += 1
+    }
+  }
+  
+  fn test(m: mut Map<string, mut Ref<Counter>>) {
+    let Some(c) = m.get("a") else { return; };
+    c.*.increment()
+  }
 ---
 package main
 
-import "fmt"
-
 type Counter struct {
 	count int
-}
-
-func (c Counter) String() string {
-	return fmt.Sprintf("Counter { count: %v }", c.count)
 }
 
 func (c *Counter) increment() {
@@ -19,5 +26,9 @@ func (c *Counter) increment() {
 }
 
 func test(m map[string]*Counter) {
-	m["a"].increment()
+	c, ok_1 := m["a"]
+	if !ok_1 {
+		return
+	}
+	c.increment()
 }

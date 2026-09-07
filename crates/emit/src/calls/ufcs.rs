@@ -1,205 +1,439 @@
-use crate::write_line;
+use crate::calls::dispatch::{CallArgShape, all_type_params_inferrable};
+use crate::calls::native::{apply_inline_import, native_method_lowers_to_plain_call};
+use crate::plan::calls::plan_variadic_spread;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::Emitter;
+use crate::Planner;
+use crate::context::expression::ExpressionContext;
+use crate::expressions::staging::SpreadSequenceOptions;
 use crate::names::generics::extract_type_mapping;
 use crate::names::go_name;
+use crate::plan::bodies::LoweredStatement;
+use crate::plan::calls::{CallPlan, ResolvedCallee};
+use crate::plan::values::{CaptureBoundary, EvaluationEffect, GoExpression, ValuePlan};
 use crate::types::native::NativeGoType;
-use crate::utils::Staged;
-use syntax::ast::{Annotation, Expression};
+use syntax::EcoString;
+use syntax::ast::{Expression, Literal, ResolvedCallTypeArguments};
 use syntax::program::ReceiverCoercion;
 use syntax::types::Type;
 
-impl Emitter<'_> {
-    fn infer_ufcs_return_only_type_args(
+#[derive(Clone, Copy)]
+struct UfcsCallSite<'e, 'c> {
+    function: &'e Expression,
+    callee: &'e ResolvedCallee<'c>,
+}
+
+impl Planner<'_> {
+    fn ufcs_type_args(
         &mut self,
         function: &Expression,
-        qualified_name: &str,
-        member: &str,
+        callee: &ResolvedCallee<'_>,
         receiver_ty: &Type,
+        type_args: ResolvedCallTypeArguments<'_>,
+        arg_shape: CallArgShape,
     ) -> Option<String> {
-        let method_key = format!("{}.{}", qualified_name, member);
-        let definition_ty = self.ctx.definitions.get(method_key.as_str())?.ty().clone();
+        let definition_ty = callee.declared_type()?;
 
+        // A method with no type parameters lowers to a non-generic free function.
         let Type::Forall { vars, body } = &definition_ty else {
             return None;
         };
-        let Type::Function {
-            params: generic_params,
-            ..
-        } = body.as_ref()
-        else {
+        let Type::Function(f) = body.as_ref() else {
             return None;
         };
 
-        let all_inferable = vars.iter().all(|var| {
-            let param_ty = Type::Parameter(var.clone());
-            generic_params.iter().any(|pt| pt.contains_type(&param_ty))
-        });
-        if all_inferable {
-            return None;
+        let mut receiver_mapping: HashMap<String, Type> = HashMap::default();
+        if let Some(self_param) = f.params.first() {
+            extract_type_mapping(
+                &self_param.ty.strip_refs(),
+                receiver_ty,
+                &mut receiver_mapping,
+            );
         }
 
-        let instantiated_ty = function.get_type().resolve();
-        let mut mapping: HashMap<String, Type> = HashMap::default();
-        extract_type_mapping(body, &instantiated_ty, &mut mapping);
-
-        let mut go_type_strs = Vec::new();
-        if let Type::Constructor { params, .. } = receiver_ty {
-            for param in params {
-                go_type_strs.push(self.go_type_as_string(param));
+        if !type_args.is_empty() {
+            let impl_count = vars.len().saturating_sub(type_args.len());
+            let mut go_type_strs = Vec::with_capacity(vars.len());
+            for (index, var) in vars.iter().enumerate() {
+                let go_type = if index < impl_count {
+                    self.use_go_type(receiver_mapping.get(var.as_str())?)
+                } else {
+                    self.use_go_type(type_args.get(index - impl_count)?)
+                };
+                go_type_strs.push(go_type);
             }
+            return (!go_type_strs.is_empty()).then(|| format!("[{}]", go_type_strs.join(", ")));
         }
-        let base_generics_count = if let Type::Constructor { params, .. } = receiver_ty {
-            params.len()
-        } else {
-            0
-        };
-        for var in vars.iter().skip(base_generics_count) {
-            if let Some(resolved) = mapping.get(var.as_str()) {
-                go_type_strs.push(self.go_type_as_string(resolved));
+
+        let receiver_count = callee.receiver_offset.min(1);
+        if all_type_params_inferrable(vars, &f.params, receiver_count, arg_shape) {
+            return None;
+        }
+
+        let mut inferred_mapping: HashMap<String, Type> = HashMap::default();
+        if let Type::Function(inst) = function.get_type() {
+            let self_curried = inst.params.len() + 1 == f.params.len();
+            let declared = if self_curried {
+                &f.params[1..]
             } else {
-                return None;
+                &f.params[..]
+            };
+            for (decl, conc) in declared.iter().zip(inst.params.iter()) {
+                extract_type_mapping(&decl.ty, &conc.ty, &mut inferred_mapping);
             }
+            extract_type_mapping(&f.return_type, &inst.return_type, &mut inferred_mapping);
         }
 
-        if go_type_strs.is_empty() {
-            return None;
+        let mut go_type_strs = Vec::with_capacity(vars.len());
+        for var in vars {
+            let resolved = receiver_mapping
+                .get(var.as_str())
+                .or_else(|| inferred_mapping.get(var.as_str()))?;
+            go_type_strs.push(self.use_go_type(resolved));
         }
-
-        Some(format!("[{}]", go_type_strs.join(", ")))
+        (!go_type_strs.is_empty()).then(|| format!("[{}]", go_type_strs.join(", ")))
     }
 
-    pub(super) fn emit_ufcs_call(
+    pub(super) fn lower_ufcs_call(
         &mut self,
-        output: &mut String,
         function: &Expression,
         args: &[Expression],
-        type_args: &[Annotation],
+        type_args: ResolvedCallTypeArguments<'_>,
         spread: Option<&Expression>,
-    ) -> String {
+        call_plan: &CallPlan<'_>,
+    ) -> ValuePlan {
         let Expression::DotAccess {
             expression: receiver,
             member,
+            resolution,
             ..
         } = function
         else {
-            unreachable!("emit_ufcs_call called on non-DotAccess");
+            unreachable!("lower_ufcs_call called on non-DotAccess");
         };
 
-        let receiver_ty = receiver.get_type().resolve().strip_refs().clone();
-        let Type::Constructor {
-            id: qualified_name, ..
-        } = &receiver_ty
-        else {
-            unreachable!("UFCS receiver must be a constructor type");
+        let coercion = resolution.receiver_coercion();
+        let receiver_ty = self.facts.strip_and_peel(&receiver.get_type());
+        let site = UfcsCallSite {
+            function,
+            callee: &call_plan.resolved,
         };
 
-        let coercion = self.ctx.coercions.get_coercion(receiver.get_span());
-
-        // Stage receiver + args together for eval-order sequencing
-        let mut all_stages: Vec<Staged> =
-            Vec::with_capacity(1 + args.len() + spread.is_some() as usize);
-        all_stages.push(self.stage_operand(receiver));
-        for arg in args {
-            all_stages.push(self.stage_composite(arg));
-        }
-        let all_values = self.sequence_with_spread(output, all_stages, spread, false, "_arg");
-        let receiver_arg = all_values[0].clone();
-        let emitted_args: Vec<String> = all_values[1..].to_vec();
-
+        let (setup, receiver_arg, emitted_args, arguments_contain_deferred_evaluation) =
+            self.lower_ufcs_call_args(site, receiver, args, spread, coercion);
         let receiver_arg = match coercion {
-            Some(ReceiverCoercion::AutoAddress) => {
-                if matches!(receiver.unwrap_parens(), Expression::Call { .. }) {
-                    let tmp = self.fresh_var(Some("ref"));
-                    self.declare(&tmp);
-                    write_line!(output, "{} := {}", tmp, receiver_arg);
-                    format!("&{}", tmp)
-                } else {
-                    format!("&{}", receiver_arg)
-                }
-            }
-            Some(ReceiverCoercion::AutoDeref) => format!("*{}", receiver_arg),
-            None => receiver_arg,
+            Some(ReceiverCoercion::AutoDeref) => format!("*{receiver_arg}"),
+            Some(ReceiverCoercion::AutoAddress) | None => receiver_arg,
         };
 
-        if let Some(native_type) = NativeGoType::from_type(&receiver.get_type())
-            && let Some((inlined, extra_import)) = super::native::try_inline_native_method(
-                &native_type,
-                member,
-                &receiver_arg,
-                &emitted_args,
-            )
+        if let Some(inlined) =
+            try_inline_native_ufcs(self, receiver, member, &receiver_arg, &emitted_args)
         {
-            self.apply_inline_import(extra_import);
-            return inlined;
+            let native_type = NativeGoType::from_type(&receiver.get_type())
+                .expect("inlined UFCS receiver has a native type");
+            let plain_call =
+                native_method_lowers_to_plain_call(&native_type, member, emitted_args.len());
+            let deferred_evaluation =
+                plain_call || member == "is_empty" || arguments_contain_deferred_evaluation;
+            let expression =
+                GoExpression::opaque_with_deferred_evaluation(inlined, deferred_evaluation);
+            return if plain_call {
+                ValuePlan::plain_call(setup, expression, EvaluationEffect::EffectfulCall)
+            } else {
+                ValuePlan::computed(setup, expression, EvaluationEffect::EffectfulCall)
+            };
         }
 
         let mut new_args = vec![receiver_arg];
         new_args.extend(emitted_args);
 
-        let type_args_string = if !type_args.is_empty() {
-            self.format_type_args_with_receiver(&receiver_ty, type_args)
+        let fn_name = self.build_ufcs_qualified_call(
+            site,
+            &receiver_ty,
+            member,
+            type_args,
+            CallArgShape {
+                value_count: args.len(),
+                has_spread: spread.is_some(),
+            },
+        );
+        let expression = GoExpression::call(
+            GoExpression::opaque(fn_name),
+            new_args.into_iter().map(GoExpression::opaque).collect(),
+        );
+        if self.callee_lowers_to_type_construction(function) {
+            ValuePlan::observable_call(setup, expression, EvaluationEffect::EffectfulCall)
         } else {
-            self.infer_ufcs_return_only_type_args(function, qualified_name, member, &receiver_ty)
-                .unwrap_or_default()
-        };
+            ValuePlan::plain_call(setup, expression, EvaluationEffect::EffectfulCall)
+        }
+    }
 
-        let method_key = format!("{}.{}", qualified_name, member);
-        let is_public = self
-            .ctx
-            .definitions
-            .get(method_key.as_str())
-            .map(|d| d.visibility().is_public())
+    fn lower_ufcs_call_args(
+        &mut self,
+        site: UfcsCallSite<'_, '_>,
+        receiver: &Expression,
+        args: &[Expression],
+        spread: Option<&Expression>,
+        coercion: Option<ReceiverCoercion>,
+    ) -> (Vec<LoweredStatement>, String, Vec<String>, bool) {
+        let UfcsCallSite { function, callee } = site;
+        // The DotAccess function type curries `self` out, so its params line
+        // up 1:1 with the user args. Pair each so a function-typed param
+        // suppresses the Go-fn-value identity short-circuit before dispatch
+        // into prelude helpers like `lisette.OptionAndThen`.
+        let mut all_stages: Vec<ValuePlan> =
+            Vec::with_capacity(1 + args.len() + spread.is_some() as usize);
+        let mut receiver_stage = self.plan_operand(receiver, ExpressionContext::value());
+        if coercion == Some(ReceiverCoercion::AutoAddress) {
+            receiver_stage = self.coerce_receiver_address_stage(receiver, receiver_stage);
+        }
+        all_stages.push(receiver_stage);
+        for (i, arg) in args.iter().enumerate() {
+            let param = callee.abi.param(i);
+            let declared = (!callee.is_prelude_dispatch)
+                .then(|| param.and_then(|param| param.declared.as_ref()))
+                .flatten();
+            let suppress_decl = callee
+                .is_prelude_dispatch
+                .then(|| param.and_then(|param| param.declared.as_ref()))
+                .flatten();
+            all_stages.push(self.stage_ufcs_arg(
+                arg,
+                declared,
+                suppress_decl,
+                param.map(|param| &param.instantiated),
+            ));
+        }
+        let vars: Vec<EcoString> = match callee.declared_type() {
+            Some(Type::Forall { vars, .. }) if !callee.is_prelude_dispatch => vars.clone(),
+            _ => Vec::new(),
+        };
+        let receiver_instantiated = receiver.get_type().strip_refs();
+        let receiver_declared = (!callee.is_prelude_dispatch && callee.receiver_offset == 1)
+            .then(|| {
+                callee
+                    .declared_type()
+                    .and_then(|ty| ty.unwrap_forall().get_function_params())
+                    .and_then(|params| params.first())
+                    .map(|param| &param.ty)
+            })
+            .flatten();
+        let receiver_binding = receiver_declared.map(|declared| (declared, &receiver_instantiated));
+        let mut slots: Vec<Option<(&Type, &Type)>> = vec![None];
+        let mut convertible = vec![false];
+        for index in 0..args.len() {
+            let param = callee.abi.param(index);
+            slots.push(
+                (!callee.is_prelude_dispatch)
+                    .then(|| {
+                        param.and_then(|param| {
+                            param
+                                .declared
+                                .as_ref()
+                                .map(|declared| (declared, &param.instantiated))
+                        })
+                    })
+                    .flatten(),
+            );
+            convertible.push(true);
+        }
+        let all_stages = self.convert_inferred_constants(
+            all_stages,
+            &slots,
+            &convertible,
+            &vars,
+            receiver_binding,
+        );
+        let combine = plan_variadic_spread(&self.facts, function, spread).map(|p| p.combine(1));
+
+        let sequenced = self.sequence_with_spread_values(
+            all_stages,
+            spread,
+            (!callee.is_prelude_dispatch)
+                .then(|| {
+                    callee
+                        .declared_type()
+                        .and_then(|ty| ty.unwrap_forall().get_function_params())
+                })
+                .flatten(),
+            SpreadSequenceOptions {
+                wrap_to_any: false,
+                combine,
+                boundary: CaptureBoundary::SiblingSequence,
+            },
+        );
+        let contains_deferred_evaluation = sequenced.contains_deferred_evaluation();
+        let (setup, all_values) = sequenced.into_rendered();
+        let receiver_arg = all_values[0].clone();
+        let emitted_args: Vec<String> = all_values[1..].to_vec();
+        (
+            setup,
+            receiver_arg,
+            emitted_args,
+            contains_deferred_evaluation,
+        )
+    }
+
+    fn stage_ufcs_arg(
+        &mut self,
+        arg: &Expression,
+        declared_param: Option<&Type>,
+        suppress_declared: Option<&Type>,
+        formal_param: Option<&Type>,
+    ) -> ValuePlan {
+        let Some(declared) = declared_param else {
+            return self.stage_prelude_arg(arg, suppress_declared, formal_param);
+        };
+        if let Some(value) = self.try_adapt_lowered_fn_arg_shape(arg, Some(declared)) {
+            return value;
+        }
+        self.lower_composite_value(arg, ExpressionContext::value())
+    }
+
+    fn build_ufcs_qualified_call(
+        &mut self,
+        site: UfcsCallSite<'_, '_>,
+        receiver_ty: &Type,
+        member: &str,
+        type_args: ResolvedCallTypeArguments<'_>,
+        arg_shape: CallArgShape,
+    ) -> String {
+        let UfcsCallSite { function, callee } = site;
+        let Type::Nominal {
+            id: qualified_name, ..
+        } = receiver_ty
+        else {
+            unreachable!("UFCS receiver must be a constructor type");
+        };
+        let type_args_string = self
+            .ufcs_type_args(function, callee, receiver_ty, type_args, arg_shape)
+            .unwrap_or_default();
+
+        let is_public = callee
+            .declaration
+            .map(|declaration| declaration.visibility().is_public())
             .unwrap_or(false)
             || self.method_needs_export(member);
 
         let qualified_method_name = self.qualify_method_call(qualified_name, member, is_public);
-        let fn_name = format!("{}{}", qualified_method_name, type_args_string);
-
-        format!("{}({})", fn_name, new_args.join(", "))
+        format!("{}{}", qualified_method_name, type_args_string)
     }
 
-    pub(super) fn emit_receiver_method_ufcs(
+    fn coerce_receiver_address_stage(
         &mut self,
-        output: &mut String,
+        receiver: &Expression,
+        mut stage: ValuePlan,
+    ) -> ValuePlan {
+        let value = stage.expression.rendered();
+        if matches!(receiver.unwrap_parens(), Expression::Call { .. }) {
+            let tmp = self.hoist_tmp_value_statement(&mut stage.setup, "ref", &value);
+            stage.expression = GoExpression::opaque(format!("&{tmp}"));
+            return stage.into_addressed_location();
+        }
+        let addressed = format!("&{value}");
+        if matches!(receiver.unwrap_parens(), Expression::Identifier { .. }) {
+            stage.expression = GoExpression::opaque(addressed);
+            stage.into_addressed_location()
+        } else if stage.setup.is_empty() {
+            stage.expression = GoExpression::opaque(addressed);
+            stage.make_observable_computed();
+            stage
+        } else {
+            let tmp = self.hoist_tmp_value_statement(&mut stage.setup, "ref", &addressed);
+            ValuePlan::captured(stage.setup, tmp)
+        }
+    }
+
+    pub(super) fn lower_receiver_method_ufcs(
+        &mut self,
+        function: &Expression,
         args: &[Expression],
-        type_args: &[Annotation],
         method: &str,
         is_public: bool,
         spread: Option<&Expression>,
-    ) -> String {
+    ) -> ValuePlan {
         let go_method = if is_public {
-            let mut chars = method.chars();
-            match chars.next() {
-                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
-                None => method.to_string(),
-            }
+            go_name::snake_to_camel(method)
         } else {
-            go_name::escape_keyword(method).into_owned()
+            go_name::unexported_method_go_name(method)
         };
 
-        let stages: Vec<Staged> = args.iter().map(|a| self.stage_composite(a)).collect();
-        let emitted_all = self.sequence_with_spread(output, stages, spread, false, "_arg");
+        let stages: Vec<ValuePlan> = args
+            .iter()
+            .map(|a| self.lower_composite_value(a, ExpressionContext::value()))
+            .collect();
+
+        let combine = plan_variadic_spread(&self.facts, function, spread).map(|p| p.combine(0));
+        let sequenced = self.sequence_with_spread_values(
+            stages,
+            spread,
+            None,
+            SpreadSequenceOptions {
+                wrap_to_any: false,
+                combine,
+                boundary: CaptureBoundary::SiblingSequence,
+            },
+        );
+        let (setup, emitted_all) = sequenced.into_rendered();
+
         let receiver = emitted_all[0].clone();
         let emitted_rest: Vec<String> = emitted_all[1..].to_vec();
 
-        let type_args_string = self.format_type_args_from_annotations(type_args);
-
         let receiver = if let Some(stripped) = receiver.strip_prefix('&') {
-            stripped.to_string()
+            if is_address_of_composite_literal(args.first()) {
+                format!("(&{})", stripped)
+            } else {
+                stripped.to_string()
+            }
         } else if receiver.starts_with('*') {
             format!("({})", receiver)
         } else {
             receiver
         };
 
-        format!(
-            "{}.{}{}({})",
-            receiver,
-            go_method,
-            type_args_string,
-            emitted_rest.join(", ")
+        ValuePlan::observable_call(
+            setup,
+            GoExpression::call(
+                GoExpression::opaque(format!("{}.{}", receiver, go_method)),
+                emitted_rest.into_iter().map(GoExpression::opaque).collect(),
+            ),
+            EvaluationEffect::EffectfulCall,
         )
     }
+}
+
+fn try_inline_native_ufcs(
+    planner: &mut Planner,
+    receiver: &Expression,
+    member: &str,
+    receiver_arg: &str,
+    emitted_args: &[String],
+) -> Option<String> {
+    let native_type = NativeGoType::from_type(&receiver.get_type())?;
+    let (inlined, extra_import) = super::native::try_inline_native_method(
+        &native_type,
+        member,
+        receiver_arg,
+        emitted_args,
+        false,
+    )?;
+    apply_inline_import(planner, extra_import);
+    Some(inlined)
+}
+
+fn is_address_of_composite_literal(arg: Option<&Expression>) -> bool {
+    let Some(Expression::Reference {
+        expression: inner, ..
+    }) = arg.map(Expression::unwrap_parens)
+    else {
+        return false;
+    };
+    matches!(
+        inner.unwrap_parens(),
+        Expression::StructCall { .. }
+            | Expression::Literal {
+                literal: Literal::Slice(_),
+                ..
+            }
+    )
 }

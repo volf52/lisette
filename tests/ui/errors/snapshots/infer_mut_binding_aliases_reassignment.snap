@@ -1,0 +1,12 @@
+---
+source: tests/ui/errors/mod.rs
+---
+  ✕ Missing write permission
+   ╭─[test.lis:4:7]
+ 3 │   let mut b = [0]
+ 4 │   b = a
+   ·       ┬
+   ·       ╰── expected `mut Slice<int>`, found `Slice<int>`
+ 5 │   b = b.append(1)
+   ╰────
+  help: `mut Slice<int>` permits writes, `Slice<int>` does not. Make the value writable where it is created, or pass a `.clone()` · code: [infer.needs_writable]

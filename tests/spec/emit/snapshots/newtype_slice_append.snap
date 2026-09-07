@@ -1,18 +1,19 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Wrap(Slice<int>)\n\nfn main() {\n  let mut w = Wrap([1])\n  w = Wrap(w.0.append(2))\n}\n"
+description: |
+  
+  struct Wrap(Slice<int>)
+  
+  fn main() {
+    let mut w = Wrap([1])
+    w = Wrap(w.0.append(2))
+  }
 ---
 package main
 
-import "fmt"
-
 type Wrap []int
-
-func (w Wrap) String() string {
-	return fmt.Sprintf("Wrap(%v)", []int(w))
-}
 
 func main() {
 	w := Wrap([]int{1})
-	w = Wrap(append([]int(w), 2))
+	w = Wrap(append(([]int)(w), 2))
 }

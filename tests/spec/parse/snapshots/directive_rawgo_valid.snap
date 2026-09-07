@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test() { @rawgo(\"fmt.Println(\\\"Hello\\\")\"); }\n"
+description: |
+  
+  fn test() { @rawgo("fmt.Println(\"Hello\")"); }
 ---
 [
     Function {
@@ -15,28 +17,30 @@ description: "input: \nfn test() { @rawgo(\"fmt.Println(\\\"Hello\\\")\"); }\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
-        visibility: Private,
-        body: Block {
-            items: [
-                RawGo {
-                    text: "fmt.Println(\\\"Hello\\\")",
-                },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 37,
-            },
+        return_type: Var {
+            id: uninferred,
         },
-        ty: Variable(
-            -1,
+        visibility: Private,
+        body: Definition(
+            Block {
+                items: [
+                    RawGo {
+                        text: "fmt.Println(\\\"Hello\\\")",
+                    },
+                ],
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 37,
+                },
+            },
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

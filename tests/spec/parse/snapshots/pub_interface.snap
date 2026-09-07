@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \npub interface Printable { fn print(self); }\n"
+description: |
+  
+  pub interface Printable { fn print(self); }
 ---
 [
     Interface {
@@ -35,21 +37,20 @@ description: "input: \npub interface Printable { fn print(self); }\n"
                             },
                         },
                         annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
+                        ty: Var {
+                            id: uninferred,
+                        },
                     },
                 ],
                 return_annotation: Unknown,
-                return_type: Variable(
-                    -1,
-                ),
+                return_type: Var {
+                    id: uninferred,
+                },
                 visibility: Private,
-                body: NoOp,
-                ty: Variable(
-                    -1,
-                ),
+                body: Declaration,
+                ty: Var {
+                    id: uninferred,
+                },
                 span: Span {
                     file_id: 0,
                     byte_offset: 30,

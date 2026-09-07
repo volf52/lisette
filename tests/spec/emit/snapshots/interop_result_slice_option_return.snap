@@ -1,0 +1,57 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:fmt"
+  import "go:example.com/aws"
+  
+  fn main() {
+    match aws.Make() {
+      Ok(xs) => {
+        for x in xs {
+          match x {
+            Some(v) => fmt.Println(v),
+            None => fmt.Println("none"),
+          }
+        }
+      },
+      Err(e) => { let _ = e },
+    }
+  }
+---
+package main
+
+import (
+	"example.com/aws"
+	"fmt"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func main() {
+	ret_1, ret_2 := aws.Make()
+	var result_3 lisette.Result[[]lisette.Option[string], error]
+	if ret_2 != nil {
+		result_3 = lisette.MakeResultErr[[]lisette.Option[string], error](ret_2)
+	} else {
+		wrapped_4 := make([]lisette.Option[string], len(ret_1))
+		for i_5, v_6 := range ret_1 {
+			if v_6 != nil {
+				wrapped_4[i_5] = lisette.MakeOptionSome[string](*v_6)
+			} else {
+				wrapped_4[i_5] = lisette.MakeOptionNone[string]()
+			}
+		}
+		result_3 = lisette.MakeResultOk[[]lisette.Option[string], error](wrapped_4)
+	}
+	if result_3.Tag == lisette.ResultOk {
+		for _, x := range result_3.OkVal {
+			if x.Tag == lisette.OptionSome {
+				fmt.Println(x.SomeVal)
+			} else {
+				fmt.Println("none")
+			}
+		}
+	} else {
+		_ = result_3.ErrVal
+	}
+}

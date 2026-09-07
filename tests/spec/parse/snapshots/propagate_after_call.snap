@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test() {\n  let data = load_data()?;\n}\n"
+description: |
+  
+  fn test() {
+    let data = load_data()?;
+  }
 ---
 [
     Function {
@@ -15,91 +19,88 @@ description: "input: \nfn test() {\n  let data = load_data()?;\n}\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Let {
-                    binding: Binding {
-                        pattern: Identifier {
-                            identifier: "data",
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 19,
-                                byte_length: 4,
+        body: Definition(
+            Block {
+                items: [
+                    Let {
+                        binding: Binding {
+                            pattern: Identifier {
+                                identifier: "data",
+                                span: Span {
+                                    file_id: 0,
+                                    byte_offset: 19,
+                                    byte_length: 4,
+                                },
+                            },
+                            annotation: None,
+                            ty: Var {
+                                id: uninferred,
                             },
                         },
-                        annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
-                    },
-                    value: Propagate {
-                        expression: Call {
-                            expression: Identifier {
-                                value: "load_data",
-                                ty: Variable(
-                                    -1,
-                                ),
+                        value: Propagate {
+                            expression: Call {
+                                expression: Identifier {
+                                    value: "load_data",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 26,
+                                        byte_length: 9,
+                                    },
+                                    resolution: Unresolved,
+                                },
+                                args: [],
+                                spread: None,
+                                type_arguments: None,
+                                ty: Var {
+                                    id: uninferred,
+                                },
                                 span: Span {
                                     file_id: 0,
                                     byte_offset: 26,
-                                    byte_length: 9,
+                                    byte_length: 11,
                                 },
-                                binding_id: None,
-                                qualified: None,
+                                call_kind: Unresolved,
                             },
-                            args: [],
-                            spread: None,
-                            type_args: [],
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                             span: Span {
                                 file_id: 0,
                                 byte_offset: 26,
-                                byte_length: 11,
+                                byte_length: 12,
                             },
                         },
-                        ty: Variable(
-                            -1,
-                        ),
+                        mode: Plain,
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 26,
-                            byte_length: 12,
+                            byte_offset: 15,
+                            byte_length: 23,
                         },
                     },
-                    mutable: false,
-                    mut_span: None,
-                    else_block: None,
-                    else_span: None,
-                    typed_pattern: None,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 15,
-                        byte_length: 23,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 30,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 30,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

@@ -1,190 +1,646 @@
-use crate::Emitter;
+use crate::Planner;
+use crate::Renderer;
+use crate::abi::callable::{CallableAbi, CallableReturnAbi, OptionReturnAbi, PayloadLayout};
+use crate::abi::coercion::{LayoutBridge, resolve_layout_bridge};
+use crate::abi::layout::{FunctionLayout, ValueLayout};
 use crate::control_flow::fallible::{
-    Fallible, FallibleEmitter, OPTION_SOME_TAG, PARTIAL_BOTH_CTOR, PARTIAL_ERR_TAG,
-    PARTIAL_OK_CTOR, PARTIAL_OK_TAG, RESULT_OK_TAG,
+    Fallible, FalliblePlanner, PARTIAL_BOTH_CTOR, PARTIAL_ERR_CTOR, PARTIAL_OK_CTOR,
 };
+use crate::control_flow::propagation::plain_return;
 use crate::is_order_sensitive;
 use crate::names::go_name;
-use crate::utils::optimize_region;
+use crate::plan::bodies::{ElseArm, IfPlan, LoweredBlock, LoweredStatement};
 use crate::write_line;
 use syntax::ast::Expression;
 use syntax::parse::TUPLE_FIELDS;
-use syntax::types::Type;
+use syntax::types::{FunctionParameter, Type};
 
-use super::GoCallStrategy;
+#[derive(Clone, Copy)]
+pub(crate) enum NilGuard {
+    /// Pointer ok-type: `ptr == nil`.
+    Pointer,
+    /// Non-error interface ok-type: `lisette.IsNilInterface(v)`.
+    Interface,
+}
 
-impl Emitter<'_> {
-    pub(super) fn emit_go_tuple_call_wrapped(
+impl NilGuard {
+    pub(crate) fn is_nil(self, var: &str) -> String {
+        match self {
+            NilGuard::Pointer => format!("{var} == nil"),
+            NilGuard::Interface => format!("lisette.IsNilInterface({var})"),
+        }
+    }
+
+    pub(crate) fn non_nil(self, var: &str) -> String {
+        match self {
+            NilGuard::Pointer => format!("{var} != nil"),
+            NilGuard::Interface => format!("!lisette.IsNilInterface({var})"),
+        }
+    }
+
+    pub(crate) fn is_interface(self) -> bool {
+        matches!(self, NilGuard::Interface)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WrapperTarget<'a> {
+    /// Allocate a fresh `var slot T` and write `slot = X` per branch.
+    FreshSlot,
+    /// Write `slot = X` per branch into the caller-provided slot name.
+    Slot(&'a str),
+    /// Emit `return X` per branch; caller skips its trailing return.
+    Return,
+}
+
+/// `Some(slot_name)` when the wrapper wrote into a fresh or named slot; `None`
+/// when it wrote a `return` statement and the caller should not emit its own.
+pub(crate) type WrapperOutcome = Option<String>;
+
+pub(super) enum ResolvedSink {
+    Slot(String),
+    Return,
+}
+
+/// `slot = value` (a `RawGo` leaf) or a structured `return value`.
+fn leaf_statement(sink: &ResolvedSink, value: &str) -> LoweredStatement {
+    match sink {
+        ResolvedSink::Slot(name) => LoweredStatement::RawGo(format!("{} = {}\n", name, value)),
+        ResolvedSink::Return => plain_return(value.to_string()),
+    }
+}
+
+/// A single-statement branch body for a wrapper-dispatch `If`.
+pub(super) fn leaf_block(sink: &ResolvedSink, value: &str) -> LoweredBlock {
+    LoweredBlock {
+        statements: vec![leaf_statement(sink, value)],
+    }
+}
+
+fn tuple_slots(layout: &ValueLayout) -> &[ValueLayout] {
+    match layout {
+        ValueLayout::Tuple { elements, .. } => elements,
+        ValueLayout::Named { underlying, .. } => tuple_slots(underlying),
+        _ => unreachable!("a tuple payload is a tuple layout"),
+    }
+}
+
+impl Planner<'_> {
+    pub(crate) fn plan_function_layout_bridge(
         &mut self,
-        output: &mut String,
-        call_expression: &Expression,
-        arity: usize,
+        statements: &mut Vec<LoweredStatement>,
+        value: &str,
+        source: &FunctionLayout,
+        target: &FunctionLayout,
     ) -> String {
-        let Expression::Call { ty, .. } = call_expression else {
-            unreachable!("emit_go_tuple_call_wrapped called with non-call expression");
+        debug_assert!(source.return_abi.same_logical_contract(&target.return_abi));
+        let function = self.hoist_tmp_value_statement(statements, "cb", value);
+        let mut body = Vec::new();
+        let mut parameters = Vec::new();
+        let mut arguments = Vec::new();
+
+        for (index, (source, target)) in
+            source.parameters.iter().zip(&target.parameters).enumerate()
+        {
+            let name = format!("arg{index}");
+            let target_type = target.go_type(self);
+            let target_type = self.use_rendered_go_type(target_type);
+            parameters.push(format!("{name} {target_type}"));
+            let bridge = resolve_layout_bridge(self, target, source);
+            let argument = self.plan_layout_bridge(&mut body, &name, &bridge);
+            if source.logical_type().get_name() == Some("VarArgs") {
+                arguments.push(format!("{argument}..."));
+            } else {
+                arguments.push(argument);
+            }
+        }
+
+        let call = format!("{function}({})", arguments.join(", "));
+        self.plan_function_result_bridge(&mut body, &call, source, target);
+        let body = Renderer.render_setup(&body);
+        let result = target
+            .result_go_type(self)
+            .map(|result| self.use_rendered_go_type(result));
+        let signature = match result {
+            Some(result) => format!("func({}) {result}", parameters.join(", ")),
+            None => format!("func({})", parameters.join(", ")),
         };
-
-        let call_str = self.emit_call(output, call_expression, None);
-
-        let temp_vars = self.create_temp_vars("ret", arity);
-
-        write_line!(output, "{} := {}", temp_vars.join(", "), call_str);
-
-        self.emit_tuple_from_vars(output, &temp_vars, ty)
+        format!("{signature} {{\n{body}}}")
     }
 
-    pub(super) fn emit_go_partial_call_wrapped(
+    fn plan_function_result_bridge(
         &mut self,
-        output: &mut String,
-        call_expression: &Expression,
-        partial_ty: &Type,
-    ) -> String {
-        self.flags.needs_stdlib = true;
+        statements: &mut Vec<LoweredStatement>,
+        call: &str,
+        source: &FunctionLayout,
+        target: &FunctionLayout,
+    ) {
+        match &source.return_abi {
+            CallableReturnAbi::Tagged | CallableReturnAbi::Direct => {
+                if source.result.logical_type().is_unit() {
+                    statements.push(LoweredStatement::RawGo(format!("{call}\n")));
+                    return;
+                }
+                let bridge = resolve_layout_bridge(self, &source.result, &target.result);
+                let value = self.plan_layout_bridge(statements, call, &bridge);
+                statements.push(plain_return(value));
+            }
+            CallableReturnAbi::BareError => statements.push(plain_return(call.to_string())),
+            CallableReturnAbi::Result { .. }
+            | CallableReturnAbi::Partial { .. }
+            | CallableReturnAbi::Option(OptionReturnAbi::CommaOk { .. }) => {
+                let source_payload = source
+                    .payload
+                    .as_deref()
+                    .expect("lowered callable has a payload layout");
+                let target_payload = target
+                    .payload
+                    .as_deref()
+                    .expect("lowered callable target has a payload layout");
+                let source_flat = source.return_abi.has_flattened_payload();
+                let slot_count = if source_flat {
+                    tuple_slots(source_payload).len()
+                } else {
+                    1
+                };
+                let mut values = self.create_temp_vars("ret", slot_count + 1);
+                statements.push(LoweredStatement::RawGo(format!(
+                    "{} := {call}\n",
+                    values.join(", ")
+                )));
+                let auxiliary = values.pop().expect("a lowered callable has a status slot");
 
-        let call_str = self.emit_call(output, call_expression, None);
-        self.emit_partial_wrapping(output, &call_str, partial_ty)
+                if matches!(source.return_abi, CallableReturnAbi::Partial { .. }) && !source_flat {
+                    let ok_type = source.result.logical_type().ok_type();
+                    if let Some(condition) = self.partial_ok_nil_check(&ok_type, &values[0]) {
+                        statements.push(LoweredStatement::If(IfPlan {
+                            condition_setup: Vec::new(),
+                            condition,
+                            then_body: LoweredBlock {
+                                statements: vec![plain_return(format!("nil, {auxiliary}"))],
+                            },
+                            else_arm: ElseArm::None,
+                        }));
+                    }
+                }
+
+                let mut values = self.bridge_payload_slots(
+                    statements,
+                    values,
+                    source_payload,
+                    target_payload,
+                    target.return_abi.has_flattened_payload(),
+                );
+                values.push(auxiliary);
+                statements.push(plain_return(values.join(", ")));
+            }
+            CallableReturnAbi::Option(OptionReturnAbi::Nullable) => {
+                let raw = self.hoist_tmp_value_statement(statements, "raw", call);
+                let condition = if self.is_interface_option(source.result.logical_type()) {
+                    self.require_stdlib();
+                    format!("lisette.IsNilInterface({raw})")
+                } else {
+                    format!("{raw} == nil")
+                };
+                statements.push(LoweredStatement::If(IfPlan {
+                    condition_setup: Vec::new(),
+                    condition,
+                    then_body: LoweredBlock {
+                        statements: vec![plain_return("nil".to_string())],
+                    },
+                    else_arm: ElseArm::None,
+                }));
+                let source_payload = source
+                    .payload
+                    .as_deref()
+                    .expect("nullable option callable has a payload layout");
+                let target_payload = target
+                    .payload
+                    .as_deref()
+                    .expect("nullable option target has a payload layout");
+                let bridge = resolve_layout_bridge(self, source_payload, target_payload);
+                let value = self.plan_layout_bridge(statements, &raw, &bridge);
+                statements.push(plain_return(value));
+            }
+            CallableReturnAbi::Option(OptionReturnAbi::Sentinel(_)) => {
+                statements.push(plain_return(call.to_string()))
+            }
+            CallableReturnAbi::Tuple { arity } => {
+                let values = self.create_temp_vars("ret", *arity);
+                statements.push(LoweredStatement::RawGo(format!(
+                    "{} := {call}\n",
+                    values.join(", ")
+                )));
+                let (
+                    ValueLayout::Tuple {
+                        elements: source, ..
+                    },
+                    ValueLayout::Tuple {
+                        elements: target, ..
+                    },
+                ) = (source.result.as_ref(), target.result.as_ref())
+                else {
+                    statements.push(plain_return(values.join(", ")));
+                    return;
+                };
+                let values = values
+                    .into_iter()
+                    .zip(source.iter().zip(target))
+                    .map(|(value, (source, target))| {
+                        let bridge = resolve_layout_bridge(self, source, target);
+                        self.plan_layout_bridge(statements, &value, &bridge)
+                    })
+                    .collect::<Vec<_>>();
+                statements.push(plain_return(values.join(", ")));
+            }
+        }
     }
 
-    pub(super) fn emit_partial_wrapping(
+    /// `values` holds one Go value per source slot: the packed payload, or one
+    /// value per tuple element when the source is flattened.
+    fn bridge_payload_slots(
         &mut self,
-        output: &mut String,
+        statements: &mut Vec<LoweredStatement>,
+        values: Vec<String>,
+        source: &ValueLayout,
+        target: &ValueLayout,
+        target_flat: bool,
+    ) -> Vec<String> {
+        let source_flat = values.len() > 1;
+        if !source_flat && !target_flat {
+            let bridge = resolve_layout_bridge(self, source, target);
+            return vec![self.plan_layout_bridge(statements, &values[0], &bridge)];
+        }
+        let source_slots = tuple_slots(source);
+        let target_slots = tuple_slots(target);
+        let elements: Vec<String> = if source_flat {
+            values
+        } else {
+            (0..source_slots.len())
+                .map(|index| format!("{}.{}", values[0], TUPLE_FIELDS[index]))
+                .collect()
+        };
+        let bridged: Vec<String> = elements
+            .into_iter()
+            .zip(source_slots.iter().zip(target_slots))
+            .map(|(value, (source, target))| {
+                let bridge = resolve_layout_bridge(self, source, target);
+                self.plan_layout_bridge(statements, &value, &bridge)
+            })
+            .collect();
+        if target_flat {
+            bridged
+        } else {
+            vec![self.plan_tuple_from_vars(statements, &bridged, target.logical_type())]
+        }
+    }
+
+    /// Prepare a wrapper sink: declare `var slot T` (slot targets) or route
+    /// writes to `return`.
+    pub(super) fn push_wrapper_slot(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        target: WrapperTarget<'_>,
+        type_str: &str,
+        name_hint: &'static str,
+    ) -> (ResolvedSink, WrapperOutcome) {
+        match target {
+            WrapperTarget::FreshSlot => {
+                let var = self.fresh_var(Some(name_hint));
+                self.declare(&var);
+                statements.push(LoweredStatement::VarDecl {
+                    name: var.clone(),
+                    go_type: type_str.to_string(),
+                    value: None,
+                });
+                (ResolvedSink::Slot(var.clone()), Some(var))
+            }
+            WrapperTarget::Slot(name) => {
+                statements.push(LoweredStatement::VarDecl {
+                    name: name.to_string(),
+                    go_type: type_str.to_string(),
+                    value: None,
+                });
+                self.declare(name);
+                let owned = name.to_string();
+                (ResolvedSink::Slot(owned.clone()), Some(owned))
+            }
+            WrapperTarget::Return => (ResolvedSink::Return, None),
+        }
+    }
+
+    fn push_go_returns(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        call_str: &str,
+        ok_ty: &Type,
+        layout: PayloadLayout,
+    ) -> (String, String) {
+        let mut buffer = String::new();
+        let result = self.extract_go_returns(&mut buffer, call_str, ok_ty, layout);
+        if !buffer.is_empty() {
+            statements.push(LoweredStatement::RawGo(buffer));
+        }
+        result
+    }
+
+    /// Single-leaf write for wrappers that fold to one constructor expression.
+    pub(super) fn push_simple_wrapper_value(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        target: WrapperTarget<'_>,
+        name_hint: &'static str,
+        value_expr: &str,
+    ) -> WrapperOutcome {
+        match target {
+            WrapperTarget::FreshSlot => {
+                Some(self.hoist_tmp_value_statement(statements, name_hint, value_expr))
+            }
+            WrapperTarget::Slot(name) => {
+                self.declare(name);
+                statements.push(LoweredStatement::RawGo(format!(
+                    "{} := {}\n",
+                    name, value_expr
+                )));
+                Some(name.to_string())
+            }
+            WrapperTarget::Return => {
+                statements.push(plain_return(value_expr.to_string()));
+                None
+            }
+        }
+    }
+}
+
+impl Planner<'_> {
+    /// Lower a `(T, error)` Go return into a tagged `Partial`.
+    pub(crate) fn lower_partial_wrapping(
+        &mut self,
         call_str: &str,
         partial_ty: &Type,
-    ) -> String {
+        layout: PayloadLayout,
+        payload_bridge: Option<&LayoutBridge>,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
         let ok_ty = partial_ty.ok_type();
         let err_ty = partial_ty.err_type();
-        let ok_ty_str = self.go_type_as_string(&ok_ty);
-        let err_ty_str = self.go_type_as_string(&err_ty);
+        let ok_ty_str = self.use_go_type(&ok_ty);
+        let err_ty_str = self.use_go_type(&err_ty);
         let pkg = go_name::GO_STDLIB_PKG;
 
-        let (err_var, val_var) = self.extract_go_returns(output, call_str, &ok_ty);
+        let mut statements = Vec::new();
+        let (err_var, val_var) = self.push_go_returns(&mut statements, call_str, &ok_ty, layout);
+        let nil_check = self.partial_ok_nil_check(&ok_ty, &val_var);
 
         let type_params = format!("{}, {}", ok_ty_str, err_ty_str);
         let result_ty_str = format!("{pkg}.Partial[{type_params}]");
-        let result_var = self.fresh_var(Some("result"));
-        self.declare(&result_var);
+        let (sink, outcome) =
+            self.push_wrapper_slot(&mut statements, target, &result_ty_str, "result");
 
-        write_line!(output, "var {} {}", result_var, result_ty_str);
-        write_line!(output, "if {} != nil {{", err_var);
-        write_line!(
-            output,
-            "{} = {PARTIAL_BOTH_CTOR}[{type_params}]({}, {})",
-            result_var,
-            val_var,
-            err_var
-        );
-        output.push_str("} else {\n");
-        write_line!(
-            output,
-            "{} = {PARTIAL_OK_CTOR}[{type_params}]({})",
-            result_var,
-            val_var
-        );
-        output.push_str("}\n");
+        let (mut both_setup, both_value) =
+            self.plan_optional_payload_bridge(&val_var, payload_bridge);
+        let both = format!("{PARTIAL_BOTH_CTOR}[{type_params}]({both_value}, {err_var})");
+        both_setup.push(leaf_statement(&sink, &both));
+        let both_body = LoweredBlock {
+            statements: both_setup,
+        };
 
-        result_var
+        let (mut ok_setup, ok_value) = self.plan_optional_payload_bridge(&val_var, payload_bridge);
+        ok_setup.push(leaf_statement(
+            &sink,
+            &format!("{PARTIAL_OK_CTOR}[{type_params}]({ok_value})"),
+        ));
+        let ok_body = LoweredBlock {
+            statements: ok_setup,
+        };
+
+        let then_body = if let Some(check) = &nil_check {
+            let inner = IfPlan {
+                condition_setup: Vec::new(),
+                condition: check.clone(),
+                then_body: leaf_block(
+                    &sink,
+                    &format!("{PARTIAL_ERR_CTOR}[{type_params}]({err_var})"),
+                ),
+                else_arm: ElseArm::from_body(both_body, false),
+            };
+            LoweredBlock {
+                statements: vec![LoweredStatement::If(inner)],
+            }
+        } else {
+            both_body
+        };
+
+        let else_arm = ElseArm::from_body(ok_body, false);
+
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition: format!("{} != nil", err_var),
+            then_body,
+            else_arm,
+        }));
+        (statements, outcome)
     }
 
-    pub(super) fn emit_go_result_call_wrapped(
-        &mut self,
-        output: &mut String,
-        call_expression: &Expression,
-        result_ty: &Type,
-    ) -> String {
-        self.flags.needs_stdlib = true;
-
-        let call_str = self.emit_call(output, call_expression, None);
-        self.emit_result_wrapping(output, &call_str, result_ty)
+    /// Whether a `Partial` ok value can be Go nil, which makes the bare `Err`
+    /// variant reachable (a nil value alongside a non-nil error).
+    pub(crate) fn partial_ok_is_nilable(&self, ok_ty: &Type) -> bool {
+        let peeled = self.facts.peel_alias(ok_ty);
+        self.facts.is_nilable_go_type(ok_ty) || peeled.is_slice()
     }
 
-    pub(super) fn emit_result_wrapping(
+    pub(crate) fn partial_ok_nil_guard(&self, ok_ty: &Type) -> Option<NilGuard> {
+        self.partial_ok_is_nilable(ok_ty).then(|| {
+            if self.facts.as_interface(ok_ty).is_some() {
+                NilGuard::Interface
+            } else {
+                NilGuard::Pointer
+            }
+        })
+    }
+
+    pub(crate) fn partial_ok_nil_check(&mut self, ok_ty: &Type, val: &str) -> Option<String> {
+        let guard = self.partial_ok_nil_guard(ok_ty)?;
+        if guard.is_interface() {
+            self.require_stdlib();
+        }
+        Some(guard.is_nil(val))
+    }
+
+    fn go_result_needs_nil_guard(&self, ok_ty: &Type) -> bool {
+        ok_ty.is_ref()
+            || self
+                .facts
+                .as_interface(ok_ty)
+                .as_deref()
+                .is_some_and(|id| id != go_name::PRELUDE_ERROR_ID)
+    }
+
+    pub(crate) fn result_nil_guard(&self, ok_ty: &Type) -> Option<NilGuard> {
+        if !self.go_result_needs_nil_guard(ok_ty) {
+            return None;
+        }
+        Some(if self.facts.is_interface(ok_ty) {
+            NilGuard::Interface
+        } else {
+            NilGuard::Pointer
+        })
+    }
+
+    /// Lower a `(T, error)` Go return into a tagged `Result`.
+    pub(crate) fn lower_result_wrapping(
         &mut self,
-        output: &mut String,
         call_str: &str,
         result_ty: &Type,
-    ) -> String {
+        layout: PayloadLayout,
+        payload_bridge: Option<&LayoutBridge>,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
         let fallible = Fallible::from_type(result_ty).expect("Result type expected");
+        debug_assert!(!fallible.ok_ty().is_unit());
 
-        if fallible.ok_ty().is_unit() {
-            return self.emit_unit_result_wrapping(output, call_str, &fallible);
-        }
-
+        let mut statements = Vec::new();
         let ok_ty = fallible.ok_ty();
-        let (err_var, ok_val) = self.extract_go_returns(output, call_str, ok_ty);
+        let (err_var, ok_val) = self.push_go_returns(&mut statements, call_str, ok_ty, layout);
 
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let result_ty_str = fe.full_type_string();
-        let result_var = fe.emitter.fresh_var(Some("result"));
-        fe.emitter.declare(&result_var);
+        let result_ty_str = {
+            let mut fe = FalliblePlanner::new(self, &fallible);
+            fe.full_type_string()
+        };
 
-        let needs_nil_guard = ok_ty.is_ref() || self.as_interface(ok_ty).is_some();
+        let needs_nil_guard = self.go_result_needs_nil_guard(ok_ty);
 
-        write_line!(output, "var {} {}", result_var, result_ty_str);
-        write_line!(output, "if {} != nil {{", err_var);
+        let (sink, outcome) =
+            self.push_wrapper_slot(&mut statements, target, &result_ty_str, "result");
 
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let err_wrapper = fe.emit_failure(Some(&err_var));
-        write_line!(output, "{} = {}", result_var, err_wrapper);
+        let (mut ok_setup, ok_value) = self.plan_optional_payload_bridge(&ok_val, payload_bridge);
+        let ok_wrapper = {
+            let mut fe = FalliblePlanner::new(self, &fallible);
+            fe.emit_success(&ok_value)
+        };
+        ok_setup.push(leaf_statement(&sink, &ok_wrapper));
+        let ok_body = LoweredBlock {
+            statements: ok_setup,
+        };
 
-        if needs_nil_guard {
-            self.emit_nil_guard(output, &ok_val, ok_ty, &result_var, &fallible);
-        }
+        let err_wrapper = {
+            let mut fe = FalliblePlanner::new(self, &fallible);
+            fe.emit_failure(Some(&err_var))
+        };
+        let then_body = leaf_block(&sink, &err_wrapper);
 
-        output.push_str("} else {\n");
+        let else_arm = if needs_nil_guard {
+            let nil_check = if ok_ty.is_tuple() {
+                format!("{}.First", ok_val)
+            } else {
+                ok_val.clone()
+            };
+            let nil_condition = if self.facts.is_interface(ok_ty) {
+                format!("lisette.IsNilInterface({})", nil_check)
+            } else {
+                format!("{} == nil", nil_check)
+            };
+            self.require_errors();
+            let nil_err = {
+                let mut fe = FalliblePlanner::new(self, &fallible);
+                fe.emit_failure(Some("errors.New(\"unexpected nil\")"))
+            };
+            ElseArm::ElseIf(Box::new(IfPlan {
+                condition_setup: Vec::new(),
+                condition: nil_condition,
+                then_body: leaf_block(&sink, &nil_err),
+                else_arm: ElseArm::from_body(ok_body, false),
+            }))
+        } else {
+            ElseArm::from_body(ok_body, false)
+        };
 
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let ok_wrapper = fe.emit_success(&ok_val);
-        write_line!(output, "{} = {}", result_var, ok_wrapper);
-
-        output.push_str("}\n");
-
-        result_var
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition: format!("{} != nil", err_var),
+            then_body,
+            else_arm,
+        }));
+        (statements, outcome)
     }
 
-    fn emit_unit_result_wrapping(
+    /// Lower a bare `error` Go return into a tagged `Result<(), E>`.
+    pub(crate) fn lower_bare_error_wrapping(
         &mut self,
-        output: &mut String,
+        call_str: &str,
+        result_ty: &Type,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
+        let fallible = Fallible::from_type(result_ty).expect("Result type expected");
+        debug_assert!(fallible.ok_ty().is_unit());
+        self.lower_unit_result_wrapping(call_str, &fallible, target)
+    }
+
+    fn plan_optional_payload_bridge(
+        &mut self,
+        value: &str,
+        bridge: Option<&LayoutBridge>,
+    ) -> (Vec<LoweredStatement>, String) {
+        let mut statements = Vec::new();
+        let value = bridge.map_or_else(
+            || value.to_string(),
+            |bridge| self.plan_layout_bridge(&mut statements, value, bridge),
+        );
+        (statements, value)
+    }
+
+    fn lower_unit_result_wrapping(
+        &mut self,
         call_str: &str,
         fallible: &Fallible,
-    ) -> String {
-        let err_var = self.fresh_var(Some("ret"));
-        self.declare(&err_var);
-        write_line!(output, "{} := {}", err_var, call_str);
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
+        let mut statements = Vec::new();
+        let err_var = self.hoist_tmp_value_statement(&mut statements, "ret", call_str);
 
-        let mut fe = FallibleEmitter::new(self, fallible);
-        let result_ty_str = fe.full_type_string();
-        let result_var = fe.emitter.fresh_var(Some("result"));
-        fe.emitter.declare(&result_var);
+        let result_ty_str = {
+            let mut fe = FalliblePlanner::new(self, fallible);
+            fe.full_type_string()
+        };
 
-        write_line!(output, "var {} {}", result_var, result_ty_str);
-        write_line!(output, "if {} != nil {{", err_var);
+        let (sink, outcome) =
+            self.push_wrapper_slot(&mut statements, target, &result_ty_str, "result");
 
-        let mut fe = FallibleEmitter::new(self, fallible);
-        let err_wrapper = fe.emit_failure(Some(&err_var));
-        write_line!(output, "{} = {}", result_var, err_wrapper);
+        let err_wrapper = {
+            let mut fe = FalliblePlanner::new(self, fallible);
+            fe.emit_failure(Some(&err_var))
+        };
+        let then_body = leaf_block(&sink, &err_wrapper);
 
-        output.push_str("} else {\n");
+        let ok_wrapper = {
+            let mut fe = FalliblePlanner::new(self, fallible);
+            fe.emit_success("struct{}{}")
+        };
+        let else_arm = ElseArm::from_body(leaf_block(&sink, &ok_wrapper), false);
 
-        let mut fe = FallibleEmitter::new(self, fallible);
-        let ok_wrapper = fe.emit_success("struct{}{}");
-        write_line!(output, "{} = {}", result_var, ok_wrapper);
-
-        output.push_str("}\n");
-
-        result_var
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition: format!("{} != nil", err_var),
+            then_body,
+            else_arm,
+        }));
+        (statements, outcome)
     }
 
-    /// Destructure a Go multi-return call into error and value variables.
-    ///
-    /// For tuple ok types, creates N+1 temp variables and rebuilds the Lisette tuple.
-    /// For non-tuple ok types, creates 2 temp variables (value, error).
+    /// Destructure a Go multi-return into error and value temps. A `Flattened`
+    /// tuple ok type (Go-imported `(T1, ..., Tn, error)`) gets N+1 temps and a
+    /// rebuilt Lisette tuple; a `Packed` one (Lisette `(Tuple_n[...], error)`)
+    /// gets 2 temps like any other ok type.
     fn extract_go_returns(
         &mut self,
         output: &mut String,
         call_str: &str,
         ok_ty: &Type,
+        layout: PayloadLayout,
     ) -> (String, String) {
-        if let Type::Tuple(elements) = ok_ty {
+        if layout.is_flattened()
+            && let Type::Tuple(elements) = ok_ty
+        {
             let tuple_arity = elements.len();
             let temp_vars = self.create_temp_vars("ret", tuple_arity + 1);
             write_line!(output, "{} := {}", temp_vars.join(", "), call_str);
@@ -200,118 +656,42 @@ impl Emitter<'_> {
         }
     }
 
-    fn emit_nil_guard(
+    fn hoist_go_fn_if_needed(
         &mut self,
-        output: &mut String,
-        ok_val: &str,
-        ok_ty: &Type,
-        result_var: &str,
-        fallible: &Fallible,
-    ) {
-        let nil_check = if ok_ty.is_tuple() {
-            format!("{}.First", ok_val)
-        } else {
-            ok_val.to_string()
-        };
+        setup: &mut Vec<LoweredStatement>,
+        expression: &Expression,
+    ) -> String {
+        let go_fn_str = self.capture_operand_into(setup, expression);
 
-        let is_interface = self.as_interface(ok_ty).is_some();
-        if is_interface {
-            write_line!(
-                output,
-                "}} else if lisette.IsNilInterface({}) {{",
-                nil_check
-            );
-        } else {
-            write_line!(output, "}} else if {} == nil {{", nil_check);
-        }
-
-        self.flags.needs_errors = true;
-        let mut fe = FallibleEmitter::new(self, fallible);
-        let nil_err = fe.emit_failure(Some("errors.New(\"unexpected nil\")"));
-        write_line!(output, "{} = {}", result_var, nil_err);
-    }
-
-    pub(crate) fn classify_go_fn_value(&self, expression: &Expression) -> Option<GoCallStrategy> {
-        let inner = expression.unwrap_parens();
-
-        if let Expression::DotAccess {
-            expression: receiver,
-            ..
-        } = inner
-            && Self::is_go_receiver(receiver)
-        {
-            let fn_type = expression.get_type().resolve();
-            let Type::Function { return_type, .. } = fn_type else {
-                return None;
-            };
-
-            let go_hints = if let Expression::DotAccess {
-                expression: receiver_expression,
-                member,
-                ..
-            } = inner
-            {
-                self.go_qualified_name(receiver_expression, member)
-                    .and_then(|name| self.ctx.definitions.get(name.as_str()))
-                    .map(|d| d.go_hints().to_vec())
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            };
-
-            return self.classify_go_return_type(&return_type, &go_hints);
-        }
-
-        None
-    }
-
-    pub(crate) fn is_go_array_return_value(&self, expression: &Expression) -> bool {
-        if let Expression::DotAccess {
-            expression: receiver,
-            member,
-            ..
-        } = expression.unwrap_parens()
-            && Self::is_go_receiver(receiver)
-        {
-            return self.has_go_array_return(receiver, member);
-        }
-        false
-    }
-
-    fn hoist_go_fn_if_needed(&mut self, output: &mut String, expression: &Expression) -> String {
-        let go_fn_str = self.emit_operand(output, expression);
-
-        let is_go_module_fn = matches!(
+        let is_go_package_fn = matches!(
             expression.unwrap_parens(),
             Expression::DotAccess { expression, .. }
-            if matches!(
-                expression.get_type(),
-                Type::Constructor { ref id, .. } if id.starts_with(go_name::IMPORT_GO_PREFIX)
-            )
+            if expression.get_type().as_import_namespace()
+                .is_some_and(|m| m.starts_with(go_name::GO_IMPORT_PREFIX))
         );
-        if is_go_module_fn {
+        if is_go_package_fn {
             return go_fn_str;
         }
 
         if is_order_sensitive(expression) {
-            let temp = self.fresh_var(Some("fn"));
-            self.declare(&temp);
-            write_line!(output, "{} := {}", temp, go_fn_str);
-            temp
+            self.hoist_tmp_value_statement(setup, "fn", &go_fn_str)
         } else {
             go_fn_str
         }
     }
 
-    fn build_wrapper_params(&mut self, params: &[Type]) -> (Vec<String>, Vec<String>) {
+    pub(crate) fn build_wrapper_params(
+        &mut self,
+        params: &[FunctionParameter],
+    ) -> (Vec<String>, Vec<String>) {
         let mut param_strs = Vec::new();
         let mut arg_names = Vec::new();
-        let last_idx = params.len().saturating_sub(1);
-        for (i, param_ty) in params.iter().enumerate() {
+        let last_index = params.len().saturating_sub(1);
+        for (i, param) in params.iter().enumerate() {
             let name = format!("arg{}", i);
-            let ty_str = self.go_type_as_string(param_ty);
+            let ty_str = self.use_go_type(&param.ty);
             param_strs.push(format!("{} {}", name, ty_str));
-            if i == last_idx && param_ty.get_name() == Some("VarArgs") {
+            if i == last_index && param.ty.get_name() == Some("VarArgs") {
                 arg_names.push(format!("{}...", name));
             } else {
                 arg_names.push(name);
@@ -320,88 +700,68 @@ impl Emitter<'_> {
         (param_strs, arg_names)
     }
 
-    pub(crate) fn emit_array_return_wrapper(
+    /// Common wrapper-builder prologue: returns `(return_type, param_strs,
+    /// call_str)` for a go-fn expression, or `None` for non-function types.
+    fn wrapper_call_parts(
         &mut self,
-        output: &mut String,
+        setup: &mut Vec<LoweredStatement>,
         expression: &Expression,
-    ) -> String {
-        let fn_type = expression.get_type().resolve();
-        let (params, return_type) = match fn_type {
-            Type::Function {
-                params,
-                return_type,
-                ..
-            } => (params, *return_type),
-            _ => return self.emit_operand(output, expression),
-        };
-
-        let go_fn_str = self.hoist_go_fn_if_needed(output, expression);
+    ) -> Option<(Type, Vec<String>, String)> {
+        let fn_type = expression.get_type();
+        let f = fn_type.as_function_type()?;
+        let (params, return_type) = (f.params.clone(), (*f.return_type).clone());
+        let go_fn_str = self.hoist_go_fn_if_needed(setup, expression);
         let (param_strs, arg_names) = self.build_wrapper_params(&params);
-
-        let ret_ty_str = self.go_type_as_string(&return_type);
         let call_str = format!("{}({})", go_fn_str, arg_names.join(", "));
-
-        let arr_var = self.fresh_var(Some("arr"));
-        self.declare(&arr_var);
-
-        format!(
-            "func({}) {} {{\n{} := {}\nreturn {}[:]\n}}",
-            param_strs.join(", "),
-            ret_ty_str,
-            arr_var,
-            call_str,
-            arr_var,
-        )
+        Some((return_type, param_strs, call_str))
     }
 
     pub(crate) fn emit_go_fn_wrapper(
         &mut self,
-        output: &mut String,
+        setup: &mut Vec<LoweredStatement>,
         expression: &Expression,
-        strategy: &GoCallStrategy,
+        abi: &CallableAbi,
     ) -> String {
-        self.flags.needs_stdlib = true;
+        self.require_stdlib();
 
-        let fn_type = expression.get_type().resolve();
-        let (params, return_type) = match fn_type {
-            Type::Function {
-                params,
-                return_type,
-                ..
-            } => (params, *return_type),
-            _ => unreachable!("expected function type"),
-        };
+        let (return_type, param_strs, call_str) = self
+            .wrapper_call_parts(setup, expression)
+            .expect("expected function type");
 
-        let go_fn_str = self.hoist_go_fn_if_needed(output, expression);
-        let (param_strs, arg_names) = self.build_wrapper_params(&params);
+        let ret_ty_str = self.use_go_type(&return_type);
 
-        let ret_ty_str = self.go_type_as_string(&return_type);
-        let call_str = format!("{}({})", go_fn_str, arg_names.join(", "));
-
-        let mut body = String::new();
-        let result_var = match strategy {
-            GoCallStrategy::Result => self.emit_result_wrapping(&mut body, &call_str, &return_type),
-            GoCallStrategy::CommaOk => {
-                self.emit_comma_ok_wrapping(&mut body, &call_str, &return_type)
+        let mut statements = Vec::new();
+        let outcome = match &abi.result {
+            CallableReturnAbi::Tagged | CallableReturnAbi::Direct => {
+                unreachable!("passthrough Go function needs no wrapper")
             }
-            GoCallStrategy::NullableReturn => {
-                let raw_var = self.fresh_var(Some("raw"));
-                self.declare(&raw_var);
-                write_line!(body, "{} := {}", raw_var, call_str);
-                self.emit_nil_check_option_wrap(&mut body, &raw_var, &return_type)
-            }
-            GoCallStrategy::Tuple { arity } => {
+            CallableReturnAbi::Tuple { arity } => {
                 let temp_vars = self.create_temp_vars("ret", *arity);
-                write_line!(body, "{} := {}", temp_vars.join(", "), call_str);
-                self.emit_tuple_from_vars(&mut body, &temp_vars, &return_type)
+                statements.push(LoweredStatement::RawGo(format!(
+                    "{} := {}\n",
+                    temp_vars.join(", "),
+                    call_str
+                )));
+                Some(self.plan_tuple_from_vars(&mut statements, &temp_vars, &return_type))
             }
-            GoCallStrategy::Partial => {
-                self.emit_partial_wrapping(&mut body, &call_str, &return_type)
+            result => {
+                let payload_bridge = self.go_return_payload_bridge(abi, &return_type);
+                let (wrap, outcome) = self.lower_abi_wrapping_with_payload_bridge(
+                    &call_str,
+                    result,
+                    &return_type,
+                    payload_bridge.as_ref(),
+                    WrapperTarget::Return,
+                );
+                statements.extend(wrap);
+                outcome
             }
         };
 
-        write_line!(body, "return {}", result_var);
-        optimize_region(&mut body, 0, Some(&result_var));
+        let mut body = Renderer.render_setup(&statements);
+        if let Some(result_var) = outcome {
+            write_line!(body, "return {}", result_var);
+        }
 
         format!(
             "func({}) {} {{\n{}}}",
@@ -411,200 +771,64 @@ impl Emitter<'_> {
         )
     }
 
-    pub(crate) fn emit_return_adapter(
+    /// Closure that bundles a raw `(T1, T2, error)` return into the slot's `(Tuple, error)` shape.
+    pub(crate) fn emit_go_fn_lowered_tuple_adapter(
         &mut self,
-        inner_call: &str,
-        lisette_return_type: &Type,
-    ) -> Option<(String, String)> {
-        let return_type = lisette_return_type.resolve();
-        self.flags.needs_stdlib = true;
-
-        if return_type.is_result() {
-            return Some(self.emit_result_return_adapter(inner_call, &return_type));
-        }
-        if return_type.is_partial() {
-            return Some(self.emit_partial_return_adapter(inner_call, &return_type));
-        }
-        if return_type.is_option() {
-            return Some(self.emit_option_return_adapter(inner_call, &return_type));
-        }
-        if return_type.tuple_arity().is_some_and(|n| n >= 2) {
-            return self.emit_tuple_return_adapter(inner_call, &return_type);
-        }
-        None
-    }
-
-    /// `Result<(), error>` → `error`; `Result<T, error>` → `(T, error)`.
-    fn emit_result_return_adapter(
-        &mut self,
-        inner_call: &str,
-        return_type: &Type,
-    ) -> (String, String) {
-        let ok_ty = return_type.ok_type();
-        let err_ty = return_type.err_type();
-        let err_ty_str = self.go_type_as_string(&err_ty);
-        let res = self.fresh_var(Some("res"));
-        self.declare(&res);
-
-        let mut b = format!("{res} := {inner_call}\n");
-        let ok_tag = RESULT_OK_TAG;
-        if ok_ty.is_unit() {
-            write_line!(
-                b,
-                "if {res}.Tag == {ok_tag} {{\nreturn nil\n}}\nreturn {res}.ErrVal"
-            );
-            return (err_ty_str, b);
-        }
-        let ok_ty_str = self.go_type_as_string(&ok_ty);
-        write_line!(
-            b,
-            "if {res}.Tag == {ok_tag} {{\nreturn {res}.OkVal, nil\n}}\n\
-             return *new({ok_ty_str}), {res}.ErrVal"
-        );
-        (format!("({ok_ty_str}, {err_ty_str})"), b)
-    }
-
-    /// `Partial<T, error>` → `(T, error)`, distinguishing Ok/Err/both branches.
-    fn emit_partial_return_adapter(
-        &mut self,
-        inner_call: &str,
-        return_type: &Type,
-    ) -> (String, String) {
-        let ok_ty = return_type.ok_type();
-        let err_ty = return_type.err_type();
-        let ok_ty_str = self.go_type_as_string(&ok_ty);
-        let err_ty_str = self.go_type_as_string(&err_ty);
-        let res = self.fresh_var(Some("res"));
-        self.declare(&res);
-
-        let b = format!(
-            "{res} := {inner_call}\n\
-             if {res}.Tag == {PARTIAL_OK_TAG} {{\nreturn {res}.OkVal, nil\n}}\n\
-             if {res}.Tag == {PARTIAL_ERR_TAG} {{\nreturn *new({ok_ty_str}), {res}.ErrVal\n}}\n\
-             return {res}.OkVal, {res}.ErrVal\n"
-        );
-        (format!("({ok_ty_str}, {err_ty_str})"), b)
-    }
-
-    /// `Option<fn>`/`Option<Ref<T>>`/`Option<Interface>` → bare nilable Go type
-    /// (collapsed because Go's nil already encodes absence). Other payloads use
-    /// the Go-idiomatic `(T, bool)` comma-ok convention.
-    fn emit_option_return_adapter(
-        &mut self,
-        inner_call: &str,
-        return_type: &Type,
-    ) -> (String, String) {
-        let inner = return_type.ok_type();
-        let some_tag = OPTION_SOME_TAG;
-        let opt = self.fresh_var(Some("opt"));
-        self.declare(&opt);
-
-        let is_nilable =
-            self.resolve_to_function_type(&inner).is_some() || self.is_nullable_option(return_type);
-        if is_nilable {
-            let go_ret = self.go_type_as_string(&inner);
-            let b = format!(
-                "{opt} := {inner_call}\n\
-                 if {opt}.Tag == {some_tag} {{\nreturn {opt}.SomeVal\n}}\n\
-                 return nil\n"
-            );
-            return (go_ret, b);
-        }
-
-        let inner_ty_str = self.go_type_as_string(&inner);
-        let b = format!(
-            "{opt} := {inner_call}\n\
-             if {opt}.Tag == {some_tag} {{\nreturn {opt}.SomeVal, true\n}}\n\
-             return *new({inner_ty_str}), false\n"
-        );
-        (format!("({inner_ty_str}, bool)"), b)
-    }
-
-    /// Arity-2+ tuple → Go multi-return. Each slot recurses through
-    /// `emit_return_adapter`, wrapping in an IIFE when the slot itself needs
-    /// adapter-style unwrapping. Returns `None` only if the resolved type
-    /// isn't actually a tuple/constructor shape.
-    fn emit_tuple_return_adapter(
-        &mut self,
-        inner_call: &str,
-        return_type: &Type,
-    ) -> Option<(String, String)> {
-        let tuple_params: Vec<Type> = match return_type {
-            Type::Tuple(elements) => elements.clone(),
-            Type::Constructor { params, .. } => params.clone(),
-            _ => return None,
-        };
-        let arity = tuple_params.len();
-        let tup = self.fresh_var(Some("tup"));
-        self.declare(&tup);
-
-        let mut body = format!("{tup} := {inner_call}\n");
-        let mut ret_types: Vec<String> = Vec::with_capacity(arity);
-        let mut field_exprs: Vec<String> = Vec::with_capacity(arity);
-
-        for (i, slot_ty) in tuple_params.iter().enumerate() {
-            let raw_field = format!("{tup}.{}", TUPLE_FIELDS[i]);
-            match self.emit_return_adapter(&raw_field, slot_ty) {
-                Some((inner_ret, inner_body)) => {
-                    let sub = self.fresh_var(Some("sub"));
-                    self.declare(&sub);
-                    body.push_str(&format!(
-                        "{sub} := func() {inner_ret} {{\n{inner_body}}}()\n"
-                    ));
-                    field_exprs.push(sub);
-                    ret_types.push(inner_ret);
-                }
-                None => {
-                    ret_types.push(self.go_type_as_string(slot_ty));
-                    field_exprs.push(raw_field);
-                }
-            }
-        }
-
-        body.push_str(&format!("return {}\n", field_exprs.join(", ")));
-        Some((format!("({})", ret_types.join(", ")), body))
-    }
-
-    pub(crate) fn emit_lisette_callback_wrapper(
-        &mut self,
-        output: &mut String,
-        fn_value: &str,
-        fn_type: &Type,
+        setup: &mut Vec<LoweredStatement>,
+        expression: &Expression,
     ) -> String {
-        let Type::Function {
-            params,
-            return_type,
-            ..
-        } = fn_type
-        else {
-            return fn_value.to_string();
-        };
+        self.require_stdlib();
 
-        let return_type = return_type.resolve();
+        let (return_type, param_strs, call_str) = self
+            .wrapper_call_parts(setup, expression)
+            .expect("expected function type");
 
-        let (param_strs, arg_names) = self.build_wrapper_params(params);
-        let params_str = param_strs.join(", ");
+        let ok_ty = return_type.ok_type();
+        let err_ty = return_type.err_type();
+        let ret_ty_str = format!(
+            "({}, {})",
+            self.use_go_type(&ok_ty),
+            self.use_go_type(&err_ty)
+        );
+        let arity = ok_ty.tuple_arity().expect("tuple ok type");
 
-        let cb_var = self.fresh_var(Some("cb"));
-        self.declare(&cb_var);
-        write_line!(output, "{} := {}", cb_var, fn_value);
+        let mut body = String::new();
+        let temp_vars = self.create_temp_vars("ret", arity + 1);
+        write_line!(body, "{} := {}", temp_vars.join(", "), call_str);
+        let tuple_str = self.emit_tuple_from_vars(&mut body, &temp_vars[..arity], &ok_ty);
+        write_line!(body, "return {}, {}", tuple_str, temp_vars[arity]);
 
-        let call_str = format!("{}({})", cb_var, arg_names.join(", "));
+        format!(
+            "func({}) {} {{\n{}}}",
+            param_strs.join(", "),
+            ret_ty_str,
+            body
+        )
+    }
 
-        // Option<fn> adaptation only fires in interface-method shims. Here
-        // a closure-valued Option means the caller owns the nil check.
-        if let Type::Constructor { id, params: ps, .. } = &return_type
-            && id == "Option"
-            && let Some(inner) = ps.first()
-            && matches!(inner.resolve(), Type::Function { .. })
-        {
-            return fn_value.to_string();
-        }
+    pub(crate) fn emit_go_fn_sentinel_adapter(
+        &mut self,
+        setup: &mut Vec<LoweredStatement>,
+        expression: &Expression,
+        sentinel: i64,
+    ) -> String {
+        let (return_type, param_strs, call_str) = self
+            .wrapper_call_parts(setup, expression)
+            .expect("expected function type");
 
-        let Some((go_ret, body)) = self.emit_return_adapter(&call_str, &return_type) else {
-            return fn_value.to_string();
-        };
+        let inner_ty_str = self.use_go_type(&return_type.ok_type());
+        let ret_var = self.fresh_var(Some("ret"));
+        self.declare(&ret_var);
 
-        format!("func({params_str}) {go_ret} {{\n{body}}}")
+        let mut body = String::new();
+        write_line!(body, "{} := {}", ret_var, call_str);
+        write_line!(body, "return {}, {} != {}", ret_var, ret_var, sentinel);
+
+        format!(
+            "func({}) ({}, bool) {{\n{}}}",
+            param_strs.join(", "),
+            inner_ty_str,
+            body
+        )
     }
 }

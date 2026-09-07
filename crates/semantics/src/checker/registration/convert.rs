@@ -1,14 +1,205 @@
-use rustc_hash::FxHashMap as HashMap;
-
+use crate::checker::EnvResolve;
+use crate::checker::infer::BuiltinBound;
+use crate::checker::infer::expressions::comparison::{
+    check_never_comparable, check_never_comparable_with_bounds, check_not_comparable_with_bounds,
+};
+use std::mem;
 use syntax::EcoString;
-use syntax::ast::{Annotation, Generic, Span};
-use syntax::program::Definition;
-use syntax::types::{SubstitutionMap, Type, substitute};
+use syntax::ast::{Annotation, Generic, Span, VariantFields};
+use syntax::program::{AliasKind, ConstantValue, DefinitionBody};
+use syntax::types::{
+    FunctionParameter, SimpleKind, Symbol, Type, build_named_substitution_map, substitute,
+    unqualified_name,
+};
 
-use crate::checker::Checker;
+use crate::checker::TaskState;
+use crate::checker::scopes::DeferredMapKeyCheck;
+use crate::checker::state::PendingArraySizeCheck;
+use crate::generics::apply_bounds;
+use crate::prelude::PRELUDE_PACKAGE_ID;
+use crate::store::Store;
 
-impl Checker<'_, '_> {
-    pub fn convert_to_type(&mut self, annotation: &Annotation, span: &Span) -> Type {
+enum ArraySizeError {
+    NotInteger,
+    Negative,
+    TooLarge,
+}
+
+impl ArraySizeError {
+    fn into_diagnostic(self, name: &str, value: u64, span: Span) -> diagnostics::LisetteDiagnostic {
+        match self {
+            Self::NotInteger => diagnostics::infer::array_size_not_integer_constant(name, span),
+            Self::Negative => diagnostics::infer::array_size_negative_constant(name, span),
+            Self::TooLarge => diagnostics::infer::array_size_too_large(value, span),
+        }
+    }
+}
+
+fn constant_size_of(kind: SimpleKind, value: u64) -> Result<u64, ArraySizeError> {
+    if kind.integer_range().is_none() {
+        return Err(ArraySizeError::NotInteger);
+    }
+    // Past `i64::MAX` a signed constant is a wrapped negative, not a huge size.
+    if value > i64::MAX as u64 {
+        return Err(if kind.is_signed_int() {
+            ArraySizeError::Negative
+        } else {
+            ArraySizeError::TooLarge
+        });
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypePosition {
+    Value,
+    Bound,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeArgumentChecks {
+    All,
+    Descendants,
+    Deferred,
+}
+
+impl TypeArgumentChecks {
+    fn current(self) -> bool {
+        self == Self::All
+    }
+
+    fn nested(self) -> Self {
+        match self {
+            Self::Descendants => Self::All,
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReadOnlyWrapper {
+    name: &'static str,
+    name_span: Span,
+}
+
+#[derive(Clone, Copy)]
+struct ConvertMode {
+    variadic_allowed: bool,
+    type_argument_checks: TypeArgumentChecks,
+    position: TypePosition,
+    read_only_wrapper: Option<ReadOnlyWrapper>,
+}
+
+impl ConvertMode {
+    fn nested(self) -> Self {
+        ConvertMode {
+            variadic_allowed: false,
+            type_argument_checks: self.type_argument_checks.nested(),
+            position: TypePosition::Value,
+            read_only_wrapper: self.read_only_wrapper,
+        }
+    }
+}
+
+fn read_only_wrapper_name(qualified_name: &str) -> Option<&'static str> {
+    match qualified_name {
+        "prelude.Ref" => Some("Ref"),
+        "prelude.Slice" => Some("Slice"),
+        "prelude.Map" => Some("Map"),
+        _ => None,
+    }
+}
+
+impl TaskState {
+    /// Resolves a generic-bound annotation. Bound-only markers like
+    /// `Comparable` are admitted here; the same names in value position
+    /// are flagged inside `convert_to_type`.
+    pub(crate) fn convert_bound_to_type(
+        &mut self,
+        store: &Store,
+        annotation: &Annotation,
+        span: &Span,
+    ) -> Type {
+        self.convert_to_type_mode(
+            store,
+            annotation,
+            span,
+            ConvertMode {
+                variadic_allowed: false,
+                type_argument_checks: TypeArgumentChecks::Deferred,
+                position: TypePosition::Bound,
+                read_only_wrapper: None,
+            },
+        )
+    }
+
+    pub(crate) fn convert_to_type(
+        &mut self,
+        store: &Store,
+        annotation: &Annotation,
+        span: &Span,
+    ) -> Type {
+        let ty = self.convert_to_type_mode(
+            store,
+            annotation,
+            span,
+            ConvertMode {
+                variadic_allowed: false,
+                type_argument_checks: TypeArgumentChecks::All,
+                position: TypePosition::Value,
+                read_only_wrapper: None,
+            },
+        );
+        store.normalized_annotation_type(&ty)
+    }
+
+    pub(crate) fn convert_variadic_to_type(
+        &mut self,
+        store: &Store,
+        annotation: &Annotation,
+        span: &Span,
+    ) -> Type {
+        let ty = self.convert_to_type_mode(
+            store,
+            annotation,
+            span,
+            ConvertMode {
+                variadic_allowed: true,
+                type_argument_checks: TypeArgumentChecks::All,
+                position: TypePosition::Value,
+                read_only_wrapper: None,
+            },
+        );
+        store.normalized_annotation_type(&ty)
+    }
+
+    pub(crate) fn convert_receiver_to_type(
+        &mut self,
+        store: &Store,
+        annotation: &Annotation,
+        span: &Span,
+    ) -> Type {
+        let ty = self.convert_to_type_mode(
+            store,
+            annotation,
+            span,
+            ConvertMode {
+                variadic_allowed: false,
+                type_argument_checks: TypeArgumentChecks::Descendants,
+                position: TypePosition::Value,
+                read_only_wrapper: None,
+            },
+        );
+        store.normalized_annotation_type(&ty)
+    }
+
+    fn convert_to_type_mode(
+        &mut self,
+        store: &Store,
+        annotation: &Annotation,
+        span: &Span,
+        mode: ConvertMode,
+    ) -> Type {
         match annotation {
             Annotation::Unknown => self.new_type_var(),
 
@@ -17,157 +208,56 @@ impl Checker<'_, '_> {
                 return_type,
                 ..
             } => {
+                let last_param = params.len().wrapping_sub(1);
                 let new_params: Vec<Type> = params
                     .iter()
-                    .map(|param| self.convert_to_type(param, span))
+                    .enumerate()
+                    .map(|(index, param)| {
+                        self.convert_to_type_mode(
+                            store,
+                            param,
+                            span,
+                            ConvertMode {
+                                variadic_allowed: index == last_param,
+                                read_only_wrapper: None,
+                                ..mode.nested()
+                            },
+                        )
+                    })
                     .collect();
                 // For function type annotations, omitted return type means Unit (`()`),
                 // not a type variable. This ensures `fn(T)` is `fn(T) -> ()`.
                 let new_return_type = if matches!(return_type.as_ref(), Annotation::Unknown) {
                     self.type_unit()
                 } else {
-                    self.convert_to_type(return_type, span)
+                    self.convert_to_type_mode(store, return_type, span, mode.nested())
                 };
 
-                Type::Function {
-                    param_mutability: vec![false; new_params.len()],
-                    params: new_params,
-                    bounds: Default::default(),
-                    return_type: new_return_type.into(),
-                }
+                Type::function(
+                    new_params.into_iter().map(FunctionParameter::new).collect(),
+                    Default::default(),
+                    new_return_type.into(),
+                )
             }
 
-            Annotation::Constructor {
-                name: type_name,
-                params,
-                span: annotation_span,
-            } => {
-                // Unit is internal — `()` desugars to Constructor { name: "Unit" }.
-                // Return the interned unit type directly, unless a user-defined
-                // type named `Unit` exists in scope.
-                if type_name == "Unit"
-                    && params.is_empty()
-                    && self.resolve_type_name("Unit").is_none()
-                {
-                    return Type::unit();
-                }
-
-                if self.lookup_generic_index(type_name).is_some() {
-                    if !params.is_empty() {
-                        self.sink.push(diagnostics::infer::type_param_with_args(
-                            params.len(),
-                            *annotation_span,
-                        ));
-                    }
-                    return Type::Parameter(type_name.into());
-                }
-
-                let Some((qualified_name, ty)) =
-                    self.resolve_type_with_arity(type_name, params.len())
-                else {
-                    if type_name == "Self" {
-                        self.sink.push(diagnostics::infer::self_type_not_supported(
-                            *annotation_span,
-                        ));
-                    } else {
-                        self.sink.push(diagnostics::infer::type_not_found(
-                            type_name,
-                            *annotation_span,
-                        ));
-                    }
-                    return Type::Error;
-                };
-
-                self.track_name_usage(&qualified_name, annotation_span, type_name.len() as u32);
-
-                if qualified_name == "prelude.Unknown" && self.is_lis() {
-                    self.sink.push(diagnostics::infer::unknown_outside_typedef(
-                        *annotation_span,
-                    ));
-                }
-
-                let (generics, body) = match &ty {
-                    Type::Forall { vars, body } => (vars.clone(), body.as_ref().clone()),
-                    _ => (vec![], ty.clone()),
-                };
-
-                if generics.len() != params.len() {
-                    let actual_types: Vec<Type> = params
-                        .iter()
-                        .map(|arg| self.convert_to_type(arg, span))
-                        .collect();
-                    let generics_as_str: Vec<String> =
-                        generics.iter().map(|s| s.to_string()).collect();
-                    self.sink.push(diagnostics::infer::generics_arity_mismatch(
-                        &generics_as_str,
-                        params,
-                        &actual_types,
-                        *span,
-                    ));
-                }
-
-                let concrete_args: Vec<Type> = params
-                    .iter()
-                    .map(|arg| self.convert_to_type(arg, span))
-                    .collect();
-                let map: SubstitutionMap = generics
-                    .iter()
-                    .cloned()
-                    .zip(concrete_args.iter().cloned())
-                    .collect();
-                let resolved_ty = substitute(&body, &map);
-
-                // Reject Ref<InterfaceType> — Go pointer-to-interface is invalid
-                if self.is_lis()
-                    && qualified_name == "prelude.Ref"
-                    && params.len() == 1
-                    && let Some(inner) = resolved_ty.inner()
-                {
-                    let peeled_inner = self.store.peel_alias(&inner.resolve());
-                    if let Some(inner_id) = peeled_inner.get_qualified_id()
-                        && self.store.get_interface(inner_id).is_some()
-                    {
-                        self.sink.push(diagnostics::infer::ref_of_interface_type(
-                            &inner,
-                            *annotation_span,
-                        ));
-                    }
-                }
-
-                if qualified_name == "prelude.Map"
-                    && !params.is_empty()
-                    && let Some(key_ty) = resolved_ty
-                        .get_type_params()
-                        .and_then(|p| p.first().cloned())
-                {
-                    self.check_map_key_comparable(&key_ty, *annotation_span);
-                }
-
-                // Preserve alias name in emitter output. Guard against re-wrapping bodies whose
-                // id already matches (function aliases are pre-wrapped by populate_type_alias).
-                if let Some(Definition::TypeAlias {
-                    annotation: alias_ann,
-                    ..
-                }) = self.store.get_definition(&qualified_name)
-                    && !alias_ann.is_opaque()
-                    && matches!(&resolved_ty, Type::Constructor { id, .. } if id.as_str() != qualified_name.as_str())
-                {
-                    return Type::Constructor {
-                        id: qualified_name.into(),
-                        params: concrete_args,
-                        underlying_ty: Some(Box::new(resolved_ty)),
-                    };
-                }
-
-                resolved_ty
+            Annotation::Constructor { .. } => {
+                self.convert_constructor_annotation(store, annotation, span, mode)
             }
 
             Annotation::Tuple { elements, .. } => {
                 let element_types = elements
                     .iter()
-                    .map(|e| self.convert_to_type(e, span))
+                    .map(|element| self.convert_to_type_mode(store, element, span, mode.nested()))
                     .collect();
                 Type::Tuple(element_types)
+            }
+
+            Annotation::Constant {
+                span: const_span, ..
+            } => {
+                self.sink
+                    .push(diagnostics::infer::integer_in_type_position(*const_span));
+                Type::Error
             }
 
             Annotation::Opaque { .. } => {
@@ -176,8 +266,477 @@ impl Checker<'_, '_> {
         }
     }
 
-    pub(super) fn resolve_type_with_arity(
+    fn convert_constructor_annotation(
         &mut self,
+        store: &Store,
+        annotation: &Annotation,
+        span: &Span,
+        mode: ConvertMode,
+    ) -> Type {
+        let Annotation::Constructor {
+            name: type_name,
+            params,
+            writable,
+            mut_span,
+            span: annotation_span,
+        } = annotation
+        else {
+            unreachable!("convert_constructor_annotation called with non-Constructor annotation");
+        };
+        let writable = *writable;
+        let annotation_span = *annotation_span;
+        let contents_span =
+            mut_span.map_or(annotation_span, |mut_span| mut_span.merge(annotation_span));
+        let ConvertMode {
+            variadic_allowed,
+            type_argument_checks,
+            position,
+            read_only_wrapper,
+        } = mode;
+
+        if type_name == "VarArgs" && !variadic_allowed {
+            self.sink
+                .push(diagnostics::infer::variadic_type_not_allowed(
+                    annotation_span,
+                ));
+            return Type::Error;
+        }
+
+        // Unit is internal: `()` desugars to Constructor { name: "Unit" }.
+        // Return the interned unit type directly, unless a user-defined
+        // type named `Unit` exists in scope.
+        if type_name == "Unit"
+            && params.is_empty()
+            && self.resolve_type_name(store, "Unit").is_none()
+        {
+            return Type::unit();
+        }
+
+        if self.lookup_generic_index(type_name).is_some() {
+            if !params.is_empty() {
+                self.sink.push(diagnostics::infer::type_param_with_args(
+                    params.len(),
+                    annotation_span,
+                ));
+            }
+            if writable {
+                self.sink.push(diagnostics::infer::mut_without_effect(
+                    type_name,
+                    annotation_span,
+                ));
+            }
+            return Type::Parameter(type_name.into());
+        }
+
+        // `Array` carries a const-integer size, so it needs its own path.
+        if type_name == "Array" {
+            if writable {
+                self.sink.push(diagnostics::infer::mut_without_effect(
+                    type_name,
+                    annotation_span,
+                ));
+            }
+            return self.convert_array_annotation(store, params, annotation_span, span, mode);
+        }
+
+        let Some((qualified_name, ty)) =
+            self.resolve_type_with_arity(store, type_name, params.len())
+        else {
+            if type_name == "Self" {
+                let receiver = self.scopes.impl_receiver_type().map(|ty| ty.stringify());
+                self.sink.push(diagnostics::infer::self_type_not_supported(
+                    annotation_span,
+                    receiver.as_deref(),
+                ));
+            } else if let Some((kind, help)) = self.classify_unregistered_variant(store, type_name)
+            {
+                self.sink.push(diagnostics::infer::value_in_type_position(
+                    type_name,
+                    kind,
+                    annotation_span,
+                    help,
+                ));
+            } else if !self.may_name_uninferred_export(store, type_name) {
+                self.sink.push(diagnostics::infer::type_not_found(
+                    type_name,
+                    annotation_span,
+                ));
+            }
+            return Type::Error;
+        };
+
+        if let Some((kind, help)) = self.classify_non_type_name(store, &qualified_name, type_name) {
+            self.sink.push(diagnostics::infer::value_in_type_position(
+                type_name,
+                kind,
+                annotation_span,
+                help,
+            ));
+            return Type::Error;
+        }
+
+        self.track_name_usage(
+            store,
+            &qualified_name,
+            &annotation_span,
+            type_name.len() as u32,
+        );
+
+        if position == TypePosition::Value
+            && let Some(builtin) = BuiltinBound::from_qualified_id(&qualified_name)
+        {
+            self.sink
+                .push(diagnostics::infer::bound_only_in_value_position(
+                    builtin.label(),
+                    annotation_span,
+                ));
+            return Type::Error;
+        }
+
+        let (generics, body) = match ty {
+            Type::Forall { vars, body } => (vars, *body),
+            other => (vec![], other),
+        };
+        // Applied before substitution, so a read-only template does not
+        // demote writable type arguments.
+        let body = if writable { body.make_writable() } else { body };
+
+        let argument_mode = ConvertMode {
+            read_only_wrapper: read_only_wrapper.or_else(|| {
+                read_only_wrapper_name(&qualified_name)
+                    .filter(|_| !writable)
+                    .map(|name| ReadOnlyWrapper {
+                        name,
+                        name_span: Span::new(
+                            annotation_span.file_id,
+                            annotation_span.byte_offset,
+                            type_name.len() as u32,
+                        ),
+                    })
+            }),
+            ..mode.nested()
+        };
+        let concrete_args: Vec<Type> = params
+            .iter()
+            .map(|arg| self.convert_to_type_mode(store, arg, span, argument_mode))
+            .collect();
+
+        if generics.len() != params.len() {
+            let generics_as_str: Vec<String> = generics.iter().map(|s| s.to_string()).collect();
+            self.sink.push(diagnostics::infer::generics_arity_mismatch(
+                &generics_as_str,
+                params,
+                &concrete_args,
+                *span,
+            ));
+        }
+        if type_argument_checks.current() && qualified_name != "prelude.Map" {
+            self.check_type_argument_bounds(
+                store,
+                &qualified_name,
+                &concrete_args,
+                annotation_span,
+            );
+        }
+        let resolved_ty = if generics.is_empty() && concrete_args.is_empty() {
+            body
+        } else {
+            let map = build_named_substitution_map(&generics, &concrete_args);
+            substitute(&body, &map)
+        };
+
+        // Reject Ref<InterfaceType>: Go pointer-to-interface is invalid
+        if self.is_lis(store)
+            && qualified_name == "prelude.Ref"
+            && params.len() == 1
+            && let Some(inner) = resolved_ty.inner()
+        {
+            let peeled_inner = store.peel_alias(&inner.resolve_in(&self.env));
+            if let Some(inner_id) = peeled_inner.get_qualified_id()
+                && store.get_interface(inner_id).is_some()
+            {
+                self.sink.push(diagnostics::infer::ref_of_interface_type(
+                    &inner,
+                    annotation_span,
+                ));
+            }
+        }
+
+        if type_argument_checks.current()
+            && qualified_name == "prelude.Map"
+            && let Some(key_ty) = resolved_ty
+                .get_type_params()
+                .and_then(|parameters| parameters.first())
+        {
+            self.check_map_key_comparable(store, key_ty, annotation_span);
+        }
+
+        if writable && !writable_qualifier_has_effect(store, &qualified_name, &resolved_ty) {
+            self.sink.push(diagnostics::infer::mut_without_effect(
+                type_name,
+                annotation_span,
+            ));
+            return resolved_ty.shallow_demoted();
+        }
+        if writable && let Some(wrapper) = read_only_wrapper {
+            self.sink
+                .push(diagnostics::infer::mut_under_read_only_wrapper(
+                    wrapper.name,
+                    wrapper.name_span,
+                    contents_span,
+                ));
+        }
+
+        resolved_ty
+    }
+
+    fn convert_array_annotation(
+        &mut self,
+        store: &Store,
+        params: &[Annotation],
+        annotation_span: Span,
+        span: &Span,
+        mode: ConvertMode,
+    ) -> Type {
+        if params.len() == 1 && self.cursor.package_id() == PRELUDE_PACKAGE_ID {
+            let element = self.convert_to_type_mode(store, &params[0], span, mode.nested());
+            return Type::Nominal {
+                id: Symbol::from_parts("prelude", "Array"),
+                params: vec![element],
+                writable: false,
+            };
+        }
+
+        if params.len() != 2 {
+            self.sink.push(diagnostics::infer::array_type_arity(
+                params.len(),
+                annotation_span,
+            ));
+            for param in params {
+                let _ = self.convert_to_type_mode(store, param, span, mode.nested());
+            }
+            return Type::Error;
+        }
+
+        let element = self.convert_to_type_mode(store, &params[0], span, mode.nested());
+        if element.contains_error() {
+            return Type::Error;
+        }
+
+        match self.resolve_array_size(store, &params[1]) {
+            Some(length) => Type::Array {
+                length,
+                element: Box::new(element),
+            },
+            None => Type::Error,
+        }
+    }
+
+    pub(crate) fn resolve_array_size(
+        &mut self,
+        store: &Store,
+        annotation: &Annotation,
+    ) -> Option<u64> {
+        let span = annotation.get_span();
+        match annotation {
+            Annotation::Constant { value, .. } => self
+                .check_array_size_in_bounds(*value, span)
+                .then_some(*value),
+            Annotation::Constructor { name, params, .. }
+                if params.is_empty() && self.lookup_generic_index(name).is_none() =>
+            {
+                self.resolve_named_array_size(store, name, span)
+            }
+            _ => {
+                self.sink
+                    .push(diagnostics::infer::array_size_not_literal(span));
+                None
+            }
+        }
+    }
+
+    fn resolve_named_array_size(&mut self, store: &Store, name: &str, span: Span) -> Option<u64> {
+        if self.scopes.lookup_value(name).is_some() {
+            self.sink.push(if self.scopes.lookup_const(name) {
+                diagnostics::infer::array_size_local_constant(name, span)
+            } else {
+                diagnostics::infer::array_size_not_constant(name, span)
+            });
+            return None;
+        }
+
+        let Some(qualified_name) = self.lookup_qualified_name(store, name) else {
+            self.sink
+                .push(diagnostics::infer::array_size_unknown_constant(name, span));
+            return None;
+        };
+        let Some(definition) = store.get_definition(&qualified_name) else {
+            self.sink
+                .push(diagnostics::infer::array_size_unknown_constant(name, span));
+            return None;
+        };
+        if !definition.is_const() {
+            self.sink.push(if definition.is_value(&qualified_name) {
+                diagnostics::infer::array_size_not_constant(name, span)
+            } else {
+                // A type in size position, as in `Array<int, int>`.
+                diagnostics::infer::array_size_not_literal(span)
+            });
+            return None;
+        }
+        self.track_name_usage(store, &qualified_name, &span, name.len() as u32);
+
+        let Some(literal) = definition.const_value() else {
+            self.sink
+                .push(diagnostics::infer::array_size_computed_constant(name, span));
+            return None;
+        };
+        let ConstantValue::Integer { value, .. } = literal else {
+            self.sink
+                .push(diagnostics::infer::array_size_not_integer_constant(
+                    name, span,
+                ));
+            return None;
+        };
+        let value = *value;
+
+        // A type alias holding an array can read a constant before that constant's
+        // own type name resolves, so settle those after registration instead.
+        let Some(kind) = store.underlying_simple_kind(&definition.ty.resolve_in(&self.env)) else {
+            self.pending.array_size_checks.push(PendingArraySizeCheck {
+                qualified_name: qualified_name.to_string(),
+                name: name.into(),
+                span,
+            });
+            return (value <= i64::MAX as u64).then_some(value);
+        };
+
+        match constant_size_of(kind, value) {
+            Ok(length) => Some(length),
+            Err(error) => {
+                self.sink.push(error.into_diagnostic(name, value, span));
+                None
+            }
+        }
+    }
+
+    /// Settles the size constants whose type had not resolved at conversion time.
+    pub(super) fn check_pending_array_size_checks(&mut self, store: &Store) {
+        let mut seen = rustc_hash::FxHashSet::default();
+        for pending in mem::take(&mut self.pending.array_size_checks) {
+            if !seen.insert((pending.span, pending.qualified_name.clone())) {
+                continue;
+            }
+            let Some(definition) = store.get_definition(&pending.qualified_name) else {
+                continue;
+            };
+            let Some(ConstantValue::Integer { value, .. }) = definition.const_value() else {
+                continue;
+            };
+            let outcome = store
+                .underlying_simple_kind(&definition.ty.resolve_in(&self.env))
+                .map_or(Err(ArraySizeError::NotInteger), |kind| {
+                    constant_size_of(kind, *value)
+                });
+            if let Err(error) = outcome {
+                self.sink
+                    .push(error.into_diagnostic(&pending.name, *value, pending.span));
+            }
+        }
+    }
+
+    pub(crate) fn check_array_size_in_bounds(&mut self, value: u64, span: Span) -> bool {
+        if value > i64::MAX as u64 {
+            self.sink
+                .push(diagnostics::infer::array_size_too_large(value, span));
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Classifies `Enum.Variant` in type position before its constructor value exists.
+    fn classify_unregistered_variant(
+        &mut self,
+        store: &Store,
+        type_name: &str,
+    ) -> Option<(&'static str, Option<String>)> {
+        let (parent, variant_name) = type_name.rsplit_once('.')?;
+        let qualified = self.lookup_qualified_name_in_type_position(store, parent)?;
+        let Some(DefinitionBody::Enum { variants, .. }) =
+            store.get_definition(&qualified).map(|d| &d.body)
+        else {
+            return None;
+        };
+        let variant = variants.iter().find(|v| v.name == variant_name)?;
+        let enum_name = unqualified_name(&qualified);
+        let help = if variant.fields.is_empty() {
+            format!("Use `{}` for the enum type", enum_name)
+        } else {
+            format!(
+                "Use `{}` for the enum type, or call `{}(...)` to construct a value",
+                enum_name, type_name
+            )
+        };
+        Some(("enum variant", Some(help)))
+    }
+
+    fn classify_non_type_name(
+        &self,
+        store: &Store,
+        qualified_name: &str,
+        type_name: &str,
+    ) -> Option<(&'static str, Option<String>)> {
+        let definition = store.get_definition(qualified_name)?;
+        if !definition.is_value(qualified_name) {
+            return None;
+        }
+        let body = definition.ty.unwrap_forall();
+
+        let is_function = matches!(body, Type::Function(_));
+        let enum_id = match body {
+            Type::Function(f) => f.return_type.get_qualified_id(),
+            other => other.get_qualified_id(),
+        };
+        let variant_name = unqualified_name(qualified_name);
+        let parent_enum = enum_id.filter(|id| {
+            store.get_definition(id).is_some_and(|d| match &d.body {
+                DefinitionBody::Enum { variants, .. } => {
+                    variants.iter().any(|v| v.name == variant_name)
+                }
+                _ => false,
+            })
+        });
+
+        if let Some(enum_id) = parent_enum {
+            let enum_name = unqualified_name(enum_id);
+            let mut help = if is_function {
+                format!(
+                    "Use `{}` for the enum type, or call `{}(...)` to construct a value",
+                    enum_name, type_name
+                )
+            } else {
+                format!("Use `{}` for the enum type", enum_name)
+            };
+            if enum_id == "prelude.Result" && variant_name == "Err" {
+                help.push_str(". If you meant an error type, use `error`");
+            }
+            return Some(("enum variant", Some(help)));
+        }
+
+        if is_function {
+            return Some((
+                "function",
+                Some("Use a function type alias or write the function type directly".to_string()),
+            ));
+        }
+
+        Some(("value", Some("Only a type is allowed here".to_string())))
+    }
+
+    fn resolve_type_with_arity(
+        &mut self,
+        store: &Store,
         type_name: &str,
         expected_arity: usize,
     ) -> Option<(String, Type)> {
@@ -186,12 +745,20 @@ impl Checker<'_, '_> {
             _ => 0,
         };
 
-        if let Some((qname, ty)) = self.resolve_type_name(type_name) {
+        if !type_name.contains('.')
+            && is_reserved_prelude_generic(type_name)
+            && let Some((pname, pty)) = self.resolve_type_from_prelude(store, type_name)
+            && arity_of(&pty) == expected_arity
+        {
+            return Some((pname, pty));
+        }
+
+        if let Some((qname, ty)) = self.resolve_type_name(store, type_name) {
             if arity_of(&ty) == expected_arity {
                 return Some((qname, ty));
             }
             if !type_name.contains('.')
-                && let Some((pname, pty)) = self.resolve_type_from_prelude(type_name)
+                && let Some((pname, pty)) = self.resolve_type_from_prelude(store, type_name)
                 && arity_of(&pty) == expected_arity
             {
                 return Some((pname, pty));
@@ -199,33 +766,35 @@ impl Checker<'_, '_> {
             return Some((qname, ty));
         }
 
-        self.resolve_type_from_prelude(type_name)
+        self.resolve_type_from_prelude(store, type_name)
     }
 
-    pub fn instantiate_from_annotations(
+    /// Substitute the `body` with the resolved `type_args`, keeping each source
+    /// annotation paired with its type so callers can reuse the result without
+    /// re-resolving (which would re-emit diagnostics).
+    pub(crate) fn instantiate_from_annotations(
         &mut self,
+        store: &Store,
         generics: &[EcoString],
         body: &Type,
         type_args: &[Annotation],
         span: &Span,
-    ) -> Type {
-        let args: Vec<Type> = type_args
+    ) -> (Type, Vec<(Annotation, Type)>) {
+        let args: Vec<(Annotation, Type)> = type_args
             .iter()
-            .map(|arg_ann| self.convert_to_type(arg_ann, span))
+            .map(|annotation| {
+                (
+                    annotation.clone(),
+                    self.convert_to_type(store, annotation, span),
+                )
+            })
             .collect();
 
-        let map: SubstitutionMap = generics
-            .iter()
-            .zip(args.iter())
-            .map(|(name, ty)| (name.clone(), ty.clone()))
-            .collect();
+        let map = build_named_substitution_map(generics, args.iter().map(|(_, ty)| ty));
 
-        substitute(body, &map)
+        (substitute(body, &map), args)
     }
 
-    /// Check that a map key type is comparable.
-    /// Only rejects concrete non-comparable types (Slice, Map, Function).
-    /// Type parameters are allowed here — they may be instantiated with comparable types.
     /// Pre-check impl annotation for undeclared type params (e.g. `impl Container<T>`
     /// without `impl<T>`). Adds them to scope to prevent cascading errors from
     /// `convert_to_type`, and emits a diagnostic with the specific fix.
@@ -250,12 +819,13 @@ impl Checker<'_, '_> {
                     name,
                     params: sub_params,
                     span: param_span,
+                    ..
                 } = param
                 else {
                     return None;
                 };
 
-                // Single uppercase letter not declared as a type param — always a typo.
+                // Single uppercase letter not declared as a type param, always a typo.
                 // Multi-letter names (Key, Error, etc.) are left to `type_not_found`.
                 if sub_params.is_empty()
                     && name.len() == 1
@@ -270,11 +840,7 @@ impl Checker<'_, '_> {
             .collect();
 
         for (i, (name, param_span)) in undeclared.iter().enumerate() {
-            self.scopes
-                .current_mut()
-                .type_params
-                .get_or_insert_with(HashMap::default)
-                .insert(name.clone(), generics.len() + i);
+            self.scopes.insert_type_param(name, generics.len() + i);
             self.sink
                 .push(diagnostics::infer::undeclared_impl_type_param(
                     name,
@@ -284,20 +850,236 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn check_map_key_comparable(&mut self, key_ty: &Type, span: Span) {
-        let resolved = key_ty.resolve();
+    pub(super) fn check_map_key_comparable(&mut self, store: &Store, key_ty: &Type, span: Span) {
+        let resolved = key_ty.resolve_in(&self.env);
 
-        let reason = match &resolved {
-            Type::Function { .. } => Some("functions"),
-            _ if resolved.has_name("Slice") => Some("slices"),
-            _ if resolved.has_name("Map") => Some("maps"),
-            _ => None,
-        };
+        if self.is_lis(store) && store.resolves_to_unknown(&resolved) {
+            self.sink.push(diagnostics::infer::unknown_as_map_key(span));
+            return;
+        }
 
-        if let Some(reason) = reason {
+        if let Some(reason) = check_never_comparable(&self.env, store, &resolved) {
             self.sink.push(diagnostics::infer::non_comparable_map_key(
                 &resolved, reason, span,
             ));
+            return;
         }
+        if !self.is_lis(store) {
+            return;
+        }
+
+        self.check_missing_map_key_bounds(store, &resolved, span);
+    }
+
+    fn check_missing_map_key_bounds(&mut self, store: &Store, key_ty: &Type, span: Span) {
+        let mut missing = Vec::new();
+        let resolved = key_ty.resolve_in(&self.env);
+        let _ = check_never_comparable_with_bounds(&self.env, store, &resolved, &mut |parameter| {
+            if !self.parameter_satisfies_bound(parameter, BuiltinBound::Comparable) {
+                missing.push(parameter.to_string());
+            }
+            true
+        });
+        missing.sort_unstable();
+        missing.dedup();
+        for parameter in missing {
+            self.sink
+                .push(diagnostics::infer::missing_map_key_bound(&parameter, span));
+        }
+    }
+
+    pub(crate) fn check_deferred_map_key_bounds(&mut self, store: &Store) {
+        for check in self.scopes.take_deferred_map_key_checks() {
+            match check {
+                DeferredMapKeyCheck::Comparable { key, span } => {
+                    let resolved = key.resolve_in(&self.env);
+                    if !store.resolves_to_unknown(&resolved) {
+                        self.check_map_key_comparable(store, &resolved, span);
+                    }
+                }
+                DeferredMapKeyCheck::Bounds { key, span } => {
+                    self.check_missing_map_key_bounds(store, &key, span);
+                }
+            }
+        }
+    }
+
+    fn check_type_argument_bounds(
+        &mut self,
+        store: &Store,
+        definition_name: &str,
+        arguments: &[Type],
+        span: Span,
+    ) {
+        let Some(definition) = store.get_definition(definition_name) else {
+            return;
+        };
+        let generics = definition.body.generics().unwrap_or_default();
+        let has_equals_method = store.definition_has_equals_method(definition_name);
+        for applied in apply_bounds(generics, arguments) {
+            match applied
+                .required
+                .get_qualified_id()
+                .and_then(BuiltinBound::from_qualified_id)
+            {
+                Some(builtin) => {
+                    let hint = has_equals_method.then(|| diagnostics::infer::EquatableFieldHint {
+                        type_name: unqualified_name(definition_name),
+                        param_name: applied.parameter_name.as_str(),
+                    });
+                    self.check_builtin_bound_argument(store, &applied.argument, builtin, span, hint)
+                }
+                None => self.check_interface_type_argument(
+                    store,
+                    &applied.argument,
+                    &applied.required,
+                    span,
+                ),
+            }
+        }
+    }
+
+    fn check_interface_type_argument(
+        &mut self,
+        store: &Store,
+        argument: &Type,
+        required: &Type,
+        span: Span,
+    ) {
+        if required.contains_error() {
+            return;
+        }
+        let resolved_required = store.deep_resolve_alias(required);
+        let Some(required_id) = resolved_required.get_qualified_id() else {
+            return;
+        };
+        if store.get_interface(required_id).is_none() {
+            return;
+        }
+        let argument = store.deep_resolve_alias(&argument.resolve_in(&self.env));
+        if argument.is_variable()
+            || matches!(argument, Type::Parameter(_))
+            || argument.contains_error()
+            || store.contains_unknown(&argument)
+        {
+            return;
+        }
+        self.pending
+            .post_inference_bound_checks
+            .push((argument, required.clone(), span));
+    }
+
+    pub(crate) fn check_builtin_bound_argument(
+        &mut self,
+        store: &Store,
+        argument: &Type,
+        required: BuiltinBound,
+        span: Span,
+        equals_hint: Option<diagnostics::infer::EquatableFieldHint<'_>>,
+    ) {
+        let resolved = store.deep_resolve_alias(&argument.resolve_in(&self.env));
+        if resolved.is_variable() {
+            return;
+        }
+        if let Type::Parameter(parameter) = &resolved {
+            if !self.parameter_satisfies_bound(parameter, required) {
+                self.sink.push(diagnostics::infer::missing_bound_on_param(
+                    parameter,
+                    required.label(),
+                    span,
+                ));
+            }
+            return;
+        }
+
+        match required {
+            BuiltinBound::Comparable => {
+                let mut missing_parameter = None;
+                let reason = check_not_comparable_with_bounds(
+                    &self.env,
+                    store,
+                    &resolved,
+                    &mut |parameter| {
+                        let satisfied =
+                            self.parameter_satisfies_bound(parameter, BuiltinBound::Comparable);
+                        if !satisfied && missing_parameter.is_none() {
+                            missing_parameter = Some(parameter.to_string());
+                        }
+                        satisfied
+                    },
+                );
+                if let Some(parameter) = missing_parameter {
+                    self.sink.push(diagnostics::infer::missing_bound_on_param(
+                        &parameter,
+                        required.label(),
+                        span,
+                    ));
+                } else if let Some(reason) = reason {
+                    self.sink.push(diagnostics::infer::not_comparable_bound(
+                        reason,
+                        equals_hint,
+                        span,
+                    ));
+                }
+            }
+            BuiltinBound::Ordered if !store.satisfies_ordered_constraint(&resolved) => {
+                self.sink
+                    .push(diagnostics::infer::not_orderable_bound(span));
+            }
+            BuiltinBound::Ordered => {}
+        }
+    }
+}
+
+fn is_reserved_prelude_generic(name: &str) -> bool {
+    matches!(name, "Option" | "Result" | "Partial")
+}
+
+/// Whether `mut` on this annotation can ever permit a write.
+fn writable_qualifier_has_effect(store: &Store, qualified_name: &str, resolved_ty: &Type) -> bool {
+    if !resolved_ty.is_writable() {
+        return false;
+    }
+    let Type::Nominal { .. } = resolved_ty else {
+        return true;
+    };
+    if resolved_ty.is_unknown() {
+        return true;
+    }
+    let package = qualified_name
+        .rsplit_once('.')
+        .map_or("", |(package, _)| package);
+    if store.go_package_names.contains_key(package) {
+        return true;
+    }
+    let Some(definition) = store.get_definition(qualified_name) else {
+        return true;
+    };
+    match &definition.body {
+        DefinitionBody::TypeAlias {
+            alias: AliasKind::Opaque(_),
+            ..
+        } => true,
+        DefinitionBody::TypeAlias { .. } => {
+            let underlying = store.peel_alias(resolved_ty);
+            match underlying.get_qualified_id() {
+                Some(underlying_name) if underlying_name != qualified_name => {
+                    writable_qualifier_has_effect(store, underlying_name, &underlying)
+                }
+                _ => underlying.is_writable(),
+            }
+        }
+        DefinitionBody::Struct { fields, .. } => fields
+            .as_slice()
+            .iter()
+            .any(|field| store.demotion_changes(&field.ty)),
+        DefinitionBody::Enum { variants, .. } => variants
+            .iter()
+            .flat_map(|variant| match &variant.fields {
+                VariantFields::Unit => [].as_slice(),
+                VariantFields::Tuple(fields) | VariantFields::Struct(fields) => fields,
+            })
+            .any(|field| store.demotion_changes(&field.ty)),
+        _ => true,
     }
 }

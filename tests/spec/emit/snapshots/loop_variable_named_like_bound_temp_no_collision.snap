@@ -1,0 +1,28 @@
+---
+source: tests/spec/emit/expressions.rs
+description: |
+  
+  fn make_bound() -> int { 3 }
+  
+  fn main() {
+    let mut sum = 0;
+    for bound_1 in 0..=make_bound() {
+      sum = sum + bound_1;
+    }
+    let _ = sum;
+  }
+---
+package main
+
+func makeBound() int {
+	return 3
+}
+
+func main() {
+	sum := 0
+	bound_1 := makeBound()
+	for bound_1_2 := 0; bound_1_2 <= bound_1; bound_1_2++ {
+		sum += bound_1_2
+	}
+	_ = sum
+}

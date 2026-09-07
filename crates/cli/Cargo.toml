@@ -11,24 +11,32 @@ readme = "../../README.md"
 
 [lib]
 doctest = false
-test = false
+
+[features]
+self-upgrade = []
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "lis"
 path = "src/main.rs"
 
 [dependencies]
-semantics = { package = "lisette-semantics", version = "0.1.17", path = "../semantics" }
-syntax = { package = "lisette-syntax", version = "0.1.17", path = "../syntax" }
-diagnostics = { package = "lisette-diagnostics", version = "0.1.17", path = "../diagnostics" }
-format = { package = "lisette-format", version = "0.1.17", path = "../format" }
-emit = { package = "lisette-emit", version = "0.1.17", path = "../emit" }
-stdlib = { package = "lisette-stdlib", version = "0.1.17", path = "../stdlib" }
-deps = { package = "lisette-deps", version = "0.1.17", path = "../deps" }
-lsp = { package = "lisette-lsp", version = "0.1.17", path = "../lsp" }
-tokio = { version = "1", features = ["rt-multi-thread", "io-std"] }
-tower-lsp = "0.20"
-fs2 = "0.4"
+semantics = { package = "lisette-semantics", version = "=0.12.1", path = "../semantics" }
+passes = { package = "lisette-passes", version = "=0.12.1", path = "../passes" }
+syntax = { package = "lisette-syntax", version = "=0.12.1", path = "../syntax" }
+diagnostics = { package = "lisette-diagnostics", version = "=0.12.1", path = "../diagnostics" }
+format = { package = "lisette-format", version = "=0.12.1", path = "../format" }
+emit = { package = "lisette-emit", version = "=0.12.1", path = "../emit" }
+stdlib = { package = "lisette-stdlib", version = "=0.12.1", path = "../stdlib" }
+deps = { package = "lisette-deps", version = "=0.12.1", path = "../deps" }
+lsp = { package = "lisette-lsp", version = "=0.12.1", path = "../lsp" }
 owo-colors.workspace = true
 rustc-hash.workspace = true
+rayon.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true

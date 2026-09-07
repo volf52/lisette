@@ -1,13 +1,25 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test() -> int {\n  let x = loop {\n    if true {\n      break 42\n    }\n  };\n  x\n}\n"
+description: |
+  
+  fn test() -> int {
+    let x = loop {
+      if true {
+        break 42
+      }
+    };
+    x
+  }
 ---
 package main
 
 func test() int {
+	var x int
 	for {
 		if true {
-			return 42
+			x = 42
+			break
 		}
 	}
+	return x
 }

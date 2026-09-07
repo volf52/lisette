@@ -1,34 +1,71 @@
-use crate::Emitter;
-use crate::control_flow::fallible::{Fallible, FallibleEmitter, OPTION_SOME_TAG};
-use crate::write_line;
-use syntax::ast::Expression;
+use crate::Planner;
+use crate::abi::callable::PayloadLayout;
+use crate::abi::coercion::{BridgeDirection, LayoutBridge};
+use crate::abi::layout::ValueLayout;
+use crate::calls::go_interop::build_tuple_literal;
+use crate::calls::go_interop::wrappers::{WrapperOutcome, WrapperTarget, leaf_block};
+use crate::control_flow::fallible::{Fallible, FalliblePlanner, OPTION_SOME_TAG};
+use crate::plan::bodies::{ElseArm, IfPlan, LoopKind, LoopPlan, LoweredBlock, LoweredStatement};
+use std::iter;
 use syntax::types::Type;
 
-impl Emitter<'_> {
-    pub(super) fn emit_go_option_call_wrapped(
+impl Planner<'_> {
+    /// Wrap a sentinel-call via `OptionFromCommaOk` with `raw != sentinel`.
+    pub(crate) fn lower_sentinel_wrapping(
         &mut self,
-        output: &mut String,
-        call_expression: &Expression,
-        option_ty: &Type,
-    ) -> String {
-        let call_str = self.emit_call(output, call_expression, None);
-        self.emit_comma_ok_wrapping(output, &call_str, option_ty)
-    }
-
-    pub(super) fn emit_comma_ok_wrapping(
-        &mut self,
-        output: &mut String,
         call_str: &str,
         option_ty: &Type,
-    ) -> String {
-        self.flags.needs_stdlib = true;
+        sentinel: i64,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
+        self.require_stdlib();
+        let mut statements = Vec::new();
+        let raw = self.hoist_tmp_value_statement(&mut statements, "ret", call_str);
+        let inner_ty_str = self.use_go_type(&option_ty.ok_type());
+        let value_expr = format!(
+            "lisette.OptionFromCommaOk[{}]({}, {} != {})",
+            inner_ty_str, raw, raw, sentinel
+        );
+        let outcome =
+            self.push_simple_wrapper_value(&mut statements, target, "option", &value_expr);
+        (statements, outcome)
+    }
 
-        let fallible = Fallible::from_type(option_ty).expect("Option type expected");
+    /// Wrap a comma-ok-returning call into a tagged `Option`. A `Flattened`
+    /// tuple inner type comes from a Go-imported `(T1, ..., Tn, bool)`; a
+    /// `Packed` one from a Lisette `(Tuple_n[...], bool)`.
+    pub(crate) fn lower_comma_ok_wrapping(
+        &mut self,
+        call_str: &str,
+        option_ty: &Type,
+        layout: PayloadLayout,
+        payload_bridge: Option<&LayoutBridge>,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
+        self.require_stdlib();
+        let mut statements = Vec::new();
 
         let inner_ty = option_ty.ok_type();
         let inner_tuple_arity = inner_ty.tuple_arity();
+        let needs_nilable_validation = self.facts.is_nullable_option(option_ty);
 
-        let val_vars = if let Some(arity) = inner_tuple_arity {
+        let needs_complex = payload_bridge.is_some()
+            || needs_nilable_validation
+            || (layout.is_flattened() && inner_tuple_arity.is_some());
+
+        if !needs_complex {
+            let inner_ty_str = self.use_go_type(&inner_ty);
+            let value_expr = format!("lisette.OptionFromCommaOk[{}]({})", inner_ty_str, call_str);
+            let outcome =
+                self.push_simple_wrapper_value(&mut statements, target, "option", &value_expr);
+            return (statements, outcome);
+        }
+
+        let fallible = Fallible::from_type(option_ty).expect("Option type expected");
+
+        let val_vars = if layout.is_flattened()
+            && let Some(arity) = inner_tuple_arity
+        {
             self.create_temp_vars("ret", arity)
         } else {
             self.create_temp_vars("ret", 1)
@@ -39,298 +76,549 @@ impl Emitter<'_> {
         let all_vars: Vec<&str> = val_vars
             .iter()
             .map(|s| s.as_str())
-            .chain(std::iter::once(ok_var.as_str()))
+            .chain(iter::once(ok_var.as_str()))
             .collect();
-        write_line!(output, "{} := {}", all_vars.join(", "), call_str);
+        statements.push(LoweredStatement::RawGo(format!(
+            "{} := {}\n",
+            all_vars.join(", "),
+            call_str
+        )));
 
-        let val_expression = if inner_tuple_arity.is_some() {
-            self.build_tuple_literal(&val_vars, &inner_ty)
+        let val_expression = if layout.is_flattened() && inner_tuple_arity.is_some() {
+            build_tuple_literal(self, &val_vars, &inner_ty)
         } else {
             val_vars[0].clone()
         };
+        let (mut payload_setup, val_expression) = match payload_bridge {
+            Some(bridge) => {
+                let mut setup = Vec::new();
+                let value = self.plan_layout_bridge(&mut setup, &val_expression, bridge);
+                (setup, value)
+            }
+            None => (Vec::new(), val_expression),
+        };
 
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let option_ty_str = fe.full_type_string();
-        let option_var = fe.emitter.fresh_var(Some("option"));
-        fe.emitter.declare(&option_var);
+        let option_ty_str = {
+            let mut fe = FalliblePlanner::new(self, &fallible);
+            fe.full_type_string()
+        };
 
         let condition = if self.is_interface_option(option_ty) {
             format!("{} && !lisette.IsNilInterface({})", ok_var, val_vars[0])
-        } else if self.is_nullable_option(option_ty) {
+        } else if needs_nilable_validation {
             format!("{} && {} != nil", ok_var, val_vars[0])
         } else {
             ok_var.clone()
         };
-        write_line!(output, "var {} {}", option_var, option_ty_str);
-        write_line!(output, "if {} {{", condition);
 
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let some_wrapper = fe.emit_success(&val_expression);
-        write_line!(output, "{} = {}", option_var, some_wrapper);
+        let (sink, outcome) =
+            self.push_wrapper_slot(&mut statements, target, &option_ty_str, "option");
 
-        output.push_str("} else {\n");
-
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let none_wrapper = fe.emit_failure(None);
-        write_line!(output, "{} = {}", option_var, none_wrapper);
-
-        output.push_str("}\n");
-
-        option_var
-    }
-
-    pub(crate) fn emit_nil_check_option_wrap(
-        &mut self,
-        output: &mut String,
-        raw_value: &str,
-        option_ty: &Type,
-    ) -> String {
-        self.flags.needs_stdlib = true;
-
-        let fallible = Fallible::from_type(option_ty).expect("Option type expected");
-
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let option_ty_str = fe.full_type_string();
-        let option_var = fe.emitter.fresh_var(Some("option"));
-        fe.emitter.declare(&option_var);
-
-        let is_interface = self.is_interface_option(option_ty);
-        write_line!(output, "var {} {}", option_var, option_ty_str);
-        if is_interface {
-            write_line!(output, "if !lisette.IsNilInterface({}) {{", raw_value);
-        } else {
-            write_line!(output, "if {} != nil {{", raw_value);
-        }
-
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let some_wrapper = fe.emit_success(raw_value);
-        write_line!(output, "{} = {}", option_var, some_wrapper);
-
-        output.push_str("} else {\n");
-
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let none_wrapper = fe.emit_failure(None);
-        write_line!(output, "{} = {}", option_var, none_wrapper);
-
-        output.push_str("}\n");
-
-        option_var
-    }
-
-    pub(crate) fn maybe_unwrap_go_nullable(
-        &mut self,
-        output: &mut String,
-        value_str: &str,
-        value_ty: &Type,
-    ) -> String {
-        if self.is_nullable_option(value_ty) {
-            return self.emit_option_unwrap_to_nullable(output, value_str, value_ty);
-        }
-        if let Some(elem_option_ty) = self.nullable_collection_element_ty(value_ty) {
-            return self.emit_collection_nullable_unwrap(
-                output,
-                value_str,
-                value_ty,
-                &elem_option_ty,
-            );
-        }
-        value_str.to_string()
-    }
-
-    pub(crate) fn maybe_wrap_go_nullable(
-        &mut self,
-        output: &mut String,
-        value_str: &str,
-        value_ty: &Type,
-    ) -> String {
-        if self.is_nullable_option(value_ty) {
-            return self.emit_nil_check_option_wrap(output, value_str, value_ty);
-        }
-        if let Some(elem_option_ty) = self.nullable_collection_element_ty(value_ty) {
-            return self.emit_collection_nullable_wrap(
-                output,
-                value_str,
-                value_ty,
-                &elem_option_ty,
-            );
-        }
-        value_str.to_string()
-    }
-
-    pub(crate) fn emit_option_unwrap_to_nullable(
-        &mut self,
-        output: &mut String,
-        option_value: &str,
-        option_ty: &Type,
-    ) -> String {
-        let inner_ty = option_ty.ok_type();
-        let go_inner_ty = self.go_type_as_string(&inner_ty);
-
-        let opt_var = self.fresh_var(Some("opt"));
-        self.declare(&opt_var);
-        let unwrapped_var = self.fresh_var(Some("unwrap"));
-        self.declare(&unwrapped_var);
-
-        self.flags.needs_stdlib = true;
-
-        write_line!(output, "{} := {}", opt_var, option_value);
-        write_line!(output, "var {} {}", unwrapped_var, go_inner_ty);
-        write_line!(output, "if {}.Tag == {} {{", opt_var, OPTION_SOME_TAG);
-        write_line!(output, "{} = {}.SomeVal", unwrapped_var, opt_var);
-        output.push_str("}\n");
-
-        unwrapped_var
-    }
-
-    pub(crate) fn emit_collection_nullable_wrap(
-        &mut self,
-        output: &mut String,
-        raw_value: &str,
-        collection_ty: &Type,
-        elem_option_ty: &Type,
-    ) -> String {
-        self.flags.needs_stdlib = true;
-
-        let lisette_collection_ty = self.go_type_as_string(collection_ty);
-        let src_var = self.fresh_var(Some("src"));
-        self.declare(&src_var);
-        let wrapped_var = self.fresh_var(Some("wrapped"));
-        self.declare(&wrapped_var);
-        let idx_var = self.fresh_var(Some("i"));
-        self.declare(&idx_var);
-        let val_var = self.fresh_var(Some("v"));
-        self.declare(&val_var);
-
-        write_line!(output, "{} := {}", src_var, raw_value);
-        write_line!(
-            output,
-            "{} := make({}, len({}))",
-            wrapped_var,
-            lisette_collection_ty,
-            src_var
-        );
-
-        write_line!(
-            output,
-            "for {}, {} := range {} {{",
-            idx_var,
-            val_var,
-            src_var
-        );
-
-        let fallible = Fallible::from_type(elem_option_ty).expect("Option type expected");
-
-        let is_interface = self.is_interface_option(elem_option_ty);
-        if is_interface {
-            write_line!(output, "if !lisette.IsNilInterface({}) {{", val_var);
-        } else {
-            write_line!(output, "if {} != nil {{", val_var);
-        }
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let some_wrapper = fe.emit_success(&val_var);
-        write_line!(output, "{}[{}] = {}", wrapped_var, idx_var, some_wrapper);
-        output.push_str("} else {\n");
-        let mut fe = FallibleEmitter::new(self, &fallible);
-        let none_wrapper = fe.emit_failure(None);
-        write_line!(output, "{}[{}] = {}", wrapped_var, idx_var, none_wrapper);
-        output.push_str("}\n");
-
-        output.push_str("}\n");
-
-        wrapped_var
-    }
-
-    pub(crate) fn emit_collection_nullable_unwrap(
-        &mut self,
-        output: &mut String,
-        lisette_value: &str,
-        collection_ty: &Type,
-        elem_option_ty: &Type,
-    ) -> String {
-        self.flags.needs_stdlib = true;
-
-        let resolved = collection_ty.resolve();
-        let is_map = resolved.has_name("Map");
-
-        let inner_ty = elem_option_ty.ok_type();
-        let go_inner_ty = self.go_type_as_string(&inner_ty);
-        let raw_collection_ty = if is_map {
-            let params = resolved
-                .get_type_params()
-                .expect("Map should have type params");
-            let key_ty = self.go_type_as_string(&params[0]);
-            format!("map[{}]{}", key_ty, go_inner_ty)
-        } else {
-            format!("[]{}", go_inner_ty)
+        let some_wrapper = {
+            let mut fe = FalliblePlanner::new(self, &fallible);
+            fe.emit_success(&val_expression)
+        };
+        let none_wrapper = {
+            let mut fe = FalliblePlanner::new(self, &fallible);
+            fe.emit_failure(None)
         };
 
-        let src_var = self.fresh_var(Some("src"));
-        self.declare(&src_var);
-        let unwrapped_var = self.fresh_var(Some("unwrapped"));
-        self.declare(&unwrapped_var);
-        let idx_var = self.fresh_var(Some("i"));
-        self.declare(&idx_var);
-        let val_var = self.fresh_var(Some("v"));
-        self.declare(&val_var);
-
-        write_line!(output, "{} := {}", src_var, lisette_value);
-        write_line!(
-            output,
-            "{} := make({}, len({}))",
-            unwrapped_var,
-            raw_collection_ty,
-            src_var
-        );
-
-        write_line!(
-            output,
-            "for {}, {} := range {} {{",
-            idx_var,
-            val_var,
-            src_var
-        );
-
-        if is_map {
-            write_line!(output, "if {}.Tag == {} {{", val_var, OPTION_SOME_TAG);
-            write_line!(
-                output,
-                "{}[{}] = {}.SomeVal",
-                unwrapped_var,
-                idx_var,
-                val_var
-            );
-            output.push_str("} else {\n");
-            write_line!(output, "{}[{}] = nil", unwrapped_var, idx_var);
-            output.push_str("}\n");
-        } else {
-            write_line!(output, "if {}.Tag == {} {{", val_var, OPTION_SOME_TAG);
-            write_line!(
-                output,
-                "{}[{}] = {}.SomeVal",
-                unwrapped_var,
-                idx_var,
-                val_var
-            );
-            output.push_str("}\n");
-        }
-
-        output.push_str("}\n");
-
-        unwrapped_var
+        let mut then_body = leaf_block(&sink, &some_wrapper);
+        payload_setup.append(&mut then_body.statements);
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition,
+            then_body: LoweredBlock {
+                statements: payload_setup,
+            },
+            else_arm: ElseArm::from_body(leaf_block(&sink, &none_wrapper), false),
+        }));
+        (statements, outcome)
     }
 
-    pub(super) fn emit_go_single_return_option_wrapped(
+    /// Wrap a nilable Go value into a tagged `Option` via `OptionFromNilable`.
+    pub(crate) fn lower_nil_check_option_wrap(
         &mut self,
-        output: &mut String,
-        call_expression: &Expression,
+        raw_value: &str,
+        option_ty: &Type,
+        target: WrapperTarget<'_>,
+    ) -> (Vec<LoweredStatement>, WrapperOutcome) {
+        self.require_stdlib();
+        let mut statements = Vec::new();
+        let inner_ty = option_ty.ok_type();
+        let inner_ty_str = self.use_go_type(&inner_ty);
+        let is_nil_check = if self.is_interface_option(option_ty) {
+            format!("lisette.IsNilInterface({})", raw_value)
+        } else {
+            format!("{} == nil", raw_value)
+        };
+        let value_expr = format!(
+            "lisette.OptionFromNilable[{}]({}, {})",
+            inner_ty_str, raw_value, is_nil_check
+        );
+        let outcome =
+            self.push_simple_wrapper_value(&mut statements, target, "option", &value_expr);
+        (statements, outcome)
+    }
+
+    pub(crate) fn plan_option_projection(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        option_value: &str,
+        slot_hint: &str,
+        slot_ty: &str,
+        address: bool,
+    ) -> String {
+        let opt_var = self.stable_source(statements, "opt", option_value);
+        let slot_var = self.fresh_var(Some(slot_hint));
+        self.declare(&slot_var);
+        statements.push(LoweredStatement::VarDecl {
+            name: slot_var.clone(),
+            go_type: slot_ty.to_string(),
+            value: None,
+        });
+
+        self.require_stdlib();
+        let amp = if address { "&" } else { "" };
+        let body = LoweredBlock {
+            statements: vec![LoweredStatement::RawGo(format!(
+                "{} = {}{}.SomeVal\n",
+                slot_var, amp, opt_var
+            ))],
+        };
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition: format!("{}.Tag == {}", opt_var, OPTION_SOME_TAG),
+            then_body: body,
+            else_arm: ElseArm::None,
+        }));
+        slot_var
+    }
+
+    /// Wrap a Go `*T` (T value-typed) into Lisette `Option<T>`.
+    fn plan_pointer_to_option_wrap(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        ptr_value: &str,
         option_ty: &Type,
     ) -> String {
-        let call_str = self.emit_call(output, call_expression, None);
+        self.require_stdlib();
+        let inner_ty_str = self.use_go_type(&option_ty.ok_type());
+        let value_expr = format!("lisette.OptionFromPointer[{}]({})", inner_ty_str, ptr_value);
+        self.hoist_tmp_value_statement(statements, "option", &value_expr)
+    }
 
-        let raw_var = self.fresh_var(Some("raw"));
-        self.declare(&raw_var);
-        write_line!(output, "{} := {}", raw_var, call_str);
+    /// `FreshSlot` form of `lower_nil_check_option_wrap` (extends `statements`
+    /// and returns the option var).
+    pub(crate) fn plan_nil_check_option_wrap(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        raw_value: &str,
+        option_ty: &Type,
+    ) -> String {
+        let (wrap_statements, outcome) =
+            self.lower_nil_check_option_wrap(raw_value, option_ty, WrapperTarget::FreshSlot);
+        statements.extend(wrap_statements);
+        outcome.expect("FreshSlot produces a slot")
+    }
 
-        self.emit_nil_check_option_wrap(output, &raw_var, option_ty)
+    pub(crate) fn plan_layout_bridge(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        value: &str,
+        bridge: &LayoutBridge,
+    ) -> String {
+        match bridge {
+            LayoutBridge::Identity => value.to_string(),
+            LayoutBridge::UnwrapNullableOption {
+                target_payload,
+                payload,
+                ..
+            } => {
+                if payload.is_identity() {
+                    let slot_type = target_payload.go_type(self);
+                    let slot_type = self.use_rendered_go_type(slot_type);
+                    self.plan_option_projection(statements, value, "unwrap", &slot_type, false)
+                } else {
+                    self.plan_option_projection_with_bridge(
+                        statements,
+                        value,
+                        target_payload,
+                        payload,
+                        false,
+                    )
+                }
+            }
+            LayoutBridge::UnwrapPointerOption {
+                target_payload,
+                payload,
+                ..
+            } => {
+                if payload.is_identity() {
+                    let slot_type = target_payload.go_type(self);
+                    let slot_type = format!("*{}", self.use_rendered_go_type(slot_type));
+                    self.plan_option_projection(statements, value, "ptr", &slot_type, true)
+                } else {
+                    self.plan_option_projection_with_bridge(
+                        statements,
+                        value,
+                        target_payload,
+                        payload,
+                        true,
+                    )
+                }
+            }
+            LayoutBridge::WrapNullableOption {
+                option_type,
+                payload,
+                ..
+            } => {
+                if payload.is_identity() {
+                    self.plan_nil_check_option_wrap(statements, value, option_type)
+                } else {
+                    self.plan_option_wrap_with_bridge(
+                        statements,
+                        value,
+                        option_type,
+                        payload,
+                        false,
+                    )
+                }
+            }
+            LayoutBridge::WrapPointerOption {
+                option_type,
+                payload,
+                ..
+            } => {
+                if payload.is_identity() {
+                    self.plan_pointer_to_option_wrap(statements, value, option_type)
+                } else {
+                    self.plan_option_wrap_with_bridge(statements, value, option_type, payload, true)
+                }
+            }
+            LayoutBridge::Reference { pointee } => {
+                let source = self.stable_source(statements, "src", value);
+                let pointee = self.plan_layout_bridge(statements, &format!("*{source}"), pointee);
+                self.hoist_tmp_value_statement(statements, "ref", &format!("&{pointee}"))
+            }
+            LayoutBridge::Function { source, target, .. } => {
+                self.plan_function_layout_bridge(statements, value, source, target)
+            }
+            LayoutBridge::Aggregate { .. } => {
+                self.plan_aggregate_layout_bridge(statements, value, bridge)
+            }
+        }
+    }
+
+    fn plan_option_projection_with_bridge(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        option_value: &str,
+        target_payload: &ValueLayout,
+        payload_bridge: &LayoutBridge,
+        address: bool,
+    ) -> String {
+        let option = self.stable_source(statements, "opt", option_value);
+        let target_type = target_payload.go_type(self);
+        let target_type = self.use_rendered_go_type(target_type);
+        let slot_type = if address {
+            format!("*{target_type}")
+        } else {
+            target_type
+        };
+        let slot_hint = if address { "ptr" } else { "unwrap" };
+        let slot = self.fresh_var(Some(slot_hint));
+        self.declare(&slot);
+        statements.push(LoweredStatement::VarDecl {
+            name: slot.clone(),
+            go_type: slot_type,
+            value: None,
+        });
+
+        let mut then_statements = Vec::new();
+        let payload = self.plan_layout_bridge(
+            &mut then_statements,
+            &format!("{}.SomeVal", option),
+            payload_bridge,
+        );
+        let payload = if address {
+            format!("&{payload}")
+        } else {
+            payload
+        };
+        then_statements.push(LoweredStatement::RawGo(format!("{slot} = {payload}\n")));
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition: format!("{}.Tag == {}", option, OPTION_SOME_TAG),
+            then_body: LoweredBlock {
+                statements: then_statements,
+            },
+            else_arm: ElseArm::None,
+        }));
+        slot
+    }
+
+    fn plan_option_wrap_with_bridge(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        raw_value: &str,
+        option_type: &Type,
+        payload_bridge: &LayoutBridge,
+        pointer: bool,
+    ) -> String {
+        self.require_stdlib();
+        let source = self.stable_source(statements, "raw", raw_value);
+        let fallible = Fallible::from_type(option_type).expect("Option type expected");
+        let option_type_string = {
+            let mut planner = FalliblePlanner::new(self, &fallible);
+            planner.full_type_string()
+        };
+        let option = self.fresh_var(Some("option"));
+        self.declare(&option);
+        statements.push(LoweredStatement::VarDecl {
+            name: option.clone(),
+            go_type: option_type_string,
+            value: None,
+        });
+
+        let raw_payload = if pointer {
+            format!("*{source}")
+        } else {
+            source.clone()
+        };
+        let mut then_statements = Vec::new();
+        let payload = self.plan_layout_bridge(&mut then_statements, &raw_payload, payload_bridge);
+        let some = {
+            let mut planner = FalliblePlanner::new(self, &fallible);
+            planner.emit_success(&payload)
+        };
+        then_statements.push(LoweredStatement::RawGo(format!("{option} = {some}\n")));
+        let none = {
+            let mut planner = FalliblePlanner::new(self, &fallible);
+            planner.emit_failure(None)
+        };
+        let condition = if !pointer && self.is_interface_option(option_type) {
+            format!("!lisette.IsNilInterface({source})")
+        } else {
+            format!("{source} != nil")
+        };
+        statements.push(LoweredStatement::If(IfPlan {
+            condition_setup: Vec::new(),
+            condition,
+            then_body: LoweredBlock {
+                statements: then_statements,
+            },
+            else_arm: ElseArm::from_body(
+                LoweredBlock {
+                    statements: vec![LoweredStatement::RawGo(format!("{option} = {none}\n"))],
+                },
+                false,
+            ),
+        }));
+        option
+    }
+
+    fn plan_aggregate_layout_bridge(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        value: &str,
+        bridge: &LayoutBridge,
+    ) -> String {
+        let LayoutBridge::Aggregate {
+            source,
+            target,
+            key,
+            element,
+        } = bridge
+        else {
+            unreachable!("plan_aggregate_layout_bridge requires an Aggregate bridge");
+        };
+        let source_layout: &ValueLayout = source;
+        let target_layout: &ValueLayout = target;
+        let element_bridge: &LayoutBridge = element;
+        let key_bridge = key.as_deref();
+        self.require_stdlib();
+        let source = self.stable_source(statements, "src", value);
+        let direction = key_bridge
+            .and_then(LayoutBridge::direction)
+            .or_else(|| element_bridge.direction())
+            .expect("aggregate layout bridge must contain an option bridge");
+        let output_hint = match direction {
+            BridgeDirection::ToGo => "unwrapped",
+            BridgeDirection::FromGo => "wrapped",
+        };
+        let target_type = target_layout.go_type(self);
+        let target_type = self.use_rendered_go_type(target_type);
+        let output = if matches!(target_layout, ValueLayout::Array { .. }) {
+            let output = self.fresh_var(Some(output_hint));
+            self.declare(&output);
+            statements.push(LoweredStatement::VarDecl {
+                name: output.clone(),
+                go_type: target_type,
+                value: None,
+            });
+            output
+        } else {
+            self.hoist_tmp_value_statement(
+                statements,
+                output_hint,
+                &format!("make({}, len({}))", target_type, source),
+            )
+        };
+        let index = self.fresh_var(Some("i"));
+        self.declare(&index);
+        let element = self.fresh_var(Some("v"));
+        self.declare(&element);
+        let mut key_statements = Vec::new();
+        let output_index = key_bridge.map_or_else(
+            || index.clone(),
+            |bridge| self.plan_layout_bridge(&mut key_statements, &index, bridge),
+        );
+        let mut body = self.plan_aggregate_element_bridge(
+            &output,
+            &output_index,
+            &element,
+            source_layout,
+            element_bridge,
+        );
+        if !key_statements.is_empty() {
+            key_statements.append(&mut body.statements);
+            body.statements = key_statements;
+        }
+        statements.push(LoweredStatement::Loop(LoopPlan {
+            prologue: Vec::new(),
+            kind: LoopKind::Generated { label: None },
+            header: format!("for {index}, {element} := range {source} {{\n"),
+            body,
+        }));
+        output
+    }
+
+    fn plan_aggregate_element_bridge(
+        &mut self,
+        output: &str,
+        index: &str,
+        element: &str,
+        source_layout: &ValueLayout,
+        bridge: &LayoutBridge,
+    ) -> LoweredBlock {
+        match bridge {
+            LayoutBridge::UnwrapNullableOption { payload, .. }
+            | LayoutBridge::UnwrapPointerOption { payload, .. } => {
+                let pointer = matches!(bridge, LayoutBridge::UnwrapPointerOption { .. });
+                let mut then_statements = Vec::new();
+                let projected = format!("{element}.SomeVal");
+                let projected = if payload.is_identity() {
+                    projected
+                } else {
+                    self.plan_layout_bridge(&mut then_statements, &projected, payload)
+                };
+                let projected = if pointer {
+                    format!("&{projected}")
+                } else {
+                    projected
+                };
+                then_statements.push(LoweredStatement::RawGo(format!(
+                    "{output}[{index}] = {projected}\n"
+                )));
+                let needs_nil_else = matches!(source_layout, ValueLayout::Map { .. }) || pointer;
+                let else_arm = if needs_nil_else {
+                    ElseArm::from_body(
+                        LoweredBlock {
+                            statements: vec![LoweredStatement::RawGo(format!(
+                                "{output}[{index}] = nil\n"
+                            ))],
+                        },
+                        false,
+                    )
+                } else {
+                    ElseArm::None
+                };
+                LoweredBlock {
+                    statements: vec![LoweredStatement::If(IfPlan {
+                        condition_setup: Vec::new(),
+                        condition: format!("{element}.Tag == {OPTION_SOME_TAG}"),
+                        then_body: LoweredBlock {
+                            statements: then_statements,
+                        },
+                        else_arm,
+                    })],
+                }
+            }
+            LayoutBridge::WrapNullableOption {
+                option_type,
+                payload,
+                ..
+            }
+            | LayoutBridge::WrapPointerOption {
+                option_type,
+                payload,
+                ..
+            } => {
+                let pointer = matches!(bridge, LayoutBridge::WrapPointerOption { .. });
+                let raw_payload = if pointer {
+                    format!("*{element}")
+                } else {
+                    element.to_string()
+                };
+                let mut then_statements = Vec::new();
+                let payload = if payload.is_identity() {
+                    raw_payload
+                } else {
+                    self.plan_layout_bridge(&mut then_statements, &raw_payload, payload)
+                };
+                let fallible = Fallible::from_type(option_type).expect("Option type expected");
+                let some = {
+                    let mut planner = FalliblePlanner::new(self, &fallible);
+                    planner.emit_success(&payload)
+                };
+                let none = {
+                    let mut planner = FalliblePlanner::new(self, &fallible);
+                    planner.emit_failure(None)
+                };
+                then_statements.push(LoweredStatement::RawGo(format!(
+                    "{output}[{index}] = {some}\n"
+                )));
+                let condition = if !pointer && self.is_interface_option(option_type) {
+                    format!("!lisette.IsNilInterface({element})")
+                } else {
+                    format!("{element} != nil")
+                };
+                LoweredBlock {
+                    statements: vec![LoweredStatement::If(IfPlan {
+                        condition_setup: Vec::new(),
+                        condition,
+                        then_body: LoweredBlock {
+                            statements: then_statements,
+                        },
+                        else_arm: ElseArm::from_body(
+                            LoweredBlock {
+                                statements: vec![LoweredStatement::RawGo(format!(
+                                    "{output}[{index}] = {none}\n"
+                                ))],
+                            },
+                            false,
+                        ),
+                    })],
+                }
+            }
+            LayoutBridge::Aggregate { .. }
+            | LayoutBridge::Reference { .. }
+            | LayoutBridge::Function { .. } => {
+                let mut inner_statements = Vec::new();
+                let inner = self.plan_layout_bridge(&mut inner_statements, element, bridge);
+                inner_statements.push(LoweredStatement::RawGo(format!(
+                    "{output}[{index}] = {inner}\n"
+                )));
+                LoweredBlock {
+                    statements: inner_statements,
+                }
+            }
+            LayoutBridge::Identity => LoweredBlock {
+                statements: vec![LoweredStatement::RawGo(format!(
+                    "{output}[{index}] = {element}\n"
+                ))],
+            },
+        }
     }
 }

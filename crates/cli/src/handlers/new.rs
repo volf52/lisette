@@ -1,7 +1,12 @@
 use std::fs;
 use std::path::Path;
 
+use crate::agents_md;
 use crate::cli_error;
+use crate::go_cli;
+use crate::output;
+use crate::reference;
+use std::process::Command;
 
 pub fn new_project(name: &str) -> i32 {
     let project_dir = Path::new(name);
@@ -95,8 +100,7 @@ fn main() {
         r#"# {}
 
 ```bash
-lis build
-go run -C target .
+lis run
 ```
 "#,
         project_name
@@ -110,10 +114,19 @@ go run -C target .
         return 1;
     }
 
-    if let Err(e) = fs::write(project_dir.join("AGENTS.md"), crate::agents_md::AGENTS_MD) {
+    if let Err(e) = fs::write(project_dir.join("AGENTS.md"), agents_md::AGENTS_MD) {
         cli_error!(
             "Failed to create project",
             format!("Failed to write `AGENTS.md`: {}", e),
+            "Check file permissions"
+        );
+        return 1;
+    }
+
+    if let Err(e) = reference::write_to(project_dir) {
+        cli_error!(
+            "Failed to create project",
+            format!("Failed to write `.lisette/docs`: {}", e),
             "Check file permissions"
         );
         return 1;
@@ -129,27 +142,33 @@ go run -C target .
         return 1;
     }
 
-    let _ = std::process::Command::new("git")
+    let _ = Command::new("git")
         .arg("init")
         .arg("--quiet")
         .current_dir(project_dir)
         .status();
 
-    crate::go_cli::prewarm_module_cache();
+    go_cli::prewarm_module_cache(stdlib::Target::host());
 
     eprintln!();
-    if crate::output::use_color() {
+    if output::use_color() {
         use owo_colors::OwoColorize;
         eprintln!("  ✓ Created {} project", project_name.bright_magenta());
+        eprintln!(
+            "    cd {} then {} to test it",
+            project_name.bright_magenta(),
+            "lis run".bright_magenta()
+        );
     } else {
         eprintln!("  ✓ Created `{}` project", project_name);
+        eprintln!("    cd `{}` then `lis run` to test it", project_name);
     }
 
     0
 }
 
 fn is_go_stdlib_package(name: &str) -> bool {
-    stdlib::get_go_stdlib_packages()
+    stdlib::get_go_stdlib_packages(stdlib::Target::host())
         .iter()
         .any(|pkg| pkg.split('/').next() == Some(name))
 }

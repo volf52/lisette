@@ -1,0 +1,83 @@
+use crate::passes::lints::span_edit::statement_deletion;
+use crate::passes::walk::NodeCtx;
+use diagnostics::{Edit, Fix};
+use syntax::ast::{Expression, IdentifierResolution, Pattern};
+
+/// Flags `let x = x`, an immutable rebinding of a variable to itself.
+pub fn check_redundant_rebinding(expression: &Expression, ctx: &NodeCtx) {
+    let Expression::Let {
+        binding,
+        value,
+        mode,
+        span,
+        ..
+    } = expression
+    else {
+        return;
+    };
+
+    if mode.else_block().is_some() {
+        return;
+    }
+
+    if binding.is_mutable() {
+        return;
+    }
+
+    // An annotation can coerce the value (for example to an interface).
+    if binding.annotation.is_some() {
+        return;
+    }
+
+    let Pattern::Identifier {
+        identifier,
+        span: new_span,
+    } = &binding.pattern
+    else {
+        return;
+    };
+
+    let Expression::Identifier {
+        value: rhs_name,
+        resolution: IdentifierResolution::Binding(outer_id),
+        ..
+    } = value.unwrap_parens()
+    else {
+        return;
+    };
+
+    if rhs_name != identifier {
+        return;
+    }
+
+    // `let x = x` copies into a distinct storage slot, so a `&x` on either
+    // binding (recorded as `mutated`) makes the two slots observable apart
+    // through a `Ref` and removing the rebinding would merge them. A `mut`
+    // outer is a deliberate freeze; an unused new binding is owned by
+    // `unused_variable`.
+    let outer_is_stable = ctx
+        .facts
+        .bindings
+        .get(outer_id)
+        .is_some_and(|b| !b.kind.is_mutable() && b.mutation.is_none());
+    if !outer_is_stable {
+        return;
+    }
+
+    let new_is_plain_use = ctx
+        .facts
+        .bindings
+        .values()
+        .any(|b| b.span == *new_span && b.used && b.mutation.is_none());
+    if !new_is_plain_use {
+        return;
+    }
+
+    let deletion = statement_deletion(ctx.source(), *span);
+    ctx.sink.push(
+        diagnostics::lint::redundant_rebinding(span, identifier).with_fix(Fix::new(
+            "Remove the redundant rebinding",
+            Edit::deletion(deletion),
+        )),
+    );
+}

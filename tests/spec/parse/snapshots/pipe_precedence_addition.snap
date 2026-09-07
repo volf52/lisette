@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test() { let result = a + b |> func; }\n"
+description: |
+  
+  fn test() { let result = a + b |> func; }
 ---
 [
     Function {
@@ -15,116 +17,110 @@ description: "input: \nfn test() { let result = a + b |> func; }\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Let {
-                    binding: Binding {
-                        pattern: Identifier {
-                            identifier: "result",
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 17,
-                                byte_length: 6,
+        body: Definition(
+            Block {
+                items: [
+                    Let {
+                        binding: Binding {
+                            pattern: Identifier {
+                                identifier: "result",
+                                span: Span {
+                                    file_id: 0,
+                                    byte_offset: 17,
+                                    byte_length: 6,
+                                },
+                            },
+                            annotation: None,
+                            ty: Var {
+                                id: uninferred,
                             },
                         },
-                        annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
-                    },
-                    value: Binary {
-                        operator: Pipeline,
-                        left: Binary {
-                            operator: Addition,
-                            left: Identifier {
-                                value: "a",
-                                ty: Variable(
-                                    -1,
-                                ),
+                        value: Binary {
+                            operator: Pipeline,
+                            left: Binary {
+                                operator: Addition,
+                                left: Identifier {
+                                    value: "a",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 26,
+                                        byte_length: 1,
+                                    },
+                                    resolution: Unresolved,
+                                },
+                                right: Identifier {
+                                    value: "b",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 30,
+                                        byte_length: 1,
+                                    },
+                                    resolution: Unresolved,
+                                },
+                                ty: Var {
+                                    id: uninferred,
+                                },
                                 span: Span {
                                     file_id: 0,
                                     byte_offset: 26,
-                                    byte_length: 1,
+                                    byte_length: 5,
                                 },
-                                binding_id: None,
-                                qualified: None,
                             },
                             right: Identifier {
-                                value: "b",
-                                ty: Variable(
-                                    -1,
-                                ),
+                                value: "func",
+                                ty: Var {
+                                    id: uninferred,
+                                },
                                 span: Span {
                                     file_id: 0,
-                                    byte_offset: 30,
-                                    byte_length: 1,
+                                    byte_offset: 35,
+                                    byte_length: 4,
                                 },
-                                binding_id: None,
-                                qualified: None,
+                                resolution: Unresolved,
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                             span: Span {
                                 file_id: 0,
                                 byte_offset: 26,
-                                byte_length: 5,
+                                byte_length: 13,
                             },
                         },
-                        right: Identifier {
-                            value: "func",
-                            ty: Variable(
-                                -1,
-                            ),
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 35,
-                                byte_length: 4,
-                            },
-                            binding_id: None,
-                            qualified: None,
+                        mode: Plain,
+                        ty: Var {
+                            id: uninferred,
                         },
-                        ty: Variable(
-                            -1,
-                        ),
                         span: Span {
                             file_id: 0,
-                            byte_offset: 26,
-                            byte_length: 13,
+                            byte_offset: 13,
+                            byte_length: 26,
                         },
                     },
-                    mutable: false,
-                    mut_span: None,
-                    else_block: None,
-                    else_span: None,
-                    typed_pattern: None,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 13,
-                        byte_length: 26,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 31,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 31,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

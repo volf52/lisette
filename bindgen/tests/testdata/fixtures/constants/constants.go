@@ -61,15 +61,14 @@ const (
 
 // Numeric notation (hex, octal, binary)
 const (
-	HexConst    = 0xFF
-	HexLarge    = 0xDEADBEEF
-	OctalConst  = 0o755
-	OctalLegacy = 0644
-	BinaryConst = 0b1010
-	BinaryLong  = 0b11110000
+	HexConst         = 0xFF
+	HexLarge         = 0xDEADBEEF
+	OctalConst       = 0o755
+	LeadingZeroOctal = 0644
+	BinaryConst      = 0b1010
+	BinaryLong       = 0b11110000
 )
 
-// Value enum with negative values (tests parseIntValue handles negatives)
 type Priority int
 
 const (

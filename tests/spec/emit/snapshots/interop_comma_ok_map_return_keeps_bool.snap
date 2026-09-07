@@ -1,0 +1,24 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:example.com/reg"
+  
+  fn main() {
+    match reg.Lookup("a") {
+      Some(m) => { let _ = m.length() },
+      None => { let _ = 0 },
+    }
+  }
+---
+package main
+
+import "example.com/reg"
+
+func main() {
+	ret_1, ok_2 := reg.Lookup("a")
+	if ok_2 && ret_1 != nil {
+		m := ret_1
+		_ = len(m)
+	}
+}

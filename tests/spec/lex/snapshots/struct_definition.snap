@@ -1,6 +1,11 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: \nstruct Point {\n  x: int,\n  y: int,\n}\n"
+description: |
+  
+  struct Point {
+    x: int,
+    y: int,
+  }
 ---
 LexResult {
     tokens: [
@@ -90,9 +95,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

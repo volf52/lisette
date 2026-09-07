@@ -1,9 +1,12 @@
+use crate::checker::EnvResolve;
 use syntax::ast::{Expression, Span};
-use syntax::types::Type;
+use syntax::types::{SimpleKind, Type};
 
-use crate::checker::Checker;
+use crate::checker::infer::InferCtx;
+use syntax::ast::Literal;
+use syntax::ast::UnaryOperator;
 
-impl Checker<'_, '_> {
+impl InferCtx<'_> {
     /// Validates that an integer literal fits within the target numeric type.
     /// Note: value is u64 from the parser, so negative literals are handled via unary minus.
     pub(crate) fn check_integer_literal_overflow(
@@ -23,7 +26,7 @@ impl Checker<'_, '_> {
         if value as i128 > bounds.max {
             self.sink.push(diagnostics::infer::integer_literal_overflow(
                 bounds.name,
-                0,
+                bounds.min,
                 bounds.max,
                 span,
             ));
@@ -52,17 +55,11 @@ impl Checker<'_, '_> {
         target_ty: &Type,
         span: Span,
     ) {
-        let inner = expression.unwrap_parens();
-
-        let Expression::Literal {
-            literal: syntax::ast::Literal::Integer { value, .. },
-            ..
-        } = inner
-        else {
+        let Some(value) = expression.as_integer() else {
             return;
         };
 
-        self.check_negative_magnitude_overflow(*value, target_ty, span);
+        self.check_negative_magnitude_overflow(value, target_ty, span);
     }
 
     pub(crate) fn check_negative_magnitude_overflow(
@@ -104,23 +101,23 @@ impl Checker<'_, '_> {
         target_ty: &Type,
         span: Span,
     ) {
-        let resolved = target_ty.resolve();
+        let resolved = target_ty.resolve_in(&self.env);
         if !resolved.is_numeric() {
             return;
         }
 
         let (value, is_negative) = match expression.unwrap_parens() {
             Expression::Literal {
-                literal: syntax::ast::Literal::Integer { value, .. },
+                literal: Literal::Integer { value, .. },
                 ..
             } => (*value, false),
             Expression::Unary {
-                operator: syntax::ast::UnaryOperator::Negative,
+                operator: UnaryOperator::Negative,
                 expression: inner,
                 ..
             } => {
                 if let Expression::Literal {
-                    literal: syntax::ast::Literal::Integer { value, .. },
+                    literal: Literal::Integer { value, .. },
                     ..
                 } = inner.unwrap_parens()
                 {
@@ -160,54 +157,21 @@ struct IntegerBounds {
 }
 
 fn integer_bounds(type_name: Option<&str>) -> Option<IntegerBounds> {
-    Some(match type_name? {
-        "int8" => IntegerBounds {
-            name: "int8",
-            min: i8::MIN as i128,
-            max: i8::MAX as i128,
-        },
-        "int16" => IntegerBounds {
-            name: "int16",
-            min: i16::MIN as i128,
-            max: i16::MAX as i128,
-        },
-        "int32" => IntegerBounds {
-            name: "int32",
-            min: i32::MIN as i128,
-            max: i32::MAX as i128,
-        },
-        "int64" | "int" => IntegerBounds {
-            name: "int64",
-            min: i64::MIN as i128,
-            max: i64::MAX as i128,
-        },
-        "rune" => IntegerBounds {
-            name: "rune",
-            min: i32::MIN as i128,
-            max: i32::MAX as i128,
-        },
-        "uint8" | "byte" => IntegerBounds {
-            name: "uint8",
-            min: 0,
-            max: u8::MAX as i128,
-        },
-        "uint16" => IntegerBounds {
-            name: "uint16",
-            min: 0,
-            max: u16::MAX as i128,
-        },
-        "uint32" => IntegerBounds {
-            name: "uint32",
-            min: 0,
-            max: u32::MAX as i128,
-        },
-        "uint64" | "uint" | "uintptr" => IntegerBounds {
-            name: "uint64",
-            min: 0,
-            max: u64::MAX as i128,
-        },
+    let kind = SimpleKind::from_name(type_name?)?;
+    let (min, max) = kind.integer_range()?;
+    let name = match kind {
+        SimpleKind::Int | SimpleKind::Int64 => "int64",
+        SimpleKind::Int8 => "int8",
+        SimpleKind::Int16 => "int16",
+        SimpleKind::Int32 => "int32",
+        SimpleKind::Rune => "rune",
+        SimpleKind::Byte | SimpleKind::Uint8 => "uint8",
+        SimpleKind::Uint16 => "uint16",
+        SimpleKind::Uint32 => "uint32",
+        SimpleKind::Uint | SimpleKind::Uint64 | SimpleKind::Uintptr => "uint64",
         _ => return None,
-    })
+    };
+    Some(IntegerBounds { name, min, max })
 }
 
 fn is_unsigned_type(type_name: Option<&str>) -> bool {

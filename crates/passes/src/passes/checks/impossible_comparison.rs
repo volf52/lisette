@@ -1,0 +1,175 @@
+use crate::passes::comparison::{
+    Bound, expressions_equivalent, in_scope_integer_literal_comparison, is_side_effect_free,
+    is_skippable_boolean, tighter,
+};
+use crate::passes::walk::{ClaimKind, NodeCtx};
+use syntax::ast::{BinaryOperator, Expression, Span};
+
+pub(crate) fn check(expression: &Expression, ctx: &mut NodeCtx) {
+    let Expression::Binary {
+        operator: BinaryOperator::And,
+        span: root_span,
+        ..
+    } = expression
+    else {
+        return;
+    };
+
+    // A nested `&&` is covered by the outermost chain that encloses it.
+    if ctx.is_claimed(ClaimKind::ImpossibleComparison, root_span) {
+        return;
+    }
+
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(expression, root_span, &mut conjuncts, ctx);
+
+    // Constraints combine only across side-effect-free conjuncts: a conjunct
+    // that could mutate state may change the compared operand, ending the run.
+    let mut groups: Vec<Group> = Vec::new();
+    let mut impossible = false;
+    for conjunct in conjuncts {
+        if !is_side_effect_free(conjunct) {
+            impossible |= groups.iter().any(|group| group.is_unsatisfiable());
+            groups.clear();
+            continue;
+        }
+        if let Some((operand, constraint)) = comparison_constraint(conjunct) {
+            match groups
+                .iter_mut()
+                .find(|group| expressions_equivalent(group.operand, operand))
+            {
+                Some(group) => group.add(constraint),
+                None => {
+                    let mut group = Group::new(operand);
+                    group.add(constraint);
+                    groups.push(group);
+                }
+            }
+        } else if !is_skippable_boolean(conjunct) {
+            // Barrier on any conjunct not positively recognized as a value-stable
+            // boolean: reasoning across an out-of-scope or type-invalid one (e.g.
+            // `s < 5`, or an invalid comparison buried in `s < 5 || flag`) is unsound.
+            impossible |= groups.iter().any(|group| group.is_unsatisfiable());
+            groups.clear();
+        }
+    }
+    impossible |= groups.iter().any(|group| group.is_unsatisfiable());
+
+    if impossible {
+        ctx.sink
+            .push(diagnostics::infer::impossible_comparison(root_span));
+    }
+}
+
+/// Flattens an `&&` chain into its conjuncts, claiming every nested `&&` span so
+/// the walk does not also report a sub-chain.
+fn collect_conjuncts<'a>(
+    expression: &'a Expression,
+    root_span: &Span,
+    conjuncts: &mut Vec<&'a Expression>,
+    ctx: &mut NodeCtx,
+) {
+    match expression.unwrap_parens() {
+        Expression::Binary {
+            operator: BinaryOperator::And,
+            left,
+            right,
+            span,
+            ..
+        } => {
+            if span != root_span {
+                ctx.claim(ClaimKind::ImpossibleComparison, *span);
+            }
+            collect_conjuncts(left, root_span, conjuncts, ctx);
+            collect_conjuncts(right, root_span, conjuncts, ctx);
+        }
+        other => conjuncts.push(other),
+    }
+}
+
+enum Constraint {
+    Bounded {
+        low: Option<Bound>,
+        high: Option<Bound>,
+    },
+    Excluded(i128),
+}
+
+/// The constraint a `variable OP integer-literal` comparison puts on its operand,
+/// paired with that operand. `None` for anything out of the integer scope.
+fn comparison_constraint(expression: &Expression) -> Option<(&Expression, Constraint)> {
+    use BinaryOperator::*;
+    let (operand, operator, bound) = in_scope_integer_literal_comparison(expression)?;
+
+    let constraint = match operator {
+        LessThan => Constraint::Bounded {
+            low: None,
+            high: Some(Bound::new(bound, false)),
+        },
+        LessThanOrEqual => Constraint::Bounded {
+            low: None,
+            high: Some(Bound::new(bound, true)),
+        },
+        GreaterThan => Constraint::Bounded {
+            low: Some(Bound::new(bound, false)),
+            high: None,
+        },
+        GreaterThanOrEqual => Constraint::Bounded {
+            low: Some(Bound::new(bound, true)),
+            high: None,
+        },
+        Equal => Constraint::Bounded {
+            low: Some(Bound::new(bound, true)),
+            high: Some(Bound::new(bound, true)),
+        },
+        NotEqual => Constraint::Excluded(bound),
+        _ => return None,
+    };
+
+    Some((operand, constraint))
+}
+
+/// The integer constraints on one operand, accumulated across the chain.
+struct Group<'a> {
+    operand: &'a Expression,
+    low: Option<Bound>,
+    high: Option<Bound>,
+    excluded: Vec<i128>,
+}
+
+impl<'a> Group<'a> {
+    fn new(operand: &'a Expression) -> Self {
+        Group {
+            operand,
+            low: None,
+            high: None,
+            excluded: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, constraint: Constraint) {
+        match constraint {
+            Constraint::Bounded { low, high } => {
+                self.low = tighter(self.low, low, |a, b| a > b);
+                self.high = tighter(self.high, high, |a, b| a < b);
+            }
+            Constraint::Excluded(value) => self.excluded.push(value),
+        }
+    }
+
+    // Bounds are a continuous interval: `x > 0 && x < 1` (empty only for
+    // integers) is deliberately not flagged, since it holds for `float64`.
+    fn is_unsatisfiable(&self) -> bool {
+        let (Some(low), Some(high)) = (self.low, self.high) else {
+            return false;
+        };
+        if low.value > high.value {
+            return true;
+        }
+        if low.value == high.value {
+            // Single point `low`: empty if either side excludes it or a `!=` rules it out.
+            return !(low.inclusive && high.inclusive) || self.excluded.contains(&low.value);
+        }
+        false
+    }
+}

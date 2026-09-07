@@ -1,0 +1,30 @@
+---
+source: tests/spec/emit/functions.rs
+description: |
+  
+  fn double(x: int) -> Option<int> { Some(x + x) }
+  
+  fn run() -> Option<int> {
+    Option.and_then(Some(2), double)
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func double(x int) (int, bool) {
+	return x + x, true
+}
+
+func run() (int, bool) {
+	arg_3 := lisette.MakeOptionSome(2)
+	cb_1 := double
+	tagged_2 := func(arg0 int) lisette.Option[int] {
+		return lisette.OptionFromCommaOk[int](cb_1(arg0))
+	}
+	v_4 := lisette.OptionAndThen(arg_3, tagged_2)
+	if v_4.Tag == lisette.OptionSome {
+		return v_4.SomeVal, true
+	}
+	return 0, false
+}

@@ -1,15 +1,29 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn get_value() -> Option<int> {\n  Some(42)\n}\n\nfn test() -> Option<int> {\n  let x = get_value();\n  x\n}\n"
+description: |
+  
+  fn get_value() -> Option<int> {
+    Some(42)
+  }
+  
+  fn test() -> Option<int> {
+    let x = get_value();
+    x
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func get_value() lisette.Option[int] {
-	return lisette.MakeOptionSome[int](42)
+func getValue() (int, bool) {
+	return 42, true
 }
 
-func test() lisette.Option[int] {
-	return get_value()
+func test() (int, bool) {
+	x := lisette.OptionFromCommaOk[int](getValue())
+	v_1 := x
+	if v_1.Tag == lisette.OptionSome {
+		return v_1.SomeVal, true
+	}
+	return 0, false
 }

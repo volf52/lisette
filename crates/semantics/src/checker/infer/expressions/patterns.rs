@@ -1,63 +1,28 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use ecow::EcoString;
+use std::sync::Arc;
 use syntax::ast::BindingKind;
 use syntax::ast::{
-    EnumFieldDefinition, Expression, Literal, Pattern, RestPattern, Span, StructFieldPattern,
-    TypedPattern,
+    ConstructorPatternResolution, EnumFieldDefinition, Expression, Literal, Pattern,
+    RecordPatternResolution, RestPattern, SequencePatternResolution, Span, StructFieldPattern,
+    collect_pattern_bindings,
 };
-use syntax::program::Definition;
-use syntax::types::{Type, substitute};
+use syntax::program::{Definition, DefinitionBody};
+use syntax::types::{CompoundKind, Type, substitute, unqualified_name};
 
-use super::super::Checker;
-use super::super::checks::check_duplicate_bindings;
+use crate::checker::EnvResolve;
 
-pub(crate) fn collect_pattern_bindings(pattern: &Pattern) -> Vec<(String, Span)> {
-    match pattern {
-        Pattern::Identifier { identifier, span } => vec![(identifier.to_string(), *span)],
-        Pattern::Tuple { elements, .. } => {
-            elements.iter().flat_map(collect_pattern_bindings).collect()
-        }
-        Pattern::EnumVariant { fields, .. } => {
-            fields.iter().flat_map(collect_pattern_bindings).collect()
-        }
-        Pattern::Struct { fields, .. } => fields
-            .iter()
-            .flat_map(|f| collect_pattern_bindings(&f.value))
-            .collect(),
-        Pattern::Slice { prefix, rest, .. } => {
-            let mut bindings: Vec<_> = prefix.iter().flat_map(collect_pattern_bindings).collect();
-            if let RestPattern::Bind { name, span } = rest {
-                bindings.push((name.to_string(), *span));
-            }
-            bindings
-        }
-        Pattern::Or { patterns, .. } => patterns
-            .first()
-            .map(collect_pattern_bindings)
-            .unwrap_or_default(),
-        Pattern::AsBinding {
-            pattern,
-            name,
-            span,
-        } => {
-            let mut bindings = collect_pattern_bindings(pattern);
-            bindings.push((name.to_string(), *span));
-            bindings
-        }
-        Pattern::WildCard { .. } | Pattern::Literal { .. } | Pattern::Unit { .. } => vec![],
-    }
-}
+use crate::checker::infer::InferCtx;
+use crate::facts::BindingOrigin;
 
-impl Checker<'_, '_> {
+impl InferCtx<'_> {
     pub(super) fn infer_pattern(
         &mut self,
         pattern: Pattern,
         expected_ty: Type,
         kind: BindingKind,
-    ) -> (Pattern, TypedPattern) {
-        check_duplicate_bindings(self.sink, &pattern);
-        self.infer_pattern_inner(pattern, expected_ty, kind, false)
+    ) -> Pattern {
+        self.with_pattern(|this| this.infer_pattern_inner(pattern, expected_ty, kind, false))
     }
 
     fn infer_pattern_inner(
@@ -66,22 +31,22 @@ impl Checker<'_, '_> {
         expected_ty: Type,
         kind: BindingKind,
         is_struct_field: bool,
-    ) -> (Pattern, TypedPattern) {
+    ) -> Pattern {
+        let store = self.store;
         match pattern {
             Pattern::Identifier { identifier, span } => {
+                let is_d_lis = self.is_d_lis(store);
                 self.bind_name_in_scope(
                     identifier.to_string(),
                     span,
                     expected_ty,
                     kind,
-                    self.is_d_lis(),
-                    is_struct_field,
-                    false,
+                    BindingOrigin::Name {
+                        in_typedef: is_d_lis,
+                        shorthand_field: is_struct_field,
+                    },
                 );
-                (
-                    Pattern::Identifier { identifier, span },
-                    TypedPattern::Wildcard,
-                )
+                Pattern::Identifier { identifier, span }
             }
 
             Pattern::Literal { literal, ty, span } => {
@@ -90,15 +55,15 @@ impl Checker<'_, '_> {
 
                 match inferred_literal {
                     Expression::Literal { literal, ty, span } => {
-                        let typed = TypedPattern::Literal(literal.clone());
-                        (Pattern::Literal { literal, ty, span }, typed)
+                        Pattern::Literal { literal, ty, span }
                     }
                     _ => unreachable!(),
                 }
             }
 
             Pattern::Tuple { elements, span } => {
-                let element_types: Vec<Type> = match &expected_ty {
+                let peeled = self.store.peel_alias(&expected_ty.resolve_in(&self.env));
+                let element_types: Vec<Type> = match &peeled {
                     Type::Tuple(types) if types.len() == elements.len() => types.clone(),
                     Type::Tuple(types) => {
                         self.sink.push(diagnostics::infer::tuple_arity_mismatch(
@@ -117,109 +82,42 @@ impl Checker<'_, '_> {
                     }
                 };
 
-                let (inferred_elements, typed_elements): (Vec<_>, Vec<_>) = elements
+                let inferred_elements: Vec<_> = elements
                     .into_iter()
                     .zip(element_types.iter())
                     .map(|(p, ty)| self.infer_pattern_inner(p, ty.clone(), kind, false))
-                    .unzip();
+                    .collect();
 
-                let pattern = Pattern::Tuple {
+                Pattern::Tuple {
                     elements: inferred_elements,
                     span,
-                };
-                let typed = TypedPattern::Tuple {
-                    arity: typed_elements.len(),
-                    elements: typed_elements,
-                };
-                (pattern, typed)
+                }
             }
 
-            Pattern::EnumVariant {
-                identifier,
-                fields,
-                rest,
-                span,
-                ..
-            } => self.infer_enum_variant_pattern(identifier, fields, rest, span, expected_ty, kind),
+            pattern @ Pattern::EnumVariant { .. } => {
+                self.infer_enum_variant_pattern(pattern, expected_ty, kind)
+            }
 
-            Pattern::Struct {
-                identifier,
-                fields,
-                rest,
-                span,
-                ..
-            } => self.infer_struct_pattern(identifier, fields, rest, span, expected_ty, kind),
+            pattern @ Pattern::Struct { .. } => {
+                self.infer_struct_pattern(pattern, expected_ty, kind)
+            }
 
-            Pattern::WildCard { span } => (Pattern::WildCard { span }, TypedPattern::Wildcard),
+            Pattern::WildCard { span } => Pattern::WildCard { span },
 
             Pattern::Unit { span, .. } => {
-                self.unify(&expected_ty, &self.type_unit(), &span);
-                (
-                    Pattern::Unit {
-                        ty: self.type_unit(),
-                        span,
-                    },
-                    TypedPattern::Wildcard,
-                )
+                let unit_ty = self.type_unit();
+                self.unify(&expected_ty, &unit_ty, &span);
+                Pattern::Unit { ty: unit_ty, span }
             }
 
-            Pattern::Slice {
-                prefix, rest, span, ..
-            } => {
-                let resolved_ty = expected_ty.resolve();
-                let element_ty = match &resolved_ty {
-                    Type::Constructor { id, params, .. }
-                        if id.ends_with("Slice") && params.len() == 1 =>
-                    {
-                        params[0].clone()
-                    }
-                    _ => {
-                        let element_ty = self.new_type_var();
-                        let slice_ty = Type::Constructor {
-                            id: "Slice".into(),
-                            params: vec![element_ty.clone()],
-                            underlying_ty: None,
-                        };
-
-                        self.unify(&expected_ty, &slice_ty, &span);
-
-                        element_ty
-                    }
-                };
-
-                let (inferred_prefix, typed_prefix): (Vec<_>, Vec<_>) = prefix
-                    .into_iter()
-                    .map(|p| self.infer_pattern_inner(p, element_ty.clone(), kind, false))
-                    .unzip();
-
-                if let RestPattern::Bind { ref name, ref span } = rest {
-                    let rest_ty = self.type_slice(element_ty.clone());
-                    let is_typedef = self.is_d_lis();
-                    let binding_id = self.facts.add_binding(
-                        name.to_string(),
-                        *span,
-                        kind,
-                        is_typedef,
-                        false,
-                        false,
-                    );
-                    let scope = self.scopes.current_mut();
-                    scope.values.insert(name.to_string(), rest_ty);
-                    scope.name_to_binding.insert(name.to_string(), binding_id);
+            pattern @ Pattern::Slice { .. } => {
+                let resolved_ty = store.peel_alias(&expected_ty.resolve_in(&self.env));
+                if let Type::Array { length, element } = &resolved_ty {
+                    let (length, element_ty) = (*length, element.as_ref().clone());
+                    self.infer_array_pattern(pattern, length, element_ty, kind)
+                } else {
+                    self.infer_slice_pattern(pattern, resolved_ty, expected_ty, kind)
                 }
-
-                let pattern = Pattern::Slice {
-                    prefix: inferred_prefix,
-                    rest: rest.clone(),
-                    element_ty: element_ty.clone(),
-                    span,
-                };
-                let typed = TypedPattern::Slice {
-                    prefix: typed_prefix,
-                    has_rest: rest.is_present(),
-                    element_type: element_ty,
-                };
-                (pattern, typed)
             }
 
             Pattern::Or { patterns, span } => {
@@ -229,11 +127,12 @@ impl Checker<'_, '_> {
             Pattern::AsBinding {
                 pattern,
                 name,
+                name_span,
                 span,
             } => {
                 if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                     self.sink
-                        .push(diagnostics::infer::uppercase_binding(span, &name));
+                        .push(diagnostics::infer::uppercase_binding(name_span, &name));
                 }
                 match pattern.as_ref() {
                     Pattern::Identifier { identifier, .. } => {
@@ -256,147 +155,274 @@ impl Checker<'_, '_> {
                 }
                 let inner_kind = match kind {
                     BindingKind::Let { .. } => BindingKind::Let { mutable: false },
-                    BindingKind::Parameter { .. } => BindingKind::Parameter { mutable: false },
+                    BindingKind::Parameter => BindingKind::Parameter,
                     other => other,
                 };
-                let (inner, typed) = self.infer_pattern_inner(
+                let inner = self.infer_pattern_inner(
                     *pattern,
                     expected_ty.clone(),
                     inner_kind,
                     is_struct_field,
                 );
                 let alias_ty = inner.get_type().unwrap_or_else(|| expected_ty.clone());
-                let name_span = Span::new(
-                    span.file_id,
-                    span.byte_offset + span.byte_length - name.len() as u32,
-                    name.len() as u32,
-                );
                 self.bind_name_in_scope(
                     name.to_string(),
                     name_span,
                     alias_ty,
                     kind,
-                    false,
-                    is_struct_field,
-                    true,
-                );
-                (
-                    Pattern::AsBinding {
-                        pattern: Box::new(inner),
-                        name,
-                        span,
+                    BindingOrigin::AsAlias {
+                        shorthand_field: is_struct_field,
                     },
-                    typed,
-                )
+                );
+                Pattern::AsBinding {
+                    pattern: Box::new(inner),
+                    name,
+                    name_span,
+                    span,
+                }
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn bind_name_in_scope(
         &mut self,
         name: String,
         span: Span,
         ty: Type,
         kind: BindingKind,
-        is_typedef: bool,
-        is_struct_field: bool,
-        is_as_alias: bool,
+        origin: BindingOrigin,
     ) {
-        let binding_id = self.facts.add_binding(
-            name.clone(),
-            span,
-            kind,
-            is_typedef,
-            is_struct_field,
-            is_as_alias,
-        );
+        self.check_binding_shadows_import(&name, span, origin.is_typedef());
+
+        let shadows = self.shadowed_capture_span(&name);
+        let binding_id = self
+            .facts
+            .add_binding(name.clone(), span, kind, origin, shadows);
         let scope = self.scopes.current_mut();
-        scope.values.insert(name.clone(), ty);
-        scope.name_to_binding.insert(name.clone(), binding_id);
-        if kind.is_mutable() {
-            scope
-                .mutables
-                .get_or_insert_with(HashSet::default)
-                .insert(name);
+        scope.insert_binding(name, ty, binding_id, kind.is_mutable());
+    }
+
+    fn shadowed_capture_span(&self, name: &str) -> Option<Span> {
+        if name.starts_with('_') {
+            return None;
+        }
+        let shadowed = self.scopes.shadowed_capturable_binding(name)?;
+        self.facts.binding_span(shadowed)
+    }
+
+    fn infer_array_pattern(
+        &mut self,
+        pattern: Pattern,
+        length: u64,
+        element_ty: Type,
+        kind: BindingKind,
+    ) -> Pattern {
+        let Pattern::Slice {
+            prefix, rest, span, ..
+        } = pattern
+        else {
+            unreachable!("infer_array_pattern called with non-Slice pattern");
+        };
+        let store = self.store;
+        let inferred_prefix: Vec<_> = prefix
+            .into_iter()
+            .map(|p| self.infer_pattern_inner(p, element_ty.clone(), kind, false))
+            .collect();
+
+        let prefix_count = inferred_prefix.len() as u64;
+        let arity_ok = if rest.is_present() {
+            prefix_count <= length
+        } else {
+            prefix_count == length
+        };
+        if !arity_ok {
+            self.sink
+                .push(diagnostics::infer::array_pattern_length_mismatch(
+                    length,
+                    inferred_prefix.len(),
+                    rest.is_present(),
+                    span,
+                ));
+        }
+
+        if let RestPattern::Bind { ref name, ref span } = rest {
+            let remaining = length.saturating_sub(inferred_prefix.len() as u64);
+            let rest_ty = if element_ty.shallow_resolve_in(&self.env).is_error() {
+                Type::Error
+            } else {
+                self.type_array(remaining, element_ty.clone())
+            };
+            let is_typedef = self.is_d_lis(store);
+            self.bind_name_in_scope(
+                name.to_string(),
+                *span,
+                rest_ty,
+                kind,
+                BindingOrigin::Name {
+                    in_typedef: is_typedef,
+                    shorthand_field: false,
+                },
+            );
+        }
+
+        Pattern::Slice {
+            prefix: inferred_prefix,
+            rest,
+            resolution: SequencePatternResolution::Array {
+                element_type: element_ty,
+                length,
+            },
+            span,
+        }
+    }
+
+    fn infer_slice_pattern(
+        &mut self,
+        pattern: Pattern,
+        resolved_ty: Type,
+        expected_ty: Type,
+        kind: BindingKind,
+    ) -> Pattern {
+        let Pattern::Slice {
+            prefix, rest, span, ..
+        } = pattern
+        else {
+            unreachable!("infer_slice_pattern called with non-Slice pattern");
+        };
+        let store = self.store;
+        let element_ty = match resolved_ty.as_compound() {
+            Some((CompoundKind::Slice, args)) if args.len() == 1 => args[0].clone(),
+            _ => {
+                let element_ty = self.new_type_var();
+                let slice_ty = self.type_slice(element_ty.clone());
+                self.unify(&expected_ty, &slice_ty, &span);
+                element_ty
+            }
+        };
+
+        let inferred_prefix: Vec<_> = prefix
+            .into_iter()
+            .map(|p| self.infer_pattern_inner(p, element_ty.clone(), kind, false))
+            .collect();
+
+        if let RestPattern::Bind { ref name, ref span } = rest {
+            let rest_ty = if element_ty.shallow_resolve_in(&self.env).is_error() {
+                Type::Error
+            } else {
+                self.type_slice(element_ty.clone())
+            };
+            let is_typedef = self.is_d_lis(store);
+            self.bind_name_in_scope(
+                name.to_string(),
+                *span,
+                rest_ty,
+                kind,
+                BindingOrigin::Name {
+                    in_typedef: is_typedef,
+                    shorthand_field: false,
+                },
+            );
+        }
+
+        Pattern::Slice {
+            prefix: inferred_prefix,
+            rest,
+            resolution: SequencePatternResolution::Slice {
+                element_type: element_ty,
+            },
+            span,
         }
     }
 
     fn infer_enum_variant_pattern(
         &mut self,
-        identifier: EcoString,
-        fields: Vec<Pattern>,
-        rest: bool,
-        span: Span,
+        pattern: Pattern,
         expected_ty: Type,
         kind: BindingKind,
-    ) -> (Pattern, TypedPattern) {
-        let is_bare_name = fields.is_empty() && !identifier.contains('.') && !kind.is_match_arm();
+    ) -> Pattern {
+        let Pattern::EnumVariant {
+            identifier,
+            fields,
+            rest,
+            span,
+            ..
+        } = pattern
+        else {
+            unreachable!("infer_enum_variant_pattern called with non-EnumVariant pattern");
+        };
+        let store = self.store;
+        if fields.is_empty()
+            && let Some(result) =
+                self.try_infer_const_pattern(&identifier, rest, kind, &expected_ty, span)
+        {
+            return result;
+        }
 
-        let ty = if let Some(ty) = self.lookup_type(&identifier) {
+        let is_bare_name = is_bare_constructor_name(&identifier, &fields, kind);
+
+        let constructor_ty = if kind.is_match_arm()
+            && let Some(ty) = self.resolve_bare_variant_type(&identifier, &expected_ty)
+        {
+            ty
+        } else if let Some(value_ty) = self.lookup_type(store, &identifier) {
+            if matches!(self.instantiate(&value_ty).0, Type::Error) {
+                return Pattern::WildCard { span };
+            }
+            let Some(ty) =
+                self.resolve_pattern_constructor(&identifier, &expected_ty, is_bare_name)
+            else {
+                return self.reject_non_constructor_pattern(
+                    &identifier,
+                    &expected_ty,
+                    span,
+                    kind,
+                    &fields,
+                );
+            };
             ty
         } else if let Some((alias_ty, _)) = self.try_resolve_type_alias_variant(&identifier) {
             alias_ty
         } else {
-            if is_bare_name {
-                self.sink
-                    .push(diagnostics::infer::uppercase_binding(span, &identifier));
-                return (Pattern::WildCard { span }, TypedPattern::Wildcard);
+            return self.reject_non_constructor_pattern(
+                &identifier,
+                &expected_ty,
+                span,
+                kind,
+                &fields,
+            );
+        };
+
+        let (pattern_ty, params) = match self.instantiate(&constructor_ty).0 {
+            Type::Function(f) => {
+                let f = Arc::try_unwrap(f).unwrap_or_else(|arc| (*arc).clone());
+                (*f.return_type, f.params)
             }
-            let enum_info = self.get_enum_variant_info(&expected_ty);
-            let bare_name = identifier.rsplit('.').next().unwrap_or(&identifier);
-            self.sink
-                .push(diagnostics::infer::enum_variant_constructor_not_found(
-                    span,
-                    enum_info.as_ref().map(|(n, v)| (n.as_str(), v.as_slice())),
-                    bare_name,
-                ));
-            return (Pattern::WildCard { span }, TypedPattern::Wildcard);
+            other => (other, vec![]),
         };
 
-        let (value_constructor_type, _) = self.instantiate(&ty);
+        let unify_expected = store.deep_resolve_alias(&expected_ty.resolve_in(&self.env));
+        self.unify(&unify_expected.shallow_demoted(), &pattern_ty, &span);
 
-        if is_bare_name
-            && matches!(&value_constructor_type, Type::Constructor { .. })
-            && !self.is_enum_type(&value_constructor_type)
-        {
-            self.sink
-                .push(diagnostics::infer::uppercase_binding(span, &identifier));
-            return (Pattern::WildCard { span }, TypedPattern::Wildcard);
-        }
-
-        let (pattern_ty, params) = match value_constructor_type {
-            Type::Function {
-                params,
-                return_type,
-                ..
-            } => (*return_type, params),
-            Type::Constructor { .. } => (value_constructor_type, vec![]),
-            _ => unreachable!(),
-        };
-
-        self.unify(&expected_ty, &pattern_ty, &span);
-
-        let (new_fields, mut typed_fields): (Vec<_>, Vec<_>) = fields
+        let new_fields: Vec<_> = fields
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                let param_ty = params.get(i).cloned().unwrap_or_else(|| Type::Error);
+                let param_ty = params
+                    .get(i)
+                    .map(|param| self.granted_component_type(&param.ty, &unify_expected))
+                    .unwrap_or(Type::Error);
                 self.infer_pattern_inner(f.clone(), param_ty, kind, false)
             })
-            .unzip();
+            .collect();
 
-        if rest {
-            for _ in new_fields.len()..params.len() {
-                typed_fields.push(TypedPattern::Wildcard);
-            }
-        } else if params.len() != new_fields.len() {
+        if !rest && params.len() != new_fields.len() {
             let actual_types: Vec<Type> = new_fields
                 .iter()
                 .map(|p| p.get_type().unwrap_or_else(|| self.new_type_var()))
                 .collect();
+            let expected_types: Vec<Type> = params.iter().map(|param| param.ty.clone()).collect();
             self.sink.push(diagnostics::infer::arity_mismatch(
-                &params,
+                &expected_types,
                 &actual_types,
                 &[],
                 true,
@@ -404,127 +430,344 @@ impl Checker<'_, '_> {
             ));
         }
 
-        let resolved_field_types: Box<[Type]> = params.iter().map(|p| p.resolve()).collect();
-
-        let resolved_ty = pattern_ty.resolve();
-        let typed = match &resolved_ty {
-            Type::Constructor { id, params, .. } => {
-                let variant_name = identifier.rsplit('.').next().unwrap_or(identifier.as_str());
-                let variant_qualified = format!("{}.{}", id, variant_name);
-                if let Some(definition_span) = self.get_definition_name_span(&variant_qualified) {
+        let resolved_ty = pattern_ty.resolve_in(&self.env);
+        let resolution = match &resolved_ty {
+            Type::Nominal { id, .. } => {
+                let variant_name = unqualified_name(&identifier);
+                let variant_qualified = id.with_segment(variant_name);
+                if let Some(definition_span) =
+                    self.get_definition_name_span(store, &variant_qualified)
+                {
                     self.facts.add_usage(span, definition_span);
                 }
 
-                let variant_fields = self
-                    .store
-                    .get_definition(id)
-                    .and_then(|definition| match definition {
-                        Definition::Enum { variants, .. } => variants
-                            .iter()
-                            .find(|v| v.name == variant_name)
-                            .map(|v| v.fields.iter().cloned().collect()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-
-                TypedPattern::EnumVariant {
+                ConstructorPatternResolution::EnumVariant {
                     enum_name: id.into(),
                     variant_name: identifier.clone(),
-                    variant_fields,
-                    fields: typed_fields,
-                    type_args: params.clone(),
-                    field_types: resolved_field_types,
                 }
             }
-            _ => TypedPattern::Wildcard,
+            _ => return Pattern::WildCard { span },
         };
 
-        let pattern = Pattern::EnumVariant {
+        Pattern::EnumVariant {
             identifier,
             fields: new_fields,
             rest,
+            resolution,
             ty: pattern_ty,
             span,
+        }
+    }
+
+    fn resolve_pattern_constructor(
+        &mut self,
+        identifier: &str,
+        expected_ty: &Type,
+        is_bare_name: bool,
+    ) -> Option<Type> {
+        if let Some(ty) = self.resolve_variant_type(identifier, expected_ty) {
+            return Some(ty);
+        }
+        let accepts_struct = !is_bare_name && self.scrutinee_is_interface(expected_ty);
+        let definition = self.resolve_struct_definition(identifier)?;
+        if let Some(constructor_ty) = definition.constructor_type() {
+            Some(constructor_ty)
+        } else if accepts_struct {
+            Some(definition.ty.clone())
+        } else {
+            None
+        }
+    }
+
+    fn scrutinee_is_interface(&self, expected_ty: &Type) -> bool {
+        let store = self.store;
+        let resolved = store.deep_resolve_alias(&expected_ty.resolve_in(&self.env));
+        store.is_interface(&resolved)
+    }
+
+    fn resolve_variant_type(&mut self, identifier: &str, expected_ty: &Type) -> Option<Type> {
+        let store = self.store;
+        // A bare name is a variant of the scrutinee's enum, if any.
+        if !identifier.contains('.') {
+            return self.resolve_bare_variant_type(identifier, expected_ty);
+        }
+        // A qualified name is a variant when it is an enum's own nested member.
+        let qualified = self.lookup_qualified_name(store, identifier)?;
+        let (parent, variant_name) = qualified.rsplit_once('.')?;
+        let variant = store
+            .variants_of(parent)?
+            .iter()
+            .find(|v| v.name == variant_name)?;
+        if let Some(ty) = store.get_type(&qualified) {
+            return Some(ty.clone());
+        }
+        variant
+            .fields
+            .is_empty()
+            .then(|| store.get_type(parent).cloned())
+            .flatten()
+    }
+
+    fn resolve_struct_definition(&mut self, identifier: &str) -> Option<&Definition> {
+        let store = self.store;
+        let qualified_name = self.lookup_qualified_name(store, identifier)?;
+        let definition = store.get_definition(&qualified_name)?;
+        match &definition.body {
+            DefinitionBody::Struct { .. } => Some(definition),
+            DefinitionBody::TypeAlias { .. } => {
+                let underlying = store.peel_alias(&definition.ty);
+                let Type::Nominal { id, .. } = underlying else {
+                    return None;
+                };
+                let target = store.get_definition(&id)?;
+                matches!(target.body, DefinitionBody::Struct { .. }).then_some(target)
+            }
+            _ => None,
+        }
+    }
+
+    fn reject_non_constructor_pattern(
+        &mut self,
+        identifier: &str,
+        expected_ty: &Type,
+        span: Span,
+        kind: BindingKind,
+        fields: &[Pattern],
+    ) -> Pattern {
+        if self.may_name_uninferred_export(self.store, identifier) {
+            for field in fields {
+                self.infer_pattern_inner(field.clone(), Type::Error, kind, false);
+            }
+            return Pattern::WildCard { span };
+        }
+
+        if is_bare_constructor_name(identifier, fields, kind) {
+            self.sink
+                .push(diagnostics::infer::uppercase_binding(span, identifier));
+        } else {
+            let enum_info = self.get_enum_variant_info(expected_ty);
+            self.sink
+                .push(diagnostics::infer::enum_variant_constructor_not_found(
+                    span,
+                    enum_info.as_ref().map(|(n, v)| (n.as_str(), v.as_slice())),
+                    identifier,
+                    kind.is_match_arm(),
+                ));
+        }
+        Pattern::WildCard { span }
+    }
+
+    fn try_infer_const_pattern(
+        &mut self,
+        identifier: &str,
+        rest: bool,
+        kind: BindingKind,
+        expected_ty: &Type,
+        span: Span,
+    ) -> Option<Pattern> {
+        let store = self.store;
+        let is_qualified = identifier.contains('.');
+        if !is_qualified
+            && (!kind.is_pattern_position()
+                || self
+                    .resolve_bare_variant_type(identifier, expected_ty)
+                    .is_some())
+        {
+            return None;
+        }
+        let qualified = self.lookup_qualified_name(store, identifier)?;
+        let definition = store.get_definition(&qualified)?;
+        if !matches!(definition.body, DefinitionBody::Value { .. }) {
+            return None;
+        }
+
+        let definition_ty = &definition.ty;
+        let unwrapped_ty = definition_ty.unwrap_forall();
+
+        // Enum-variant resolution takes precedence, so a unit variant of its own
+        // enum type stays on the enum-variant path.
+        let member_name = unqualified_name(&qualified);
+        if !definition.is_const()
+            && let Type::Nominal { id, .. } = unwrapped_ty
+            && store
+                .variants_of(id.as_str())
+                .is_some_and(|variants| variants.iter().any(|v| v.name == member_name))
+        {
+            return None;
+        }
+
+        if matches!(unwrapped_ty, Type::Function(_)) {
+            if !is_qualified {
+                return None;
+            }
+            self.sink.push(if kind.is_match_arm() {
+                diagnostics::infer::const_pattern_not_eligible(identifier, span)
+            } else {
+                diagnostics::infer::const_pattern_outside_match_arm(identifier, span)
+            });
+            return Some(Pattern::WildCard { span });
+        }
+
+        let outside_match_arm = !kind.is_match_arm();
+        if outside_match_arm {
+            self.sink
+                .push(diagnostics::infer::const_pattern_outside_match_arm(
+                    identifier, span,
+                ));
+            if !kind.is_pattern_position() {
+                return Some(Pattern::WildCard { span });
+            }
+        }
+
+        if let Some(definition_span) = self.get_definition_name_span(store, &qualified) {
+            self.facts.add_usage(span, definition_span);
+        }
+
+        let resolution = match definition.const_value().map(|value| value.to_literal()) {
+            Some(value) => ConstructorPatternResolution::ConstValue {
+                qualified_name: qualified,
+                value,
+            },
+            None => ConstructorPatternResolution::Const {
+                qualified_name: qualified,
+            },
         };
-        (pattern, typed)
+
+        let ty = if outside_match_arm {
+            expected_ty.clone()
+        } else {
+            let (const_ty, _) = self.instantiate(definition_ty);
+            let unify_expected = store.deep_resolve_alias(&expected_ty.resolve_in(&self.env));
+            self.unify(&unify_expected, &const_ty, &span);
+            const_ty.resolve_in(&self.env)
+        };
+
+        Some(Pattern::EnumVariant {
+            identifier: identifier.into(),
+            fields: vec![],
+            rest,
+            resolution,
+            ty,
+            span,
+        })
+    }
+
+    fn unresolved_struct_pattern(
+        &mut self,
+        identifier: &str,
+        fields: &[StructFieldPattern],
+        span: Span,
+        kind: BindingKind,
+    ) -> Pattern {
+        if !self.may_name_uninferred_export(self.store, identifier) {
+            self.sink
+                .push(diagnostics::infer::struct_not_found(identifier, span));
+            return Pattern::WildCard { span };
+        }
+
+        for field in fields {
+            let is_shorthand = matches!(
+                &field.value,
+                Pattern::Identifier { identifier, .. } if identifier == &field.name
+            );
+            self.infer_pattern_inner(field.value.clone(), Type::Error, kind, is_shorthand);
+        }
+        Pattern::WildCard { span }
     }
 
     fn infer_struct_pattern(
         &mut self,
-        identifier: EcoString,
-        fields: Vec<StructFieldPattern>,
-        rest: bool,
-        span: Span,
+        pattern: Pattern,
         expected_ty: Type,
         kind: BindingKind,
-    ) -> (Pattern, TypedPattern) {
-        let Some(qualified_name) = self.lookup_qualified_name(&identifier) else {
-            return self
-                .try_infer_enum_struct_variant(
-                    &identifier,
-                    &fields,
-                    rest,
-                    &span,
-                    &expected_ty,
-                    kind,
-                )
-                .unwrap_or_else(|| {
-                    self.sink
-                        .push(diagnostics::infer::struct_not_found(&identifier, span));
-                    (Pattern::WildCard { span }, TypedPattern::Wildcard)
-                });
-        };
-        let Some(Definition::Struct {
-            ty: struct_forall_ty,
-            fields: definition_struct_fields,
+    ) -> Pattern {
+        let Pattern::Struct {
+            identifier,
+            fields,
+            rest,
+            span,
             ..
-        }) = self.store.get_definition(&qualified_name)
+        } = &pattern
+        else {
+            unreachable!("infer_struct_pattern called with non-Struct pattern");
+        };
+        let rest = *rest;
+        let span = *span;
+        let store = self.store;
+        if kind.is_match_arm()
+            && self
+                .resolve_bare_variant_type(identifier, &expected_ty)
+                .is_some()
+            && let Some(result) = self.try_infer_enum_struct_variant(&pattern, &expected_ty, kind)
+        {
+            return result;
+        }
+
+        let Some(qualified_name) = self.lookup_qualified_name(store, identifier) else {
+            return self
+                .try_infer_enum_struct_variant(&pattern, &expected_ty, kind)
+                .unwrap_or_else(|| self.unresolved_struct_pattern(identifier, fields, span, kind));
+        };
+        let Some(Definition {
+            ty: struct_forall_ty,
+            body:
+                DefinitionBody::Struct {
+                    fields: definition_struct_fields,
+                    ..
+                },
+            ..
+        }) = store.get_definition(&qualified_name)
         else {
             return self
-                .try_infer_enum_struct_variant(
-                    &identifier,
-                    &fields,
-                    rest,
-                    &span,
-                    &expected_ty,
-                    kind,
-                )
-                .unwrap_or_else(|| {
-                    self.sink
-                        .push(diagnostics::infer::struct_not_found(&identifier, span));
-                    (Pattern::WildCard { span }, TypedPattern::Wildcard)
-                });
+                .try_infer_enum_struct_variant(&pattern, &expected_ty, kind)
+                .unwrap_or_else(|| self.unresolved_struct_pattern(identifier, fields, span, kind));
         };
 
         let struct_forall_ty = struct_forall_ty.clone();
         let struct_fields = definition_struct_fields.clone();
 
-        self.track_name_usage(&qualified_name, &span, identifier.len() as u32);
+        self.track_name_usage(store, &qualified_name, &span, identifier.len() as u32);
 
         let (struct_ty, map) = self.instantiate(&struct_forall_ty);
 
-        self.unify(&expected_ty, &struct_ty, &span);
+        self.unify(
+            &expected_ty.resolve_in(&self.env).shallow_demoted(),
+            &struct_ty,
+            &span,
+        );
 
-        let struct_module = qualified_name.split('.').next().unwrap_or(&qualified_name);
-        let is_cross_module = struct_module != self.cursor.module_id;
+        let scrutinee_is_error = expected_ty.shallow_resolve_in(&self.env).is_error();
+
+        let struct_package = store
+            .package_for_qualified_name(&qualified_name)
+            .unwrap_or(&qualified_name);
+        let is_cross_package = struct_package != self.cursor.package_id();
 
         let available: Vec<String> = struct_fields.iter().map(|f| f.name.to_string()).collect();
 
-        let (new_fields, typed_field_values): (Vec<_>, Vec<_>) = fields
+        let new_fields: Vec<_> = fields
             .iter()
             .map(|field| {
                 let field_definition = struct_fields.iter().find(|x| x.name == field.name);
 
                 let field_ty = match field_definition {
                     Some(field_definition) => {
-                        if is_cross_module && !field_definition.visibility.is_public() {
+                        if is_cross_package && !field_definition.visibility.is_public() {
                             self.sink.push(diagnostics::infer::private_field_access(
                                 &field.name,
                                 &qualified_name,
+                                struct_package,
                                 field.value.get_span(),
                             ));
                         }
-                        substitute(&field_definition.ty, &map)
+                        if scrutinee_is_error {
+                            Type::Error
+                        } else {
+                            substitute(
+                                &self.granted_component_type(&field_definition.ty, &expected_ty),
+                                &map,
+                            )
+                        }
                     }
                     None => {
                         self.sink.push(diagnostics::infer::member_not_found(
@@ -532,6 +775,8 @@ impl Checker<'_, '_> {
                             &field.name,
                             span,
                             Some(&available),
+                            None,
+                            false,
                         ));
                         Type::Error
                     }
@@ -541,17 +786,14 @@ impl Checker<'_, '_> {
                     &field.value,
                     Pattern::Identifier { identifier, .. } if identifier == &field.name
                 );
-                let (inferred_value, typed_value) =
+                let inferred_value =
                     self.infer_pattern_inner(field.value.clone(), field_ty, kind, is_shorthand);
-                (
-                    StructFieldPattern {
-                        name: field.name.clone(),
-                        value: inferred_value,
-                    },
-                    (field.name.clone(), typed_value),
-                )
+                StructFieldPattern {
+                    name: field.name.clone(),
+                    value: inferred_value,
+                }
             })
-            .unzip();
+            .collect();
 
         if !rest {
             let pattern_field_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
@@ -566,25 +808,22 @@ impl Checker<'_, '_> {
             }
         }
 
-        let resolved_ty = struct_ty.resolve();
-        let typed = match &resolved_ty {
-            Type::Constructor { id, params, .. } => TypedPattern::Struct {
+        let resolved_ty = struct_ty.resolve_in(&self.env);
+        let resolution = match &resolved_ty {
+            Type::Nominal { id, .. } => RecordPatternResolution::Struct {
                 struct_name: id.into(),
-                struct_fields,
-                pattern_fields: typed_field_values,
-                type_args: params.clone(),
             },
-            _ => TypedPattern::Wildcard,
+            _ => return Pattern::WildCard { span },
         };
 
-        let pattern = Pattern::Struct {
-            identifier,
+        Pattern::Struct {
+            identifier: identifier.clone(),
             fields: new_fields,
             rest,
+            resolution,
             ty: struct_ty,
             span,
-        };
-        (pattern, typed)
+        }
     }
 
     fn infer_or_pattern(
@@ -593,8 +832,8 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: Type,
         kind: BindingKind,
-    ) -> (Pattern, TypedPattern) {
-        let (first, first_typed) = self.infer_pattern_inner(
+    ) -> Pattern {
+        let first = self.infer_pattern_inner(
             patterns
                 .first()
                 .cloned()
@@ -619,86 +858,106 @@ impl Checker<'_, '_> {
             .collect();
 
         let mut inferred = vec![first];
-        let mut typed_alternatives = vec![first_typed];
 
         for pattern in patterns.iter().skip(1) {
-            self.scopes.push();
-            let checkpoint = self.facts.binding_checkpoint();
-            let (alt, alt_typed) =
-                self.infer_pattern_inner(pattern.clone(), expected_ty.clone(), kind, false);
-            let alt_bindings = collect_pattern_bindings(&alt);
-            let alt_names: HashSet<&str> =
-                alt_bindings.iter().map(|(name, _)| name.as_str()).collect();
+            let alt = self.with_temporary_bindings(|this| {
+                this.with_scope(|this| {
+                    let alt =
+                        this.infer_pattern_inner(pattern.clone(), expected_ty.clone(), kind, false);
+                    let alt_bindings = collect_pattern_bindings(&alt);
+                    let alt_names: HashSet<&str> =
+                        alt_bindings.iter().map(|(name, _)| name.as_str()).collect();
 
-            if first_names != alt_names {
-                let missing_in_alt: Vec<&str> =
-                    first_names.difference(&alt_names).copied().collect();
-                let missing_in_first: Vec<&str> =
-                    alt_names.difference(&first_names).copied().collect();
+                    if first_names != alt_names {
+                        let missing_in_alt: Vec<&str> =
+                            first_names.difference(&alt_names).copied().collect();
+                        let missing_in_first: Vec<&str> =
+                            alt_names.difference(&first_names).copied().collect();
 
-                let error_span = if let Some(name) = missing_in_alt.first() {
-                    first_bindings
-                        .iter()
-                        .find(|(n, _)| n == *name)
-                        .map(|(_, s)| *s)
-                } else if let Some(name) = missing_in_first.first() {
-                    alt_bindings
-                        .iter()
-                        .find(|(n, _)| n == *name)
-                        .map(|(_, s)| *s)
-                } else {
-                    None
-                };
+                        let error_span = or_pattern_error_span(
+                            &first_bindings,
+                            &alt_bindings,
+                            &missing_in_alt,
+                            &missing_in_first,
+                        );
 
-                self.sink
-                    .push(diagnostics::infer::or_pattern_binding_mismatch(
-                        error_span.unwrap_or(span),
-                        &missing_in_alt,
-                        &missing_in_first,
-                    ));
-                self.facts.or_pattern_error_spans.insert(span);
-            } else {
-                for (name, alt_span) in &alt_bindings {
-                    if let Some(first_ty) = first_binding_types.get(name)
-                        && let Some(alt_ty) = self.scopes.lookup_value(name)
-                    {
-                        let first_resolved = first_ty.resolve();
-                        let alt_resolved = alt_ty.resolve();
-                        if first_resolved != alt_resolved {
-                            self.sink.push(diagnostics::infer::or_pattern_type_mismatch(
-                                *alt_span,
-                                &first_resolved.to_string(),
-                                &alt_resolved.to_string(),
+                        this.sink
+                            .push(diagnostics::infer::or_pattern_binding_mismatch(
+                                error_span.unwrap_or(span),
+                                &missing_in_alt,
+                                &missing_in_first,
                             ));
-                        }
+                        this.facts.or_pattern_error_spans.insert(span);
+                    } else {
+                        this.check_or_pattern_binding_types(&alt_bindings, &first_binding_types);
                     }
-                }
-            }
-            self.scopes.pop();
-            self.facts.remove_bindings_from(checkpoint);
+                    alt
+                })
+            });
             inferred.push(alt);
-            typed_alternatives.push(alt_typed);
         }
 
-        let pattern = Pattern::Or {
+        Pattern::Or {
             patterns: inferred,
             span,
-        };
-        let typed = TypedPattern::Or {
-            alternatives: typed_alternatives,
-        };
-        (pattern, typed)
+        }
+    }
+
+    fn check_or_pattern_binding_types(
+        &mut self,
+        alt_bindings: &[(String, Span)],
+        first_binding_types: &HashMap<String, Type>,
+    ) {
+        for (name, alt_span) in alt_bindings {
+            if let Some(first_ty) = first_binding_types.get(name)
+                && let Some(alt_ty) = self.scopes.lookup_value(name)
+            {
+                let first_resolved = first_ty.resolve_in(&self.env);
+                let alt_resolved = alt_ty.resolve_in(&self.env);
+                if first_resolved != alt_resolved {
+                    self.sink.push(diagnostics::infer::or_pattern_type_mismatch(
+                        *alt_span,
+                        &first_resolved.to_string(),
+                        &alt_resolved.to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     fn get_enum_variant_info(&self, ty: &Type) -> Option<(String, Vec<String>)> {
-        let resolved = ty.resolve();
-        let Type::Constructor { id, .. } = resolved else {
+        let store = self.store;
+        let resolved = ty.resolve_in(&self.env);
+        let Type::Nominal { id: display_id, .. } = &resolved else {
             return None;
         };
-        let variants = self.store.get_enum_variants(&id)?;
+        let enum_ty = self.peel_to_enum(&resolved)?;
+        let Type::Nominal { id: enum_id, .. } = &enum_ty else {
+            return None;
+        };
+        let variants = store.variants_of(enum_id.as_str())?;
         let variant_names: Vec<String> = variants.iter().map(|v| v.name.to_string()).collect();
-        let simple_name = id.rsplit('.').next().unwrap_or(&id);
-        Some((simple_name.to_string(), variant_names))
+        let display_name = self.enum_display_name(display_id.as_str());
+        Some((display_name, variant_names))
+    }
+
+    fn enum_display_name(&self, id: &str) -> String {
+        let store = self.store;
+        let simple = unqualified_name(id);
+        let Some(package_id) = store.package_for_qualified_name(id) else {
+            return simple.to_string();
+        };
+        if package_id == self.cursor.package_id()
+            || self.imports.unprefixed_imports.contains(package_id)
+        {
+            return simple.to_string();
+        }
+        for (prefix, imported_package_id) in self.imports.packages() {
+            if imported_package_id == package_id {
+                return format!("{}.{}", prefix, simple);
+            }
+        }
+        simple.to_string()
     }
 
     /// Tries to resolve an identifier like `api.UIEvent.Click` through a type alias.
@@ -707,26 +966,22 @@ impl Checker<'_, '_> {
     /// For tuple variants, returns the function type (e.g., `fn(string) -> Event`).
     /// For unit variants, returns the enum type directly.
     fn try_resolve_type_alias_variant(&mut self, identifier: &str) -> Option<(Type, String)> {
+        let store = self.store;
         let (type_part, variant_name) = identifier.rsplit_once('.')?;
 
-        let qualified_name = self.lookup_qualified_name(type_part)?;
-        let Definition::TypeAlias { ty: alias_ty, .. } =
-            self.store.get_definition(&qualified_name)?
-        else {
+        let qualified_name = self.lookup_qualified_name(store, type_part)?;
+        let def = store.get_definition(&qualified_name)?;
+        let DefinitionBody::TypeAlias { .. } = &def.body else {
             return None;
         };
+        let underlying = store.peel_alias(&def.ty);
 
-        let underlying = match &alias_ty {
-            Type::Forall { body, .. } => body.as_ref().clone(),
-            _ => alias_ty.clone(),
-        };
-
-        if let Type::Constructor { id: enum_id, .. } = &underlying
-            && let Some(Definition::Enum { variants, .. }) = self.store.get_definition(enum_id)
+        if let Type::Nominal { id: enum_id, .. } = &underlying
+            && let Some(variants) = store.variants_of(enum_id.as_str())
             && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
         {
-            let variant_qualified_name = format!("{}.{}", enum_id, variant_name);
-            if let Some(variant_ty) = self.store.get_type(&variant_qualified_name) {
+            let variant_qualified_name = enum_id.with_segment(variant_name);
+            if let Some(variant_ty) = store.get_type(&variant_qualified_name) {
                 return Some((variant_ty.clone(), variant_name.to_string()));
             }
             if variant.fields.is_empty() {
@@ -737,18 +992,65 @@ impl Checker<'_, '_> {
         None
     }
 
+    fn peel_to_enum(&self, ty: &Type) -> Option<Type> {
+        let store = self.store;
+        let resolved = store.deep_resolve_alias(&ty.resolve_in(&self.env));
+        match &resolved {
+            Type::Nominal { id, .. } if store.variants_of(id.as_str()).is_some() => Some(resolved),
+            _ => None,
+        }
+    }
+
+    fn resolve_bare_variant_type(&self, identifier: &str, expected_ty: &Type) -> Option<Type> {
+        let store = self.store;
+        if identifier.contains('.') || !identifier.chars().next().is_some_and(char::is_uppercase) {
+            return None;
+        }
+        let resolved = self.peel_to_enum(expected_ty)?;
+        let Type::Nominal { id, .. } = &resolved else {
+            return None;
+        };
+        let variant = store
+            .variants_of(id.as_str())?
+            .iter()
+            .find(|v| v.name == identifier)?;
+        let variant_qualified = id.with_segment(identifier);
+        if let Some(ty) = store.get_type(&variant_qualified) {
+            return Some(ty.clone());
+        }
+        variant.fields.is_empty().then(|| resolved.clone())
+    }
+
     /// Tries to infer an enum struct variant pattern like `Move { x, y }`.
     fn try_infer_enum_struct_variant(
         &mut self,
-        identifier: &str,
-        fields: &[StructFieldPattern],
-        rest: bool,
-        span: &Span,
+        pattern: &Pattern,
         expected_ty: &Type,
         kind: BindingKind,
-    ) -> Option<(Pattern, TypedPattern)> {
-        let (ty, variant_name) = if let Some(ty) = self.lookup_type(identifier) {
-            let variant_name = identifier.split('.').next_back().unwrap_or(identifier);
+    ) -> Option<Pattern> {
+        let Pattern::Struct {
+            identifier,
+            fields,
+            rest,
+            span,
+            ..
+        } = pattern
+        else {
+            unreachable!("try_infer_enum_struct_variant called with non-Struct pattern");
+        };
+        let rest = *rest;
+        let store = self.store;
+        let bare_variant = if kind.is_match_arm() {
+            self.resolve_bare_variant_type(identifier, expected_ty)
+                .map(|ty| (ty, unqualified_name(identifier).to_string()))
+        } else {
+            None
+        };
+
+        let (ty, variant_name) = if let Some(resolved) = bare_variant {
+            resolved
+        } else if let Some(ty) = self.lookup_type(store, identifier) {
+            let variant_name = unqualified_name(identifier);
             (ty, variant_name.to_string())
         } else if let Some((alias_ty, variant_name)) =
             self.try_resolve_type_alias_variant(identifier)
@@ -761,21 +1063,20 @@ impl Checker<'_, '_> {
         let (value_constructor_type, map) = self.instantiate(&ty);
 
         let pattern_ty = match value_constructor_type {
-            Type::Function { return_type, .. } => *return_type,
-            Type::Constructor { .. } => value_constructor_type,
+            Type::Function(f) => (*f.return_type).clone(),
+            Type::Nominal { .. } => value_constructor_type,
             _ => return None,
         };
 
-        self.unify(expected_ty, &pattern_ty, span);
+        let unify_expected = store.deep_resolve_alias(&expected_ty.resolve_in(&self.env));
+        self.unify(&unify_expected.shallow_demoted(), &pattern_ty, span);
 
-        let resolved_ty = pattern_ty.resolve();
+        let resolved_ty = pattern_ty.resolve_in(&self.env);
 
-        let Type::Constructor { id, .. } = &resolved_ty else {
+        let Type::Nominal { id, .. } = &resolved_ty else {
             return None;
         };
-        let Definition::Enum { variants, .. } = self.store.get_definition(id)? else {
-            return None;
-        };
+        let variants = store.variants_of(id)?;
         let variant = variants.iter().find(|v| v.name == variant_name)?;
         if !variant.fields.is_struct() {
             return None;
@@ -784,18 +1085,23 @@ impl Checker<'_, '_> {
         let variant_fields: Vec<EnumFieldDefinition> = variant.fields.iter().cloned().collect();
         let available: Vec<String> = variant_fields.iter().map(|f| f.name.to_string()).collect();
 
-        let (new_fields, typed_field_values): (Vec<_>, Vec<_>) = fields
+        let new_fields: Vec<_> = fields
             .iter()
             .map(|field| {
                 let field_definition = variant_fields.iter().find(|x| x.name == field.name);
                 let field_ty = match field_definition {
-                    Some(field_definition) => substitute(&field_definition.ty, &map),
+                    Some(field_definition) => substitute(
+                        &self.granted_component_type(&field_definition.ty, &unify_expected),
+                        &map,
+                    ),
                     None => {
                         self.sink.push(diagnostics::infer::member_not_found(
                             &pattern_ty,
                             &field.name,
                             *span,
                             Some(&available),
+                            None,
+                            false,
                         ));
                         Type::Error
                     }
@@ -805,17 +1111,14 @@ impl Checker<'_, '_> {
                     &field.value,
                     Pattern::Identifier { identifier, .. } if identifier == &field.name
                 );
-                let (inferred_value, typed_value) =
+                let inferred_value =
                     self.infer_pattern_inner(field.value.clone(), field_ty, kind, is_shorthand);
-                (
-                    StructFieldPattern {
-                        name: field.name.clone(),
-                        value: inferred_value,
-                    },
-                    (field.name.clone(), typed_value),
-                )
+                StructFieldPattern {
+                    name: field.name.clone(),
+                    value: inferred_value,
+                }
             })
-            .unzip();
+            .collect();
 
         if !rest {
             let pattern_field_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
@@ -830,33 +1133,57 @@ impl Checker<'_, '_> {
             }
         }
 
-        let typed = match &resolved_ty {
-            Type::Constructor { id, params, .. } => {
-                let variant_qualified = format!("{}.{}", id, variant_name);
-                if let Some(definition_span) = self.get_definition_name_span(&variant_qualified) {
+        let resolution = match &resolved_ty {
+            Type::Nominal { id, .. } => {
+                let variant_qualified = id.with_segment(&variant_name);
+                if let Some(definition_span) =
+                    self.get_definition_name_span(store, &variant_qualified)
+                {
                     self.facts.add_usage(*span, definition_span);
                 }
 
-                TypedPattern::EnumStructVariant {
+                RecordPatternResolution::EnumVariant {
                     enum_name: id.into(),
                     variant_name: identifier.into(),
-                    variant_fields,
-                    pattern_fields: typed_field_values,
-                    type_args: params.clone(),
                 }
             }
-            _ => TypedPattern::Wildcard,
+            _ => return None,
         };
 
-        let pattern = Pattern::Struct {
+        Some(Pattern::Struct {
             identifier: identifier.into(),
             fields: new_fields,
             rest,
+            resolution,
             ty: pattern_ty,
             span: *span,
-        };
-        Some((pattern, typed))
+        })
     }
+}
+
+fn or_pattern_error_span(
+    first_bindings: &[(String, Span)],
+    alt_bindings: &[(String, Span)],
+    missing_in_alt: &[&str],
+    missing_in_first: &[&str],
+) -> Option<Span> {
+    if let Some(name) = missing_in_alt.first() {
+        first_bindings
+            .iter()
+            .find(|(n, _)| n == *name)
+            .map(|(_, s)| *s)
+    } else if let Some(name) = missing_in_first.first() {
+        alt_bindings
+            .iter()
+            .find(|(n, _)| n == *name)
+            .map(|(_, s)| *s)
+    } else {
+        None
+    }
+}
+
+fn is_bare_constructor_name(identifier: &str, fields: &[Pattern], kind: BindingKind) -> bool {
+    fields.is_empty() && !identifier.contains('.') && !kind.is_pattern_position()
 }
 
 fn format_literal(lit: &Literal) -> String {
@@ -865,7 +1192,8 @@ fn format_literal(lit: &Literal) -> String {
         Literal::Float { text, value } => text.as_ref().unwrap_or(&value.to_string()).clone(),
         Literal::Imaginary(v) => format!("{}i", v),
         Literal::Boolean(b) => b.to_string(),
-        Literal::String(s) => format!("\"{}\"", s),
+        Literal::String { value, raw: true } => format!("r\"{}\"", value),
+        Literal::String { value, raw: false } => format!("\"{}\"", value),
         Literal::Char(c) => format!("'{}'", c),
         Literal::FormatString(_) => "f\"...\"".to_string(),
         Literal::Slice(_) => "[...]".to_string(),

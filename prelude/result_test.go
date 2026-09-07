@@ -1,6 +1,9 @@
 package lisette
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestResultOk(t *testing.T) {
 	res := MakeResultOk[int, string](42)
@@ -81,11 +84,61 @@ func TestResultMap(t *testing.T) {
 	}
 }
 
+func TestResultMapOr(t *testing.T) {
+	ok := MakeResultOk[int, string](21)
+	err := MakeResultErr[int, string]("fail")
+	if ResultMapOr(ok, -1, func(v int) int { return v * 2 }) != 42 {
+		t.Fatal("expected 42")
+	}
+	if ResultMapOr(err, -1, func(v int) int { return v * 2 }) != -1 {
+		t.Fatal("expected -1")
+	}
+}
+
+func TestResultMapOrElse(t *testing.T) {
+	ok := MakeResultOk[int, string](21)
+	err := MakeResultErr[int, string]("fail")
+	if ResultMapOrElse(ok, func(e string) int { return len(e) }, func(v int) int { return v * 2 }) != 42 {
+		t.Fatal("expected 42")
+	}
+	if ResultMapOrElse(err, func(e string) int { return len(e) }, func(v int) int { return v * 2 }) != 4 {
+		t.Fatal("expected 4")
+	}
+}
+
 func TestResultMapErr(t *testing.T) {
 	err := MakeResultErr[int, string]("fail")
 	mapped := ResultMapErr(err, func(e string) int { return len(e) })
 	if mapped.Err().UnwrapOr(0) != 4 {
 		t.Fatal("expected 4")
+	}
+}
+
+func TestResultWrapErr(t *testing.T) {
+	sentinel := errors.New("disk full")
+	err := MakeResultErr[int, error](sentinel)
+	wrapped := ResultWrapErr(err, "saving file")
+	if wrapped.ErrVal.Error() != "saving file: disk full" {
+		t.Fatalf("expected wrapped message, got %q", wrapped.ErrVal.Error())
+	}
+	if !errors.Is(wrapped.ErrVal, sentinel) {
+		t.Fatal("expected wrapped error to unwrap to sentinel")
+	}
+}
+
+func TestResultWrapErrPassesThroughOk(t *testing.T) {
+	ok := MakeResultOk[int, error](42)
+	wrapped := ResultWrapErr(ok, "saving file")
+	if wrapped.UnwrapOr(0) != 42 {
+		t.Fatal("expected 42")
+	}
+}
+
+func TestResultWrapErrEscapesPercentInMessage(t *testing.T) {
+	err := MakeResultErr[int, error](errors.New("boom"))
+	wrapped := ResultWrapErr(err, "100% failure")
+	if wrapped.ErrVal.Error() != "100% failure: boom" {
+		t.Fatalf("expected literal percent preserved, got %q", wrapped.ErrVal.Error())
 	}
 }
 

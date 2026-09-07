@@ -1,39 +1,45 @@
-use rustc_hash::FxHashMap as HashMap;
+use crate::checker::{EnvResolve, resolved_generic_bounds};
+use syntax::ast::{Annotation, Binding, BindingKind, Expression, Pattern, Span};
+use syntax::types::{CompoundKind, FunctionParameter, Type};
 
-use syntax::ast::BindingKind;
-use syntax::ast::{Annotation, Binding, Expression, Pattern, Span, StructKind};
-use syntax::program::{CallKind, Definition, NativeTypeKind};
-use syntax::types::{Bound, SubstitutionMap, Type, substitute, unqualified_name};
+use crate::analysis::ProjectKind;
+use crate::checker::infer::InferCtx;
+use crate::checker::infer::context::{Expectation, ExpectationRole};
+use crate::checker::registration::test_functions::normalize_test_params;
+use crate::prelude;
+use crate::store::ENTRY_PACKAGE_ID;
 
-use super::super::Checker;
-use super::super::checks::{check_binding_pattern, reject_as_binding_in_irrefutable_context};
-use super::primitives::contains_deref;
-use crate::checker::PostInferenceCheck;
-use crate::checker::scopes::UseContext;
-use crate::store::ENTRY_MODULE_ID;
-
-fn has_numeric_member_in_chain(expression: &Expression) -> bool {
-    let mut current = expression.unwrap_parens();
-    while let Expression::DotAccess {
-        expression: inner,
-        member,
-        ..
-    } = current
-    {
-        if member.parse::<usize>().is_ok() {
-            return true;
-        }
-        current = inner.unwrap_parens();
+impl InferCtx<'_> {
+    fn ty_is_test_context(&self, ty: &Type) -> bool {
+        let resolved = ty.resolve_in(&self.env).strip_refs();
+        resolved.get_qualified_id().is_some_and(|id| {
+            id.strip_suffix(".TestContext")
+                .is_some_and(|package| package == prelude::TEST_PRELUDE_PACKAGE_ID)
+        })
     }
-    false
-}
 
-impl Checker<'_, '_> {
+    fn param_provides_test_handle(&self, param: &Binding) -> bool {
+        matches!(&param.pattern, Pattern::Identifier { identifier, .. } if identifier != "_")
+            && self.ty_is_test_context(&param.ty)
+    }
+
+    fn mark_test_context_params_used(&mut self, params: &[Binding]) {
+        for param in params {
+            if let Pattern::Identifier { identifier, .. } = &param.pattern
+                && self.param_provides_test_handle(param)
+                && let Some(id) = self.scopes.lookup_binding_id(identifier)
+            {
+                self.facts.mark_used(id);
+            }
+        }
+    }
+
     pub(super) fn infer_function(
         &mut self,
         expression: Expression,
         expected_ty: &Type,
     ) -> Expression {
+        let store = self.store;
         let Expression::Function {
             doc,
             attributes,
@@ -57,94 +63,90 @@ impl Checker<'_, '_> {
         }
 
         if name == "main"
-            && self.cursor.module_id == ENTRY_MODULE_ID
+            && self.project_kind == ProjectKind::Binary
+            && self.cursor.package_id() == ENTRY_PACKAGE_ID
             && (!params.is_empty() || return_annotation != Annotation::Unknown)
         {
             self.sink
                 .push(diagnostics::infer::invalid_main_signature(name_span));
         }
 
-        self.scopes.push();
+        let (generics, new_params, return_ty, base_fn_ty, new_body) = self.with_scope(|this| {
+            this.put_in_scope(&generics);
+            let generics = this.ensure_generic_bounds(store, generics, &span);
+            let bounds = resolved_generic_bounds(&generics);
 
-        self.put_in_scope(&generics);
+            let resolved_expected = expected_ty.resolve_in(&this.env);
+            let expected_function = store.resolve_to_function_type(&resolved_expected);
+            let expected_params = expected_function
+                .as_ref()
+                .and_then(Type::get_function_params)
+                .unwrap_or_default();
+            let is_test = attributes.iter().any(|a| a.name == "test");
+            let params = normalize_test_params(params, is_test);
+            let new_params = this.infer_function_params(params, expected_params, true);
 
-        let mut bounds = vec![];
-
-        for g in &generics {
-            let qualified_name = self.qualify_name(&g.name);
-
-            for b in &g.bounds {
-                let bound_ty = self.convert_to_type(b, &span);
-
-                self.scopes
-                    .current_mut()
-                    .trait_bounds
-                    .get_or_insert_with(HashMap::default)
-                    .entry(qualified_name.clone())
-                    .or_default()
-                    .push(bound_ty.clone());
-
-                bounds.push(Bound {
-                    param_name: g.name.clone(),
-                    generic: Type::Parameter(g.name.clone()),
-                    ty: bound_ty,
-                });
+            if is_test {
+                this.scopes.set_test_fn_name(name.clone());
+            } else if new_params
+                .iter()
+                .any(|param| this.param_provides_test_handle(param))
+            {
+                this.scopes.mark_test_handle();
             }
-        }
+            this.mark_test_context_params_used(&new_params);
 
-        let resolved_expected = expected_ty.resolve();
-        let expected_params = resolved_expected.get_function_params().unwrap_or_default();
-        let new_params = self.infer_function_params(params, expected_params, true);
+            let unit_ty = this.type_unit();
+            let return_ty =
+                this.infer_return_type(&return_annotation, &resolved_expected, &span, unit_ty);
 
-        let return_ty = self.infer_return_type(
-            &return_annotation,
-            &resolved_expected,
-            &span,
-            self.type_unit(),
-        );
+            this.scopes.set_fn_return_type(return_ty.clone());
 
-        self.scopes.current_mut().fn_return_type = Some(return_ty.clone());
+            let base_fn_ty = Type::function(
+                new_params
+                    .iter()
+                    .map(|param| {
+                        FunctionParameter::named(param.ty.clone(), param.pattern.get_identifier())
+                    })
+                    .collect(),
+                bounds,
+                return_ty.clone().into(),
+            );
 
-        let base_fn_ty = Type::Function {
-            param_mutability: new_params.iter().map(|p| p.mutable).collect(),
-            params: new_params.iter().map(|p| p.ty.clone()).collect(),
-            bounds,
-            return_type: return_ty.clone().into(),
-        };
+            let has_implicit_unit_return = return_annotation == Annotation::Unknown;
+            let body_ty = if has_implicit_unit_return {
+                Type::ignored()
+            } else {
+                return_ty.clone()
+            };
 
-        let has_implicit_unit_return = return_annotation == Annotation::Unknown;
-        let body_ty = if has_implicit_unit_return {
-            Type::ignored()
+            let new_body = body.map_definition(|body| {
+                this.infer_function_body(
+                    Box::new(body),
+                    &body_ty,
+                    &return_annotation,
+                    &return_ty,
+                    Some(name.as_str()),
+                )
+            });
+
+            this.check_deferred_map_key_bounds(store);
+            (generics, new_params, return_ty, base_fn_ty, new_body)
+        });
+
+        let fn_ty = if generics.is_empty() {
+            base_fn_ty
         } else {
-            return_ty.clone()
-        };
-
-        let new_body = self.infer_function_body(body, &body_ty, &return_annotation, &return_ty);
-
-        self.scopes.pop();
-
-        self.check_constrained_return_type(
-            &return_ty,
-            &generics,
-            &return_annotation.get_span(),
-            &name,
-        );
-
-        self.check_unused_type_parameters(&generics, &base_fn_ty);
-        self.check_type_params_only_in_bound(&generics, &base_fn_ty);
-
-        let fn_forall_ty = if generics.is_empty() {
-            base_fn_ty.clone()
-        } else {
-            Type::Forall {
+            let fn_forall_ty = Type::Forall {
                 vars: generics.iter().map(|g| g.name.clone()).collect(),
                 body: Box::new(base_fn_ty),
-            }
+            };
+            self.instantiate(&fn_forall_ty).0
         };
 
-        let (fn_ty, _) = self.instantiate(&fn_forall_ty);
-
         self.unify(expected_ty, &fn_ty, &span);
+
+        self.facts.add_function_span(span);
 
         Expression::Function {
             doc,
@@ -156,7 +158,7 @@ impl Checker<'_, '_> {
             return_annotation,
             return_type: return_ty,
             visibility,
-            body: new_body.into(),
+            body: new_body,
             ty: fn_ty,
             span,
         }
@@ -170,620 +172,69 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
-        self.scopes.push();
+        let store = self.store;
+        let (new_params, base_fn_ty, new_body) = self.with_scope(|this| {
+            this.scopes.mark_lambda_scope();
+            let resolved_expected = expected_ty.resolve_in(&this.env);
+            let expected_function = store.resolve_to_function_type(&resolved_expected);
+            let expected_params = expected_function
+                .as_ref()
+                .and_then(Type::get_function_params)
+                .unwrap_or_default();
+            let new_params = this.infer_function_params(params, expected_params, false);
 
-        // Resolve type variables so that a Go function alias bound via speculative
-        // unification (e.g. T = tea.Cmd) is visible as its underlying function shape.
-        let resolved_expected = expected_ty.resolve();
-        let expected_params = resolved_expected.get_function_params().unwrap_or_default();
-        let new_params = self.infer_function_params(params, expected_params, false);
+            if new_params
+                .iter()
+                .any(|param| this.param_provides_test_handle(param))
+            {
+                this.scopes.mark_test_handle();
+            }
+            this.mark_test_context_params_used(&new_params);
 
-        let default_return = self.new_type_var();
-        let return_ty = self.infer_return_type(
-            &return_annotation,
-            &resolved_expected,
-            &span,
-            default_return,
-        );
+            let default_return = this.new_type_var();
+            let return_ty = this.infer_return_type(
+                &return_annotation,
+                &resolved_expected,
+                &span,
+                default_return,
+            );
 
-        self.scopes.current_mut().fn_return_type = Some(return_ty.clone());
+            this.scopes.set_fn_return_type(return_ty.clone());
 
-        let base_fn_ty = Type::Function {
-            param_mutability: vec![false; new_params.len()],
-            params: new_params.iter().map(|p| p.ty.clone()).collect(),
-            bounds: vec![],
-            return_type: return_ty.clone().into(),
-        };
+            let base_fn_ty = Type::function(
+                new_params
+                    .iter()
+                    .map(|param| {
+                        FunctionParameter::named(param.ty.clone(), param.pattern.get_identifier())
+                    })
+                    .collect(),
+                vec![],
+                return_ty.clone().into(),
+            );
 
-        // Reset loop depth — closures introduce a new function scope, so
-        // `defer` inside a closure body should not be flagged as "defer in loop"
-        // even when the closure is lexically inside a loop.
-        let saved_loop_depth = self.scopes.reset_loop_depth();
-        let new_body = self.infer_function_body(body, &return_ty, &return_annotation, &return_ty);
-        self.scopes.restore_loop_depth(saved_loop_depth);
+            let relax_body_to_unit =
+                return_annotation == Annotation::Unknown && return_ty.is_unit();
+            let body_ty = if relax_body_to_unit {
+                Type::ignored()
+            } else {
+                return_ty.clone()
+            };
+            let new_body = this.without_enclosing_loop(|this| {
+                this.infer_function_body(body, &body_ty, &return_annotation, &return_ty, None)
+            });
 
-        self.scopes.pop();
+            this.check_deferred_map_key_bounds(store);
+            (new_params, base_fn_ty, new_body)
+        });
 
-        let (fn_ty, _) = self.instantiate(&base_fn_ty);
-
-        self.unify(expected_ty, &fn_ty, &span);
+        self.unify(expected_ty, &base_fn_ty, &span);
 
         Expression::Lambda {
             params: new_params,
             return_annotation,
             body: new_body.into(),
-            ty: fn_ty,
+            ty: base_fn_ty,
             span,
-        }
-    }
-
-    pub(super) fn infer_function_call(
-        &mut self,
-        expression: Box<Expression>,
-        args: Vec<Expression>,
-        spread: Box<Option<Expression>>,
-        type_args: Vec<Annotation>,
-        span: Span,
-        expected_ty: &Type,
-    ) -> Expression {
-        let callee_ty = self.new_type_var();
-
-        let prev_context = self.scopes.set_callee_context();
-        let callee_expression = self.infer_expression(*expression, &callee_ty);
-        self.scopes.restore_use_context(prev_context);
-
-        let forall_ty = self.resolve_callee_forall_type(&callee_expression, &type_args);
-        let (callee_ty, new_type_args) =
-            self.instantiate_callee_type(&forall_ty, &type_args, &callee_expression, &span);
-
-        if let Some(underlying_fn) = self.try_as_type_conversion(&callee_expression, &callee_ty) {
-            return self.infer_type_conversion_call(
-                callee_expression,
-                callee_ty,
-                underlying_fn,
-                args,
-                spread,
-                new_type_args,
-                span,
-                expected_ty,
-            );
-        }
-
-        let variadic_elem_ty = if spread.is_some() {
-            callee_ty.resolve().is_variadic()
-        } else {
-            None
-        };
-
-        let (param_types, param_mutability, return_ty, bounds) =
-            self.extract_call_signature(callee_ty, args.len(), &callee_expression);
-
-        if self.is_panic_call(&callee_expression)
-            && self.scopes.is_value_context()
-            && !expected_ty.is_unit()
-            && !expected_ty.is_ignored()
-            && !expected_ty.is_never()
-            && !expected_ty.is_variable()
-        {
-            self.sink
-                .push(diagnostics::infer::panic_in_expression_position(span));
-        }
-
-        // Speculatively unify the expected type with the return type before
-        // checking arguments, so e.g. `Some(Text{})` with expected `Option<Printable>`
-        // constrains T = Printable and the argument coerces via interface satisfaction.
-        // Also fires for Go-imported named types so that `Some(tea.Quit)` in
-        // context `Option<tea.Cmd>` constrains T = tea.Cmd instead of
-        // collapsing to the Cmd alias's underlying function shape. Guarded
-        // to named types to avoid affecting numeric literal inference.
-        if self.is_generic_callee(&callee_expression)
-            && !expected_ty.resolve().is_variable()
-            && !expected_ty.is_ignored()
-            && self.is_enum_type(&return_ty.resolve())
-            && (self.has_interface_type_param(expected_ty)
-                || self.has_go_named_type_param(expected_ty))
-        {
-            let _ = self.speculatively(|this| this.try_unify(expected_ty, &return_ty, &span));
-        }
-
-        let new_args = self.infer_call_arguments(args, &param_types);
-        for arg in &new_args {
-            self.check_not_temp_producing(arg);
-        }
-        self.check_call_arity(&param_types, &new_args, &callee_expression, &span);
-        self.check_mut_param_arguments(&new_args, &param_mutability, &callee_expression);
-
-        let new_spread = (*spread).map(|spread_expr| {
-            self.check_not_temp_producing(&spread_expr);
-            match variadic_elem_ty {
-                Some(elem_ty) => {
-                    let expected_slice = self.type_slice(elem_ty);
-                    let inferred = self
-                        .with_value_context(|s| s.infer_expression(spread_expr, &expected_slice));
-                    if param_mutability.last().copied().unwrap_or(false) {
-                        let is_external = self.is_external_callee(&callee_expression);
-                        self.check_arg_against_mut_param(&inferred, is_external);
-                    }
-                    inferred
-                }
-                None => {
-                    self.sink
-                        .push(diagnostics::infer::spread_on_non_variadic(span));
-                    self.with_value_context(|s| s.infer_expression(spread_expr, &Type::Error))
-                }
-            }
-        });
-
-        // Capture whether expected_ty is unresolved BEFORE
-        // unification, because unify will resolve a fresh variable to the
-        // concrete return type (e.g. Slice<int>). A fresh variable means the
-        // caller doesn't consume the result (non-last block item).
-        let expected_was_variable = expected_ty.resolve().is_variable();
-
-        self.unify(expected_ty, &return_ty, &span);
-        self.unify_trait_bounds(&bounds, &new_args, &span);
-
-        // Native mutating methods (append, extend, delete) are rewritten by
-        // the emitter into mutations of the receiver binding. Require `mut`
-        // on the receiver when the call mutates:
-        //   - delete: always mutates (no return value)
-        //   - append/extend: mutates only when the result is not consumed
-        let result_unused = prev_context != UseContext::Value && {
-            let resolved = expected_ty.resolve();
-            resolved.is_unit() || resolved.is_ignored() || expected_was_variable
-        };
-        self.check_native_mutating_call(&callee_expression, result_unused, &span);
-
-        self.check_unconstrained_bounded_type_params(&bounds, &span);
-
-        if self.is_generic_callee(&callee_expression)
-            && type_args.is_empty()
-            && !self.is_enum_type(&return_ty.resolve())
-        {
-            self.post_inference_checks
-                .push(PostInferenceCheck::GenericCall {
-                    return_ty: return_ty.clone(),
-                    span,
-                });
-        }
-
-        // Use expected_ty for generic containers (Option, Result) when it has
-        // interface type parameters. This ensures coercion like `Option<Printable>`
-        // from `Some(Text{...})` gets the correct type for codegen.
-        let call_ty = if !expected_ty.is_variable()
-            && self.is_generic_container_with_interface(expected_ty)
-        {
-            expected_ty.clone()
-        } else {
-            return_ty.clone()
-        };
-
-        let call_kind = self.classify_call(&callee_expression);
-        self.resolutions.mark_call(span, call_kind);
-
-        Expression::Call {
-            expression: callee_expression.into(),
-            args: new_args,
-            spread: Box::new(new_spread),
-            type_args: new_type_args,
-            ty: call_ty,
-            span,
-        }
-    }
-
-    fn resolve_callee_forall_type(
-        &mut self,
-        expression: &Expression,
-        type_args: &[Annotation],
-    ) -> Type {
-        if type_args.is_empty() {
-            return expression.get_type();
-        }
-
-        match expression {
-            Expression::Identifier { value, .. } => self
-                .lookup_type(value)
-                .unwrap_or_else(|| expression.get_type()),
-            Expression::DotAccess {
-                expression: receiver,
-                member,
-                ..
-            } => {
-                let receiver_ty = receiver.get_type().resolve();
-
-                if let Some(method_ty) = self
-                    .get_all_methods(&receiver_ty.strip_refs())
-                    .get(member)
-                    .cloned()
-                {
-                    return method_ty;
-                }
-
-                if let Type::Constructor { id, .. } = receiver_ty.strip_refs() {
-                    let qualified = format!("{}.{}", id, member);
-                    if let Some(definition) = self.store.get_definition(&qualified) {
-                        return definition.ty().clone();
-                    }
-
-                    if let Some(module_id) = id.strip_prefix("@import/") {
-                        let qualified = format!("{}.{}", module_id, member);
-                        if let Some(definition) = self.store.get_definition(&qualified) {
-                            return definition.ty().clone();
-                        }
-                    }
-                }
-
-                expression.get_type()
-            }
-            _ => expression.get_type(),
-        }
-    }
-
-    fn is_generic_callee(&self, expression: &Expression) -> bool {
-        match expression {
-            Expression::Identifier { value, .. } => self
-                .lookup_type(value)
-                .map(|ty| matches!(ty, Type::Forall { .. }))
-                .unwrap_or(false),
-            Expression::DotAccess {
-                expression: receiver,
-                member,
-                ..
-            } => {
-                let receiver_ty = receiver.get_type().resolve();
-                self.get_all_methods(&receiver_ty.strip_refs())
-                    .get(member)
-                    .map(|ty| matches!(ty, Type::Forall { .. }))
-                    .unwrap_or(false)
-            }
-            _ => false,
-        }
-    }
-
-    fn instantiate_callee_type(
-        &mut self,
-        forall_ty: &Type,
-        type_args: &[Annotation],
-        callee_expression: &Expression,
-        span: &Span,
-    ) -> (Type, Vec<Annotation>) {
-        let Type::Forall { vars, body } = forall_ty else {
-            if !type_args.is_empty() {
-                self.sink.push(diagnostics::infer::type_args_on_non_generic(
-                    type_args.len(),
-                    *span,
-                ));
-            }
-            let (instantiated, _) = self.instantiate(forall_ty);
-            return (instantiated.resolve(), vec![]);
-        };
-
-        if type_args.is_empty() {
-            let (instantiated, _) = self.instantiate(forall_ty);
-            return (instantiated.resolve(), vec![]);
-        }
-
-        // For DotAccess method calls, accept type args that provide only the
-        // method-own generics (excluding receiver/impl generics).
-        let receiver_generics_count =
-            if let Expression::DotAccess { expression, .. } = callee_expression {
-                let receiver_ty = expression.get_type().resolve().strip_refs().clone();
-                self.get_receiver_generics_count(&receiver_ty)
-            } else {
-                0
-            };
-
-        let method_only_count = vars.len().saturating_sub(receiver_generics_count);
-        let is_full_arity = type_args.len() == vars.len();
-        let is_method_only_arity =
-            receiver_generics_count > 0 && type_args.len() == method_only_count;
-
-        if !is_full_arity && !is_method_only_arity {
-            let actual_types: Vec<Type> = type_args
-                .iter()
-                .map(|arg| self.convert_to_type(arg, span))
-                .collect();
-            let vars_as_str: Vec<String> = vars.iter().map(|s| s.to_string()).collect();
-            self.sink.push(diagnostics::infer::generics_arity_mismatch(
-                &vars_as_str,
-                type_args,
-                &actual_types,
-                *span,
-            ));
-        }
-
-        let mut instantiated = if is_method_only_arity {
-            let mut map: SubstitutionMap = SubstitutionMap::default();
-            for var in &vars[..receiver_generics_count] {
-                map.insert(var.clone(), self.new_type_var());
-            }
-            for (var, ann) in vars[receiver_generics_count..].iter().zip(type_args.iter()) {
-                map.insert(var.clone(), self.convert_to_type(ann, span));
-            }
-            substitute(body, &map)
-        } else {
-            self.instantiate_from_annotations(vars, body, type_args, span)
-        };
-
-        if let Expression::DotAccess { expression, .. } = callee_expression {
-            let receiver_ty = expression.get_type().resolve();
-
-            // Only strip the receiver param for instance methods (which have `self`).
-            // Instance methods: `as_instance_method` already stripped `self` from
-            // the callee type, so the Forall body has one more param than the callee.
-            // Static methods and module free functions: no `self`, param counts match.
-            let callee_params = callee_expression.get_type().resolve().param_count();
-            let instantiated_params = instantiated.param_count();
-            let has_receiver = instantiated_params > callee_params;
-
-            if has_receiver
-                && let Type::Function {
-                    ref mut params,
-                    ref mut param_mutability,
-                    ..
-                } = instantiated
-                && !params.is_empty()
-            {
-                let receiver_param = params.remove(0);
-                if !param_mutability.is_empty() {
-                    param_mutability.remove(0);
-                }
-                let receiver_ty_stripped = receiver_ty.strip_refs();
-                if receiver_param.is_ref() && !receiver_ty.is_ref() {
-                    if let Some(inner) = receiver_param.inner() {
-                        self.unify(&inner, &receiver_ty_stripped, span);
-                    }
-                } else {
-                    self.unify(&receiver_param, &receiver_ty_stripped, span);
-                }
-            }
-            self.unify(&instantiated, &callee_expression.get_type(), span);
-        }
-
-        (instantiated, type_args.to_vec())
-    }
-
-    fn extract_call_signature(
-        &mut self,
-        callee_ty: Type,
-        arg_count: usize,
-        callee_expression: &Expression,
-    ) -> (Vec<Type>, Vec<bool>, Type, Vec<Bound>) {
-        let callee_ty = callee_ty.resolve();
-        let bounds = callee_ty.get_bounds().to_vec();
-        let mut param_mutability = callee_ty.get_param_mutability().to_vec();
-        let is_variadic = callee_ty.is_variadic();
-
-        let (param_types, return_ty) = match self.extract_function_type(&callee_ty) {
-            Some((mut params, return_type)) => {
-                if let Some(variadic_ty) = is_variadic {
-                    params.pop();
-                    while params.len() < arg_count {
-                        params.push(variadic_ty.clone());
-                    }
-                    if let Some(&variadic_mut) = param_mutability.last() {
-                        while param_mutability.len() < arg_count {
-                            param_mutability.push(variadic_mut);
-                        }
-                    }
-                }
-                (params, return_type)
-            }
-            None if callee_ty.is_variable() => {
-                let param_types = (0..arg_count).map(|_| self.new_type_var()).collect();
-                let return_ty = self.new_type_var();
-                (param_types, return_ty)
-            }
-            None if callee_ty.resolve().is_error() => {
-                let param_types = (0..arg_count).map(|_| Type::Error).collect();
-                let return_ty = Type::Error;
-                (param_types, return_ty)
-            }
-            None => {
-                self.sink.push(diagnostics::infer::not_callable(
-                    &callee_ty,
-                    callee_expression.get_span(),
-                ));
-                let param_types = (0..arg_count).map(|_| Type::Error).collect();
-                let return_ty = Type::Error;
-                (param_types, return_ty)
-            }
-        };
-
-        (param_types, param_mutability, return_ty, bounds)
-    }
-
-    fn extract_function_type(&self, ty: &Type) -> Option<(Vec<Type>, Type)> {
-        let fn_type = |ty: &Type| -> Option<(Vec<Type>, Type)> {
-            if let Type::Function {
-                params,
-                return_type,
-                ..
-            } = ty
-            {
-                Some((params.clone(), (**return_type).clone()))
-            } else {
-                None
-            }
-        };
-
-        if let result @ Some(_) = fn_type(ty) {
-            return result;
-        }
-
-        if let Type::Constructor {
-            underlying_ty: Some(underlying),
-            ..
-        } = ty
-            && let result @ Some(_) = fn_type(underlying)
-        {
-            return result;
-        }
-
-        if let Type::Constructor { id, params, .. } = ty
-            && let Some(Definition::TypeAlias { ty: alias_ty, .. }) = self.store.get_definition(id)
-        {
-            let concrete_alias_ty = match alias_ty {
-                Type::Forall { vars, body } => {
-                    let map: SubstitutionMap =
-                        vars.iter().cloned().zip(params.iter().cloned()).collect();
-                    substitute(body, &map)
-                }
-                other => other.clone(),
-            };
-            let resolved = concrete_alias_ty.resolve();
-            if let Type::Constructor {
-                underlying_ty: Some(underlying),
-                ..
-            } = &resolved
-            {
-                return fn_type(underlying);
-            }
-        }
-
-        None
-    }
-
-    fn try_as_type_conversion(&self, callee: &Expression, callee_ty: &Type) -> Option<Type> {
-        let Type::Constructor {
-            id,
-            underlying_ty: Some(underlying),
-            ..
-        } = callee_ty
-        else {
-            return None;
-        };
-
-        if !matches!(underlying.as_ref(), Type::Function { .. }) {
-            return None;
-        }
-
-        if !matches!(
-            self.store.get_definition(id),
-            Some(Definition::TypeAlias { .. })
-        ) {
-            return None;
-        }
-
-        let is_bare_type_name = match callee.unwrap_parens() {
-            Expression::Identifier { binding_id, .. } => binding_id.is_none(),
-            Expression::DotAccess {
-                expression: base, ..
-            } => matches!(
-                base.get_type().resolve(),
-                Type::Constructor { id, .. } if id.starts_with("@import/")
-            ),
-            _ => false,
-        };
-
-        if !is_bare_type_name {
-            return None;
-        }
-
-        Some(underlying.as_ref().clone())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn infer_type_conversion_call(
-        &mut self,
-        callee_expression: Expression,
-        named_ty: Type,
-        underlying_fn: Type,
-        args: Vec<Expression>,
-        spread: Box<Option<Expression>>,
-        type_args: Vec<Annotation>,
-        span: Span,
-        expected_ty: &Type,
-    ) -> Expression {
-        if let Some(spread_expr) = *spread {
-            self.sink
-                .push(diagnostics::infer::spread_on_non_variadic(span));
-            self.with_value_context(|s| s.infer_expression(spread_expr, &Type::Error));
-        }
-
-        if args.len() != 1 {
-            let Type::Constructor { id, .. } = &named_ty else {
-                unreachable!("type_conversion_underlying only fires for Constructor callees")
-            };
-            self.sink.push(diagnostics::infer::type_conversion_arity(
-                unqualified_name(id),
-                args.len(),
-                span,
-            ));
-            let new_args: Vec<Expression> = args
-                .into_iter()
-                .map(|arg| self.with_value_context(|s| s.infer_expression(arg, &Type::Error)))
-                .collect();
-            self.unify(expected_ty, &Type::Error, &span);
-            self.resolutions.mark_call(span, CallKind::Regular);
-            return Expression::Call {
-                expression: callee_expression.into(),
-                args: new_args,
-                spread: Box::new(None),
-                type_args,
-                ty: Type::Error,
-                span,
-            };
-        }
-
-        let arg = args.into_iter().next().unwrap();
-        let new_arg = self.with_value_context(|s| s.infer_expression(arg, &underlying_fn));
-        self.check_not_temp_producing(&new_arg);
-
-        self.unify(expected_ty, &named_ty, &span);
-        self.resolutions.mark_call(span, CallKind::Regular);
-
-        Expression::Call {
-            expression: callee_expression.into(),
-            args: vec![new_arg],
-            spread: Box::new(None),
-            type_args,
-            ty: named_ty,
-            span,
-        }
-    }
-
-    fn infer_call_arguments(
-        &mut self,
-        args: Vec<Expression>,
-        param_types: &[Type],
-    ) -> Vec<Expression> {
-        args.into_iter()
-            .enumerate()
-            .map(|(i, arg)| {
-                let expected_ty = param_types
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| self.new_type_var());
-                self.with_value_context(|s| s.infer_expression(arg, &expected_ty))
-            })
-            .collect()
-    }
-
-    fn unify_trait_bounds(&mut self, bounds: &[Bound], args: &[Expression], fallback_span: &Span) {
-        for bound in bounds {
-            let resolved_ty = bound.generic.resolve();
-
-            if resolved_ty.is_variable() {
-                continue;
-            }
-
-            let interface_ty = bound.ty.resolve();
-            let Type::Constructor { id, params, .. } = interface_ty else {
-                continue;
-            };
-
-            let Some(interface) = self.store.get_interface(&id).cloned() else {
-                continue;
-            };
-
-            let span = args
-                .iter()
-                .find(|arg| arg.get_type().resolve() == resolved_ty)
-                .map(|arg| arg.get_span())
-                .unwrap_or_else(|| *fallback_span);
-
-            let _ = self.satisfies_interface(&resolved_ty, &interface, &params, &span);
         }
     }
 
@@ -793,6 +244,7 @@ impl Checker<'_, '_> {
         body_ty: &Type,
         return_annotation: &Annotation,
         return_ty: &Type,
+        function_name: Option<&str>,
     ) -> Expression {
         if let Expression::Block {
             items,
@@ -815,21 +267,57 @@ impl Checker<'_, '_> {
             };
         }
 
+        if let Some(function_name) = function_name
+            && *return_annotation != Annotation::Unknown
+            && let Expression::Block { items, .. } = body.as_ref()
+            && let Some(tail) = items.last()
+        {
+            let expectation = Expectation {
+                role: ExpectationRole::TailReturn {
+                    function_name: function_name.to_string(),
+                    return_annotation_span: return_annotation.get_span(),
+                },
+                span: tail.get_span(),
+                expected_ty: body_ty.clone(),
+                value_context: None,
+            };
+            return self.with_expectation(expectation, |s| s.infer_expression(*body, body_ty));
+        }
+
         self.infer_expression(*body, body_ty)
     }
 
     fn infer_function_params(
         &mut self,
         params: Vec<Binding>,
-        expected_params: &[Type],
+        expected_params: &[FunctionParameter],
         handle_self_receiver: bool,
     ) -> Vec<Binding> {
+        let store = self.store;
+
+        // `VarArgs<T>` must be the last function parameter
+        if let Some((_last, leading)) = params.split_last() {
+            for binding in leading {
+                if let Some(annotation @ Annotation::Constructor { name, .. }) = &binding.annotation
+                    && name == "VarArgs"
+                {
+                    self.sink.push(diagnostics::infer::variadic_param_not_last(
+                        annotation.get_span(),
+                    ));
+                }
+            }
+        }
+
         params
             .into_iter()
             .enumerate()
             .map(|(index, binding)| {
                 let expected_param_ty = match binding.annotation {
-                    None => expected_params.get(index).cloned(),
+                    // A `#[test]` handle carries a resolved type with no
+                    // annotation. Honor it before falling back to the expected
+                    // function type.
+                    None if !binding.ty.is_uninferred() => Some(binding.ty.clone()),
+                    None => expected_params.get(index).map(|param| param.ty.clone()),
                     _ => None,
                 };
 
@@ -840,7 +328,7 @@ impl Checker<'_, '_> {
                         && let Pattern::Identifier { identifier, .. } = &binding.pattern
                         && identifier == "self"
                         && binding.annotation.is_none()
-                        && let Some(impl_ty) = &self.inference.impl_receiver_type
+                        && let Some(impl_ty) = self.scopes.impl_receiver_type()
                     {
                         return impl_ty.clone();
                     }
@@ -848,28 +336,31 @@ impl Checker<'_, '_> {
                     binding
                         .annotation
                         .as_ref()
-                        .map(|a| self.convert_to_type(a, pattern_span))
+                        .map(|a| self.convert_variadic_to_type(store, a, pattern_span))
                         .unwrap_or_else(|| self.new_type_var())
                 });
 
-                reject_as_binding_in_irrefutable_context(self.sink, &binding.pattern);
-
-                let (new_pattern, typed_pattern) = self.infer_pattern(
-                    binding.pattern,
-                    binding_ty.clone(),
-                    BindingKind::Parameter {
-                        mutable: binding.mutable,
-                    },
-                );
-
-                check_binding_pattern(self.sink, &new_pattern);
+                // A `...T` parameter is a `[]T` in the body, as in Go. `Binding.ty`
+                // stays `VarArgs<T>`: call-site arity and emit's parameter
+                // declaration read it, so matching the two would emit `[]T`.
+                let body_ty = match binding_ty.get_type_params() {
+                    Some([element]) if binding_ty.is_native(CompoundKind::VarArgs) => {
+                        Type::qualified_compound(
+                            CompoundKind::Slice,
+                            vec![element.clone()],
+                            binding_ty.is_writable(),
+                        )
+                    }
+                    _ => binding_ty.clone(),
+                };
+                let new_pattern =
+                    self.infer_pattern(binding.pattern, body_ty, BindingKind::Parameter);
 
                 Binding {
                     pattern: new_pattern,
                     annotation: binding.annotation,
-                    typed_pattern: Some(typed_pattern),
                     ty: binding_ty,
-                    mutable: binding.mutable,
+                    mut_span: binding.mut_span,
                 }
             })
             .collect()
@@ -882,316 +373,17 @@ impl Checker<'_, '_> {
         span: &Span,
         default_for_unknown: Type,
     ) -> Type {
+        let store = self.store;
         match annotation {
             Annotation::Unknown => {
-                if let Type::Function { return_type, .. } = expected_ty {
-                    (**return_type).clone()
-                } else if let Type::Constructor {
-                    underlying_ty: Some(inner),
-                    ..
-                } = expected_ty
-                    && let Type::Function { return_type, .. } = inner.as_ref()
-                {
-                    (**return_type).clone()
+                let expected_function = store.resolve_to_function_type(expected_ty);
+                if let Type::Function(f) = expected_function.as_ref().unwrap_or(expected_ty) {
+                    (*f.return_type).clone()
                 } else {
                     default_for_unknown
                 }
             }
-            _ => self.convert_to_type(annotation, span),
-        }
-    }
-
-    fn classify_call(&self, callee: &Expression) -> CallKind {
-        let callee = callee.unwrap_parens();
-        match callee {
-            Expression::DotAccess {
-                expression: receiver,
-                member,
-                ..
-            } => {
-                let receiver_ty = receiver.get_type().resolve().strip_refs();
-
-                // UFCS method: receiver.method() where method is a free function
-                if let Type::Constructor { id, .. } = &receiver_ty
-                    && self
-                        .ufcs_methods
-                        .contains(&(id.to_string(), member.to_string()))
-                {
-                    return CallKind::UfcsMethod;
-                }
-
-                // Native method: receiver.method() on Slice/Map/Channel/etc.
-                if let Some(kind) = NativeTypeKind::from_type(&receiver.get_type()) {
-                    return CallKind::NativeMethod(kind);
-                }
-
-                // Cross-module tuple struct constructor (e.g. `mod.Point(1, 2)`)
-                if let Type::Constructor { id, .. } = receiver.get_type().resolve()
-                    && let Some(module_id) = id.strip_prefix("@import/")
-                {
-                    let qualified = format!("{}.{}", module_id, member);
-                    if matches!(
-                        self.store.get_definition(&qualified),
-                        Some(Definition::Struct {
-                            kind: StructKind::Tuple,
-                            ..
-                        })
-                    ) {
-                        return CallKind::TupleStructConstructor;
-                    }
-                }
-            }
-            Expression::Identifier { value, .. } => {
-                let qualified = self.qualify_name(value);
-                let definition = self.store.get_definition(&qualified);
-                if definition.is_none() && value == "assert_type" {
-                    return CallKind::AssertType;
-                }
-                if self.is_tuple_struct_definition(definition, callee) {
-                    return CallKind::TupleStructConstructor;
-                }
-
-                // Native constructor: Channel.new, Map.new, Slice.new
-                let constructor_kind = match value.as_str() {
-                    "Channel.new" | "Channel.buffered" => Some(NativeTypeKind::Channel),
-                    "Map.new" => Some(NativeTypeKind::Map),
-                    "Slice.new" => Some(NativeTypeKind::Slice),
-                    _ => None,
-                };
-                if let Some(kind) = constructor_kind {
-                    return CallKind::NativeConstructor(kind);
-                }
-
-                // Native method identifier: Slice.contains(s, x), Map.delete(m, k), etc.
-                if let Some((prefix, _method)) = value.split_once('.')
-                    && let Some(kind) = NativeTypeKind::from_name(prefix)
-                {
-                    return CallKind::NativeMethodIdentifier(kind);
-                }
-
-                // Receiver method UFCS: Type.method(receiver, args)
-                if let Some(kind) = self.try_classify_receiver_ufcs(value) {
-                    return kind;
-                }
-            }
-            _ => {}
-        }
-        CallKind::Regular
-    }
-
-    /// Classify `Type.method(receiver, args)` as `ReceiverMethodUfcs`.
-    /// Uses scope-aware name resolution instead of the old suffix-matching heuristic.
-    fn try_classify_receiver_ufcs(&self, value: &str) -> Option<CallKind> {
-        let last_dot = value.rfind('.')?;
-        let method = &value[last_dot + 1..];
-        let type_part = &value[..last_dot];
-
-        // Resolve type name using checker's scope-aware lookup
-        let qualified_name = self.lookup_qualified_name(type_part)?;
-
-        let definition = self.store.get_definition(&qualified_name)?;
-        let methods = match definition {
-            Definition::Struct { methods, .. } => methods,
-            Definition::Enum { methods, .. } => methods,
-            Definition::TypeAlias { methods, .. } => methods,
-            _ => return None,
-        };
-
-        let method_ty = methods.get(method)?;
-
-        let has_self = match method_ty {
-            Type::Function { params, .. } => !params.is_empty(),
-            Type::Forall { body, .. } => {
-                if let Type::Function { params, .. } = body.as_ref() {
-                    !params.is_empty()
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
-
-        if !has_self {
-            return None;
-        }
-
-        // If it's a UFCS-lowered method, skip — the emitter handles it differently
-        if self
-            .ufcs_methods
-            .contains(&(qualified_name.to_string(), method.to_string()))
-        {
-            return None;
-        }
-
-        let is_public = self
-            .store
-            .get_definition(&format!("{}.{}", qualified_name, method))
-            .map(|d| d.visibility().is_public())
-            .unwrap_or(false);
-
-        Some(CallKind::ReceiverMethodUfcs { is_public })
-    }
-
-    /// Check if a definition (or type alias target) is a multi-field tuple struct constructor.
-    fn is_tuple_struct_definition(
-        &self,
-        definition: Option<&Definition>,
-        callee: &Expression,
-    ) -> bool {
-        // Direct tuple struct
-        if matches!(
-            definition,
-            Some(Definition::Struct {
-                kind: StructKind::Tuple,
-                ..
-            })
-        ) {
-            return true;
-        }
-        // Type alias → follow to the underlying struct via the callee's return type
-        if matches!(definition, Some(Definition::TypeAlias { .. })) {
-            let ty = callee.get_type().resolve();
-            let return_ty = match ty.unwrap_forall() {
-                Type::Function { return_type, .. } => return_type.as_ref().clone(),
-                _ => return false,
-            };
-            if let Type::Constructor { id, .. } = return_ty.resolve() {
-                return matches!(
-                    self.store.get_definition(&id),
-                    Some(Definition::Struct {
-                        kind: StructKind::Tuple,
-                        ..
-                    })
-                );
-            }
-        }
-        false
-    }
-
-    fn is_panic_call(&self, expression: &Expression) -> bool {
-        match expression {
-            Expression::Identifier { value, .. } => value == "panic",
-            _ => false,
-        }
-    }
-
-    fn is_external_callee(&self, expression: &Expression) -> bool {
-        if let Expression::DotAccess {
-            expression: base, ..
-        } = expression
-            && let Expression::Identifier { value, .. } = base.as_ref()
-        {
-            return self
-                .imports
-                .prefix_to_module
-                .get(value.as_ref())
-                .is_some_and(|module_id| module_id.starts_with("go:"));
-        }
-        false
-    }
-
-    /// Check that native mutating methods (append, extend,
-    /// delete) are called on mutable receivers. The emitter rewrites these into
-    /// mutations, so the checker must enforce `mut` on the binding.
-    ///
-    /// - `delete`: always mutates (returns unit, modifies map in-place)
-    /// - `append`/`extend`: mutates when the return value is discarded (the
-    ///   emitter rewrites to `s = append(s, ...)` in statement position)
-    fn check_native_mutating_call(
-        &mut self,
-        callee: &Expression,
-        result_unused: bool,
-        span: &Span,
-    ) {
-        let Expression::DotAccess {
-            expression: receiver,
-            member,
-            ..
-        } = callee
-        else {
-            return;
-        };
-        let receiver_ty = receiver.get_type().resolve().strip_refs();
-
-        // append/extend on a map entry field generates an invalid write-back
-        // (Go map values aren't addressable, so `m[k].field = append(...)` fails).
-        // Newtype .0 access is excluded — the emitter treats it as non-lvalue.
-        if matches!(receiver_ty.get_name(), Some("Slice"))
-            && (member == "append" || member == "extend")
-            && self.has_map_field_in_chain(receiver)
-            && !has_numeric_member_in_chain(receiver)
-        {
-            self.sink
-                .push(diagnostics::infer::map_field_chain_assignment(*span));
-            return;
-        }
-
-        let is_mutating = match receiver_ty.get_name() {
-            Some("Slice") => {
-                // append/extend only mutate when the result is discarded
-                (member == "append" || member == "extend") && result_unused
-            }
-            Some("Map") => member == "delete",
-            _ => false,
-        };
-        if !is_mutating {
-            return;
-        }
-        let Some(var_name) = receiver.get_var_name() else {
-            return;
-        };
-        if let Some(binding_id) = self.scopes.lookup_binding_id(&var_name) {
-            self.facts.mark_mutated(binding_id);
-        }
-        let is_deref = contains_deref(receiver);
-        let binding_is_ref = self
-            .scopes
-            .lookup_value(&var_name)
-            .map(|t| t.resolve().is_ref())
-            .unwrap_or(false);
-        if !is_deref && !binding_is_ref && !self.scopes.lookup_mutable(&var_name) {
-            let is_match_arm = self
-                .scopes
-                .lookup_binding_id(&var_name)
-                .and_then(|id| self.facts.bindings.get(&id))
-                .is_some_and(|b| b.kind.is_match_arm());
-            self.sink.push(diagnostics::infer::disallowed_mutation(
-                &var_name,
-                *span,
-                None,
-                is_match_arm,
-            ));
-        }
-    }
-
-    fn check_mut_param_arguments(
-        &mut self,
-        args: &[Expression],
-        param_mutability: &[bool],
-        callee: &Expression,
-    ) {
-        let is_external = self.is_external_callee(callee);
-        for (i, arg) in args.iter().enumerate() {
-            if param_mutability.get(i).copied().unwrap_or(false) {
-                self.check_arg_against_mut_param(arg, is_external);
-            }
-        }
-    }
-
-    fn check_arg_against_mut_param(&mut self, arg: &Expression, is_external: bool) {
-        let Some(var_name) = arg.get_var_name() else {
-            return;
-        };
-        if !self.scopes.lookup_mutable(&var_name) {
-            self.sink
-                .push(diagnostics::infer::immutable_argument_to_mut_param(
-                    &var_name,
-                    arg.get_span(),
-                    is_external,
-                ));
-        }
-        if let Some(binding_id) = self.scopes.lookup_binding_id(&var_name) {
-            self.facts.mark_mutated(binding_id);
+            _ => self.convert_to_type(store, annotation, span),
         }
     }
 }

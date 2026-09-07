@@ -1,6 +1,14 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Math {}\n\nimpl Math {\n  fn add(a: int, b: int) -> int {\n    return a + b;\n  }\n}\n"
+description: |
+  
+  struct Math {}
+  
+  impl Math {
+    fn add(a: int, b: int) -> int {
+      return a + b;
+    }
+  }
 ---
 [
     Struct {
@@ -13,8 +21,9 @@ description: "input: \nstruct Math {}\n\nimpl Math {\n  fn add(a: int, b: int) -
             byte_length: 4,
         },
         generics: [],
-        fields: [],
-        kind: Record,
+        fields: Record(
+            [],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,
@@ -65,10 +74,9 @@ description: "input: \nstruct Math {}\n\nimpl Math {\n  fn add(a: int, b: int) -
                                 },
                             },
                         ),
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
+                        ty: Var {
+                            id: uninferred,
+                        },
                     },
                     Binding {
                         pattern: Identifier {
@@ -90,10 +98,9 @@ description: "input: \nstruct Math {}\n\nimpl Math {\n  fn add(a: int, b: int) -
                                 },
                             },
                         ),
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
+                        ty: Var {
+                            id: uninferred,
+                        },
                     },
                 ],
                 return_annotation: Constructor {
@@ -105,72 +112,72 @@ description: "input: \nstruct Math {}\n\nimpl Math {\n  fn add(a: int, b: int) -
                         byte_length: 3,
                     },
                 },
-                return_type: Variable(
-                    -1,
-                ),
+                return_type: Var {
+                    id: uninferred,
+                },
                 visibility: Private,
-                body: Block {
-                    items: [
-                        Return {
-                            expression: Binary {
-                                operator: Addition,
-                                left: Identifier {
-                                    value: "a",
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                body: Definition(
+                    Block {
+                        items: [
+                            Return {
+                                expression: Binary {
+                                    operator: Addition,
+                                    left: Identifier {
+                                        value: "a",
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
+                                        span: Span {
+                                            file_id: 0,
+                                            byte_offset: 74,
+                                            byte_length: 1,
+                                        },
+                                        resolution: Unresolved,
+                                    },
+                                    right: Identifier {
+                                        value: "b",
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
+                                        span: Span {
+                                            file_id: 0,
+                                            byte_offset: 78,
+                                            byte_length: 1,
+                                        },
+                                        resolution: Unresolved,
+                                    },
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 74,
-                                        byte_length: 1,
+                                        byte_length: 5,
                                     },
-                                    binding_id: None,
-                                    qualified: None,
                                 },
-                                right: Identifier {
-                                    value: "b",
-                                    ty: Variable(
-                                        -1,
-                                    ),
-                                    span: Span {
-                                        file_id: 0,
-                                        byte_offset: 78,
-                                        byte_length: 1,
-                                    },
-                                    binding_id: None,
-                                    qualified: None,
+                                ty: Var {
+                                    id: uninferred,
                                 },
-                                ty: Variable(
-                                    -1,
-                                ),
                                 span: Span {
                                     file_id: 0,
-                                    byte_offset: 74,
-                                    byte_length: 5,
+                                    byte_offset: 67,
+                                    byte_length: 12,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 67,
-                                byte_length: 12,
-                            },
+                        ],
+                        ty: Var {
+                            id: uninferred,
                         },
-                    ],
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 61,
-                        byte_length: 23,
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 61,
+                            byte_length: 23,
+                        },
                     },
-                },
-                ty: Variable(
-                    -1,
                 ),
+                ty: Var {
+                    id: uninferred,
+                },
                 span: Span {
                     file_id: 0,
                     byte_offset: 31,
@@ -179,9 +186,9 @@ description: "input: \nstruct Math {}\n\nimpl Math {\n  fn add(a: int, b: int) -
             },
         ],
         generics: [],
-        ty: Variable(
-            -1,
-        ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 17,

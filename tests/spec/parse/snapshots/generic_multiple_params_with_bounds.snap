@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn compare<T: Display, U: Debug>(x: T, y: U) -> bool {\n  return true;\n}\n"
+description: |
+  
+  fn compare<T: Display, U: Debug>(x: T, y: U) -> bool {
+    return true;
+  }
 ---
 [
     Function {
@@ -26,6 +30,7 @@ description: "input: \nfn compare<T: Display, U: Debug>(x: T, y: U) -> bool {\n 
                         },
                     },
                 ],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 12,
@@ -45,6 +50,7 @@ description: "input: \nfn compare<T: Display, U: Debug>(x: T, y: U) -> bool {\n 
                         },
                     },
                 ],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 24,
@@ -73,10 +79,9 @@ description: "input: \nfn compare<T: Display, U: Debug>(x: T, y: U) -> bool {\n 
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
             Binding {
                 pattern: Identifier {
@@ -98,10 +103,9 @@ description: "input: \nfn compare<T: Display, U: Debug>(x: T, y: U) -> bool {\n 
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
         ],
         return_annotation: Constructor {
@@ -113,48 +117,50 @@ description: "input: \nfn compare<T: Display, U: Debug>(x: T, y: U) -> bool {\n 
                 byte_length: 4,
             },
         },
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Return {
-                    expression: Literal {
-                        literal: Boolean(
-                            true,
-                        ),
-                        ty: Variable(
-                            -1,
-                        ),
+        body: Definition(
+            Block {
+                items: [
+                    Return {
+                        expression: Literal {
+                            literal: Boolean(
+                                true,
+                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
+                            span: Span {
+                                file_id: 0,
+                                byte_offset: 65,
+                                byte_length: 4,
+                            },
+                        },
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 65,
-                            byte_length: 4,
+                            byte_offset: 58,
+                            byte_length: 11,
                         },
                     },
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 58,
-                        byte_length: 11,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 54,
-                byte_length: 18,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 54,
+                    byte_length: 18,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

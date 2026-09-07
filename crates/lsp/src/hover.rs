@@ -1,196 +1,179 @@
-use syntax::ast::{Expression, Pattern, Span, TypedPattern};
-use syntax::program::Definition;
+use syntax::ast::{Annotation, Expression, IdentifierResolution, Span};
+use syntax::program::{Definition, DefinitionBody};
 
-use crate::analysis::find_module_by_alias;
+use crate::analysis::find_package_by_alias;
 use crate::definition::{
     get_root_expression, resolve_dot_access_definition, resolve_enum_in_pattern,
     resolve_match_pattern_definition,
 };
 use crate::offset_in_span;
+use crate::patterns::get_pattern_element_type;
 use crate::snapshot::AnalysisSnapshot;
 use crate::traversal::find_expression_at;
 use crate::type_name;
+use syntax::ast::Binding;
+use syntax::program::File;
+use syntax::types::Type;
+
+/// Hover for top-level declarations and the annotation trees inside them.
+pub(crate) fn resolve_declaration_hover(
+    expression: &Expression,
+    offset: u32,
+    file: &File,
+    snapshot: &AnalysisSnapshot,
+) -> Option<(Type, Span)> {
+    let name_hover = |name: &str, name_span: Span| -> Option<(Type, Span)> {
+        if !offset_in_span(offset, &name_span) {
+            return None;
+        }
+        let qualified = format!("{}.{}", file.package_id, name);
+        let definition = snapshot.definitions().get(qualified.as_str())?;
+        let ty = definition
+            .instantiate_alias_target(&[], false)
+            .unwrap_or_else(|| definition.ty.clone());
+        Some((ty, name_span))
+    };
+
+    match expression {
+        Expression::TypeAlias {
+            name,
+            name_span,
+            annotation,
+            ..
+        } => resolve_annotation_hover(annotation, offset, file, snapshot)
+            .or_else(|| name_hover(name, *name_span)),
+        Expression::Function {
+            name,
+            name_span,
+            params,
+            return_annotation,
+            ..
+        } => params
+            .iter()
+            .filter_map(|p| p.annotation.as_ref())
+            .find_map(|a| resolve_annotation_hover(a, offset, file, snapshot))
+            .or_else(|| resolve_annotation_hover(return_annotation, offset, file, snapshot))
+            .or_else(|| name_hover(name, *name_span)),
+        Expression::Enum {
+            name, name_span, ..
+        }
+        | Expression::Struct {
+            name, name_span, ..
+        }
+        | Expression::Interface {
+            name, name_span, ..
+        } => name_hover(name, *name_span),
+        _ => None,
+    }
+}
+
+fn resolve_annotation_hover(
+    annotation: &Annotation,
+    offset: u32,
+    file: &File,
+    snapshot: &AnalysisSnapshot,
+) -> Option<(Type, Span)> {
+    if !offset_in_span(offset, &annotation.get_span()) {
+        return None;
+    }
+    let recurse = |child| resolve_annotation_hover(child, offset, file, snapshot);
+    match annotation {
+        Annotation::Constructor {
+            name, params, span, ..
+        } => params
+            .iter()
+            .find_map(recurse)
+            .or_else(|| resolve_constructor_name_hover(name, *span, offset, file, snapshot)),
+        Annotation::Function {
+            params,
+            return_type,
+            ..
+        } => params
+            .iter()
+            .find_map(recurse)
+            .or_else(|| recurse(return_type.as_ref())),
+        Annotation::Tuple { elements, .. } => elements.iter().find_map(recurse),
+        Annotation::Unknown | Annotation::Opaque { .. } | Annotation::Constant { .. } => None,
+    }
+}
+
+fn resolve_constructor_name_hover(
+    name: &str,
+    span: Span,
+    offset: u32,
+    file: &File,
+    snapshot: &AnalysisSnapshot,
+) -> Option<(Type, Span)> {
+    let cursor_in_name = (offset - span.byte_offset) as usize;
+    let dot_pos = name.find('.').unwrap_or(name.len());
+
+    if cursor_in_name > dot_pos {
+        let (qualifier, simple) = name.split_once('.')?;
+        let package_name = find_package_by_alias(
+            file,
+            qualifier,
+            &snapshot.analysis.emit_input.go_package_names,
+        )?;
+        let qualified = format!("{}.{}", package_name, simple);
+        let definition = snapshot.definitions().get(qualified.as_str())?;
+        let simple_offset = span.byte_offset + dot_pos as u32 + 1;
+        let simple_span = Span::new(span.file_id, simple_offset, simple.len() as u32);
+        return Some((definition.ty.clone(), simple_span));
+    }
+
+    let first = &name[..dot_pos];
+    let first_span = Span::new(span.file_id, span.byte_offset, dot_pos as u32);
+    let ty = lookup_type_by_name(first, file, snapshot)?;
+    Some((ty, first_span))
+}
+
+fn lookup_type_by_name(name: &str, file: &File, snapshot: &AnalysisSnapshot) -> Option<Type> {
+    let candidates = [
+        format!("{}.{}", file.package_id, name),
+        name.to_string(),
+        format!("prelude.{}", name),
+    ];
+    for qualified in &candidates {
+        if let Some(def) = snapshot.definitions().get(qualified.as_str()) {
+            return Some(def.ty.clone());
+        }
+    }
+    for import in file.imports() {
+        if import.name.starts_with("go:") {
+            continue;
+        }
+        let qualified = format!("{}.{}", import.name, name);
+        if let Some(def) = snapshot.definitions().get(qualified.as_str()) {
+            return Some(def.ty.clone());
+        }
+    }
+    None
+}
 
 /// Extract the type and span for hover display at the given offset within an expression.
 pub(crate) fn get_hover_type_and_span(
+    snapshot: &AnalysisSnapshot,
     expression: &Expression,
     offset: u32,
-) -> (syntax::types::Type, Span) {
-    fn get_pattern_element_type(
-        pattern: &Pattern,
-        typed_pattern: Option<&TypedPattern>,
-        fallback_ty: &syntax::types::Type,
-        offset: u32,
-    ) -> Option<(syntax::types::Type, Span)> {
-        let span = pattern.get_span();
-        if offset < span.byte_offset || offset >= span.byte_offset + span.byte_length {
-            return None;
-        }
-
-        match (pattern, typed_pattern) {
-            (Pattern::Identifier { .. }, _) => Some((fallback_ty.clone(), span)),
-
-            (
-                Pattern::Tuple { elements, .. },
-                Some(TypedPattern::Tuple {
-                    elements: typed_elements,
-                    ..
-                }),
-            ) => elements.iter().enumerate().find_map(|(i, elem)| {
-                get_pattern_element_type(elem, typed_elements.get(i), fallback_ty, offset)
-            }),
-
-            (Pattern::Tuple { elements, .. }, _) => {
-                let type_elements = match fallback_ty {
-                    syntax::types::Type::Tuple(elems) => elems,
-                    _ => return None,
-                };
-                elements.iter().enumerate().find_map(|(i, elem)| {
-                    let elem_ty = type_elements.get(i)?;
-                    get_pattern_element_type(elem, None, elem_ty, offset)
-                })
-            }
-
-            (
-                Pattern::EnumVariant { fields, .. },
-                Some(TypedPattern::EnumVariant {
-                    fields: typed_fields,
-                    field_types,
-                    ..
-                }),
-            ) => fields.iter().enumerate().find_map(|(i, field)| {
-                let field_ty = field_types.get(i).unwrap_or(fallback_ty);
-                get_pattern_element_type(field, typed_fields.get(i), field_ty, offset)
-            }),
-
-            (
-                Pattern::EnumVariant { fields, .. },
-                Some(TypedPattern::EnumStructVariant { variant_fields, .. }),
-            ) => fields.iter().enumerate().find_map(|(i, field)| {
-                let field_ty = variant_fields.get(i).map(|f| &f.ty).unwrap_or(fallback_ty);
-                get_pattern_element_type(field, None, field_ty, offset)
-            }),
-
-            (Pattern::Struct { fields, .. }, Some(typed)) => {
-                let (field_defs, pattern_fields): (Vec<_>, _) = match typed {
-                    TypedPattern::Struct {
-                        struct_fields,
-                        pattern_fields,
-                        ..
-                    } => (
-                        struct_fields.iter().map(|f| (&f.name, &f.ty)).collect(),
-                        pattern_fields,
-                    ),
-                    TypedPattern::EnumStructVariant {
-                        variant_fields,
-                        pattern_fields,
-                        ..
-                    } => (
-                        variant_fields.iter().map(|f| (&f.name, &f.ty)).collect(),
-                        pattern_fields,
-                    ),
-                    _ => return None,
-                };
-
-                fields.iter().find_map(|field| {
-                    let field_ty = field_defs
-                        .iter()
-                        .find(|(name, _)| *name == &field.name)
-                        .map(|(_, ty)| *ty)
-                        .unwrap_or(fallback_ty);
-                    let typed_field = pattern_fields
-                        .iter()
-                        .find(|(name, _)| name == &field.name)
-                        .map(|(_, tp)| tp);
-                    get_pattern_element_type(&field.value, typed_field, field_ty, offset)
-                })
-            }
-
-            (
-                Pattern::Slice {
-                    prefix,
-                    rest,
-                    element_ty,
-                    ..
-                },
-                typed,
-            ) => {
-                let elem_type = match typed {
-                    Some(TypedPattern::Slice { element_type, .. }) => element_type,
-                    _ => element_ty,
-                };
-
-                prefix
-                    .iter()
-                    .find_map(|elem| get_pattern_element_type(elem, None, elem_type, offset))
-                    .or_else(|| {
-                        if let syntax::ast::RestPattern::Bind { span, .. } = rest
-                            && offset >= span.byte_offset
-                            && offset < span.byte_offset + span.byte_length
-                        {
-                            let slice_ty = syntax::types::Type::Constructor {
-                                id: "Slice".into(),
-                                params: vec![elem_type.clone()],
-                                underlying_ty: None,
-                            };
-                            Some((slice_ty, *span))
-                        } else {
-                            None
-                        }
-                    })
-            }
-
-            (Pattern::Or { patterns, .. }, Some(TypedPattern::Or { alternatives, .. })) => {
-                patterns.iter().enumerate().find_map(|(i, alt)| {
-                    get_pattern_element_type(alt, alternatives.get(i), fallback_ty, offset)
-                })
-            }
-
-            (
-                Pattern::AsBinding {
-                    pattern: inner,
-                    name,
-                    ..
-                },
-                _,
-            ) => {
-                get_pattern_element_type(inner, typed_pattern, fallback_ty, offset).or_else(|| {
-                    let binding_ty = inner.get_type().unwrap_or_else(|| fallback_ty.clone());
-                    let name_span = Span::new(
-                        span.file_id,
-                        span.byte_offset + span.byte_length - name.len() as u32,
-                        name.len() as u32,
-                    );
-                    Some((binding_ty, name_span))
-                })
-            }
-
-            _ => None,
-        }
-    }
-
+) -> (Type, Span) {
     fn get_binding_type(
-        binding: &syntax::ast::Binding,
+        snapshot: &AnalysisSnapshot,
+        binding: &Binding,
         offset: u32,
-    ) -> Option<(syntax::types::Type, Span)> {
-        get_pattern_element_type(
-            &binding.pattern,
-            binding.typed_pattern.as_ref(),
-            &binding.ty,
-            offset,
-        )
+    ) -> Option<(Type, Span)> {
+        get_pattern_element_type(snapshot, &binding.pattern, &binding.ty, offset)
     }
 
     match expression {
         Expression::Let { binding, .. } | Expression::For { binding, .. } => {
-            if let Some(result) = get_binding_type(binding, offset) {
+            if let Some(result) = get_binding_type(snapshot, binding, offset) {
                 return result;
             }
         }
 
         Expression::Function { params, .. } | Expression::Lambda { params, .. } => {
             for param in params {
-                if let Some(result) = get_binding_type(param, offset) {
+                if let Some(result) = get_binding_type(snapshot, param, offset) {
                     return result;
                 }
             }
@@ -198,30 +181,21 @@ pub(crate) fn get_hover_type_and_span(
 
         Expression::Match { subject, arms, .. } => {
             for arm in arms {
-                if let Some(result) = get_pattern_element_type(
-                    &arm.pattern,
-                    arm.typed_pattern.as_ref(),
-                    &subject.get_type(),
-                    offset,
-                ) {
+                if let Some(result) =
+                    get_pattern_element_type(snapshot, &arm.pattern, &subject.get_type(), offset)
+                {
                     return result;
                 }
             }
         }
 
         Expression::IfLet {
-            pattern,
-            scrutinee,
-            typed_pattern,
-            ..
+            pattern, scrutinee, ..
         } => {
             if offset_in_span(offset, &pattern.get_span()) {
-                if let Some(result) = get_pattern_element_type(
-                    pattern,
-                    typed_pattern.as_ref(),
-                    &scrutinee.get_type(),
-                    offset,
-                ) {
+                if let Some(result) =
+                    get_pattern_element_type(snapshot, pattern, &scrutinee.get_type(), offset)
+                {
                     return result;
                 }
                 let ty = pattern.get_type().unwrap_or_else(|| scrutinee.get_type());
@@ -230,18 +204,12 @@ pub(crate) fn get_hover_type_and_span(
         }
 
         Expression::WhileLet {
-            pattern,
-            scrutinee,
-            typed_pattern,
-            ..
+            pattern, scrutinee, ..
         } => {
             if offset_in_span(offset, &pattern.get_span()) {
-                if let Some(result) = get_pattern_element_type(
-                    pattern,
-                    typed_pattern.as_ref(),
-                    &scrutinee.get_type(),
-                    offset,
-                ) {
+                if let Some(result) =
+                    get_pattern_element_type(snapshot, pattern, &scrutinee.get_type(), offset)
+                {
                     return result;
                 }
                 let ty = pattern.get_type().unwrap_or_else(|| scrutinee.get_type());
@@ -278,19 +246,15 @@ pub(crate) fn get_hover_type_and_span(
 /// the offset lands on a sub-item and returns that sub-item's doc instead.
 fn extract_doc_from_expression(expression: &Expression, offset: u32) -> Option<String> {
     match expression {
-        Expression::Function { doc, .. }
-        | Expression::Const { doc, .. }
-        | Expression::VariableDeclaration { doc, .. }
-        | Expression::TypeAlias { doc, .. }
-        | Expression::Interface { doc, .. } => doc.clone(),
+        Expression::Const { doc, .. } | Expression::VariableDeclaration { doc, .. } => doc.clone(),
+
+        Expression::Function { doc, name_span, .. }
+        | Expression::TypeAlias { doc, name_span, .. }
+        | Expression::Interface { doc, name_span, .. } => offset_in_span(offset, name_span)
+            .then(|| doc.clone())
+            .flatten(),
 
         Expression::Enum { doc, variants, .. } => variants
-            .iter()
-            .find(|v| offset_in_span(offset, &v.name_span))
-            .and_then(|v| v.doc.clone())
-            .or_else(|| doc.clone()),
-
-        Expression::ValueEnum { doc, variants, .. } => variants
             .iter()
             .find(|v| offset_in_span(offset, &v.name_span))
             .and_then(|v| v.doc.clone())
@@ -322,13 +286,13 @@ fn find_doc_at_definition_span(
 fn resolve_dot_access_doc(
     expression: &Expression,
     member: &str,
-    file: &syntax::program::File,
+    file: &File,
     snapshot: &AnalysisSnapshot,
 ) -> Option<String> {
-    if let Some(type_id) = type_name(&expression.get_type().resolve()) {
+    if let Some(type_id) = type_name(&expression.get_type(), snapshot) {
         let qualified = format!("{}.{}", type_id, member);
         if let Some(def) = snapshot.definitions().get(qualified.as_str())
-            && let Some(doc) = def.doc()
+            && let Some(doc) = &def.doc
         {
             return Some(doc.clone());
         }
@@ -337,14 +301,13 @@ fn resolve_dot_access_doc(
     let root = get_root_expression(expression);
     let alias = match root.unwrap_parens() {
         Expression::Identifier {
-            value,
-            binding_id: None,
-            ..
-        } => value.as_str(),
+            value, resolution, ..
+        } if !matches!(resolution, IdentifierResolution::Binding(_)) => value.as_str(),
         _ => return None,
     };
 
-    let module_name = find_module_by_alias(file, alias, &snapshot.result.go_package_names)?;
+    let package_name =
+        find_package_by_alias(file, alias, &snapshot.analysis.emit_input.go_package_names)?;
 
     let qualified = if matches!(expression, Expression::DotAccess { .. }) {
         if let Some(dotted) = expression.as_dotted_path()
@@ -352,27 +315,23 @@ fn resolve_dot_access_doc(
         {
             dotted
                 .strip_prefix(root_id)
-                .map(|rest| format!("{}{}.{}", module_name, rest, member))
-                .unwrap_or_else(|| format!("{}.{}", module_name, member))
+                .map(|rest| format!("{}{}.{}", package_name, rest, member))
+                .unwrap_or_else(|| format!("{}.{}", package_name, member))
         } else {
-            format!("{}.{}", module_name, member)
+            format!("{}.{}", package_name, member)
         }
     } else {
-        format!("{}.{}", module_name, member)
+        format!("{}.{}", package_name, member)
     };
 
-    snapshot
-        .definitions()
-        .get(qualified.as_str())?
-        .doc()
-        .cloned()
+    snapshot.definitions().get(qualified.as_str())?.doc.clone()
 }
 
 /// Resolve the doc comment for the hovered expression.
 pub(crate) fn get_hover_doc(
     expression: &Expression,
     offset: u32,
-    file: &syntax::program::File,
+    file: &File,
     snapshot: &AnalysisSnapshot,
 ) -> Option<String> {
     if let Some(doc) = extract_doc_from_expression(expression, offset) {
@@ -381,21 +340,22 @@ pub(crate) fn get_hover_doc(
 
     match expression {
         Expression::Identifier {
-            qualified: Some(qname),
+            resolution: IdentifierResolution::Definition(qname),
             ..
         } => {
             let definition = snapshot.definitions().get(qname.as_str())?;
             definition
-                .name_span()
+                .name_span
                 .and_then(|span| find_doc_at_definition_span(span, snapshot))
-                .or_else(|| definition.doc().cloned())
+                .or_else(|| definition.doc.clone())
         }
 
         Expression::DotAccess {
             expression: base,
             member,
+            span,
             ..
-        } => resolve_dot_access_definition(base, member, file, snapshot)
+        } => resolve_dot_access_definition(base, member, *span, file, snapshot)
             .and_then(|span| find_doc_at_definition_span(span, snapshot))
             .or_else(|| resolve_dot_access_doc(base, member, file, snapshot)),
 
@@ -404,14 +364,16 @@ pub(crate) fn get_hover_doc(
             ty,
             ..
         } => {
-            let resolved = ty.resolve();
-            let type_id = type_name(&resolved)?;
+            let type_id = type_name(ty, snapshot)?;
 
             if let Some(fa) = field_assignments
                 .iter()
                 .find(|fa| offset_in_span(offset, &fa.name_span))
             {
-                if let Some(Definition::Struct { fields, .. }) = snapshot.definitions().get(type_id)
+                if let Some(Definition {
+                    body: DefinitionBody::Struct { fields, .. },
+                    ..
+                }) = snapshot.definitions().get(type_id.as_str())
                 {
                     return fields
                         .iter()
@@ -421,7 +383,7 @@ pub(crate) fn get_hover_doc(
                 return None;
             }
 
-            let span = snapshot.definitions().get(type_id)?.name_span()?;
+            let span = snapshot.definitions().get(type_id.as_str())?.name_span?;
             find_doc_at_definition_span(span, snapshot)
         }
 
@@ -430,18 +392,8 @@ pub(crate) fn get_hover_doc(
             find_doc_at_definition_span(span, snapshot)
         }
 
-        Expression::IfLet {
-            pattern,
-            typed_pattern,
-            ..
-        }
-        | Expression::WhileLet {
-            pattern,
-            typed_pattern,
-            ..
-        } => {
-            let span =
-                resolve_enum_in_pattern(pattern, typed_pattern.as_ref(), offset, file, snapshot)?;
+        Expression::IfLet { pattern, .. } | Expression::WhileLet { pattern, .. } => {
+            let span = resolve_enum_in_pattern(pattern, offset, file, snapshot)?;
             find_doc_at_definition_span(span, snapshot)
         }
 

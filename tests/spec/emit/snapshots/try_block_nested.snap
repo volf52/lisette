@@ -1,16 +1,36 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn risky_a() -> Result<int, string> { Ok(1) }\nfn risky_b() -> Result<int, string> { Ok(2) }\n\nfn test() -> int {\n  let outer = try {\n    let inner: Result<int, string> = try {\n      risky_a()?\n    };\n    let inner_val = match inner {\n      Ok(x) => x,\n      Err(_) => 0,\n    };\n    inner_val + risky_b()?\n  };\n  match outer {\n    Ok(x) => x,\n    Err(_) => -1,\n  }\n}\n"
+description: |
+  
+  fn risky_a() -> Result<int, string> { Ok(1) }
+  fn risky_b() -> Result<int, string> { Ok(2) }
+  
+  fn test() -> int {
+    let outer = try {
+      let inner: Result<int, string> = try {
+        risky_a()?
+      };
+      let inner_val = match inner {
+        Ok(x) => x,
+        Err(_) => 0,
+      };
+      inner_val + risky_b()?
+    };
+    match outer {
+      Ok(x) => x,
+      Err(_) => -1,
+    }
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func risky_a() lisette.Result[int, string] {
+func riskyA() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](1)
 }
 
-func risky_b() lisette.Result[int, string] {
+func riskyB() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](2)
 }
 
@@ -19,12 +39,11 @@ func test() int {
 	tryResult_1 := func() lisette.Result[int, string] {
 		var inner lisette.Result[int, string]
 		tryResult_2 := func() lisette.Result[int, string] {
-			check_3 := risky_a()
+			check_3 := riskyA()
 			if check_3.Tag != lisette.ResultOk {
 				return lisette.MakeResultErr[int, string](check_3.ErrVal)
 			}
-			result_4 := check_3.OkVal
-			return lisette.MakeResultOk[int, string](result_4)
+			return lisette.MakeResultOk[int, string](check_3.OkVal)
 		}()
 		inner = tryResult_2
 		var inner_val int
@@ -33,12 +52,11 @@ func test() int {
 		} else {
 			inner_val = 0
 		}
-		check_5 := risky_b()
-		if check_5.Tag != lisette.ResultOk {
-			return lisette.MakeResultErr[int, string](check_5.ErrVal)
+		check_4 := riskyB()
+		if check_4.Tag != lisette.ResultOk {
+			return lisette.MakeResultErr[int, string](check_4.ErrVal)
 		}
-		result_6 := check_5.OkVal
-		return lisette.MakeResultOk[int, string](inner_val + result_6)
+		return lisette.MakeResultOk[int, string](inner_val + check_4.OkVal)
 	}()
 	outer = tryResult_1
 	if outer.Tag == lisette.ResultOk {

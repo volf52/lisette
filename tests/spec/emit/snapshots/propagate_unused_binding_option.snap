@@ -1,19 +1,24 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn maybe() -> Option<int> { Some(1) }\n\nfn test() -> Option<()> {\n  let _x = maybe()?\n  Some(())\n}\n"
+description: |
+  
+  fn maybe() -> Option<int> { Some(1) }
+  
+  fn test() -> Option<()> {
+    let _x = maybe()?
+    Some(())
+  }
 ---
 package main
 
-import lisette "github.com/ivov/lisette/prelude"
-
-func maybe() lisette.Option[int] {
-	return lisette.MakeOptionSome[int](1)
+func maybe() (int, bool) {
+	return 1, true
 }
 
-func test() lisette.Option[struct{}] {
-	check_1 := maybe()
-	if check_1.Tag != lisette.OptionSome {
-		return lisette.MakeOptionNone[struct{}]()
+func test() (struct{}, bool) {
+	_, ret_1 := maybe()
+	if !ret_1 {
+		return struct{}{}, false
 	}
-	return lisette.MakeOptionSome[struct{}](struct{}{})
+	return struct{}{}, true
 }

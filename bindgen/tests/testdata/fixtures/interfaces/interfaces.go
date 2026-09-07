@@ -37,6 +37,12 @@ type ReadWriteSeeker interface {
 // Empty interface alias
 type Any interface{}
 
+// Empty named interface used as a struct field — alias must resolve to
+// Unknown end-to-end so any value can be assigned.
+type Holder struct {
+	Hook Any
+}
+
 // Custom error types
 
 // Custom error type implementing error interface
@@ -64,6 +70,11 @@ type Node struct {
 type Cache interface {
 	Get(key string) (node *Node, ok bool)
 	Set(key string, value *Node)
+}
+
+// Variadic method on interface
+type Logger interface {
+	Logf(format string, args ...any)
 }
 
 // Function returning custom error

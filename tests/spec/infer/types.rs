@@ -1289,6 +1289,20 @@ fn shadowing_changes_mutability() {
 }
 
 #[test]
+fn immutable_shadow_does_not_inherit_outer_mutability() {
+    infer(
+        r#"{
+    let mut x = 42;
+    {
+      let x = x + 1;
+      x = 10;
+    }
+  }"#,
+    )
+    .assert_infer_code("immutable");
+}
+
+#[test]
 fn function_parameter_immutable() {
     infer(
         r#"{
@@ -1413,14 +1427,25 @@ fn slice_range_preserves_element_type() {
 }
 
 #[test]
-fn string_range_returns_string() {
+fn string_substring_returns_string() {
     infer(
         r#"{
     let s = "hello world";
-    let sub: string = s[0..5];
+    let sub: string = s.substring(0..5);
   }"#,
     )
     .assert_no_errors();
+}
+
+#[test]
+fn string_range_slice_rejected() {
+    infer(
+        r#"{
+    let s = "hello world";
+    let _ = s[0..5];
+  }"#,
+    )
+    .assert_infer_code("string_not_sliceable");
 }
 
 #[test]
@@ -1474,7 +1499,7 @@ fn field_assignment_through_deref_allowed() {
         r#"
     struct Point { x: int, y: int }
 
-    fn set_field(p: Ref<Point>) {
+    fn set_field(p: mut Ref<Point>) {
       p.*.x = p.*.x + 1
     }
         "#,
@@ -1624,6 +1649,261 @@ fn generic_interface_with_type_parameter_satisfied() {
 }
 
 #[test]
+fn generic_impl_satisfies_interface_for_matching_instantiation() {
+    infer(
+        r#"
+interface IntGetter { fn get() -> int }
+struct Box<T> { value: T }
+impl<T> Box<T> { fn get(self) -> T { self.value } }
+fn want(g: IntGetter) -> int { g.get() }
+fn main() {
+  let b: Box<int> = Box { value: 1 }
+  let _ = want(b)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_impl_mismatched_instantiation_rejected() {
+    infer(
+        r#"
+interface IntGetter { fn get() -> int }
+struct Box<T> { value: T }
+impl<T> Box<T> { fn get(self) -> T { self.value } }
+fn want(g: IntGetter) -> int { g.get() }
+fn main() {
+  let b: Box<string> = Box { value: "hello" }
+  let _ = want(b)
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn builtin_type_satisfies_empty_interface() {
+    infer(
+        r#"
+interface Marker {}
+fn tag(m: Marker) -> Marker { m }
+fn main() {
+  let _ = tag([1, 2, 3])
+  let _ = [1, 2] as Marker
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_value_narrowed_with_assert_type_satisfies_concrete_positions() {
+    infer(
+        r#"
+struct FooError {}
+impl FooError { fn Error(self) -> string { "foo failed" } }
+struct Holder { inner: FooError }
+fn take(f: FooError) -> string { f.Error() }
+fn unwrap(e: error) -> Option<FooError> { assert_type<FooError>(e) }
+fn main() {
+  let e: error = FooError {}
+  let concrete = assert_type<FooError>(e).unwrap_or(FooError {})
+  let held = Holder { inner: concrete }
+  let _ = take(held.inner)
+  let _ = unwrap(e)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn failed_cast_to_interface_reports_single_error() {
+    infer(
+        r#"
+interface Sized { fn length() -> int }
+fn main() {
+  let _ = [1, 2, 3] as Sized
+}
+"#,
+    )
+    .assert_infer_code_once("interface_not_implemented")
+    .assert_infer_code_count("invalid_conversion", 0);
+}
+
+#[test]
+fn generic_impl_mismatched_param_position_rejected() {
+    infer(
+        r#"
+interface IntSetter { fn set(v: int) }
+struct Box<T> { value: T }
+impl<T> Box<T> { fn set(self, v: T) {} }
+fn want(s: IntSetter) { s.set(1) }
+fn main() {
+  let b: Box<string> = Box { value: "hi" }
+  want(b)
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn constrained_generic_impl_receiver_mismatch_rejected() {
+    infer(
+        r#"
+interface Same { fn same() -> int }
+struct Pair<A, B> { a: A, b: B }
+impl<A> Pair<A, A> { fn same(self) -> int { 1 } }
+fn want(s: Same) -> int { s.same() }
+fn main() {
+  let p: Pair<int, string> = Pair { a: 1, b: "x" }
+  let _ = want(p)
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn partial_impl_receiver_cannot_satisfy_interface() {
+    infer(
+        r#"
+interface Same { fn same() -> int }
+struct Pair<A, B> { a: A, b: B }
+impl<A> Pair<A, A> { fn same(self) -> int { 1 } }
+fn want(s: Same) -> int { s.same() }
+fn main() {
+  let p: Pair<int, int> = Pair { a: 1, b: 2 }
+  let _ = want(p)
+}
+"#,
+    )
+    .assert_infer_code("specialized_impl_cannot_satisfy_interface");
+}
+
+#[test]
+fn partial_impl_on_enum_cannot_satisfy_interface() {
+    infer(
+        r#"
+interface Same { fn same() -> int }
+enum Pair<A, B> { Both(A, B) }
+impl<T> Pair<T, T> { fn same(self) -> int { 1 } }
+fn want(s: Same) -> int { s.same() }
+fn main() {
+  let p: Pair<int, int> = Pair.Both(1, 2)
+  let _ = want(p)
+}
+"#,
+    )
+    .assert_infer_code("specialized_impl_cannot_satisfy_interface");
+}
+
+#[test]
+fn generic_method_on_nongeneric_receiver_cannot_satisfy_interface() {
+    infer(
+        r#"
+interface IntId { fn id(x: int) -> int }
+struct S {}
+impl S { fn id<T>(self, x: T) -> T { x } }
+fn want(i: IntId) -> int { i.id(1) }
+fn main() {
+  let _ = want(S {})
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn alias_partial_impl_method_value_rejected() {
+    infer(
+        r#"
+struct Pair<A, B> { a: A, b: B }
+impl<T> Pair<T, T> { fn first(self) -> T { self.a } }
+type IntPair = Pair<int, int>
+fn main() {
+  let p: IntPair = Pair { a: 1, b: 2 }
+  let f = p.first
+  let _ = f()
+}
+"#,
+    )
+    .assert_infer_code("taking_value_of_ufcs_method");
+}
+
+#[test]
+fn alias_specialized_impl_method_value_rejected() {
+    infer(
+        r#"
+struct Box<T> { value: T }
+impl Box<int> { fn only_int(self) -> int { self.value } }
+type IntBox = Box<int>
+fn main() {
+  let b: IntBox = Box { value: 1 }
+  let f = b.only_int
+  let _ = f()
+}
+"#,
+    )
+    .assert_infer_code("taking_value_of_ufcs_method");
+}
+
+#[test]
+fn alias_partial_impl_cannot_satisfy_interface() {
+    infer(
+        r#"
+interface Same { fn same() -> int }
+struct Pair<A, B> { a: A, b: B }
+impl<T> Pair<T, T> { fn same(self) -> int { 1 } }
+type IntPair = Pair<int, int>
+fn want(s: Same) -> int { s.same() }
+fn main() {
+  let p: IntPair = Pair { a: 1, b: 2 }
+  let _ = want(p)
+}
+"#,
+    )
+    .assert_infer_code("specialized_impl_cannot_satisfy_interface");
+}
+
+#[test]
+fn alias_specialized_impl_cannot_satisfy_interface() {
+    infer(
+        r#"
+interface OnlyInt { fn only_int() -> int }
+struct Box<T> { value: T }
+impl Box<int> { fn only_int(self) -> int { self.value } }
+type IntBox = Box<int>
+fn want(x: OnlyInt) -> int { x.only_int() }
+fn main() {
+  let b: IntBox = Box { value: 1 }
+  let _ = want(b)
+}
+"#,
+    )
+    .assert_infer_code("specialized_impl_cannot_satisfy_interface");
+}
+
+#[test]
+fn generic_impl_satisfies_generic_interface_for_matching_instantiation() {
+    infer(
+        r#"
+interface Getter<U> { fn get() -> U }
+struct Box<T> { value: T }
+impl<T> Box<T> { fn get(self) -> T { self.value } }
+fn want(g: Getter<string>) -> string { g.get() }
+fn main() {
+  let b: Box<string> = Box { value: "hi" }
+  let _ = want(b)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
 fn unconstrained_bounded_type_param_produces_error() {
     infer(
         r#"
@@ -1639,6 +1919,344 @@ fn unconstrained_bounded_type_param_produces_error() {
         "#,
     )
     .assert_infer_code("unconstrained_type_param");
+}
+
+#[test]
+fn polymorphic_recursion_growing_slice_produces_error() {
+    infer(
+        r#"
+    fn depth<T>(x: T, n: int) -> int {
+      if n > 0 { depth([x], n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = depth(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn polymorphic_recursion_growing_option_produces_error() {
+    infer(
+        r#"
+    fn nest<T>(x: T, n: int) -> int {
+      if n > 0 { nest(Some(x), n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = nest(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn polymorphic_recursion_explicit_type_args_produces_error() {
+    infer(
+        r#"
+    fn explicit<T>(x: T, n: int) -> int {
+      if n > 0 { explicit<Slice<T>>([x], n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = explicit(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn polymorphic_recursion_through_reference_produces_error() {
+    infer(
+        r#"
+    fn indirect<T>(x: T, n: int) -> int {
+      if n > 0 {
+        let recurse: fn(Slice<T>, int) -> int = indirect
+        recurse([x], n - 1)
+      } else {
+        0
+      }
+    }
+
+    fn main() {
+      let _ = indirect(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn mutual_polymorphic_recursion_produces_error() {
+    infer(
+        r#"
+    fn ping<T>(x: T, n: int) -> int {
+      if n > 0 { pong([x], n - 1) } else { 0 }
+    }
+
+    fn pong<U>(x: U, n: int) -> int {
+      ping(x, n)
+    }
+
+    fn main() {
+      let _ = ping(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn polymorphic_recursion_growing_swap_produces_error() {
+    infer(
+        r#"
+    fn grow<A, B>(a: A, b: B, n: int) -> int {
+      if n > 0 { grow(b, [a], n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = grow(1, "x", 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn generic_recursion_with_fixed_type_args_is_valid() {
+    infer(
+        r#"
+    fn countdown<T>(x: T, n: int) -> int {
+      if n > 0 { countdown(x, n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = countdown("a", 3)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_recursion_with_swapped_type_args_is_valid() {
+    infer(
+        r#"
+    fn swap_rec<A, B>(a: A, b: B, n: int) -> int {
+      if n > 0 { swap_rec(b, a, n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = swap_rec(1, "x", 3)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn one_way_growing_generic_call_is_valid() {
+    infer(
+        r#"
+    fn wrap_once<T>(x: T, n: int) -> int {
+      measure([x], n)
+    }
+
+    fn measure<U>(x: U, n: int) -> int {
+      if n > 0 { measure(x, n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = wrap_once(1, 3)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_method_polymorphic_recursion_produces_error() {
+    infer(
+        r#"
+    struct Counter {}
+
+    impl Counter {
+      fn depth<T>(self, x: T, n: int) -> int {
+        if n > 0 { self.depth([x], n - 1) } else { 0 }
+      }
+    }
+
+    fn main() {
+      let c = Counter {}
+      let _ = c.depth(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn static_method_polymorphic_recursion_produces_error() {
+    infer(
+        r#"
+    struct Tool {}
+
+    impl Tool {
+      fn measure<T>(x: T, n: int) -> int {
+        if n > 0 { Tool.measure([x], n - 1) } else { 0 }
+      }
+    }
+
+    fn main() {
+      let _ = Tool.measure(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn impl_receiver_growth_recursion_produces_error() {
+    infer(
+        r#"
+    struct Box<U> { value: U }
+
+    impl<U> Box<U> {
+      fn deep(self, n: int) -> int {
+        if n > 0 {
+          let bigger = Box { value: self }
+          bigger.deep(n - 1)
+        } else {
+          0
+        }
+      }
+    }
+
+    fn main() {
+      let b = Box { value: 1 }
+      let _ = b.deep(3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn generic_method_recursion_with_fixed_receiver_is_valid() {
+    infer(
+        r#"
+    struct Box<U> { value: U }
+
+    impl<U> Box<U> {
+      fn count(self, n: int) -> int {
+        if n > 0 { self.count(n - 1) } else { 0 }
+      }
+    }
+
+    fn main() {
+      let b = Box { value: 1 }
+      let _ = b.count(3)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn nested_function_shadowed_generic_produces_no_cycle_error() {
+    infer(
+        r#"
+    fn outer<T>(x: T, n: int) -> int {
+      fn helper<T>(y: T) -> int {
+        outer([y], 1)
+      }
+      n
+    }
+
+    fn main() {
+      let _ = outer(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code("nested_function")
+    .assert_infer_code_count("instantiation_cycle", 0);
+}
+
+#[test]
+fn static_method_recursion_through_alias_produces_error() {
+    infer(
+        r#"
+    struct Tool {}
+
+    type Gadget = Tool
+
+    impl Tool {
+      fn measure<T>(x: T, n: int) -> int {
+        if n > 0 { Gadget.measure([x], n - 1) } else { 0 }
+      }
+    }
+
+    fn main() {
+      let _ = Tool.measure(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn imported_package_polymorphic_recursion_produces_error() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "helpers",
+        "lib.lis",
+        r#"
+pub fn tally<T>(x: T, n: int) -> int {
+  if n > 0 { tally([x], n - 1) } else { 0 }
+}
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "helpers"
+
+fn main() {
+  let _ = helpers.tally(1, 3)
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_infer_code_once("instantiation_cycle");
+}
+
+#[test]
+fn function_method_polymorphic_recursion_cycle_produces_error() {
+    infer(
+        r#"
+    struct Helper {}
+
+    impl Helper {
+      fn bounce<T>(self, x: T, n: int) -> int {
+        trampoline(x, n)
+      }
+    }
+
+    fn trampoline<T>(x: T, n: int) -> int {
+      if n > 0 { Helper {}.bounce([x], n - 1) } else { 0 }
+    }
+
+    fn main() {
+      let _ = trampoline(1, 3)
+    }
+        "#,
+    )
+    .assert_infer_code_once("instantiation_cycle");
 }
 
 #[test]
@@ -1675,7 +2293,7 @@ fn impl_bound_is_enforced_on_method_call() {
       fn show() -> string;
     }
 
-    struct Box<T> { value: T }
+    struct Box<T: Display> { value: T }
 
     impl<T: Display> Box<T> {
       fn describe(self: Box<T>) -> string {
@@ -1700,7 +2318,7 @@ fn impl_bound_is_satisfied_when_type_implements_interface() {
       fn show() -> string;
     }
 
-    struct Box<T> { value: T }
+    struct Box<T: Display> { value: T }
 
     impl<T: Display> Box<T> {
       fn describe(self: Box<T>) -> string {
@@ -1730,7 +2348,7 @@ fn impl_bound_propagated_to_method_return_type() {
     infer(
         r#"
     interface Printable {
-      fn to_str(self) -> string
+      fn to_str() -> string
     }
 
     struct Box<T: Printable> { value: T }
@@ -1858,7 +2476,7 @@ fn never_in_generic_expected_position_rejects_inhabited() {
     }
 
     fn main() {
-      let x: MyResult<Never, int> = MyOk(1);
+      let x: MyResult<Never, int> = MyResult.MyOk(1);
     }
         "#,
     )
@@ -1879,7 +2497,7 @@ fn never_in_generic_actual_position_coerces() {
     }
 
     fn test() -> MyResult<int, int> {
-      MyOk(diverges())
+      MyResult.MyOk(diverges())
     }
         "#,
     )
@@ -2116,21 +2734,20 @@ fn tuple_struct_in_function_return() {
 }
 
 #[test]
-fn value_enum_in_typedef_file_succeeds() {
+fn const_pattern_or_pattern_succeeds() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "weekday",
         "lib.d.lis",
         r#"
-pub enum Weekday {
-  Sunday = 0,
-  Monday = 1,
-  Tuesday = 2,
-  Wednesday = 3,
-  Thursday = 4,
-  Friday = 5,
-  Saturday = 6,
-}
+pub struct Weekday(int)
+pub const Sunday: Weekday = 0
+pub const Monday: Weekday = 1
+pub const Tuesday: Weekday = 2
+pub const Wednesday: Weekday = 3
+pub const Thursday: Weekday = 4
+pub const Friday: Weekday = 5
+pub const Saturday: Weekday = 6
 "#,
     );
 
@@ -2146,20 +2763,19 @@ fn is_weekend(day: weekday.Weekday) -> bool {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn value_enum_pattern_requires_catch_all() {
+fn const_pattern_requires_catch_all() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "weekday",
         "lib.d.lis",
         r#"
-pub enum Weekday {
-  Sunday = 0,
-  Monday = 1,
-}
+pub struct Weekday(int)
+pub const Sunday: Weekday = 0
+pub const Monday: Weekday = 1
 "#,
     );
 
@@ -2175,20 +2791,19 @@ fn get_name(day: weekday.Weekday) -> string {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    infer_module("main", fs).assert_exhaustiveness_error();
+    infer_package("main", fs).assert_exhaustiveness_error();
 }
 
 #[test]
-fn value_enum_pattern_with_catch_all_succeeds() {
+fn const_pattern_with_catch_all_succeeds() {
     let mut fs = MockFileSystem::new();
     fs.add_file(
         "weekday",
         "lib.d.lis",
         r#"
-pub enum Weekday {
-  Sunday = 0,
-  Monday = 1,
-}
+pub struct Weekday(int)
+pub const Sunday: Weekday = 0
+pub const Monday: Weekday = 1
 "#,
     );
 
@@ -2205,7 +2820,490 @@ fn get_name(day: weekday.Weekday) -> string {
 "#;
     fs.add_file("main", "main.lis", source);
 
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
+}
+
+fn weekday_typedef() -> &'static str {
+    r#"
+pub struct Weekday(int)
+pub const Sunday: Weekday = 0
+pub const Monday: Weekday = 1
+pub const Friday: Weekday = 5
+"#
+}
+
+#[test]
+fn const_pattern_type_mismatch() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("weekday", "lib.d.lis", weekday_typedef());
+    fs.add_file(
+        "time",
+        "time.d.lis",
+        "pub struct Duration(int64)\npub const Second: Duration = 1000000000\n",
+    );
+    let source = r#"
+import "weekday"
+import "time"
+
+fn get_name(day: weekday.Weekday) -> string {
+  match day {
+    time.Second => "second",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn const_pattern_duplicate_arm_redundant() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("weekday", "lib.d.lis", weekday_typedef());
+    let source = r#"
+import "weekday"
+
+fn get_name(day: weekday.Weekday) -> string {
+  match day {
+    weekday.Friday => "fri",
+    weekday.Friday => "again",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("redundant_arm");
+}
+
+#[test]
+fn const_pattern_alias_same_value_redundant() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "codes",
+        "lib.d.lis",
+        r#"
+pub struct Code(int)
+pub const A: Code = 1
+pub const B: Code = 1
+"#,
+    );
+    let source = r#"
+import "codes"
+
+fn name(c: codes.Code) -> string {
+  match c {
+    codes.A => "a",
+    codes.B => "b",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("redundant_arm");
+}
+
+#[test]
+fn const_pattern_unknown_value_no_string_collision() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "codes",
+        "lib.d.lis",
+        r#"
+pub struct Code(string)
+pub const UNKNOWN: Code
+"#,
+    );
+    let source = r#"
+import "codes"
+
+fn name(c: codes.Code) -> int {
+  match c {
+    codes.UNKNOWN => 1,
+    "__const__codes.UNKNOWN" => 2,
+    _ => 0,
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn const_pattern_unknown_value_same_symbol_redundant() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "codes",
+        "lib.d.lis",
+        r#"
+pub struct Code(string)
+pub const UNKNOWN: Code
+"#,
+    );
+    let source = r#"
+import "codes"
+
+fn name(c: codes.Code) -> int {
+  match c {
+    codes.UNKNOWN => 1,
+    codes.UNKNOWN => 2,
+    _ => 0,
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("redundant_arm");
+}
+
+#[test]
+fn const_pattern_in_let_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("weekday", "lib.d.lis", weekday_typedef());
+    let source = r#"
+import "weekday"
+
+fn test() {
+  let weekday.Friday = weekday.Monday
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("const_pattern_outside_match_arm");
+}
+
+#[test]
+fn const_pattern_non_const_target_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "lib",
+        "lib.d.lis",
+        "pub struct Weekday(int)\npub fn Today() -> Weekday\n",
+    );
+    let source = r#"
+import "lib"
+
+fn name(day: lib.Weekday) -> string {
+  match day {
+    lib.Today => "today",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("const_pattern_not_eligible");
+}
+
+#[test]
+fn const_pattern_sentinel_var_ok() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "io",
+        "lib.d.lis",
+        "pub var EOF: error\npub fn read() -> Result<int, error>\n",
+    );
+    let source = r#"
+import "io"
+
+fn handle() -> int {
+  match io.read() {
+    Ok(n) => n,
+    Err(io.EOF) => 0,
+    Err(_) => -1,
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_const_pattern_succeeds() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const MAX_SIZE = 1024
+
+fn classify(n: int) -> string {
+  match n {
+    MAX_SIZE => "max",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_const_pattern_from_sibling_file_succeeds() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "limits.lis", "const MAX_SIZE = 1024\n");
+    let source = r#"
+fn classify(n: int) -> string {
+  match n {
+    MAX_SIZE => "max",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_const_pattern_with_constexpr_initializer_succeeds() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const BASE = 512
+const DOUBLED = BASE * 2
+
+fn classify(n: int) -> string {
+  match n {
+    DOUBLED => "doubled",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_const_pattern_requires_catch_all() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const MAX_SIZE = 1024
+
+fn classify(n: int) -> string {
+  match n {
+    MAX_SIZE => "max",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_exhaustiveness_error();
+}
+
+#[test]
+fn bare_const_pattern_before_its_literal_is_redundant() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const MAX_SIZE = 1024
+
+fn classify(n: int) -> string {
+  match n {
+    MAX_SIZE => "max",
+    1024 => "also max",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_redundancy_error();
+}
+
+#[test]
+fn bare_const_pattern_type_mismatch() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const MAX_SIZE = 1024
+
+fn classify(s: string) -> string {
+  match s {
+    MAX_SIZE => "max",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_type_mismatch();
+}
+
+#[test]
+fn bare_const_pattern_in_if_let_rejected() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const MAX_SIZE = 1024
+
+fn classify(n: int) -> string {
+  if let MAX_SIZE = n {
+    "max"
+  } else {
+    "other"
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("const_pattern_outside_match_arm");
+}
+
+#[test]
+fn bare_const_name_in_let_still_reports_uppercase_binding() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+const MAX_SIZE = 1024
+
+fn classify() -> int {
+  let MAX_SIZE = 5
+  MAX_SIZE
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("uppercase_binding");
+}
+
+#[test]
+fn bare_prelude_variant_outranks_const_pattern() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+fn unwrap_or_zero(o: Option<int>) -> int {
+  match o {
+    Some(n) => n,
+    None => 0,
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_enum_variant_outranks_same_named_const() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+enum Color {
+  RED,
+  GREEN,
+}
+
+const RED = 1
+
+fn shade(c: Color) -> string {
+  match c {
+    RED => "red",
+    _ => "other",
+  }
+}
+
+fn size() -> int {
+  RED
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_function_name_pattern_reports_variant_not_found() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+fn Today() -> int {
+  1
+}
+
+fn name(n: int) -> string {
+  match n {
+    Today => "today",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_resolve_code("variant_not_found");
+}
+
+#[test]
+fn bare_const_holding_a_variant_matches_by_value_off_its_enum() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+interface Shape {}
+
+enum Color {
+  RED,
+  GREEN,
+}
+
+const RED: Color = Color.RED
+
+fn describe(s: Shape) -> int {
+  match s {
+    RED => 0,
+    _ => 1,
+  }
+}
+
+fn shade(c: Color) -> int {
+  match c {
+    RED => 0,
+    _ => 1,
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn bare_function_name_in_if_let_is_not_called_a_constant() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+fn Today() -> int {
+  1
+}
+
+fn name(n: int) -> string {
+  if let Today = n {
+    "today"
+  } else {
+    "other"
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs)
+        .assert_resolve_code("variant_not_found")
+        .assert_infer_code_count("const_pattern_outside_match_arm", 0);
+}
+
+#[test]
+fn bare_tuple_struct_pattern_without_payload_still_rejected() {
+    let mut fs = MockFileSystem::new();
+    let source = r#"
+struct UserId(int)
+
+fn name(n: int) -> string {
+  match n {
+    UserId => "user",
+    _ => "other",
+  }
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_infer_code("arg_count_mismatch");
+}
+
+#[test]
+fn named_primitive_method_preserved() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "time",
+        "time.d.lis",
+        r#"
+pub struct Duration(int64)
+pub const Second: Duration = 1000000000
+impl Duration {
+  pub fn Seconds(self: Duration) -> float64
+  pub fn String(self: Duration) -> string
+}
+"#,
+    );
+    let source = r#"
+import "time"
+
+fn describe(d: time.Duration) -> string {
+  let _ = d.Seconds()
+  d.String()
+}
+"#;
+    fs.add_file("main", "main.lis", source);
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2243,11 +3341,33 @@ fn pointer_to_struct_satisfies_interface() {
 }
 
 #[test]
-fn interface_method_with_bare_self_parameter() {
+fn native_ref_keeps_its_structural_identity_during_interface_conformance() {
+    infer(
+        r#"
+interface Reader {
+  fn read() -> int
+}
+
+struct Buffer { value: int }
+
+impl Buffer {
+  fn read(self: Ref<Buffer>) -> int { self.value }
+}
+
+fn consume(reader: Reader) -> int { reader.read() }
+
+fn run(buffer: Ref<Buffer>) -> int { consume(buffer) }
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_satisfied_by_receiver_method() {
     infer(
         r#"
     interface Greetable {
-      fn greet(self) -> string
+      fn greet() -> string
     }
 
     struct Person { name: string }
@@ -2263,6 +3383,84 @@ fn interface_method_with_bare_self_parameter() {
     fn main() {
       let p = Person { name: "Alice" };
       print_greeting(p);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_satisfied_when_method_names_a_later_struct() {
+    infer(
+        r#"
+    interface Handler {
+      fn serve(r: mut Ref<Request>)
+    }
+
+    struct Request { pub tags: mut Slice<string> }
+
+    struct Mux {}
+
+    impl Mux {
+      fn serve(self: Ref<Mux>, r: mut Ref<Request>) {
+        r.tags = Slice.make<string>(0)
+      }
+    }
+
+    fn take(h: Handler) -> Handler { h }
+
+    fn main() {
+      let mux = Mux {}
+      let _ = take(&mux)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn mut_without_effect_demotes_a_later_struct_the_same_way() {
+    infer(
+        r#"
+    struct C0 {}
+
+    impl C0 {
+      fn m0(self: Ref<C0>, r: mut Ref<mut S0>) {}
+    }
+
+    interface I0 {
+      fn m0(r: mut Ref<mut S0>)
+    }
+
+    struct S0 {
+      pub f0: Slice<string>,
+    }
+
+    fn take0(h: I0) -> I0 { h }
+
+    fn use0() {
+      let c = C0 {}
+      let _ = take0(&c)
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_count("mut_without_effect", 2)
+    .assert_infer_code_count("interface_not_implemented", 0);
+}
+
+#[test]
+fn go_servemux_satisfies_go_handler() {
+    infer(
+        r#"
+    import "go:net/http"
+
+    fn take(h: http.Handler) -> http.Handler { h }
+
+    fn main() {
+      let mux = http.NewServeMux()
+      let _ = take(mux)
     }
         "#,
     )
@@ -2321,12 +3519,11 @@ fn generic_static_method_infers_type_param_from_string() {
 
 fn duration_typedef() -> &'static str {
     r#"
-pub enum Duration: int64 {
-  Nanosecond = 1,
-  Microsecond = 1000,
-  Millisecond = 1000000,
-  Second = 1000000000,
-}
+pub struct Duration(int64)
+pub const Nanosecond: Duration = 1
+pub const Microsecond: Duration = 1000
+pub const Millisecond: Duration = 1000000
+pub const Second: Duration = 1000000000
 "#
 }
 
@@ -2341,11 +3538,11 @@ fn numeric_alias_t_plus_t() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second + time.Duration.Millisecond
+  time.Second + time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2359,11 +3556,11 @@ fn numeric_alias_t_minus_t() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second - time.Duration.Millisecond
+  time.Second - time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2377,11 +3574,11 @@ fn numeric_alias_t_times_t() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second * time.Duration.Millisecond
+  time.Second * time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2395,11 +3592,11 @@ fn numeric_alias_t_times_u() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second * 5
+  time.Second * 5
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2413,15 +3610,15 @@ fn numeric_alias_u_times_t() {
 import "time"
 
 fn test() -> time.Duration {
-  5 * time.Duration.Second
+  5 * time.Second
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn numeric_alias_t_div_t_yields_underlying() {
+fn numeric_alias_t_div_t_yields_named() {
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", duration_typedef());
     fs.add_file(
@@ -2430,12 +3627,12 @@ fn numeric_alias_t_div_t_yields_underlying() {
         r#"
 import "time"
 
-fn test() -> int64 {
-  time.Duration.Second / time.Duration.Millisecond
+fn test() -> time.Duration {
+  time.Second / time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2449,11 +3646,11 @@ fn numeric_alias_t_div_u() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second / 2
+  time.Second / 2
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2467,11 +3664,11 @@ fn numeric_alias_t_rem_u() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second % 3
+  time.Second % 3
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2485,11 +3682,11 @@ fn numeric_alias_unary_neg() {
 import "time"
 
 fn test() -> time.Duration {
-  -time.Duration.Second
+  -time.Second
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2503,11 +3700,11 @@ fn numeric_alias_t_lt_t() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Millisecond < time.Duration.Second
+  time.Millisecond < time.Second
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2521,11 +3718,11 @@ fn numeric_alias_t_gt_u() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Second > 1000
+  time.Second > 1000
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2539,11 +3736,11 @@ fn numeric_alias_u_lt_t() {
 import "time"
 
 fn test() -> bool {
-  1000 < time.Duration.Second
+  1000 < time.Second
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2557,11 +3754,11 @@ fn numeric_alias_t_eq_t() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Second == time.Duration.Millisecond
+  time.Second == time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2575,11 +3772,11 @@ fn numeric_alias_t_eq_u() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Second == 1000000000
+  time.Second == 1000000000
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2593,15 +3790,51 @@ fn numeric_alias_t_neq_u() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Second != 0
+  time.Second != 0
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
-fn numeric_alias_u_div_t_error() {
+fn numeric_alias_u_div_t() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", duration_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+fn test() -> time.Duration {
+  100 / time.Second
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn numeric_alias_u_rem_t() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", duration_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+fn test() -> time.Duration {
+  100 % time.Second
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn numeric_alias_typed_primitive_divides_named_primitive_rejected() {
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", duration_typedef());
     fs.add_file(
@@ -2611,33 +3844,16 @@ fn numeric_alias_u_div_t_error() {
 import "time"
 
 fn test() {
-  let x = 100 / time.Duration.Second;
+  let n: int = 100;
+  let x = n / time.Second;
 }
 "#,
     );
-    infer_module("main", fs).assert_infer_code("invalid_division_order");
+    infer_package("main", fs).assert_infer_code("type_mismatch");
 }
 
 #[test]
-fn numeric_alias_u_rem_t_error() {
-    let mut fs = MockFileSystem::new();
-    fs.add_file("time", "time.d.lis", duration_typedef());
-    fs.add_file(
-        "main",
-        "main.lis",
-        r#"
-import "time"
-
-fn test() {
-  let x = 100 % time.Duration.Second;
-}
-"#,
-    );
-    infer_module("main", fs).assert_infer_code("invalid_division_order");
-}
-
-#[test]
-fn numeric_alias_with_variable() {
+fn numeric_alias_with_variable_rejected() {
     let mut fs = MockFileSystem::new();
     fs.add_file("time", "time.d.lis", duration_typedef());
     fs.add_file(
@@ -2648,11 +3864,30 @@ import "time"
 
 fn test() -> time.Duration {
   let n: int = 5;
-  time.Duration.Second * n
+  time.Second * n
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn numeric_alias_with_variable_cast() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", duration_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+fn test() -> time.Duration {
+  let n: int = 5;
+  time.Second * (n as time.Duration)
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2666,11 +3901,11 @@ fn numeric_alias_chained_ops() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second * 2 + time.Duration.Millisecond * 500
+  time.Second * 2 + time.Millisecond * 500
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2686,11 +3921,11 @@ import "time"
 fn sleep(d: time.Duration) {}
 
 fn test() {
-  sleep(time.Duration.Second * 2);
+  sleep(time.Second * 2);
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2704,11 +3939,11 @@ fn numeric_alias_in_return() {
 import "time"
 
 fn get_delay(multiplier: int) -> time.Duration {
-  time.Duration.Millisecond * multiplier
+  time.Millisecond * (multiplier as time.Duration)
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2722,11 +3957,11 @@ fn numeric_alias_t_rem_t() {
 import "time"
 
 fn test() -> time.Duration {
-  time.Duration.Second % time.Duration.Millisecond
+  time.Second % time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2740,11 +3975,11 @@ fn numeric_alias_t_lte_u() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Second <= 2000000000
+  time.Second <= 2000000000
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2758,11 +3993,11 @@ fn numeric_alias_t_gte_u() {
 import "time"
 
 fn test() -> bool {
-  time.Duration.Second >= 500000000
+  time.Second >= 500000000
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2776,11 +4011,11 @@ fn numeric_alias_u_eq_t() {
 import "time"
 
 fn test() -> bool {
-  1000000000 == time.Duration.Second
+  1000000000 == time.Second
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2794,11 +4029,11 @@ fn numeric_alias_u_neq_t() {
 import "time"
 
 fn test() -> bool {
-  0 != time.Duration.Second
+  0 != time.Second
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2812,11 +4047,11 @@ fn numeric_alias_cross_family_error() {
 import "time"
 
 fn test() {
-  let x = time.Duration.Second * 1.5;
+  let x = time.Second * 1.5;
 }
 "#,
     );
-    infer_module("main", fs).assert_infer_code("type_mismatch");
+    infer_package("main", fs).assert_infer_code("type_mismatch");
 }
 
 #[test]
@@ -2826,8 +4061,10 @@ fn numeric_alias_different_named_types_error() {
         "time",
         "time.d.lis",
         r#"
-pub enum DurationA: int64 { Second = 1000000000 }
-pub enum DurationB: int64 { Second = 1000000000 }
+pub struct DurationA(int64)
+pub struct DurationB(int64)
+pub const SecondA: DurationA = 1000000000
+pub const SecondB: DurationB = 1000000000
 "#,
     );
     fs.add_file(
@@ -2837,11 +4074,149 @@ pub enum DurationB: int64 { Second = 1000000000 }
 import "time"
 
 fn test() {
-  let x = time.DurationA.Second + time.DurationB.Second;
+  let x = time.SecondA + time.SecondB;
 }
 "#,
     );
-    infer_module("main", fs).assert_infer_code("incompatible_named_numeric_types");
+    infer_package("main", fs).assert_infer_code("incompatible_named_types");
+}
+
+#[test]
+fn numeric_alias_compare_different_named_types_error() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "time",
+        "time.d.lis",
+        r#"
+pub struct DurationA(int64)
+pub struct DurationB(int64)
+pub const SecondA: DurationA = 1000000000
+pub const SecondB: DurationB = 1000000000
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+fn test() -> bool {
+  time.SecondA == time.SecondB
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("incompatible_named_types");
+}
+
+#[test]
+fn alias_backed_named_primitive_rejects_typed_primitive() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "time",
+        "time.d.lis",
+        r#"
+type Base = int64
+pub struct Duration(Base)
+pub const Second: Duration = 1000000000
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+fn test() -> time.Duration {
+  let n: int64 = 5;
+  time.Second * n
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn uintptr_backed_named_primitive_rejects_typed_primitive() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        r#"
+pub struct Errno(uintptr)
+pub const EPERM: Errno = 1
+pub fn current() -> uintptr
+pub fn needs(e: Errno)
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() {
+  let n = sys.current()
+  sys.needs(n)
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn uintptr_backed_named_primitive_cast_escape_hatch() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        r#"
+pub struct Errno(uintptr)
+pub const EPERM: Errno = 1
+pub fn current() -> uintptr
+pub fn needs(e: Errno)
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() {
+  let n = sys.current()
+  sys.needs(n as sys.Errno)
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn uintptr_backed_named_primitive_member_and_const_ok() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        r#"
+pub struct Errno(uintptr)
+pub const EPERM: Errno = 1
+pub const ENOENT: Errno = 2
+pub fn needs(e: Errno)
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() {
+  sys.needs(sys.EPERM)
+  sys.needs(sys.ENOENT)
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2855,13 +4230,13 @@ fn numeric_alias_complex_chained() {
 import "time"
 
 fn test() -> time.Duration {
-  let base = time.Duration.Second * 2;
-  let extra = time.Duration.Millisecond * 500;
-  base + extra - time.Duration.Millisecond
+  let base = time.Second * 2;
+  let extra = time.Millisecond * 500;
+  base + extra - time.Millisecond
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2875,13 +4250,13 @@ fn numeric_alias_parenthesized_ratio() {
 import "time"
 
 fn test() -> int64 {
-  // T / T yields int64, which is the underlying type
-  let ratio: int64 = time.Duration.Second / time.Duration.Millisecond;
+  // T / T yields the named type now; cast to the underlying for a raw ratio
+  let ratio: int64 = (time.Second / time.Millisecond) as int64;
   ratio
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -2895,12 +4270,12 @@ fn numeric_alias_assignment_from_expression() {
 import "time"
 
 fn test() {
-  let d: time.Duration = time.Duration.Second * 2;
-  let ratio: int64 = time.Duration.Second / time.Duration.Millisecond;
+  let d: time.Duration = time.Second * 2;
+  let ratio: int64 = (time.Second / time.Millisecond) as int64;
 }
 "#,
     );
-    infer_module("main", fs).assert_no_errors();
+    infer_package("main", fs).assert_no_errors();
 }
 
 #[test]
@@ -3084,6 +4459,78 @@ fn ufcs_method_with_method_only_type_args() {
         "#,
     )
     .assert_no_errors();
+}
+
+#[test]
+fn partial_impl_method_only_type_args_accepted() {
+    infer(
+        r#"
+struct Pair<A, B> { a: A, b: B }
+impl<T> Pair<T, T> { fn keep<U>(self, x: U) -> U { x } }
+fn main() {
+  let p = Pair { a: 1, b: 2 }
+  let _ = p.keep<string>("ok")
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn phantom_type_param_method_call_without_type_args_rejected() {
+    infer(
+        r#"
+struct Box<T> { value: T }
+impl Box<int> { fn tag<U>(self) -> int { 1 } }
+fn main() {
+  let b = Box { value: 1 }
+  let _ = b.tag()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
+}
+
+#[test]
+fn partial_impl_phantom_type_param_method_call_without_type_args_rejected() {
+    infer(
+        r#"
+struct Pair<A, B> { a: A, b: B }
+impl<T> Pair<T, T> { fn tag<U>(self) -> int { 1 } }
+fn main() {
+  let p = Pair { a: 1, b: 2 }
+  let _ = p.tag()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
+}
+
+#[test]
+fn phantom_type_param_function_call_without_type_args_rejected() {
+    infer(
+        r#"
+fn weird<T>() -> int { 1 }
+fn main() {
+  let _ = weird()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
+}
+
+#[test]
+fn phantom_type_param_static_method_call_without_type_args_rejected() {
+    infer(
+        r#"
+struct Box {}
+impl Box { fn weird<T>() -> int { 1 } }
+fn main() {
+  let _ = Box.weird()
+}
+"#,
+    )
+    .assert_infer_code("missing_type_argument");
 }
 
 #[test]
@@ -3381,6 +4828,20 @@ fn map_with_function_key_rejected() {
     .assert_infer_code("non_comparable_map_key");
 }
 
+// A Go array is comparable iff its element is, so an array of a non-comparable
+// element (here a slice) is rejected as a map key, recursing into the element.
+#[test]
+fn map_with_array_of_non_comparable_element_key_rejected() {
+    infer(
+        r#"
+    fn main() {
+      let mut m: Map<Array<Slice<int>, 2>, string> = {};
+    }
+        "#,
+    )
+    .assert_infer_code("non_comparable_map_key");
+}
+
 #[test]
 fn map_with_string_key_allowed() {
     infer(
@@ -3476,6 +4937,22 @@ fn recursive_struct_without_ref_rejected() {
 }
 
 #[test]
+fn recursive_struct_through_array_rejected() {
+    // A fixed-size array stores its element inline, so it is direct containment
+    // (like a tuple), recursion through it is infinite-size, not indirection.
+    infer(
+        r#"
+    struct Node {
+      kids: Array<Node, 2>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
 fn recursive_struct_through_option_self_rejected() {
     infer(
         r#"
@@ -3562,7 +5039,7 @@ fn recursive_struct_with_map_allowed() {
 }
 
 #[test]
-fn recursive_enum_through_generic_struct_rejected() {
+fn recursive_enum_through_generic_struct_allowed() {
     infer(
         r#"
     struct Box<T> { value: T }
@@ -3572,10 +5049,538 @@ fn recursive_enum_through_generic_struct_rejected() {
       Node(Box<Tree>, Box<Tree>),
     }
 
+    fn main() {
+      let t = Tree.Node(Box { value: Tree.Leaf(1) }, Box { value: Tree.Leaf(2) });
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_to_unused_generic_param_allowed() {
+    infer(
+        r#"
+    struct Foo<T> {}
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    fn main() {
+      let b = Bar { foo: Foo {} };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_behind_ref_in_generic_allowed() {
+    infer(
+        r#"
+    struct Foo<T> {
+      parent: Option<Ref<T>>,
+    }
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_behind_slice_in_generic_allowed() {
+    infer(
+        r#"
+    struct Foo<T> {
+      items: Slice<T>,
+    }
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_stored_inline_rejected() {
+    infer(
+        r#"
+    struct Foo<T> {
+      value: T,
+    }
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
     fn main() {}
         "#,
     )
     .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_stored_inline_transitively_rejected() {
+    infer(
+        r#"
+    struct Inner<U> {
+      value: U,
+    }
+
+    struct Foo<T> {
+      inner: Inner<T>,
+    }
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_inline_in_second_instantiation_rejected() {
+    infer(
+        r#"
+    struct Holder<T> {
+      value: T,
+    }
+
+    struct Bar {
+      a: Holder<int>,
+      b: Holder<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_in_indirect_position_allowed() {
+    infer(
+        r#"
+    struct Env<K, V> {
+      keys: Slice<K>,
+      current: V,
+    }
+
+    struct Bar {
+      env: Env<Bar, int>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_in_inline_position_rejected() {
+    infer(
+        r#"
+    struct Env<K, V> {
+      keys: Slice<K>,
+      current: V,
+    }
+
+    struct Bar {
+      env: Env<int, Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_to_unused_enum_param_allowed() {
+    infer(
+        r#"
+    enum Marker<T> {
+      On,
+      Off,
+    }
+
+    struct Bar {
+      marker: Marker<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_to_enum_payload_rejected() {
+    infer(
+        r#"
+    enum Wrapper<T> {
+      Empty,
+      Full(T),
+    }
+
+    struct Bar {
+      wrapper: Wrapper<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_behind_slice_alias_in_generic_allowed() {
+    infer(
+        r#"
+    type Stack<T> = Slice<T>
+
+    struct Foo<T> {
+      items: Stack<T>,
+    }
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_through_inline_alias_rejected() {
+    infer(
+        r#"
+    struct Box<T> {
+      value: T,
+    }
+
+    type Boxed<T> = Box<T>
+
+    struct Foo<T> {
+      inner: Boxed<T>,
+    }
+
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_to_generic_interface_allowed() {
+    infer(
+        r#"
+    interface Producer<T> {
+      fn produce() -> T
+    }
+
+    struct Bar {
+      producer: Producer<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn channel_of_self_allowed() {
+    infer(
+        r#"
+    struct Bar {
+      peers: Channel<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_before_generic_definition_allowed() {
+    infer(
+        r#"
+    struct Bar {
+      foo: Foo<Bar>,
+    }
+
+    struct Foo<T> {}
+
+    fn main() {
+      let b = Bar { foo: Foo {} };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_across_files_allowed() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "a.lis",
+        r#"
+struct Bar {
+  pub foo: Foo<Bar>,
+}
+
+fn main() {
+  let _b = Bar { foo: Foo {} }
+}
+"#,
+    );
+    fs.add_file(
+        "main",
+        "b.lis",
+        r#"
+struct Foo<T> {}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_to_opaque_go_type_rejected() {
+    let typedef = r#"
+pub type Registry<T>
+"#;
+    let input = r#"
+import "go:example.com/reg"
+
+struct Bar {
+  r: reg.Registry<Bar>,
+}
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/reg", typedef)])
+        .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn recursive_enum_cycle_struct_declared_first_allowed() {
+    infer(
+        r#"
+    struct Pair {
+      l: Tree,
+      r: Tree,
+    }
+
+    enum Tree {
+      Leaf(int),
+      Node(Pair),
+    }
+
+    fn main() {
+      let t = Tree.Node(Pair { l: Tree.Leaf(1), r: Tree.Leaf(2) });
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn recursive_enum_two_hop_chain_allowed() {
+    infer(
+        r#"
+    enum Expr {
+      Lit(int),
+      Add(Operands),
+    }
+
+    struct Operands {
+      wrap: Inner,
+    }
+
+    struct Inner {
+      l: Expr,
+      r: Expr,
+    }
+
+    fn main() {
+      let e = Expr.Add(Operands { wrap: Inner { l: Expr.Lit(1), r: Expr.Lit(2) } });
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn recursive_struct_through_alias_rejected() {
+    infer(
+        r#"
+    type BarAlias = Bar
+
+    struct Bar {
+      x: Option<BarAlias>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn recursive_enum_through_array_payload_allowed() {
+    infer(
+        r#"
+    enum Tree {
+      Leaf(int),
+      Node(Array<Tree, 2>),
+    }
+
+    fn main() {
+      let t = Tree.Node([Tree.Leaf(1), Tree.Leaf(2)]);
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_through_function_alias_allowed() {
+    infer(
+        r#"
+    type Callback<T> = fn(T)
+
+    struct Holder<T> {
+      cb: Callback<T>,
+    }
+
+    struct Bar {
+      h: Holder<Bar>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_behind_wrapped_enum_payload_allowed() {
+    infer(
+        r#"
+    enum Cycle<T> {
+      End,
+      Next(Link<T>),
+    }
+
+    struct Link<T> {
+      value: T,
+      next: Cycle<T>,
+    }
+
+    struct Root {
+      c: Cycle<Root>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn self_type_argument_in_unwrapped_payload_rejected() {
+    infer(
+        r#"
+    enum Mixed<T> {
+      Value(T),
+      Chain(Link<T>),
+    }
+
+    struct Link<T> {
+      next: Mixed<T>,
+    }
+
+    struct Root {
+      m: Mixed<Root>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("recursive_type");
+}
+
+#[test]
+fn self_type_argument_through_mutual_enum_cycle_allowed() {
+    infer(
+        r#"
+    enum First<T> {
+      Stop,
+      Go(Left<T>),
+    }
+
+    struct Left<T> {
+      x: Second<T>,
+    }
+
+    enum Second<T> {
+      Halt,
+      Run(Right<T>),
+    }
+
+    struct Right<T> {
+      y: First<T>,
+    }
+
+    struct Root {
+      f: First<Root>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn recursive_struct_cycle_reported_once() {
+    infer(
+        r#"
+    struct A {
+      b: B,
+    }
+
+    struct B {
+      a: Option<A>,
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_once("recursive_type");
 }
 
 #[test]
@@ -3600,8 +5605,8 @@ fn interface_self_embedding_rejected() {
     infer(
         r#"
     interface Z {
-      impl Z
-      fn z_method(self) -> string
+      embed Z
+      fn z_method() -> string
     }
 
     fn main() {}
@@ -3615,19 +5620,40 @@ fn interface_mutual_cycle_rejected() {
     infer(
         r#"
     interface P {
-      impl Q
-      fn p_method(self) -> string
+      embed Q
+      fn p_method() -> string
     }
 
     interface Q {
-      impl P
-      fn q_method(self) -> string
+      embed P
+      fn q_method() -> string
     }
 
     fn main() {}
         "#,
     )
     .assert_infer_code("interface_cycle");
+}
+
+#[test]
+fn interface_cycle_suppresses_conflicts_on_every_member() {
+    infer(
+        r#"
+    interface P {
+      embed Q
+      fn shared() -> string
+    }
+
+    interface Q {
+      embed P
+      fn shared() -> int
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_once("interface_cycle")
+    .assert_infer_code_count("interface_method_conflict", 0);
 }
 
 #[test]
@@ -3635,18 +5661,18 @@ fn interface_three_way_cycle_rejected() {
     infer(
         r#"
     interface R {
-      impl S
-      fn r_method(self) -> string
+      embed S
+      fn r_method() -> string
     }
 
     interface S {
-      impl T
-      fn s_method(self) -> string
+      embed T
+      fn s_method() -> string
     }
 
     interface T {
-      impl R
-      fn t_method(self) -> string
+      embed R
+      fn t_method() -> string
     }
 
     fn main() {}
@@ -3656,20 +5682,348 @@ fn interface_three_way_cycle_rejected() {
 }
 
 #[test]
+fn interface_cycle_with_dot_access_does_not_crash() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+interface P {
+  embed Q
+  fn foo() -> int
+}
+
+interface Q {
+  embed P
+  fn bar() -> int
+}
+
+fn use_it(p: P) -> int { p.foo() }
+
+fn main() {}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("interface_cycle");
+}
+
+#[test]
+fn interface_cycle_with_satisfaction_does_not_crash() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+interface P {
+  embed Q
+  fn foo() -> int
+}
+
+interface Q {
+  embed P
+  fn bar() -> int
+}
+
+struct S {}
+
+impl S {
+  fn foo(self) -> int { 1 }
+  fn bar(self) -> int { 2 }
+}
+
+fn take(p: P) {}
+
+fn main() { take(S {}) }
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("interface_cycle");
+}
+
+#[test]
+fn transforming_interface_cycle_with_bound_check_terminates() {
+    infer(
+        r#"
+interface Required {
+  fn required(self)
+}
+
+interface A<T> {
+  embed B<Slice<T>>
+}
+
+interface B<T> {
+  embed A<Slice<T>>
+}
+
+interface Holder<T: Required> {}
+
+interface Uses<T: Holder<U>, U: A<int>> {}
+"#,
+    )
+    .assert_infer_code("interface_cycle");
+}
+
+#[test]
+fn concrete_generic_argument_must_satisfy_user_interface_bound() {
+    infer(
+        r#"
+interface Shower {
+  fn show(self) -> string
+}
+
+interface Need<T: Shower> {}
+
+struct Plain {}
+
+interface Uses<T: Need<Plain>> {}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn nested_impl_receiver_argument_keeps_its_bound_check() {
+    infer(
+        r#"
+struct Inner<T: Comparable> {}
+
+struct Pair<A, B> {}
+
+impl<T> Pair<Inner<T>, int> {
+  fn value(self) -> int { 0 }
+}
+"#,
+    )
+    .assert_infer_code("missing_bound_on_param");
+}
+
+#[test]
+fn interface_diamond_conflicting_type_args_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+interface Base<T> {
+  fn get() -> T
+}
+
+interface A {
+  embed Base<int>
+}
+
+interface B {
+  embed Base<string>
+}
+
+interface C {
+  embed A
+  embed B
+}
+
+struct S {}
+
+impl S {
+  fn get(self) -> int { 1 }
+}
+
+fn take(c: C) {}
+
+fn main() { take(S {}) }
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("interface_method_conflict");
+}
+
+#[test]
+fn pointer_receiver_through_same_named_parent_interface_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "shapes",
+        "lib.lis",
+        r#"
+pub interface Worker {
+  fn work() -> int
+}
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "shapes"
+
+interface Worker {
+  embed shapes.Worker
+  fn name() -> string
+}
+
+struct MyWorker {}
+
+impl MyWorker {
+  fn name(self) -> string { "x" }
+  fn work(self: Ref<MyWorker>) -> int { 0 }
+}
+
+fn test() { let _w: Worker = MyWorker {} }
+
+fn main() {}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("interface_not_implemented");
+}
+
+#[test]
 fn interface_method_conflict_rejected() {
     infer(
         r#"
     interface HasName {
-      fn name(self) -> string
+      fn name() -> string
     }
 
     interface HasNameInt {
-      fn name(self) -> int
+      fn name() -> int
     }
 
     interface Both {
-      impl HasName
-      impl HasNameInt
+      embed HasName
+      embed HasNameInt
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("interface_method_conflict");
+}
+
+#[test]
+fn interface_embedding_no_conflict_across_a_struct_declaration() {
+    infer(
+        r#"
+    interface Early {
+      fn serve(r: mut Ref<Request>)
+    }
+
+    struct Request { pub tags: mut Slice<string> }
+
+    interface Late {
+      fn serve(r: mut Ref<Request>)
+    }
+
+    interface Merged {
+      embed Early
+      embed Late
+    }
+
+    fn take(m: Merged) -> Merged { m }
+
+    fn main() {
+      let _ = take
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_embedding_no_conflict_when_the_struct_comes_last() {
+    infer(
+        r#"
+    interface Early {
+      fn serve(r: mut Ref<Request>)
+    }
+
+    interface Late {
+      fn serve(r: mut Ref<mut Request>)
+    }
+
+    interface Merged {
+      embed Early
+      embed Late
+    }
+
+    struct Request { pub tags: mut Slice<string> }
+
+    fn take(m: Merged) -> Merged { m }
+
+    fn main() {
+      let _ = take
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_embedding_no_conflict_from_a_generic_parent() {
+    infer(
+        r#"
+    struct Request { pub tags: mut Slice<string> }
+
+    interface Holder<T> {
+      fn take(r: mut Ref<T>)
+    }
+
+    interface Direct {
+      fn take(r: mut Ref<Request>)
+    }
+
+    interface Merged {
+      embed Holder<Request>
+      embed Direct
+    }
+
+    fn use_it(m: Merged) -> Merged { m }
+
+    fn main() {
+      let _ = use_it
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_conflict_inside_a_go_typedef_is_reported() {
+    let typedef = r#"
+pub interface HasName {
+  fn name() -> string
+}
+
+pub interface HasNameInt {
+  fn name() -> int
+}
+
+pub interface Merged {
+  embed HasName
+  embed HasNameInt
+}
+"#;
+    let input = r#"
+import "go:example.com/names"
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/names", typedef)])
+        .assert_infer_code("interface_method_conflict");
+}
+
+#[test]
+fn interface_embedding_conflict_across_a_struct_declaration() {
+    infer(
+        r#"
+    interface Early {
+      fn serve(r: mut Ref<Request>)
+    }
+
+    struct Request { pub tags: mut Slice<string> }
+
+    interface Late {
+      fn serve(r: Ref<Request>)
+    }
+
+    interface Merged {
+      embed Early
+      embed Late
     }
 
     fn main() {}
@@ -3683,19 +6037,149 @@ fn interface_embedding_no_conflict() {
     infer(
         r#"
     interface HasName {
-      fn name(self) -> string
+      fn name() -> string
     }
 
     interface HasAge {
-      fn age(self) -> int
+      fn age() -> int
     }
 
     interface Person {
-      impl HasName
-      impl HasAge
+      embed HasName
+      embed HasAge
     }
 
     fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_embedding_unresolved_parent_survives_conformance_check() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+interface Child {
+  embed Undefined
+}
+
+struct Foo {}
+
+fn take(_c: Child) -> int { 1 }
+
+fn main() {
+  let _ = take(Foo {})
+}
+"#,
+    );
+    infer_package("main", fs).assert_resolve_code_once("type_not_found");
+}
+
+#[test]
+fn interface_embedding_builtin_rejected() {
+    infer(
+        r#"
+    interface Child {
+      embed int
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_once("embed_non_interface");
+}
+
+#[test]
+fn interface_embedding_struct_rejected() {
+    infer(
+        r#"
+    struct Base {}
+
+    impl Base {
+      fn ping(self) -> int { 1 }
+    }
+
+    interface Child {
+      embed Base
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_once("embed_non_interface");
+}
+
+#[test]
+fn interface_embedding_type_parameter_rejected() {
+    infer(
+        r#"
+    interface Child<T> {
+      embed T
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_once("embed_non_interface");
+}
+
+#[test]
+fn interface_embedding_function_type_rejected() {
+    infer(
+        r#"
+    interface Child {
+      embed fn() -> int
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code_once("embed_non_interface");
+}
+
+#[test]
+fn interface_embedding_ref_to_interface_reports_ref_only() {
+    infer(
+        r#"
+    interface Parent {
+      fn ping() -> int
+    }
+
+    interface Child {
+      embed Ref<Parent>
+    }
+
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("ref_of_interface")
+    .assert_infer_code_count("embed_non_interface", 0);
+}
+
+#[test]
+fn interface_embedding_prelude_error_accepted() {
+    infer(
+        r#"
+    interface Failure {
+      embed error
+      fn code() -> int
+    }
+
+    struct MyError {}
+
+    impl MyError {
+      fn Error(self) -> string { "boom" }
+      fn code(self) -> int { 1 }
+    }
+
+    fn describe(f: Failure) -> string { f.Error() }
+
+    fn main() {
+      let _ = describe(MyError {})
+    }
         "#,
     )
     .assert_no_errors();
@@ -3745,11 +6229,34 @@ fn byte_uint8_alias_in_generic_type() {
 }
 
 #[test]
+fn byte_uint8_alias_in_interface_method_signature() {
+    infer(
+        r#"
+    import "go:encoding"
+
+    struct Widget { id: int }
+
+    impl Widget {
+      fn MarshalText(self) -> Result<Slice<byte>, error> {
+        Ok("custom-text" as Slice<byte>)
+      }
+    }
+
+    fn main() {
+      let w = Widget { id: 7 }
+      let _: encoding.TextMarshaler = w
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
 fn impl_block_generic_bound_struct_field_method() {
     infer(
         r#"
     interface Displayable {
-      fn display(self) -> string
+      fn display() -> string
     }
 
     struct Wrapper<T: Displayable> {
@@ -3773,7 +6280,7 @@ fn impl_block_generic_bound_enum_pattern_match() {
     infer(
         r#"
     interface Displayable {
-      fn display(self) -> string
+      fn display() -> string
     }
 
     enum Boxed<T: Displayable> {
@@ -3801,7 +6308,7 @@ fn impl_block_generic_bound_with_ref() {
     infer(
         r#"
     interface Describable {
-      fn describe(self) -> string
+      fn describe() -> string
     }
 
     struct Container<T: Describable> {
@@ -3827,7 +6334,7 @@ fn ref_method_on_immutable_binding_fails() {
     struct Counter { value: int }
 
     impl Counter {
-      fn increment(self: Ref<Counter>) { self.value = self.value + 1 }
+      fn increment(self: mut Ref<Counter>) { self.value = self.value + 1 }
     }
 
     fn main() {
@@ -3845,12 +6352,12 @@ fn ref_method_on_nested_field_through_ref_receiver() {
         r#"
     struct Counter { count: int }
     impl Counter {
-      fn increment(self: Ref<Counter>) { self.count = self.count + 1 }
+      fn increment(self: mut Ref<Counter>) { self.count = self.count + 1 }
     }
 
     struct Wrapper { inner: Counter }
     impl Wrapper {
-      fn increment_inner(self: Ref<Wrapper>) {
+      fn increment_inner(self: mut Ref<Wrapper>) {
         self.inner.increment()
       }
     }
@@ -3938,7 +6445,7 @@ fn none_for_lisette_interface_still_rejected() {
 fn interface_covariant_return_rejected() {
     infer(
         r#"
-interface Maker { fn make(self) -> Maker }
+interface Maker { fn make() -> Maker }
 struct Widget {}
 impl Widget { fn make(self) -> Widget { Widget {} } }
 fn test() { let _m: Maker = Widget {} }
@@ -3952,8 +6459,8 @@ fn interface_generic_covariant_return_rejected() {
     infer(
         r#"
 interface Container<T> {
-  fn with(self, val: T) -> Container<T>
-  fn get(self) -> T
+  fn with(val: T) -> Container<T>
+  fn get() -> T
 }
 struct Box<T> { value: T }
 impl<T> Box<T> {
@@ -3970,10 +6477,10 @@ fn test() { let _c: Container<int> = Box { value: 0 } }
 fn interface_cross_interface_return_rejected() {
     infer(
         r#"
-interface Readable { fn read_val(self) -> string }
+interface Readable { fn read_val() -> string }
 interface Source {
-  fn name(self) -> string
-  fn reader(self) -> Readable
+  fn name() -> string
+  fn reader() -> Readable
 }
 struct TextReader { content: string }
 impl TextReader { fn read_val(self) -> string { self.content } }
@@ -3993,8 +6500,8 @@ fn interface_contravariant_param_rejected() {
     infer(
         r#"
 interface Processable {
-  fn value(self) -> int
-  fn apply(self, f: fn(Processable) -> int) -> int
+  fn value() -> int
+  fn apply(f: fn(Processable) -> int) -> int
 }
 struct Data { n: int }
 impl Data {
@@ -4012,8 +6519,8 @@ fn interface_pointer_receiver_rejected() {
     infer(
         r#"
 interface Worker {
-  fn name(self) -> string
-  fn work(self) -> int
+  fn name() -> string
+  fn work() -> int
 }
 struct MyWorker { label: string, count: int }
 impl MyWorker {
@@ -4024,6 +6531,100 @@ fn test() { let _w: Worker = MyWorker { label: "t", count: 0 } }
 "#,
     )
     .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn pointer_receiver_through_value_bound_rejected() {
+    infer(
+        r#"
+interface Bumper { fn bump() }
+struct Counter { n: int }
+impl Counter { fn bump(self: Ref<Counter>) { let _ = self.n } }
+fn use_bound<T: Bumper>(x: T) { x.bump() }
+fn main() { let c = Counter { n: 0 }; use_bound(c) }
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn pointer_receiver_through_ref_bound_accepted() {
+    infer(
+        r#"
+interface Bumper { fn bump() }
+struct Counter { n: int }
+impl Counter { fn bump(self: Ref<Counter>) { let _ = self.n } }
+fn use_bound<T: Bumper>(x: Ref<T>) { x.bump() }
+fn main() { let mut c = Counter { n: 0 }; use_bound(&c) }
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn pointer_receiver_through_value_bound_function_value_rejected() {
+    infer(
+        r#"
+interface Bumper { fn bump() }
+struct Counter { n: int }
+impl Counter { fn bump(self: Ref<Counter>) { let _ = self.n } }
+fn use_bound<T: Bumper>(x: T) { x.bump() }
+fn apply(f: fn(Counter)) { f(Counter { n: 0 }) }
+fn main() { apply(use_bound) }
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn pointer_receiver_through_ref_bound_function_value_accepted() {
+    infer(
+        r#"
+interface Bumper { fn bump() }
+struct Counter { n: int }
+impl Counter { fn bump(self: Ref<Counter>) { let _ = self.n } }
+fn use_bound<T: Bumper>(x: Ref<T>) { x.bump() }
+fn apply(f: fn(Ref<Counter>)) { let mut c = Counter { n: 0 }; f(&c) }
+fn main() { apply(use_bound) }
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn pointer_receiver_through_mixed_value_and_ref_bound_rejected() {
+    infer(
+        r#"
+interface Bumper { fn bump() }
+struct Counter { n: int }
+impl Counter { fn bump(self: Ref<Counter>) { let _ = self.n } }
+fn use_bound<T: Bumper>(x: T, y: Ref<T>) { x.bump(); y.bump() }
+fn main() {
+  let c = Counter { n: 0 }
+  let mut d = Counter { n: 0 }
+  use_bound(c, &d)
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn pointer_receiver_through_repeated_ref_bound_accepted() {
+    infer(
+        r#"
+interface Bumper { fn bump() }
+struct Counter { n: int }
+impl Counter { fn bump(self: Ref<Counter>) { let _ = self.n } }
+fn use_bound<T: Bumper>(x: Ref<T>, y: Ref<T>) { x.bump(); y.bump() }
+fn main() {
+  let mut c = Counter { n: 0 }
+  let mut d = Counter { n: 0 }
+  use_bound(&c, &d)
+}
+"#,
+    )
+    .assert_no_errors();
 }
 
 #[test]
@@ -4078,4 +6679,4060 @@ fn take_int(c: MyContainer<int>) -> int {
 "#,
     )
     .assert_no_errors();
+}
+
+#[test]
+fn distinct_aliases_unify_inside_option() {
+    infer(
+        r#"
+type T1 = int
+type T2 = int
+
+fn main() {
+  let _: Option<T1> = Some(1 as T2)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn distinct_aliases_unify_inside_nested_option() {
+    infer(
+        r#"
+type T1 = int
+type T2 = int
+
+fn make() -> T2 { 1 as T2 }
+
+fn main() {
+  let _: Option<Option<T1>> = Some(Some(make()))
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn distinct_aliases_unify_inside_map_value() {
+    infer(
+        r#"
+type T1 = int
+type T2 = int
+
+fn make() -> T2 { 1 as T2 }
+
+fn main() {
+  let _: Map<string, T1> = Map.from([("a", make())])
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn aliases_of_different_underlying_types_inside_option_error() {
+    infer(
+        r#"
+type T1 = int
+type T2 = string
+
+fn main() {
+  let _: Option<T1> = Some("hello" as T2)
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn cast_through_slice_with_alias_arg() {
+    infer(
+        r#"
+type UserId = int
+
+fn main() {
+  let _ = [1, 2, 3] as Slice<UserId>
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn cast_through_tuple_with_alias_elements() {
+    infer(
+        r#"
+type T1 = int
+
+fn main() {
+  let _ = (1, 2) as (T1, T1)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn tuple_alias_destructure() {
+    infer(
+        r#"
+type Pair = (int, string)
+
+fn main() {
+  let p: Pair = (1, "x")
+  let (a, b) = p
+  let _: int = a
+  let _: string = b
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn tuple_alias_destructure_arity_mismatch() {
+    infer(
+        r#"
+type Pair = (int, int)
+
+fn main() {
+  let p: Pair = (1, 2)
+  let (a, b, c) = p
+}
+"#,
+    )
+    .assert_infer_code("tuple_element_count_mismatch");
+}
+
+#[test]
+fn cast_through_generic_alias_to_underlying_generic() {
+    infer(
+        r#"
+type MyOpt<T> = Option<T>
+type T1 = int
+
+fn main() {
+  let _ = Some(1) as MyOpt<T1>
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn cast_through_slice_with_distinct_underlying_alias_rejected() {
+    infer(
+        r#"
+type T2 = string
+
+fn main() {
+  let _ = [1] as Slice<T2>
+}
+"#,
+    )
+    .assert_infer_code("invalid_conversion");
+}
+
+#[test]
+fn assign_to_imported_pub_var_succeeds() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "config",
+        "lib.d.lis",
+        r#"
+pub var Threshold: int
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "config"
+
+fn main() {
+  config.Threshold = 42
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn assign_to_aliased_imported_pub_var_succeeds() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "config",
+        "lib.d.lis",
+        r#"
+pub var Threshold: int
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import c "config"
+
+fn main() {
+  c.Threshold = 99
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn ref_self_method_call_through_imported_pub_var_succeeds() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "metrics",
+        "lib.d.lis",
+        r#"
+pub struct Counter {
+  pub n: int64,
+}
+
+impl Counter {
+  fn Value(self: Ref<Counter>) -> int64
+}
+
+pub struct Counters_struct {
+  pub Hits: Counter,
+}
+
+pub var Counters: Counters_struct
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "metrics"
+
+fn main() {
+  let _ = metrics.Counters.Hits.Value()
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn struct_field_forward_references_fn_alias() {
+    infer(
+        r#"
+struct Cmd {
+  pub v: Option<Validator>,
+}
+
+type Validator = fn(int) -> Result<(), error>
+
+fn check(_x: int) -> Result<(), error> {
+  Ok(())
+}
+
+fn main() {
+  let _c = Cmd { v: Some(check) }
+  let _ = _c.v
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn imported_struct_field_forward_references_fn_alias() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "cli",
+        "lib.d.lis",
+        r#"
+pub struct Command {
+  pub Args: Option<PositionalArgs>,
+}
+
+pub type PositionalArgs = fn(Ref<Command>, Slice<string>) -> Result<(), error>
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "cli"
+
+fn validate(_cmd: Ref<cli.Command>, _args: Slice<string>) -> Result<(), error> {
+  Ok(())
+}
+
+fn main() {
+  let _c = cli.Command { Args: Some(validate) }
+  let _ = _c.Args
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn imported_tuple_struct_alias_uses_the_underlying_constructor() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "models",
+        "models.lis",
+        r#"
+pub struct Identifier(int)
+pub type Id = Identifier
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "models"
+
+fn main() {
+  let _id = models.Id(1)
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn struct_field_via_two_alias_hops_to_fn() {
+    infer(
+        r#"
+type Inner = fn(int) -> int
+type Outer = Inner
+
+struct Wrap {
+  pub f: Option<Outer>,
+}
+
+fn dbl(x: int) -> int { x * 2 }
+
+fn main() {
+  let _w = Wrap { f: Some(dbl) }
+  let _ = _w.f
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn covariance_lifts_ref_return_for_go_interface() {
+    let typedef = r#"
+pub struct Widget { pub id: int }
+
+pub interface HasWidget {
+  fn GetWidget() -> Option<Ref<Widget>>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyBox { value: ui.Widget }
+
+impl MyBox {
+  fn GetWidget(self: Ref<MyBox>) -> Ref<ui.Widget> { &self.value }
+}
+
+fn use_it(_: ui.HasWidget) {}
+
+fn main() {
+  let b = MyBox { value: ui.Widget { id: 0 } }
+  use_it(&b)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn strict_option_match_satisfies_go_interface() {
+    let typedef = r#"
+pub struct Widget { pub id: int }
+
+pub interface HasWidget {
+  fn GetWidget() -> Option<Ref<Widget>>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyBox {}
+
+impl MyBox {
+  fn GetWidget(self: Ref<MyBox>) -> Option<Ref<ui.Widget>> { None }
+}
+
+fn use_it(_: ui.HasWidget) {}
+
+fn main() {
+  use_it(&MyBox {})
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn covariance_does_not_apply_to_user_interfaces() {
+    infer(
+        r#"
+    struct Widget { id: int }
+
+    interface HasWidget {
+      fn GetWidget() -> Option<Ref<Widget>>;
+    }
+
+    struct MyBox { value: Widget }
+
+    impl MyBox {
+      fn GetWidget(self: Ref<MyBox>) -> Ref<Widget> { return &self.value; }
+    }
+
+    fn use_it(_: HasWidget) {}
+
+    fn main() {
+      let b = MyBox { value: Widget { id: 0 } };
+      use_it(&b);
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn covariance_excludes_comma_ok_interface_methods() {
+    let typedef = r#"
+pub struct Session { pub key: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Session>>
+}
+"#;
+    let input = r#"
+import "go:example.com/cache"
+
+struct MyCache {}
+
+impl MyCache {
+  fn Get(self: Ref<MyCache>, key: string) -> Ref<cache.Session> {
+    &cache.Session { key: key }
+  }
+}
+
+fn use_it(_: cache.Cache) {}
+
+fn main() { use_it(&MyCache {}) }
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cache", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn covariance_rejects_reverse_direction() {
+    let typedef = r#"
+pub struct Widget { pub id: int }
+
+pub interface HasWidget {
+  fn GetWidget() -> Ref<Widget>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyBox {}
+
+impl MyBox {
+  fn GetWidget(self: Ref<MyBox>) -> Option<Ref<ui.Widget>> { None }
+}
+
+fn use_it(_: ui.HasWidget) {}
+
+fn main() { use_it(&MyBox {}) }
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn covariance_lifts_interface_return_for_go_interface() {
+    let typedef = r#"
+pub interface Stringer {
+  fn String() -> string
+}
+
+pub interface Source {
+  fn Get() -> Option<Stringer>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyStr {}
+
+impl MyStr {
+  fn String(self: Ref<MyStr>) -> string { "" }
+}
+
+struct MySource { value: MyStr }
+
+impl MySource {
+  fn Get(self: Ref<MySource>) -> ui.Stringer { &self.value }
+}
+
+fn use_it(_: ui.Source) {}
+
+fn main() {
+  let s = MySource { value: MyStr {} }
+  use_it(&s)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn strict_option_interface_satisfies_go_interface() {
+    let typedef = r#"
+pub interface Stringer {
+  fn String() -> string
+}
+
+pub interface Source {
+  fn Get() -> Option<Stringer>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MySource {}
+
+impl MySource {
+  fn Get(self: Ref<MySource>) -> Option<ui.Stringer> { None }
+}
+
+fn use_it(_: ui.Source) {}
+
+fn main() {
+  use_it(&MySource {})
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn value_placeholder_for_forward_reference_resolves() {
+    infer(
+        r#"{
+        struct Holder {
+          inner: Later,
+        }
+
+        struct Later {
+          n: int,
+        }
+
+        Holder { inner: Later { n: 1 } }
+        }"#,
+    )
+    .assert_type_struct("Holder");
+}
+
+#[test]
+fn interface_covariance_rejects_reverse_direction() {
+    let typedef = r#"
+pub interface Stringer {
+  fn String() -> string
+}
+
+pub interface Source {
+  fn Get() -> Stringer
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MySource {}
+
+impl MySource {
+  fn Get(self: Ref<MySource>) -> Option<ui.Stringer> { None }
+}
+
+fn use_it(_: ui.Source) {}
+
+fn main() { use_it(&MySource {}) }
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn newtype_division_with_typed_primitive_rejected() {
+    infer(
+        r#"
+struct Meters(int)
+fn test(m: Meters) {
+  let n: int = 100
+  let _x = n / m
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn alias_to_named_primitive_rejects_typed_primitive_in_operator() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", duration_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+type D = time.Duration
+
+fn test() {
+  let x: D = time.Second
+  let n: int64 = 2
+  let _y = x * n
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn alias_to_named_primitive_rejects_typed_primitive_in_comparison() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", duration_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+type D = time.Duration
+
+fn test() -> bool {
+  let x: D = time.Second
+  let n: int64 = 2
+  x == n
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn alias_to_named_primitive_with_underlying_value_ok() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("time", "time.d.lis", duration_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "time"
+
+type D = time.Duration
+
+fn test() -> D {
+  let x: D = time.Second
+  let _ = x == time.Second
+  x * time.Second
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn alias_backed_uintptr_named_primitive_rejects_typed_primitive() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        r#"
+type Base = uintptr
+pub struct Errno(Base)
+pub const EPERM: Errno = 1
+pub fn current() -> uintptr
+pub fn needs(e: Errno)
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() {
+  let n = sys.current()
+  sys.needs(n)
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn uintptr_backed_named_primitive_adapts_integer_literal() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        "pub struct Errno(uintptr)\npub const EPERM: Errno = 1\npub fn needs(e: Errno)\n",
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() {
+  let _e: sys.Errno = 1
+  let _ = sys.EPERM == 0
+  sys.needs(2)
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn uintptr_backed_named_primitive_arithmetic_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        "pub struct Errno(uintptr)\npub const EPERM: Errno = 1\n",
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() -> sys.Errno {
+  sys.EPERM + 1
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn uintptr_backed_named_primitive_ordering_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "sys",
+        "sys.d.lis",
+        "pub struct Errno(uintptr)\npub const EPERM: Errno = 1\n",
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "sys"
+
+fn test() -> bool {
+  sys.EPERM < 10
+}
+"#,
+    );
+    infer_package("main", fs).assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn bare_uintptr_arithmetic_rejected() {
+    infer(
+        r#"
+fn test() {
+  let a = 5 as uintptr
+  let b = 3 as uintptr
+  let _ = a + b
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn bare_uintptr_ordering_rejected() {
+    infer(
+        r#"
+fn test() {
+  let a = 5 as uintptr
+  let b = 3 as uintptr
+  let _ = a < b
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+fn code_typedef() -> &'static str {
+    r#"
+pub struct Code(string)
+pub const NotFound: Code = "not found"
+pub const Timeout: Code = "timeout"
+pub fn needs(c: Code)
+"#
+}
+
+fn infer_code_main(body: &str) -> InferResult {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("status", "status.d.lis", code_typedef());
+    fs.add_file(
+        "main",
+        "main.lis",
+        &format!("import \"status\"\n\nfn test() {{\n{body}\n}}\n"),
+    );
+    infer_package("main", fs)
+}
+
+#[test]
+fn string_named_primitive_adapts_string_literal() {
+    infer_code_main(
+        r#"
+  let _c: status.Code = "not found"
+  let _eq = status.NotFound == "timeout"
+  status.needs("timeout")
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn string_named_primitive_same_type_operators_ok() {
+    infer_code_main(
+        r#"
+  let _eq = status.NotFound == status.Timeout
+  let _lt = status.NotFound < status.Timeout
+  let _cat: status.Code = status.NotFound + "!"
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn string_named_primitive_rejects_typed_string_in_assignment() {
+    infer_code_main(
+        r#"
+  let s: string = "x"
+  let _c: status.Code = s
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn string_named_primitive_rejects_named_to_string_assignment() {
+    infer_code_main(
+        r#"
+  let _s: string = status.NotFound
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn string_named_primitive_rejects_typed_string_in_comparison() {
+    infer_code_main(
+        r#"
+  let s: string = "x"
+  let _eq = status.NotFound == s
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn string_named_primitive_rejects_typed_string_in_concat() {
+    infer_code_main(
+        r#"
+  let s: string = "x"
+  let _cat = status.NotFound + s
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn string_named_primitive_cast_escape_hatch() {
+    infer_code_main(
+        r#"
+  let s: string = "x"
+  let _to: status.Code = s as status.Code
+  let _from: string = status.NotFound as string
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn composite_newtype_identical_underlying_cast_ok() {
+    infer(
+        r#"
+struct Bytes(Slice<byte>)
+struct Mask(Slice<byte>)
+
+fn test(b: Bytes) {
+  let _m = b as Mask
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn newtype_struct_rejects_typed_primitive() {
+    infer(
+        r#"
+struct Meters(int)
+fn need(_m: Meters) {}
+fn test() {
+  let n: int = 5
+  need(n)
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn newtype_struct_adapts_literal_and_casts() {
+    infer(
+        r#"
+struct Meters(int)
+fn need(_m: Meters) {}
+fn test() {
+  let _m: Meters = 5
+  let n: int = 5
+  need(n as Meters)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn composite_newtype_transparent_to_unnamed_underlying() {
+    infer(
+        r#"
+struct Bytes(Slice<byte>)
+fn test(raw: Slice<byte>) {
+  let b: Bytes = raw
+  let _back: Slice<byte> = b
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn distinct_composite_newtypes_not_assignable() {
+    infer(
+        r#"
+struct Bytes(Slice<byte>)
+struct Mask(Slice<byte>)
+fn test(b: Bytes) {
+  let _m: Mask = b
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn bool_newtype_adapts_literal_and_logical_ops() {
+    infer(
+        r#"
+struct Flag(bool)
+fn test(f: Flag) -> Flag {
+  let _g: Flag = true
+  let _neg: Flag = !true
+  let _eq = f == true
+  let _and = f && true
+  let _and_neg = f && !true
+  !f
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn bool_newtype_rejects_typed_bool() {
+    infer(
+        r#"
+struct Flag(bool)
+fn test(f: Flag) -> bool {
+  let b: bool = true
+  f == b
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn bool_newtype_ordering_rejected() {
+    infer(
+        r#"
+struct Flag(bool)
+fn test(f: Flag, g: Flag) -> bool {
+  f < g
+}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn bool_newtype_in_conditions() {
+    infer(
+        r#"
+struct Flag(bool)
+fn pick(f: Flag) -> int {
+  if f { 1 } else { 0 }
+}
+fn negated(f: Flag) -> int {
+  if !f { 1 } else { 0 }
+}
+fn loops(start: Flag) {
+  let mut f = start
+  while f { f = !f }
+}
+fn guarded(f: Flag, x: int) -> int {
+  match x {
+    _ if f => 1,
+    _ => 0,
+  }
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn go_const_named_unknown_does_not_shadow_builtin_unknown_type() {
+    let typedef = r#"
+pub struct Locale(int)
+
+pub const Unknown: Locale = 0
+
+pub var Marshal: fn(Unknown) -> Result<Slice<byte>, error>
+pub var Logger: fn(int, int, string, VarArgs<Unknown>) -> ()
+"#;
+    let input = r#"
+import "go:example.com/discord"
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/discord", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn go_const_named_never_does_not_shadow_builtin_never_type() {
+    let typedef = r#"
+pub struct Status(int)
+
+pub const Never: Status = 0
+
+pub var Abort: fn() -> Never
+"#;
+    let input = r#"
+import "go:example.com/api"
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/api", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn go_value_in_type_position_without_shadowed_type_still_errors() {
+    let typedef = r#"
+pub struct Status(int)
+
+pub const Pending: Status = 0
+
+pub var Read: fn() -> Pending
+"#;
+    let input = r#"
+import "go:example.com/api"
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/api", typedef)])
+        .assert_resolve_code("value_in_type_position");
+}
+
+#[test]
+fn go_local_type_shadowing_prelude_unknown_resolves_locally_before_its_definition() {
+    let typedef = r#"
+pub struct Holder {
+  pub value: Unknown
+}
+
+pub struct Unknown {
+  pub id: int
+}
+"#;
+    let input = r#"
+import "go:example.com/api"
+
+fn read_id(holder: api.Holder) -> int {
+  holder.value.id
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/api", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_bare_builtin_rejected() {
+    infer(
+        r#"
+struct S { embed int }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_alias_to_builtin_rejected() {
+    infer(
+        r#"
+type N = int
+struct S { embed N }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_pointer_to_interface_rejected() {
+    infer(
+        r#"
+interface Greeter { fn hello() -> string }
+struct S { embed Ref<Greeter> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_pointer_to_interface");
+}
+
+#[test]
+fn embed_nested_ref_rejected() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+struct S { embed Ref<Ref<Base>> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_nested_ref");
+}
+
+#[test]
+fn embed_pointer_backed_newtype_rejected() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+struct P(Ref<Base>)
+struct S { embed P }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_pointer_backed_newtype");
+}
+
+#[test]
+fn embed_option_target_rejected() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+struct S { embed Option<Base> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_option_target");
+}
+
+#[test]
+fn embed_slice_rejected() {
+    infer(
+        r#"
+struct S { embed Slice<int> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_map_rejected() {
+    infer(
+        r#"
+struct S { embed Map<string, int> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_pointer_to_compound_rejected() {
+    infer(
+        r#"
+struct S { embed Ref<Slice<int>> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_ref_to_pointer_backed_newtype_rejected() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+struct P(Ref<Base>)
+struct S { embed Ref<P> }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_pointer_backed_newtype");
+}
+
+#[test]
+fn embed_empty_struct_rejected() {
+    infer(
+        r#"
+struct Empty {}
+struct S { embed Empty }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_empty_interface_rejected() {
+    infer(
+        r#"
+interface EmptyI {}
+struct S { embed EmptyI }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_local_newtype_rejected() {
+    infer(
+        r#"
+struct Age(int)
+impl Age { pub fn bump(self) -> int { 1 } }
+struct S { embed Age }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_defined_type");
+}
+
+#[test]
+fn embed_marker_with_only_methods_accepted() {
+    infer(
+        r#"
+struct Marker {}
+impl Marker { pub fn mark(self) -> int { 1 } }
+struct S { embed Marker }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_interface_empty_through_parent_rejected() {
+    infer(
+        r#"
+interface Empty {}
+interface AlsoEmpty { embed Empty }
+struct S { embed AlsoEmpty }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_no_surface");
+}
+
+#[test]
+fn embed_multi_field_tuple_struct_rejected() {
+    infer(
+        r#"
+struct Pair(int, int)
+struct S { embed Pair }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_defined_type");
+}
+
+#[test]
+fn embed_generic_instantiation_promotes() {
+    infer(
+        r#"
+pub struct Wrapper<T> { pub value: T }
+struct S { embed Wrapper<int> }
+fn read(s: S) -> int { s.value }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_generic_alias_to_storage_accepted() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+type P<T> = Ref<T>
+struct S { embed P<Base> }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_generic_alias_under_ref_accepted() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+type P<T> = T
+struct S { embed Ref<P<Base>> }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_imported_generic_named_ref_not_confused_with_wrapper() {
+    let typedef = r#"
+pub struct Base { pub id: int }
+pub struct Ref<T> { pub value: T }
+"#;
+    let input = r#"
+import "go:example.com/ref"
+struct S { embed ref.Ref<ref.Base> }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ref", typedef)])
+        .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn generic_embed_promotes_method_to_instantiated_return() {
+    infer(
+        r#"
+pub struct Box<T> { pub value: T }
+impl<T> Box<T> { pub fn get(self) -> T { self.value } }
+struct Outer { embed Box<string> }
+fn use_it(o: Outer) -> string { o.get() }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_embed_method_return_is_the_instantiated_type() {
+    infer(
+        r#"
+pub struct Box<T> { pub value: T }
+impl<T> Box<T> { pub fn get(self) -> T { self.value } }
+struct Outer { embed Box<int> }
+fn use_it(o: Outer) -> string { o.get() }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn generic_embedder_promotes_with_flowed_param() {
+    infer(
+        r#"
+pub struct Box<T> { pub value: T }
+impl<T> Box<T> { pub fn get(self) -> T { self.value } }
+struct Outer<U> { embed Box<U> }
+fn use_it(o: Outer<int>) -> int { o.get() }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn specialized_impl_method_not_promoted_onto_other_instantiation() {
+    infer(
+        r#"
+pub struct Box<T> { pub value: T }
+impl Box<int> { pub fn only_int(self) -> int { 0 } }
+struct Outer { embed Box<string> }
+fn use_it(o: Outer) -> int { o.only_int() }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("member_not_found");
+}
+
+#[test]
+fn specialized_impl_method_not_promoted_onto_matching_instantiation() {
+    infer(
+        r#"
+pub struct Box<T> { pub value: T }
+impl Box<int> { pub fn only_int(self) -> int { 0 } }
+struct Outer { embed Box<int> }
+fn use_it(o: Outer) -> int { o.only_int() }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("member_not_found");
+}
+
+#[test]
+fn embedded_specialized_impl_method_cannot_satisfy_interface() {
+    infer(
+        r#"
+interface OnlyInt { fn only_int() -> int }
+pub struct Box<T> { pub value: T }
+impl Box<int> { pub fn only_int(self) -> int { self.value } }
+struct Outer { embed Box<int> }
+fn want(x: OnlyInt) -> int { x.only_int() }
+fn main() {
+  let o = Outer { Box: Box { value: 1 } }
+  let _ = want(o)
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn generic_method_with_extra_type_params_not_promoted() {
+    infer(
+        r#"
+struct Box<T> { value: T }
+impl<T> Box<T> { fn mapped<U>(self, f: fn(T) -> U) -> U { f(self.value) } }
+struct Outer { embed Box<int> }
+fn use_it(o: Outer) -> int { o.mapped(|x| x + 1) }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("member_not_found");
+}
+
+#[test]
+fn generic_method_on_nongeneric_embedded_receiver_not_promoted() {
+    infer(
+        r#"
+struct S {}
+impl S { fn id<T>(self, x: T) -> T { x } }
+struct Outer { embed S }
+fn use_it(o: Outer) -> int { o.id(1) }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("member_not_found");
+}
+
+#[test]
+fn embed_imported_flat_struct_promotes_method() {
+    let typedef = r#"
+pub struct NopHandler {}
+impl NopHandler { pub fn Handle(self: NopHandler) -> int }
+"#;
+    let input = r#"
+import "go:example.com/handler"
+struct Mine { embed handler.NopHandler }
+fn use_it(m: Mine) -> int { m.Handle() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/handler", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_flat_struct_promotes_field() {
+    let typedef = r#"
+pub struct Ref { pub id: int }
+impl Ref { pub fn Get(self: Ref) -> int }
+"#;
+    let input = r#"
+import "go:example.com/ref"
+struct UsesRef { embed ref.Ref }
+fn id_of(u: UsesRef) -> int { u.id }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ref", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_stdlib_struct_promotes() {
+    infer(
+        r#"
+import "go:image"
+struct Marker { embed image.Point }
+fn x_of(m: Marker) -> int { m.X }
+fn label_of(m: Marker) -> string { m.String() }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_imported_hidden_embed_struct_rejected() {
+    let typedef = r#"
+#[go(hidden_embed)]
+pub struct Host { pub X: int }
+
+impl Host {
+  fn Secret(self) -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Host }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn hidden_embed_struct_direct_access_preserved() {
+    let typedef = r#"
+#[go(hidden_embed)]
+pub struct Host { pub X: int }
+
+impl Host {
+  fn Secret(self) -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn read(h: lib.Host) -> int { h.X }
+fn call(h: lib.Host) -> int { h.Secret() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn promote_method_through_unexported_embed() {
+    let typedef = r#"
+#[go(unexported)]
+pub type conn
+impl conn {
+  fn Read(self) -> int
+}
+
+pub struct IPConn { embed conn }
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn read(c: lib.IPConn) -> int { c.Read() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_type_with_unexported_embed_promotes() {
+    let typedef = r#"
+#[go(unexported)]
+pub type conn
+impl conn {
+  fn Read(self) -> int
+}
+
+pub struct IPConn { embed conn }
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.IPConn }
+fn read(m: Mine) -> int { m.Read() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn name_unexported_imported_type_rejected() {
+    let typedef = r#"
+#[go(unexported)]
+pub type conn
+impl conn {
+  fn Read(self) -> int
+}
+
+pub struct IPConn { embed conn }
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn use_conn(c: lib.conn) -> int { c.Read() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_resolve_code("type_not_found");
+}
+
+// A method promoted through an unexported embed sits at its true depth (2 from
+// User), so it ties with an equally-deep faithful competitor and gc rejects
+// `u.M()` as ambiguous, rather than the unexported one wrongly winning at depth 1.
+#[test]
+fn promotion_through_unexported_embed_keeps_faithful_depth() {
+    let typedef = r#"
+#[go(unexported)]
+pub type conn
+impl conn {
+  fn M(self) -> int
+}
+
+pub struct IPConn { embed conn }
+
+pub struct Inner {}
+impl Inner {
+  fn M(self) -> int
+}
+
+pub struct Mid { embed Inner }
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct User {
+  embed lib.IPConn,
+  embed lib.Mid,
+}
+fn use_m(u: User) -> int { u.M() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("ambiguous_selector");
+}
+
+#[test]
+fn embed_imported_skipped_exported_embed_rejected() {
+    let typedef = r#"
+#[go(hidden_embed)]
+pub struct Widget {
+  // SKIPPED field "Engine": internal-package-ref
+  pub X: int,
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Widget }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn embed_imported_alias_keeps_alias_name() {
+    let typedef = r#"
+pub struct Base { pub X: int }
+impl Base { pub fn M(self: Base) -> int }
+pub type Alias = Base
+pub struct Host {
+  embed Alias,
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn use_x(h: lib.Host) -> int { h.X }
+fn use_m(h: lib.Host) -> int { h.M() }
+fn use_a(h: lib.Host) -> lib.Alias { h.Alias }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_alias_rejects_rhs_name() {
+    let typedef = r#"
+pub struct Base { pub X: int }
+pub type Alias = Base
+pub struct Host {
+  embed Alias,
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn bad(h: lib.Host) -> int { h.Base.X }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("member_not_found");
+}
+
+#[test]
+fn imported_typedef_embed_promotes_on_direct_access() {
+    let typedef = r#"
+pub struct Inner { pub id: int }
+impl Inner { pub fn Get(self: Inner) -> int }
+pub struct Wrapper {
+  embed Inner,
+}
+"#;
+    let input = r#"
+import "go:example.com/wrap"
+fn get_id(w: wrap.Wrapper) -> int { w.id }
+fn get_via(w: wrap.Wrapper) -> int { w.Get() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/wrap", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn imported_typedef_pointer_embed_promotes_on_direct_access() {
+    let typedef = r#"
+pub struct Inner { pub id: int }
+impl Inner { pub fn Get(self: Inner) -> int }
+pub struct Wrapper {
+  embed Ref<Inner>,
+}
+"#;
+    let input = r#"
+import "go:example.com/wrap"
+fn get_id(w: wrap.Wrapper) -> int { w.id }
+fn get_via(w: wrap.Wrapper) -> int { w.Get() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/wrap", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_nested_faithful_struct_promotes() {
+    let typedef = r#"
+pub struct Inner { pub id: int }
+impl Inner { pub fn Get(self: Inner) -> int }
+pub struct Wrapper {
+  embed Inner,
+}
+"#;
+    let input = r#"
+import "go:example.com/wrap"
+struct Mine { embed wrap.Wrapper }
+fn use_id(m: Mine) -> int { m.id }
+fn use_get(m: Mine) -> int { m.Get() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/wrap", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_nested_hidden_embed_in_graph_rejected() {
+    let typedef = r#"
+#[go(hidden_embed)]
+pub struct Inner { pub id: int }
+impl Inner { pub fn Secret(self) -> int }
+pub struct Wrapper {
+  embed Inner,
+}
+"#;
+    let input = r#"
+import "go:example.com/wrap"
+struct Mine { embed wrap.Wrapper }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/wrap", typedef)])
+        .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn embed_imported_interface_promotes() {
+    let typedef = r#"
+pub interface Reader {
+  fn Read() -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/io"
+struct Mine { embed io.Reader }
+fn read_it(m: Mine) -> int { m.Read() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/io", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_newtype_promotes() {
+    let typedef = r#"
+pub struct Count(int)
+impl Count { pub fn Value(self: Count) -> int }
+"#;
+    let input = r#"
+import "go:example.com/metric"
+struct Mine { embed metric.Count }
+fn value_of(m: Mine) -> int { m.Value() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/metric", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_newtype_without_methods_rejected() {
+    let typedef = r#"
+pub struct Empty(int)
+"#;
+    let input = r#"
+import "go:example.com/metric"
+struct Mine { embed metric.Empty }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/metric", typedef)])
+        .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn embed_imported_opaque_method_bearing_admitted() {
+    let typedef = r#"
+pub type Mutex
+
+impl Mutex {
+  fn Lock(self: Ref<Mutex>) -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/sync"
+struct Guarded { embed sync.Mutex }
+fn lock_it(g: Ref<Guarded>) -> int { g.Lock() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/sync", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_imported_opaque_hidden_embed_rejected() {
+    let typedef = r#"
+#[go(hidden_embed)]
+pub type IPConn
+
+impl IPConn {
+  fn Read(self: Ref<IPConn>) -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/net"
+struct Mine { embed net.IPConn }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/net", typedef)])
+        .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn embed_imported_nested_through_opaque_leaf_admitted() {
+    let typedef = r#"
+pub type Leaf
+
+impl Leaf {
+  fn Ping(self: Ref<Leaf>) -> int
+}
+
+pub struct Wrapper {
+  embed Leaf,
+}
+"#;
+    let input = r#"
+import "go:example.com/wrap"
+struct Mine { embed wrap.Wrapper }
+fn use_ping(m: Ref<Mine>) -> int { m.Ping() }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/wrap", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn embed_stdlib_opaque_mixin_and_unexported_embed_admitted() {
+    infer(
+        r#"
+import "go:strings"
+struct WithBuilder { embed strings.Builder }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+
+    infer(
+        r#"
+import "go:net"
+struct WithConn { embed net.IPConn }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+
+    infer(
+        r#"
+import "go:reflect"
+struct BadEmbed { embed reflect.Value }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_imported_target");
+}
+
+#[test]
+fn go_partially_hidden_struct_autofill_admitted() {
+    let typedef = r#"
+#[go(hidden_fields)]
+pub struct Command {
+  pub Use: string,
+  pub Short: string,
+}
+"#;
+    let input = r#"
+import "go:example.com/cli"
+fn make_command(use: string) -> cli.Command {
+  cli.Command { Use: use, .. }
+}
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cli", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn go_stdlib_zero_unsafe_struct_literal_rejected() {
+    infer(
+        r#"
+import "go:encoding/csv"
+
+fn test() {
+  let mut w = csv.Writer { Comma: ',', .. }
+  let _ = w.Write(["a", "b"])
+}
+"#,
+    )
+    .assert_infer_code("hidden_state_no_zero");
+}
+
+#[test]
+fn go_zero_unsafe_struct_literal_rejected() {
+    let typedef = r#"
+#[go(hidden_fields)]
+#[go(zero_unsafe)]
+pub struct Broken {
+  pub Name: string,
+}
+"#;
+    let input = r#"
+import "go:example.com/res"
+fn make_broken() -> res.Broken {
+  res.Broken { Name: "x", .. }
+}
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/res", typedef)])
+        .assert_infer_code("hidden_state_no_zero");
+}
+
+#[test]
+fn go_zero_unsafe_field_blocks_wrapper_autofill() {
+    let typedef = r#"
+#[go(hidden_fields)]
+#[go(zero_unsafe)]
+pub struct Broken {
+  pub Name: string,
+}
+"#;
+    let input = r#"
+import "go:example.com/res"
+struct Wrapper { b: res.Broken }
+fn make_wrapper() -> Wrapper {
+  Wrapper { .. }
+}
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/res", typedef)])
+        .assert_infer_code("field_no_zero");
+}
+
+#[test]
+fn go_struct_with_unexported_embed_autofill_admitted() {
+    let typedef = r#"
+#[go(unexported)]
+pub type inner
+
+pub struct Outer {
+  embed inner,
+  pub Name: string,
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn make_outer() -> lib.Outer {
+  lib.Outer { Name: "x", .. }
+}
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn go_struct_with_only_hidden_embed_needs_curation() {
+    let typedef = r#"
+#[go(unexported)]
+pub type inner
+
+pub struct Handle {
+  embed inner,
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn make_handle() -> lib.Handle {
+  lib.Handle { .. }
+}
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("hidden_state_no_zero");
+}
+
+#[test]
+fn go_struct_with_only_hidden_embed_admitted_when_zero_safe() {
+    let typedef = r#"
+#[go(unexported)]
+pub type inner
+
+#[go(zero_safe)]
+pub struct Handle {
+  embed inner,
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn make_handle() -> lib.Handle {
+  lib.Handle { .. }
+}
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_comma_ok_interface_via_promoted_method_rejected() {
+    let typedef = r#"
+pub interface Lookup {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+
+pub struct Base {
+  pub X: int,
+}
+impl Base {
+  fn Get(self: Base) -> Option<int>
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Base }
+fn as_lookup(m: Mine) -> lib.Lookup { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn satisfy_comma_ok_interface_via_declared_method_ok() {
+    let typedef = r#"
+pub interface Lookup {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { pub x: int }
+impl Mine { fn Get(self: Mine) -> Option<int> { Some(self.x) } }
+fn as_lookup(m: Mine) -> lib.Lookup { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_comma_ok_interface_via_promoted_comma_ok_method_ok() {
+    let typedef = r#"
+pub interface Lookup {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+
+pub struct Base {}
+impl Base {
+  #[go(comma_ok)]
+  fn Get(self: Base) -> Option<int>
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Base }
+fn as_lookup(m: Mine) -> lib.Lookup { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_comma_ok_interface_via_imported_declared_method_rejected() {
+    let typedef = r#"
+pub interface Lookup {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+
+pub struct Base {}
+impl Base {
+  fn Get(self: Base) -> Option<int>
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn as_lookup(b: lib.Base) -> lib.Lookup { b }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn satisfy_comma_ok_interface_inverse_plain_target_rejected() {
+    let typedef = r#"
+pub interface Lookup {
+  fn Get() -> Option<int>
+}
+
+pub struct Base {}
+impl Base {
+  #[go(comma_ok)]
+  fn Get(self: Base) -> Option<int>
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+fn as_lookup(b: lib.Base) -> lib.Lookup { b }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn satisfy_comma_ok_interface_via_promoted_inherited_method_ok() {
+    let typedef = r#"
+pub interface Parent {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+
+pub interface Child { embed Parent }
+
+pub interface Target {
+  #[go(comma_ok)]
+  fn Get() -> Option<int>
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Child }
+fn as_target(m: Mine) -> lib.Target { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_sealed_interface_via_plain_impl_rejected() {
+    let typedef = r#"
+pub interface Sealed {
+  fn Do() -> int
+  #[go(unexported)]
+  fn private()
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine {}
+impl Mine {
+  fn Do(self: Mine) -> int { 0 }
+}
+fn as_sealed(m: Mine) -> lib.Sealed { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("sealed_interface");
+}
+
+#[test]
+fn satisfy_sealed_interface_via_embed_ok() {
+    let typedef = r#"
+pub interface Sealed {
+  fn Do() -> int
+  #[go(unexported)]
+  fn private()
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Sealed }
+fn as_sealed(m: Mine) -> lib.Sealed { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_sealed_interface_via_embedded_implementer_ok() {
+    let typedef = r#"
+pub interface Sealed {
+  fn Do() -> int
+  #[go(unexported)]
+  fn private()
+}
+
+pub type SealedImpl
+impl SealedImpl {
+  fn Do(self) -> int
+  #[go(unexported)]
+  fn private(self)
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.SealedImpl }
+fn as_sealed(m: Mine) -> lib.Sealed { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_sealed_interface_via_matching_identity_ok() {
+    let typedef = r#"
+pub interface Sealed {
+  fn Do() -> int
+  #[go(unexported, "lib.private(int)")]
+  fn private()
+}
+
+pub type Impl
+impl Impl {
+  fn Do(self) -> int
+  #[go(unexported, "lib.private(int)")]
+  fn private(self)
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Impl }
+fn as_sealed(m: Mine) -> lib.Sealed { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn satisfy_sealed_interface_via_mismatched_signature_rejected() {
+    let typedef = r#"
+pub interface Sealed {
+  fn Do() -> int
+  #[go(unexported, "lib.private(int)")]
+  fn private()
+}
+
+pub type Impl
+impl Impl {
+  fn Do(self) -> int
+  #[go(unexported, "lib.private()")]
+  fn private(self)
+}
+"#;
+    let input = r#"
+import "go:example.com/lib"
+struct Mine { embed lib.Impl }
+fn as_sealed(m: Mine) -> lib.Sealed { m }
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/lib", typedef)])
+        .assert_infer_code("sealed_interface");
+}
+
+#[test]
+fn embed_local_enum_rejected() {
+    infer(
+        r#"
+enum E { A }
+impl E { pub fn mark(self) -> int { 1 } }
+struct S { embed E }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_defined_type");
+}
+
+#[test]
+fn embed_defined_type_over_struct_rejected() {
+    infer(
+        r#"
+struct Base { x: int }
+struct P(Base)
+struct S { embed P }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_defined_type");
+}
+
+#[test]
+fn embed_defined_type_over_interface_rejected() {
+    infer(
+        r#"
+interface I { fn m() -> int }
+struct P(I)
+struct S { embed P }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_defined_type");
+}
+
+#[test]
+fn embed_recursive_newtype_rejected() {
+    infer(
+        r#"
+struct A(B)
+struct B(A)
+struct S { embed A }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("embed_defined_type");
+}
+
+#[test]
+fn embed_qualified_prelude_ref_names_target() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+struct S { embed prelude.Ref<Base> }
+fn read(s: S) -> Ref<Base> { s.Base }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_display_only_type_accepted() {
+    infer(
+        r#"
+#[display]
+struct Marker {}
+struct S { embed Marker }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_of_public_type_is_accessible_across_packages() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "types",
+        "lib.lis",
+        r#"
+pub struct Base { pub id: int }
+pub struct Outer { embed Base }
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "types"
+fn main() {
+  let o = types.Outer { Base: types.Base { id: 1 } }
+  let _ = o.Base
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn embed_of_private_type_not_accessible_across_packages() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "types",
+        "lib.lis",
+        r#"
+struct Base { pub id: int }
+pub struct Outer { embed Base }
+pub fn make() -> Outer { Outer { Base: Base { id: 1 } } }
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "types"
+fn main() {
+  let o = types.make()
+  let _ = o.Base
+}
+"#,
+    );
+    infer_package("main", fs).assert_resolve_code("private_field_access");
+}
+
+#[test]
+fn promoted_member_resolves_across_packages() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "types",
+        "lib.lis",
+        r#"
+pub struct Base { pub id: int }
+impl Base { pub fn describe(self) -> string { "b" } }
+pub struct Outer { embed Base }
+pub fn make() -> Outer { Outer { Base: Base { id: 1 } } }
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "types"
+fn main() {
+  let o = types.make()
+  let _ = o.describe()
+  let _ = o.id
+}
+"#,
+    );
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn embed_value_struct_accepted() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+struct S { embed Base }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_transparent_alias_to_ref_accepted() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+type P = Ref<Base>
+struct S { embed P }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn embed_field_named_embed_still_parses() {
+    infer(
+        r#"
+struct S { embed: int }
+fn main() {
+  let _ = S { embed: 1 }
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_embed_keyword_alias_satisfies() {
+    infer(
+        r#"
+pub interface Reader { fn read() -> int }
+pub interface ReadWriter { embed Reader }
+struct File { name: string }
+impl File { pub fn read(self) -> int { 0 } }
+fn use_rw(rw: ReadWriter) -> int { rw.read() }
+fn main() {
+  let _ = use_rw(File { name: "x" })
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_method_resolves_through_value_embed() {
+    infer(
+        r#"
+struct Base { pub id: int }
+impl Base { fn describe(self) -> string { "b" } }
+struct Outer { embed Base }
+fn use_it(o: Outer) -> string { o.describe() }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_method_expression_resolves() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+impl Base { pub fn describe(self) -> string { "b" } }
+struct Outer { embed Base }
+fn use_it(o: Outer) -> string {
+  let f = Outer.describe
+  f(o)
+}
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_private_method_expression_is_rejected() {
+    infer(
+        r#"
+struct Base { pub id: int }
+impl Base { fn describe(self) -> string { "b" } }
+struct Outer { embed Base }
+fn use_it() {
+  let _ = Outer.describe
+}
+fn main() {}
+"#,
+    )
+    .assert_infer_code("private_method_expression");
+}
+
+#[test]
+fn cross_package_promoted_private_method_expression_is_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "lib",
+        "lib.lis",
+        r#"
+pub struct Base { pub id: int }
+impl Base { fn secret(self) -> string { "s" } }
+pub struct Outer { embed Base }
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "lib"
+
+fn use_it() {
+  let _ = lib.Outer.secret
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_resolve_code("private_method_access");
+}
+
+#[test]
+fn cross_package_promoted_public_method_expression_resolves() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "lib",
+        "lib.lis",
+        r#"
+pub struct Base { pub id: int }
+impl Base { pub fn describe(self) -> string { "b" } }
+pub struct Outer { embed Base }
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "lib"
+
+fn use_it(o: lib.Outer) -> string {
+  let f = lib.Outer.describe
+  f(o)
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn own_method_expression_still_resolves() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+impl Base { pub fn describe(self) -> string { "b" } }
+fn use_it(b: Base) -> string {
+  let f = Base.describe
+  f(b)
+}
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_field_resolves_through_value_embed() {
+    infer(
+        r#"
+struct Base { pub id: int }
+struct Outer { embed Base, pub tag: string }
+fn read_id(o: Outer) -> int { o.id }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_member_resolves_two_levels_deep() {
+    infer(
+        r#"
+struct Leaf { pub value: int }
+impl Leaf { fn shout(self) -> string { "x" } }
+struct Mid { embed Leaf }
+struct Top { embed Mid }
+fn use_it(t: Top) -> string { t.shout() }
+fn read(t: Top) -> int { t.value }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn own_method_shadows_promoted() {
+    infer(
+        r#"
+struct Base { pub id: int }
+impl Base { fn name(self) -> string { "base" } }
+struct Outer { embed Base }
+impl Outer { fn name(self) -> string { "outer" } }
+fn use_it(o: Outer) -> string { o.name() }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn diamond_promotion_is_ambiguous() {
+    infer(
+        r#"
+struct A { pub x: int }
+impl A { fn m(self) -> string { "a" } }
+struct B { embed A }
+struct C { embed A }
+struct D { embed B, embed C }
+fn use_it(d: D) -> string { d.m() }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("ambiguous_selector");
+}
+
+#[test]
+fn ambiguous_field_and_method_collision() {
+    infer(
+        r#"
+struct A { pub x: int }
+struct B {}
+impl B { fn x(self) -> string { "b" } }
+struct Outer { embed A, embed B }
+fn use_it(o: Outer) -> int { o.x }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("ambiguous_selector");
+}
+
+#[test]
+fn value_embed_satisfies_interface_via_promotion() {
+    infer(
+        r#"
+pub interface Speaker { fn speak() -> string }
+struct Base {}
+impl Base { pub fn speak(self) -> string { "hi" } }
+struct Outer { embed Base }
+fn take(s: Speaker) -> string { s.speak() }
+fn main() {
+  let _ = take(Outer { Base: Base {} })
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn pointer_embed_promotes_pointer_receiver_method_as_value_callable() {
+    infer(
+        r#"
+pub interface Bumper { fn bump() -> int }
+struct Counter { pub n: int }
+impl Counter { pub fn bump(self: Ref<Counter>) -> int { self.n } }
+struct Holder { embed Ref<Counter> }
+fn take(b: Bumper) -> int { b.bump() }
+fn main() {
+  let _ = take(Holder { Counter: &Counter { n: 0 } })
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_method_through_alias_to_ref_embed() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+impl Base { pub fn describe(self) -> string { "b" } }
+type P = Ref<Base>
+struct S { embed P }
+fn use_it(s: S) -> string { s.describe() }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_local_method_conflicts_with_parent() {
+    infer(
+        r#"
+interface P { fn m() -> string }
+interface Q {
+  embed P
+  fn m() -> int
+}
+fn main() {}
+"#,
+    )
+    .assert_infer_code("interface_method_conflict");
+}
+
+#[test]
+fn ambiguous_selector_through_ref_receiver() {
+    infer(
+        r#"
+struct A { pub x: int }
+impl A { fn m(self) -> string { "a" } }
+struct B { embed A }
+struct C { embed A }
+struct D { embed B, embed C }
+fn f(r: Ref<D>) -> string { r.m() }
+fn main() {}
+"#,
+    )
+    .assert_infer_code("ambiguous_selector");
+}
+
+#[test]
+fn generic_own_method_through_embedder_keeps_receiver_return_link() {
+    infer(
+        r#"
+struct Base { pub id: int }
+struct Outer<T> { embed Base, pub value: T }
+impl<T> Outer<T> { fn get(self) -> T { self.value } }
+fn f() -> int {
+  let o = Outer { Base: Base { id: 1 }, value: "s" }
+  o.get()
+}
+fn main() {}
+"#,
+    )
+    .assert_infer_code("type_mismatch");
+}
+
+#[test]
+fn promoted_method_on_distinct_generic_instantiations() {
+    infer(
+        r#"
+struct Base { pub id: int }
+impl Base { fn describe(self) -> string { "b" } }
+struct Outer<T> { embed Base, pub value: T }
+fn main() {
+  let oi = Outer { Base: Base { id: 1 }, value: 1 }
+  let os = Outer { Base: Base { id: 1 }, value: "s" }
+  let _ = oi.describe()
+  let _ = os.describe()
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn interface_diamond_matching_type_args_is_fine() {
+    infer(
+        r#"
+interface Base<T> { fn get() -> T }
+interface Left { embed Base<int> }
+interface Right { embed Base<int> }
+interface Q {
+  embed Left
+  embed Right
+}
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_member_through_alias_to_embedder() {
+    infer(
+        r#"
+pub struct Base { pub id: int }
+impl Base { pub fn describe(self) -> string { "b" } }
+struct Outer { embed Base, pub tag: string }
+type A = Outer
+fn promoted_method(a: A) -> string { a.describe() }
+fn promoted_field(a: A) -> int { a.id }
+fn main() {}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn cross_package_promoted_private_method_is_rejected() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "types",
+        "lib.lis",
+        r#"
+struct Base { pub id: int }
+impl Base { fn secret(self) -> int { 1 } }
+pub struct Outer { embed Base }
+pub fn make() -> Outer { Outer { Base: Base { id: 1 } } }
+"#,
+    );
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+import "types"
+fn main() {
+  let o = types.make()
+  let _ = o.secret()
+}
+"#,
+    );
+    infer_package("main", fs).assert_resolve_code("private_method_access");
+}
+
+#[test]
+fn value_embed_of_pointer_receiver_method_does_not_satisfy_by_value() {
+    // The promoted `bump` keeps its pointer receiver, so a value `Holder` is not
+    // in the interface's value method set; only `Ref<Holder>` satisfies.
+    infer(
+        r#"
+pub interface Bumper { fn bump() -> int }
+struct Counter { pub n: int }
+impl Counter { pub fn bump(self: Ref<Counter>) -> int { self.n } }
+struct Holder { embed Counter }
+fn take(b: Bumper) -> int { b.bump() }
+fn main() {
+  let _ = take(Holder { Counter: Counter { n: 0 } })
+}
+"#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn go_prelude_named_type_does_not_shadow_prelude() {
+    let typedef = r#"
+pub fn TakeField(f: VarArgs<Field>)
+
+pub interface Field {
+  fn Update() -> Result<(), error>
+  fn WithWidth(n: int) -> Option<Field>
+}
+
+pub struct Input {}
+
+impl Input {
+  fn Update(self: Ref<Input>) -> Result<(), error>
+  fn WithWidth(self: Ref<Input>, w: int) -> Field
+}
+
+pub struct Option<T: Comparable> { pub Key: string, pub Value: T }
+
+pub fn NewOption<T: Comparable>(key: string, value: T) -> sample.Option<T>
+
+impl<T: Comparable> sample.Option<T> {
+  fn Selected(self, selected: bool) -> sample.Option<T>
+}
+"#;
+    let input = r#"
+import "go:example.com/sample"
+
+fn main() {
+  let input = sample.Input {}
+  sample.TakeField(&input)
+
+  let opt = sample.NewOption("k", 1)
+  let _ = opt.Selected(true)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/sample", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn go_qualified_imported_option_resolves_to_import() {
+    let optlib = r#"
+pub struct Option<T> { pub held: T }
+
+pub fn wrap<T>(value: T) -> optlib.Option<T>
+"#;
+    let input = r#"
+import "go:example.com/optlib"
+
+fn main() {
+  let imported = optlib.wrap(1)
+  let _ = imported.held
+
+  let native: Option<int> = Some(2)
+  let _ = native.unwrap_or(0)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/optlib", optlib)]).assert_no_errors();
+}
+
+#[test]
+fn go_self_qualified_option_coexists_with_import() {
+    let dep = r#"
+pub struct Thing { pub n: int }
+"#;
+    let app = r#"
+import "go:example.com/dep"
+
+pub struct Option<T> { pub held: T }
+
+pub fn keep<T>(value: T) -> app.Option<T>
+
+pub fn maybe() -> Option<dep.Thing>
+"#;
+    let input = r#"
+import "go:example.com/app"
+
+fn main() {
+  let local = app.keep(1)
+  let _ = local.held
+
+  if let Some(thing) = app.maybe() {
+    let _ = thing.n
+  }
+}
+"#;
+    infer_with_go_typedefs(
+        input,
+        &[("go:example.com/dep", dep), ("go:example.com/app", app)],
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn go_self_qualified_array_type_coexists_with_builtin() {
+    let pgtype = r#"
+pub struct Array<T> {
+  pub Elements: Slice<T>,
+  pub Valid: bool,
+}
+
+pub struct Holder {
+  pub Ints: pgtype.Array<int>,
+  pub Digest: Array<byte, 16>,
+}
+
+pub fn MakeArray<T>(seed: T) -> pgtype.Array<T>
+
+pub fn Digest() -> Array<byte, 16>
+
+impl<T> pgtype.Array<T> {
+  fn Len(self) -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/pgtype"
+
+fn main(h: pgtype.Holder) {
+  let arr = pgtype.MakeArray(1)
+  let _ = arr.Len()
+  let _ = h.Ints
+  let _ = h.Digest
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/pgtype", pgtype)]).assert_no_errors();
+}
+
+#[test]
+fn go_self_qualified_nongeneric_array_type_resolves() {
+    let goty = r#"
+pub type Array
+
+impl goty.Array {
+  fn Len(self: Ref<goty.Array>) -> int64
+}
+
+pub fn NewArray() -> Ref<goty.Array>
+"#;
+    let input = r#"
+import "go:example.com/goty"
+
+fn main() {
+  let a = goty.NewArray()
+  let _ = a.Len()
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/goty", goty)]).assert_no_errors();
+}
+
+#[test]
+fn go_bare_array_reference_binds_to_fixed_size_builtin() {
+    let typedef = r#"
+pub struct Array<T> {
+  pub Valid: bool,
+}
+
+impl<T> Array<T> {
+  fn Len(self) -> int
+}
+"#;
+    let input = r#"
+import "go:example.com/pgtype"
+
+fn main(a: pgtype.Array<int>) {
+  let _ = a.Valid
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/pgtype", typedef)])
+        .assert_infer_code("array_type_arity");
+}
+
+#[test]
+fn versioned_go_modules_do_not_falsely_conflict_when_typedefs_missing() {
+    let webrtc = r#"// Package: webrtc
+
+import "go:example.com/sdp/v3"
+import "go:example.com/dtls/v3"
+
+pub struct PeerConnection {}
+"#;
+    let input = r#"
+import "go:example.com/webrtc/v4"
+
+fn main() {
+  let _ = webrtc.PeerConnection {}
+}
+"#;
+    let result = infer_with_go_typedefs(input, &[("go:example.com/webrtc/v4", webrtc)]);
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|error| error.code_str() == Some("resolve.import_conflict")),
+        "expected no import conflict for distinct `/vN` packages, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn versioned_go_modules_resolve_to_preceding_segment_without_directive() {
+    let sdp = r#"
+pub struct SessionDescription {}
+"#;
+    let dtls = r#"
+pub struct Config {}
+"#;
+    let input = r#"
+import "go:example.com/sdp/v3"
+import "go:example.com/dtls/v3"
+
+fn main() {
+  let _ = sdp.SessionDescription {}
+  let _ = dtls.Config {}
+}
+"#;
+    infer_with_go_typedefs(
+        input,
+        &[
+            ("go:example.com/sdp/v3", sdp),
+            ("go:example.com/dtls/v3", dtls),
+        ],
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn ref_alias_unifies_with_bare_ref() {
+    infer(
+        r#"
+    struct File {}
+    type FileRef = Ref<File>
+
+    fn open(f: Ref<File>) -> FileRef { f }
+
+    fn run(f: Ref<File>) {
+      let x: Ref<File> = open(f)
+      let _ = x
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn method_resolves_through_ref_alias() {
+    infer(
+        r#"
+    struct File {}
+    type FileRef = Ref<File>
+
+    impl File {
+      fn close(self) {}
+    }
+
+    fn open(f: Ref<File>) -> FileRef { f }
+
+    fn run(f: Ref<File>) {
+      let file = open(f)
+      file.close()
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn field_resolves_through_ref_alias() {
+    infer(
+        r#"
+    struct Point { x: int }
+    type PointRef = Ref<Point>
+
+    fn at(p: Ref<Point>) -> PointRef { p }
+
+    fn run(p: Ref<Point>) -> int {
+      let r = at(p)
+      r.x
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn ref_alias_match_arm_resolves_receiver() {
+    infer(
+        r#"
+    struct File {}
+    type FileRef = Ref<File>
+
+    impl File {
+      fn close(self) {}
+    }
+
+    fn open(f: Ref<File>) -> FileRef { f }
+
+    fn run(cond: bool, f: Ref<File>, g: Ref<File>) {
+      let file = match cond {
+        true => open(f),
+        false => g,
+      }
+      file.close()
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn pointer_backed_newtype_stays_opaque() {
+    infer(
+        r#"
+    struct File {}
+
+    impl File {
+      fn close(self) {}
+    }
+
+    struct Handle(Ref<File>)
+
+    fn run(h: Handle) {
+      h.close()
+    }
+        "#,
+    )
+    .assert_infer_code("member_not_found");
+}
+
+#[test]
+fn ref_alias_satisfies_interface_with_pointer_receiver() {
+    infer(
+        r#"
+    interface Worker {
+      fn name() -> string
+      fn work() -> int
+    }
+
+    struct MyWorker { label: string, count: int }
+
+    impl MyWorker {
+      fn name(self) -> string { self.label }
+      fn work(self: Ref<MyWorker>) -> int { self.count }
+    }
+
+    type WorkerRef = Ref<MyWorker>
+
+    fn use_worker(w: Worker) -> string { w.name() }
+
+    fn run(w: WorkerRef) {
+      let _ = use_worker(w)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn integer_in_type_position_is_rejected() {
+    infer(r#"{ let x: Slice<3> = [] }"#).assert_infer_code("integer_in_type_position");
+}
+
+#[test]
+fn integer_in_type_position_not_duplicated_in_annotation() {
+    infer(r#"{ let x: Slice<int, 3> = [] }"#).assert_infer_code_once("integer_in_type_position");
+}
+
+#[test]
+fn integer_in_type_position_not_duplicated_in_call() {
+    infer(
+        r#"
+fn f<T>() {}
+fn main() {
+  f<int, 3>()
+}
+"#,
+    )
+    .assert_infer_code_once("integer_in_type_position");
+}
+
+#[test]
+fn interface_method_return_expands_alias_from_sibling_file() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "aliases.lis", "pub type MyInt = int\n");
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+interface Bar {
+  fn value() -> MyInt
+}
+
+fn baz(value: Bar) {
+  let _: int = value.value()
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn struct_field_expands_alias_from_sibling_file() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "aliases.lis", "pub type MyInt = int\n");
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+struct Holder {
+  value: MyInt,
+}
+
+fn read(h: Holder) {
+  let _: int = h.value
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn interface_method_return_expands_chained_alias_across_files() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file("main", "base.lis", "pub type B = int\n");
+    fs.add_file("main", "middle.lis", "pub type A = B\n");
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+interface Bar {
+  fn value() -> A
+}
+
+fn baz(value: Bar) {
+  let _: int = value.value()
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn interface_method_return_expands_chained_alias_declared_out_of_order() {
+    let mut fs = MockFileSystem::new();
+    fs.add_file(
+        "main",
+        "main.lis",
+        r#"
+type A = B
+type B = int
+
+interface Bar {
+  fn value() -> A
+}
+
+fn baz(value: Bar) {
+  let _: int = value.value()
+}
+"#,
+    );
+
+    infer_package("main", fs).assert_no_errors();
+}
+
+#[test]
+fn snake_case_method_satisfies_go_interface() {
+    let typedef = r#"
+pub struct Widget { pub id: int }
+
+pub interface HasWidget {
+  fn GetWidget() -> Ref<Widget>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyBox { value: ui.Widget }
+
+impl MyBox {
+  pub fn get_widget(self: Ref<MyBox>) -> Ref<ui.Widget> { &self.value }
+}
+
+fn use_it(_: ui.HasWidget) {}
+
+fn main() {
+  let b = MyBox { value: ui.Widget { id: 0 } }
+  use_it(&b)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn private_snake_case_method_does_not_satisfy_go_interface() {
+    let typedef = r#"
+pub struct Widget { pub id: int }
+
+pub interface HasWidget {
+  fn GetWidget() -> Ref<Widget>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyBox { value: ui.Widget }
+
+impl MyBox {
+  fn get_widget(self: Ref<MyBox>) -> Ref<ui.Widget> { &self.value }
+}
+
+fn use_it(_: ui.HasWidget) {}
+
+fn main() {
+  let b = MyBox { value: ui.Widget { id: 0 } }
+  use_it(&b)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn snake_case_method_satisfies_pascal_case_lisette_interface() {
+    infer(
+        r#"
+    pub interface Runner {
+      fn Run() -> int;
+    }
+
+    struct Job {}
+
+    impl Job {
+      pub fn run(self) -> int { 1 }
+    }
+
+    fn use_it(_: Runner) {}
+
+    fn main() {
+      use_it(Job {});
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn pascal_case_method_satisfies_snake_case_public_interface() {
+    infer(
+        r#"
+    pub interface Runner {
+      fn run() -> int;
+    }
+
+    struct Job {}
+
+    impl Job {
+      pub fn Run(self) -> int { 1 }
+    }
+
+    fn use_it(_: Runner) {}
+
+    fn main() {
+      use_it(Job {});
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn private_lisette_interface_requires_source_name_match() {
+    infer(
+        r#"
+    interface Runner {
+      fn Run() -> int;
+    }
+
+    struct Job {}
+
+    impl Job {
+      pub fn run(self) -> int { 1 }
+    }
+
+    fn use_it(_: Runner) {}
+
+    fn main() {
+      use_it(Job {});
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn initialism_method_does_not_satisfy_go_interface() {
+    let typedef = r#"
+pub interface Handler {
+  fn ServeHTTP(code: int)
+}
+"#;
+    let input = r#"
+import "go:example.com/web"
+
+struct MyHandler {}
+
+impl MyHandler {
+  pub fn serve_http(self, _code: int) {}
+}
+
+fn use_it(_: web.Handler) {}
+
+fn main() {
+  use_it(MyHandler {})
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/web", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn snake_case_pointer_receiver_method_rejected_for_value_coercion() {
+    let typedef = r#"
+pub struct Widget { pub id: int }
+
+pub interface HasWidget {
+  fn GetWidget() -> Ref<Widget>
+}
+"#;
+    let input = r#"
+import "go:example.com/ui"
+
+struct MyBox { value: ui.Widget }
+
+impl MyBox {
+  pub fn get_widget(self: Ref<MyBox>) -> Ref<ui.Widget> { &self.value }
+}
+
+fn use_it(_: ui.HasWidget) {}
+
+fn main() {
+  let b = MyBox { value: ui.Widget { id: 0 } }
+  use_it(b)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/ui", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn snake_case_method_satisfies_comma_ok_go_interface() {
+    let typedef = r#"
+pub struct Session { pub key: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Session>>
+}
+"#;
+    let input = r#"
+import "go:example.com/cache"
+
+struct MyCache {}
+
+impl MyCache {
+  pub fn get(self: Ref<MyCache>, key: string) -> Option<Ref<cache.Session>> { None }
+}
+
+fn use_it(_: cache.Cache) {}
+
+fn main() { use_it(&MyCache {}) }
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cache", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn exact_source_name_match_preferred_over_emitted_match() {
+    infer(
+        r#"
+    pub interface Runner {
+      fn Run() -> int;
+    }
+
+    struct Job {}
+
+    impl Job {
+      pub fn Run(self) -> int { 1 }
+      pub fn run(self) -> int { 2 }
+    }
+
+    fn use_it(_: Runner) {}
+
+    fn main() {
+      use_it(Job {});
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn promoted_snake_case_method_satisfies_go_interface() {
+    let typedef = r#"
+pub interface Named {
+  fn Describe() -> string
+}
+"#;
+    let input = r#"
+import "go:example.com/reg"
+
+pub struct Base {}
+impl Base {
+  pub fn describe(self) -> string { "base" }
+}
+struct Outer { embed Base }
+
+fn use_it(_: reg.Named) {}
+
+fn main() {
+  use_it(Outer { Base: Base {} })
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/reg", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn promoted_private_snake_case_method_does_not_satisfy_go_interface() {
+    let typedef = r#"
+pub interface Named {
+  fn Describe() -> string
+}
+"#;
+    let input = r#"
+import "go:example.com/reg"
+
+pub struct Base {}
+impl Base {
+  fn describe(self) -> string { "base" }
+}
+struct Outer { embed Base }
+
+fn use_it(_: reg.Named) {}
+
+fn main() {
+  use_it(Outer { Base: Base {} })
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/reg", typedef)])
+        .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn promoted_snake_case_method_rejected_for_comma_ok_go_interface() {
+    let typedef = r#"
+pub struct Session { pub key: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Session>>
+}
+"#;
+    let input = r#"
+import "go:example.com/cache"
+
+pub struct Base {}
+impl Base {
+  pub fn get(self, _key: string) -> Option<Ref<cache.Session>> { None }
+}
+struct Outer { embed Base }
+
+fn main() {
+  let _ = Outer { Base: Base {} } as cache.Cache
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cache", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn aliased_receiver_snake_case_method_satisfies_go_interface() {
+    let typedef = r#"
+pub interface Named {
+  fn Describe() -> string
+}
+"#;
+    let input = r#"
+import "go:example.com/reg"
+
+pub struct Base {}
+impl Base {
+  pub fn describe(self) -> string { "base" }
+}
+pub type Wrap = Base
+
+fn use_it(_: reg.Named) {}
+
+fn main() {
+  let w: Wrap = Base {}
+  use_it(w)
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/reg", typedef)]).assert_no_errors();
+}
+
+#[test]
+fn direct_snake_case_method_shadows_promoted_pascal_case() {
+    infer(
+        r#"
+    pub struct Base {}
+    impl Base {
+      pub fn Describe(self) -> int { 1 }
+    }
+    struct Outer { embed Base }
+    impl Outer {
+      pub fn describe(self) -> string { "outer" }
+    }
+    pub interface Named {
+      fn Describe() -> string
+    }
+    fn use_it(n: Named) -> string { n.Describe() }
+    fn main() {
+      let _ = use_it(Outer { Base: Base {} })
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn shadowing_direct_method_rejected_when_incompatible() {
+    infer(
+        r#"
+    pub struct Base {}
+    impl Base {
+      pub fn Describe(self) -> string { "base" }
+    }
+    struct Outer { embed Base }
+    impl Outer {
+      pub fn describe(self) -> int { 1 }
+    }
+    pub interface Named {
+      fn Describe() -> string
+    }
+    fn use_it(_n: Named) {}
+    fn main() {
+      use_it(Outer { Base: Base {} })
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn interface_value_rejected_for_comma_ok_go_interface() {
+    let typedef = r#"
+pub struct Session { pub key: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Session>>
+}
+"#;
+    let input = r#"
+import "go:example.com/cache"
+
+pub interface MyCache {
+  fn Get(key: string) -> Option<Ref<cache.Session>>
+}
+
+fn coerce(c: MyCache) {
+  let _ = c as cache.Cache
+}
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cache", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn mixed_promoted_method_rejected_for_comma_ok_go_interface() {
+    let typedef = r#"
+pub struct Session { pub key: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Session>>
+  fn Put(key: string, s: Ref<Session>)
+}
+"#;
+    let input = r#"
+import "go:example.com/cache"
+
+pub struct Base {}
+impl Base {
+  pub fn put(self, _key: string, _s: Ref<cache.Session>) {}
+}
+struct S { embed Base }
+impl S {
+  pub fn get(self, _key: string) -> Option<Ref<cache.Session>> { None }
+}
+
+fn main() {
+  let _ = S { Base: Base {} } as cache.Cache
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cache", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn interface_value_rejected_for_user_comma_ok_interface() {
+    infer(
+        r#"
+    pub struct Entry { pub name: string }
+    pub interface Cache {
+      #[go(comma_ok)]
+      fn Get(key: string) -> Option<Ref<Entry>>
+    }
+    pub interface Impl {
+      fn Get(key: string) -> Option<Ref<Entry>>
+    }
+    fn coerce(i: Impl) {
+      let _ = i as Cache
+    }
+    fn main() {}
+        "#,
+    )
+    .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn inherited_interface_method_satisfies_pascal_case_requirement() {
+    infer(
+        r#"
+    pub interface Parent {
+      fn describe() -> string
+    }
+    pub interface Child {
+      embed Parent
+    }
+    pub interface Named {
+      fn Describe() -> string
+    }
+    fn coerce(c: Child) {
+      let _ = c as Named
+    }
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn bounded_parameter_snake_case_bound_method_satisfies_pascal_requirement() {
+    infer(
+        r#"
+    pub interface Describer {
+      fn describe() -> string
+    }
+    pub interface Named {
+      fn Describe() -> string
+    }
+    fn needs_named<T: Named>(_v: T) {}
+    fn outer<U: Describer>(v: U) {
+      needs_named(v)
+    }
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn equal_depth_promoted_go_name_ambiguity_rejected() {
+    infer(
+        r#"
+    pub struct A {}
+    impl A {
+      pub fn get_item(self) -> string { "a" }
+    }
+    pub struct B {}
+    impl B {
+      pub fn getItem(self) -> string { "b" }
+    }
+    struct Outer { embed A, embed B }
+    pub interface Getter {
+      fn GetItem() -> string
+    }
+    fn use_it(_g: Getter) {}
+    fn main() {
+      use_it(Outer { A: A {}, B: B {} })
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn field_claiming_go_selector_shadows_promoted_method() {
+    infer(
+        r#"
+    pub struct Base {}
+    impl Base {
+      pub fn getItem(self) -> string { "base" }
+    }
+    struct Outer { embed Base, pub get_item: string }
+    pub interface Getter {
+      fn GetItem() -> string
+    }
+    fn use_it(_g: Getter) {}
+    fn main() {
+      use_it(Outer { Base: Base {}, get_item: "f" })
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn promoted_field_selector_shadows_promoted_method() {
+    infer(
+        r#"
+    pub struct FieldSide { pub get_item: string }
+    pub struct MethodSide {}
+    impl MethodSide {
+      pub fn getItem(self) -> string { "m" }
+    }
+    struct Outer { embed FieldSide, embed MethodSide }
+    pub interface Getter {
+      fn GetItem() -> string
+    }
+    fn use_it(_g: Getter) {}
+    fn main() {
+      use_it(Outer { FieldSide: FieldSide { get_item: "f" }, MethodSide: MethodSide {} })
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn serialized_field_export_shadows_promoted_method() {
+    infer(
+        r#"
+    #[json]
+    pub struct FieldSide { get_item: string }
+    pub struct MethodSide {}
+    impl MethodSide {
+      pub fn getItem(self) -> string { "m" }
+    }
+    struct Outer { embed FieldSide, embed MethodSide }
+    pub interface Getter {
+      fn GetItem() -> string
+    }
+    fn use_it(_g: Getter) {}
+    fn main() {
+      use_it(Outer { FieldSide: FieldSide { get_item: "f" }, MethodSide: MethodSide {} })
+    }
+        "#,
+    )
+    .assert_infer_code("interface_not_implemented");
+}
+
+#[test]
+fn constraint_intersection_merges_shared_go_selector() {
+    infer(
+        r#"
+    pub interface A {
+      fn get_item() -> string
+    }
+    pub interface B {
+      fn getItem() -> string
+    }
+    pub interface Getter {
+      fn GetItem() -> string
+    }
+    fn needs_getter<T: Getter>(_v: T) {}
+    fn outer<U: A + B>(v: U) {
+      needs_getter(v)
+    }
+    fn main() {}
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn generic_receiver_method_wins_over_specialized_ufcs_selector() {
+    infer(
+        r#"
+    pub struct Box<T> { pub value: T }
+    impl Box<int> {
+      pub fn Describe(self) -> string { "int box" }
+    }
+    impl<T> Box<T> {
+      pub fn describe(self) -> string { "any box" }
+    }
+    pub interface Named {
+      fn Describe() -> string
+    }
+    fn use_it(n: Named) -> string { n.Describe() }
+    fn main() {
+      let _ = use_it(Box { value: 1 })
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn comma_ok_interface_value_rejected_for_plain_user_interface() {
+    let typedef = r#"
+pub struct Session { pub key: string }
+
+pub interface Cache {
+  #[go(comma_ok)]
+  fn Get(key: string) -> Option<Ref<Session>>
+}
+"#;
+    let input = r#"
+import "go:example.com/cache"
+
+pub interface Plain {
+  fn Get(key: string) -> Option<Ref<cache.Session>>
+}
+
+fn coerce(c: cache.Cache) {
+  let _ = c as Plain
+}
+
+fn main() {}
+"#;
+    infer_with_go_typedefs(input, &[("go:example.com/cache", typedef)])
+        .assert_infer_code("comma_ok_abi_mismatch");
+}
+
+#[test]
+fn go_type_names_its_import_path_not_a_derived_package_name() {
+    let typedef = r#"// Package: yaml
+
+pub struct Decoder { pub Strict: bool }
+"#;
+    let input = r#"
+import yaml "go:gopkg.in/yaml.v3"
+
+fn run() {
+  let _: int = yaml.Decoder { Strict: true }
+}
+"#;
+    infer_with_go_typedefs(input, &[("go:gopkg.in/yaml.v3", typedef)])
+        .assert_error_contains("gopkg.in/yaml.v3.Decoder");
 }

@@ -1,28 +1,38 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Foo { value: int }\n\nimpl Foo {\n  fn increment(self: Ref<Foo>) {\n    self.value = self.value + 1\n  }\n}\n\nfn make_foo() -> Foo {\n  Foo { value: 42 }\n}\n\nfn test() {\n  make_foo().increment()\n}\n"
+description: |
+  
+  struct Foo { value: int }
+  
+  impl Foo {
+    fn increment(self: mut Ref<Foo>) {
+      self.value = self.value + 1
+    }
+  }
+  
+  fn make_foo() -> Foo {
+    Foo { value: 42 }
+  }
+  
+  fn test() {
+    make_foo().increment()
+  }
 ---
 package main
 
-import "fmt"
-
 type Foo struct {
 	value int
-}
-
-func (f Foo) String() string {
-	return fmt.Sprintf("Foo { value: %v }", f.value)
 }
 
 func (f *Foo) increment() {
 	f.value++
 }
 
-func make_foo() Foo {
+func makeFoo() Foo {
 	return Foo{value: 42}
 }
 
 func test() {
-	ref_1 := make_foo()
+	ref_1 := makeFoo()
 	ref_1.increment()
 }

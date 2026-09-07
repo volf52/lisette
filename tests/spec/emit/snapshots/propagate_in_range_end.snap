@@ -1,0 +1,32 @@
+---
+source: tests/spec/emit/expressions.rs
+description: |
+  
+  fn g() -> Result<int, string> { Ok(5) }
+  
+  fn f() -> Result<int, string> {
+    let mut s = 0
+    for i in 0..g()? { s = s + i }
+    Ok(s)
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func g() lisette.Result[int, string] {
+	return lisette.MakeResultOk[int, string](5)
+}
+
+func f() lisette.Result[int, string] {
+	s := 0
+	check_1 := g()
+	if check_1.Tag != lisette.ResultOk {
+		return lisette.MakeResultErr[int, string](check_1.ErrVal)
+	}
+	bound_2 := check_1.OkVal
+	for i := range bound_2 {
+		s += i
+	}
+	return lisette.MakeResultOk[int, string](s)
+}

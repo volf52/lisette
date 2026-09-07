@@ -1,6 +1,23 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn g() -> Result<Channel<int>, string> { Ok(Channel.buffered<int>(1)) }\n\nfn f() -> Result<int, string> {\n  let ch = Channel.buffered<int>(1)\n  ch.send(7)\n  let x = select {\n    match g()?.receive() {\n      Some(v) => v,\n      None => 0,\n    },\n    _ => 0,\n  }\n  Ok(x)\n}\n\nfn main() { let _ = f() }\n"
+description: |
+  
+  fn g() -> Result<Channel<int>, string> { Ok(Channel.buffered<int>(1)) }
+  
+  fn f() -> Result<int, string> {
+    let ch = Channel.buffered<int>(1)
+    ch.send(7)
+    let x = select {
+      match g()?.receive() {
+        Some(v) => v,
+        None => 0,
+      },
+      _ => 0,
+    }
+    Ok(x)
+  }
+  
+  fn main() { let _ = f() }
 ---
 package main
 
@@ -12,15 +29,14 @@ func g() lisette.Result[chan int, string] {
 
 func f() lisette.Result[int, string] {
 	ch := make(chan int, 1)
-	lisette.ChannelSend(ch, 7)
+	_ = lisette.ChannelSend(ch, 7)
 	var x int
 	check_1 := g()
 	if check_1.Tag != lisette.ResultOk {
 		return lisette.MakeResultErr[int, string](check_1.ErrVal)
 	}
-	result_2 := check_1.OkVal
 	select {
-	case v, ok := <-result_2:
+	case v, ok := <-check_1.OkVal:
 		if ok {
 			x = v
 		} else {

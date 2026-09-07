@@ -1,0 +1,716 @@
+use syntax::types::Type;
+
+use crate::Planner;
+use crate::Renderer;
+use crate::abi::callable::{CallableReturnAbi, OptionReturnAbi, PayloadLayout};
+use crate::abi::tuple_element_types;
+use crate::calls::go_interop::WrapperTarget;
+use crate::context::expression::ExpressionContext;
+use crate::control_flow::fallible::{
+    OPTION_SOME_TAG, PARTIAL_ERR_TAG, PARTIAL_OK_TAG, RESULT_OK_TAG,
+};
+use crate::control_flow::propagation::plain_return;
+use crate::plan::bodies::{ElseArm, IfPlan, LoweredBlock, LoweredStatement, ReturnForm};
+use crate::plan::values::{CaptureBoundary, EvaluationEffect, GoExpression, ValuePlan};
+use crate::write_line;
+use syntax::ast::Expression;
+use syntax::parse::TUPLE_FIELDS;
+
+/// A bare `return v0, v1, ...` statement leaf.
+pub(crate) fn multi_value_return(values: Vec<String>) -> LoweredStatement {
+    LoweredStatement::Return(ReturnForm::Multi { values })
+}
+
+/// An `if <condition> { <setup...> return <then_values...> }` tag-check leaf (no else).
+pub(crate) fn tag_check(
+    condition: String,
+    setup: Vec<LoweredStatement>,
+    then_values: Vec<String>,
+) -> LoweredStatement {
+    let mut statements = setup;
+    statements.push(multi_value_return(then_values));
+    LoweredStatement::If(IfPlan {
+        condition_setup: Vec::new(),
+        condition,
+        then_body: LoweredBlock { statements },
+        else_arm: ElseArm::None,
+    })
+}
+
+/// Render a lowered tagged-return destructure as Go text, for closure/value
+/// contexts (adapters) that embed it in a string body rather than a statement
+/// block.
+pub(crate) fn render_lowered_result_return(
+    planner: &mut Planner,
+    output: &mut String,
+    result_value: &str,
+    return_ty: &Type,
+    shape: &CallableReturnAbi,
+) {
+    let statements = emit_lowered_result_return(planner, result_value, return_ty, shape);
+    let block = LoweredBlock { statements };
+    Renderer.render_lowered_block(output, &block);
+}
+
+/// Idiomatic Go zero (`0`, `""`, `nil`, ...) for a lowered failure slot.
+fn lowered_zero(planner: &mut Planner, ok_ty: &Type) -> String {
+    let (zero, packages) = planner.zero_value(ok_ty);
+    planner.require_packages(&packages);
+    zero
+}
+
+/// The lowered Go-return values for an `Err`-with-payload failure, in the
+/// enclosing function's lowered shape (e.g. `[zero, err]`).
+pub(crate) fn lowered_err_values(
+    planner: &mut Planner,
+    shape: &CallableReturnAbi,
+    return_ty: &Type,
+    err_expr: &str,
+) -> Vec<String> {
+    match shape {
+        CallableReturnAbi::BareError => vec![err_expr.to_string()],
+        CallableReturnAbi::Result { .. } => {
+            let ok_ty = planner.facts.peel_alias(return_ty).ok_type();
+            vec![lowered_zero(planner, &ok_ty), err_expr.to_string()]
+        }
+        CallableReturnAbi::Partial { .. } | CallableReturnAbi::Tuple { .. } => {
+            unreachable!("not reached for shapes with their own emission paths")
+        }
+        CallableReturnAbi::Tagged | CallableReturnAbi::Direct | CallableReturnAbi::Option(_) => {
+            unreachable!("Option's failure constructor `None` carries no payload")
+        }
+    }
+}
+
+/// The lowered Go-return values for a success-constructor payload, in the
+/// enclosing function's lowered shape (e.g. `[ok, "nil"]`).
+pub(crate) fn lowered_ok_values(shape: &CallableReturnAbi, ok_expr: &str) -> Vec<String> {
+    match shape {
+        CallableReturnAbi::BareError => vec!["nil".to_string()],
+        CallableReturnAbi::Result { .. } => vec![ok_expr.to_string(), "nil".to_string()],
+        CallableReturnAbi::Partial { .. } | CallableReturnAbi::Tuple { .. } => {
+            unreachable!("not reached for shapes with their own emission paths")
+        }
+        CallableReturnAbi::Option(OptionReturnAbi::CommaOk { .. }) => {
+            vec![ok_expr.to_string(), "true".to_string()]
+        }
+        CallableReturnAbi::Option(OptionReturnAbi::Nullable) => vec![ok_expr.to_string()],
+        CallableReturnAbi::Tagged
+        | CallableReturnAbi::Direct
+        | CallableReturnAbi::Option(OptionReturnAbi::Sentinel(_)) => {
+            unreachable!("not a lowered Lisette return ABI")
+        }
+    }
+}
+
+/// The lowered Go-return values for a bare `None`, in an Option-shaped fn's
+/// lowered shape (e.g. `[zero, "false"]`).
+pub(crate) fn lowered_none_values(
+    planner: &mut Planner,
+    shape: &CallableReturnAbi,
+    return_ty: &Type,
+) -> Vec<String> {
+    match shape {
+        CallableReturnAbi::Option(OptionReturnAbi::CommaOk { .. }) => {
+            let inner = planner.facts.peel_alias(return_ty).ok_type();
+            vec![lowered_zero(planner, &inner), "false".to_string()]
+        }
+        CallableReturnAbi::Option(OptionReturnAbi::Nullable) => vec!["nil".to_string()],
+        _ => unreachable!("only Option's `None` lacks a payload"),
+    }
+}
+
+/// Destructure a Lisette tagged value into a lowered Go-tuple return,
+/// as structured tag-check `IfPlan`s and `Return` leaves.
+pub(crate) fn emit_lowered_result_return(
+    planner: &mut Planner,
+    result_value: &str,
+    return_ty: &Type,
+    shape: &CallableReturnAbi,
+) -> Vec<LoweredStatement> {
+    planner.require_stdlib();
+    let p = result_value;
+    match shape {
+        CallableReturnAbi::BareError | CallableReturnAbi::Result { .. } => vec![
+            tag_check(
+                format!("{p}.Tag == {RESULT_OK_TAG}"),
+                Vec::new(),
+                lowered_ok_values(shape, &format!("{p}.OkVal")),
+            ),
+            multi_value_return(lowered_err_values(
+                planner,
+                shape,
+                return_ty,
+                &format!("{p}.ErrVal"),
+            )),
+        ],
+        CallableReturnAbi::Partial { .. } => {
+            let ok_ty = planner.facts.peel_alias(return_ty).ok_type();
+            let zero = lowered_zero(planner, &ok_ty);
+            vec![
+                tag_check(
+                    format!("{p}.Tag == {PARTIAL_OK_TAG}"),
+                    Vec::new(),
+                    vec![format!("{p}.OkVal"), "nil".to_string()],
+                ),
+                tag_check(
+                    format!("{p}.Tag == {PARTIAL_ERR_TAG}"),
+                    Vec::new(),
+                    vec![zero, format!("{p}.ErrVal")],
+                ),
+                multi_value_return(vec![format!("{p}.OkVal"), format!("{p}.ErrVal")]),
+            ]
+        }
+        CallableReturnAbi::Option(OptionReturnAbi::CommaOk { .. } | OptionReturnAbi::Nullable) => {
+            vec![
+                tag_check(
+                    format!("{p}.Tag == {OPTION_SOME_TAG}"),
+                    Vec::new(),
+                    lowered_ok_values(shape, &format!("{p}.SomeVal")),
+                ),
+                multi_value_return(lowered_none_values(planner, shape, return_ty)),
+            ]
+        }
+        CallableReturnAbi::Tuple { .. } => {
+            emit_lowered_tuple_return(planner, result_value, return_ty)
+        }
+        CallableReturnAbi::Tagged
+        | CallableReturnAbi::Direct
+        | CallableReturnAbi::Option(OptionReturnAbi::Sentinel(_)) => {
+            unreachable!("not a lowered Lisette return ABI")
+        }
+    }
+}
+
+fn emit_lowered_tuple_return(
+    planner: &mut Planner,
+    result_value: &str,
+    return_ty: &Type,
+) -> Vec<LoweredStatement> {
+    let (mut statements, fields) = lowered_tuple_values(planner, result_value, return_ty);
+    statements.push(multi_value_return(fields));
+    statements
+}
+
+/// Project each field of a lowered tuple value, unwrapping any
+/// nullable-Option slot to its bare Go nilable.
+fn lowered_tuple_values(
+    planner: &mut Planner,
+    tuple_value: &str,
+    tuple_ty: &Type,
+) -> (Vec<LoweredStatement>, Vec<String>) {
+    let slot_tys = tuple_element_types(&planner.facts.peel_alias(tuple_ty));
+    let mut statements = Vec::new();
+    let fields = slot_tys
+        .iter()
+        .enumerate()
+        .map(|(i, slot_ty)| {
+            let raw = format!("{}.{}", tuple_value, TUPLE_FIELDS[i]);
+            if planner.facts.is_nullable_option(slot_ty) {
+                let inner = planner.use_go_type(&slot_ty.ok_type());
+                planner.plan_option_projection(&mut statements, &raw, "unwrap", &inner, false)
+            } else {
+                raw
+            }
+        })
+        .collect();
+    (statements, fields)
+}
+
+/// Lower each element of a tuple literal into its lowered return slot.
+fn lowered_tuple_literal_values(
+    planner: &mut Planner,
+    elements: &[Expression],
+    tuple_ty: &Type,
+) -> (Vec<LoweredStatement>, Vec<String>) {
+    let slot_tys = tuple_element_types(&planner.facts.peel_alias(tuple_ty));
+    let stages: Vec<ValuePlan> = elements
+        .iter()
+        .enumerate()
+        .map(|(i, e)| match slot_tys.get(i) {
+            Some(slot_ty) if planner.facts.is_nullable_option(slot_ty) => {
+                lower_nullable_slot_value(planner, e, slot_ty)
+            }
+            _ => planner.lower_composite_value(e, ExpressionContext::value()),
+        })
+        .collect();
+    let (mut statements, parts) = planner
+        .sequence_values(stages, CaptureBoundary::SiblingSequence, "ret")
+        .into_rendered();
+    let parts = planner.coerce_elements_to_slots(&mut statements, elements, parts, &slot_tys);
+    (statements, parts)
+}
+
+impl Planner<'_> {
+    /// Wrap a callable's physical Go result into the Lisette-visible value.
+    pub(crate) fn lower_abi_to_tagged(
+        &mut self,
+        raw_value: &str,
+        abi: &CallableReturnAbi,
+        result_ty: &Type,
+    ) -> (Vec<LoweredStatement>, String) {
+        if abi.is_passthrough() {
+            return (Vec::new(), raw_value.to_string());
+        }
+        if let CallableReturnAbi::Tuple { arity } = abi {
+            let mut statements = Vec::new();
+            let temps = self.create_temp_vars("ret", *arity);
+            statements.push(LoweredStatement::RawGo(format!(
+                "{} := {}\n",
+                temps.join(", "),
+                raw_value
+            )));
+            let slot_tys = tuple_element_types(&self.facts.peel_alias(result_ty));
+            let values: Vec<String> = temps
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    slot_tys
+                        .get(index)
+                        .filter(|slot_ty| self.facts.is_nullable_option(slot_ty))
+                        .map(|slot_ty| {
+                            self.plan_nil_check_option_wrap(&mut statements, value, slot_ty)
+                        })
+                        .unwrap_or_else(|| value.clone())
+                })
+                .collect();
+            let tuple = self.plan_tuple_from_vars(&mut statements, &values, result_ty);
+            return (statements, tuple);
+        }
+
+        let (wrap, outcome) =
+            self.lower_abi_wrapping(raw_value, abi, result_ty, WrapperTarget::FreshSlot);
+        (wrap, outcome.expect("wrapper produced no slot"))
+    }
+
+    /// Wrap a callable's physical Go result and return it in each wrapper branch.
+    pub(crate) fn lower_abi_to_tagged_return(
+        &mut self,
+        raw_value: &str,
+        abi: &CallableReturnAbi,
+        result_ty: &Type,
+    ) -> Vec<LoweredStatement> {
+        if abi.is_passthrough() || matches!(abi, CallableReturnAbi::Tuple { .. }) {
+            let (mut statements, value) = self.lower_abi_to_tagged(raw_value, abi, result_ty);
+            statements.push(plain_return(value));
+            return statements;
+        }
+        let (statements, outcome) =
+            self.lower_abi_wrapping(raw_value, abi, result_ty, WrapperTarget::Return);
+        debug_assert!(outcome.is_none(), "Return target emits its own returns");
+        statements
+    }
+}
+
+/// Wrap a tagged-return callback into a Go body producing the lowered Go
+/// return shape. Returns `(go_return_type, body)`.
+fn emit_return_adapter(
+    planner: &mut Planner,
+    inner_call: &str,
+    lisette_return_type: &Type,
+) -> Option<(String, String)> {
+    let return_type = lisette_return_type;
+
+    if return_type.is_result() {
+        planner.require_stdlib();
+        let shape = if return_type.ok_type().is_unit() {
+            CallableReturnAbi::BareError
+        } else {
+            CallableReturnAbi::Result {
+                payload: PayloadLayout::Packed,
+            }
+        };
+        return Some(emit_shape_return_adapter(
+            planner,
+            inner_call,
+            return_type,
+            &shape,
+            "res",
+        ));
+    }
+    if return_type.is_partial() {
+        planner.require_stdlib();
+        let shape = CallableReturnAbi::Partial {
+            payload: PayloadLayout::Packed,
+        };
+        return Some(emit_shape_return_adapter(
+            planner,
+            inner_call,
+            return_type,
+            &shape,
+            "res",
+        ));
+    }
+    if return_type.is_option() {
+        planner.require_stdlib();
+        let encoding = if planner.facts.is_nilable_go_type(&return_type.ok_type()) {
+            OptionReturnAbi::Nullable
+        } else {
+            OptionReturnAbi::CommaOk {
+                payload: PayloadLayout::Packed,
+            }
+        };
+        let shape = CallableReturnAbi::Option(encoding);
+        return Some(emit_shape_return_adapter(
+            planner,
+            inner_call,
+            return_type,
+            &shape,
+            "opt",
+        ));
+    }
+    if return_type.tuple_arity().is_some_and(|n| n >= 2) {
+        planner.require_stdlib();
+        return emit_tuple_return_adapter(planner, inner_call, return_type);
+    }
+    None
+}
+
+/// Returns `(go_return_type, body)` for a tagged result destructured into `shape`.
+fn emit_shape_return_adapter(
+    planner: &mut Planner,
+    inner_call: &str,
+    return_type: &Type,
+    shape: &CallableReturnAbi,
+    prefix: &str,
+) -> (String, String) {
+    let go_return = planner.render_lowered_return_ty(shape, return_type);
+    let result = planner.fresh_var(Some(prefix));
+    planner.declare(&result);
+    let mut body = format!("{result} := {inner_call}\n");
+    render_lowered_result_return(planner, &mut body, &result, return_type, shape);
+    (go_return, body)
+}
+
+/// Arity-2+ tuple → Go multi-return. Each slot recurses through
+/// `emit_return_adapter`, wrapping in an IIFE when the slot itself needs
+/// adapter-style unwrapping.
+fn emit_tuple_return_adapter(
+    planner: &mut Planner,
+    inner_call: &str,
+    return_type: &Type,
+) -> Option<(String, String)> {
+    let tuple_params: Vec<Type> = match return_type {
+        Type::Tuple(elements) => elements.clone(),
+        Type::Nominal { params, .. } => params.clone(),
+        _ => return None,
+    };
+    let arity = tuple_params.len();
+    let tup = planner.fresh_var(Some("tup"));
+    planner.declare(&tup);
+
+    let mut body = format!("{tup} := {inner_call}\n");
+    let mut ret_types: Vec<String> = Vec::with_capacity(arity);
+    let mut field_exprs: Vec<String> = Vec::with_capacity(arity);
+
+    for (i, slot_ty) in tuple_params.iter().enumerate() {
+        let raw_field = format!("{tup}.{}", TUPLE_FIELDS[i]);
+        match emit_return_adapter(planner, &raw_field, slot_ty) {
+            Some((inner_ret, inner_body)) => {
+                let sub = planner.fresh_var(Some("sub"));
+                planner.declare(&sub);
+                body.push_str(&format!(
+                    "{sub} := func() {inner_ret} {{\n{inner_body}}}()\n"
+                ));
+                field_exprs.push(sub);
+                ret_types.push(inner_ret);
+            }
+            None => {
+                ret_types.push(planner.use_go_type(slot_ty));
+                field_exprs.push(raw_field);
+            }
+        }
+    }
+
+    body.push_str(&format!("return {}\n", field_exprs.join(", ")));
+    Some((format!("({})", ret_types.join(", ")), body))
+}
+
+/// Wrap a Lisette tagged-shape function value into a Go closure that
+/// presents the lowered Go ABI to callers. Identity when the return type
+/// has no lowered shape.
+pub(crate) fn emit_lisette_callback_wrapper(
+    planner: &mut Planner,
+    setup: &mut Vec<LoweredStatement>,
+    fn_value: &str,
+    fn_type: &Type,
+) -> String {
+    let Type::Function(f) = fn_type else {
+        return fn_value.to_string();
+    };
+    let params = &f.params;
+
+    let return_type = f.return_type.as_ref();
+
+    let (param_strs, arg_names) = planner.build_wrapper_params(params);
+    let params_str = param_strs.join(", ");
+
+    let cb_var = planner.hoist_tmp_value_statement(setup, "cb", fn_value);
+
+    let mut prelude = String::new();
+    let inner_args: Vec<String> = arg_names
+        .iter()
+        .zip(params.iter())
+        .map(|(name, param)| lower_arg_to_tagged(planner, &mut prelude, name, &param.ty))
+        .collect();
+
+    let call_str = format!("{}({})", cb_var, inner_args.join(", "));
+
+    // Option<fn> adaptation only fires in interface-method shims. Here
+    // a closure-valued Option means the caller owns the nil check.
+    if let Type::Nominal { id, params: ps, .. } = return_type
+        && id == "Option"
+        && let Some(inner) = ps.first()
+        && matches!(inner.unwrap_forall(), Type::Function(_))
+    {
+        return fn_value.to_string();
+    }
+
+    let adapter = emit_return_adapter(planner, &call_str, return_type);
+    let Some((go_ret, body)) = adapter else {
+        return fn_value.to_string();
+    };
+
+    format!("func({params_str}) {go_ret} {{\n{prelude}{body}}}")
+}
+
+/// Wrap a lowered-return fn into a closure re-presenting the return in
+/// `target_shape` (tagged when `None`). Pipes through tagged form so any
+/// (arg, target) shape pair works.
+pub(crate) fn emit_fn_arg_shape_adapter(
+    planner: &mut Planner,
+    output: &mut String,
+    fn_value: &str,
+    arg_fn_type: &Type,
+    arg_abi: &CallableReturnAbi,
+    target_abi: &CallableReturnAbi,
+) -> Option<String> {
+    let params = arg_fn_type.get_function_params()?;
+    let arg_ret = arg_fn_type.get_function_ret()?;
+
+    let cb_var = planner.hoist_tmp_value(output, "cb", fn_value);
+    let (param_strs, arg_names) = planner.build_wrapper_params(params);
+    let inner_call = format!("{}({})", cb_var, arg_names.join(", "));
+
+    let outer_ret = planner.render_lowered_return_ty(target_abi, arg_ret);
+
+    let body = if target_abi.is_passthrough() {
+        let statements = planner.lower_abi_to_tagged_return(&inner_call, arg_abi, arg_ret);
+        Renderer.render_setup(&statements)
+    } else {
+        let (wrap_statements, tagged) = planner.lower_abi_to_tagged(&inner_call, arg_abi, arg_ret);
+        let mut body = Renderer.render_setup(&wrap_statements);
+        render_lowered_result_return(planner, &mut body, &tagged, arg_ret, target_abi);
+        body
+    };
+
+    Some(format!(
+        "func({}) {} {{\n{}}}",
+        param_strs.join(", "),
+        outer_ret,
+        body
+    ))
+}
+
+/// Convert a fn-typed wrapper arg from lowered Go ABI back to tagged for
+/// the inner call. Identity for non-fn args and for fn args with no
+/// lowered return.
+pub(crate) fn lower_arg_to_tagged(
+    planner: &mut Planner,
+    prelude: &mut String,
+    arg_name: &str,
+    param_ty: &Type,
+) -> String {
+    let unwrapped = param_ty.unwrap_forall();
+    let Type::Function(f) = unwrapped else {
+        return arg_name.to_string();
+    };
+    let inner_params = &f.params;
+    let inner_ret = f.return_type.as_ref();
+    let Some(shape) = planner.classify_direct_emission(inner_ret) else {
+        return arg_name.to_string();
+    };
+    let abi = shape;
+
+    let (inner_param_strs, inner_arg_names) = planner.build_wrapper_params(inner_params);
+    let inner_call = format!("{}({})", arg_name, inner_arg_names.join(", "));
+    let tagged_ret = planner.use_go_type(inner_ret);
+
+    let wrap_statements = planner.lower_abi_to_tagged_return(&inner_call, &abi, inner_ret);
+    let body = Renderer.render_setup(&wrap_statements);
+
+    let tagged_var = planner.fresh_var(Some("tagged"));
+    planner.declare(&tagged_var);
+    write_line!(
+        prelude,
+        "{} := func({}) {} {{\n{}}}",
+        tagged_var,
+        inner_param_strs.join(", "),
+        tagged_ret,
+        body
+    );
+    tagged_var
+}
+
+/// Tail return for `Partial` and `Tuple` ABIs. Returns `true` when this
+/// path handled the emission.
+pub(crate) fn try_emit_lowered_tail_return(
+    planner: &mut Planner,
+    expression: &Expression,
+) -> Option<Vec<LoweredStatement>> {
+    let shape = planner.return_ctx().lowered_shape()?;
+    match shape {
+        CallableReturnAbi::Partial { .. } => Some(emit_lowered_partial_tail(planner, expression)),
+        CallableReturnAbi::Tuple { arity, .. } => {
+            Some(emit_lowered_tuple_tail(planner, expression, arity))
+        }
+        _ => None,
+    }
+}
+
+fn lowered_tail_fallback(
+    planner: &mut Planner,
+    expression: &Expression,
+    return_ty: &Type,
+    shape: &CallableReturnAbi,
+    hoist_hint: Option<&str>,
+) -> Vec<LoweredStatement> {
+    let (mut statements, value) = planner
+        .lower_value(expression, ExpressionContext::value())
+        .into_parts();
+    let value = match hoist_hint {
+        Some(hint) => planner.hoist_tmp_value_statement(&mut statements, hint, &value),
+        None => value,
+    };
+    statements.extend(emit_lowered_result_return(
+        planner, &value, return_ty, shape,
+    ));
+    statements
+}
+
+fn emit_lowered_tuple_tail(
+    planner: &mut Planner,
+    expression: &Expression,
+    arity: usize,
+) -> Vec<LoweredStatement> {
+    use Expression;
+    let return_ty = planner.return_ctx().expect_ty();
+    if let Expression::Tuple { elements, .. } = expression
+        && elements.len() == arity
+    {
+        let (mut statements, parts) = lowered_tuple_literal_values(planner, elements, &return_ty);
+        statements.push(multi_value_return(parts));
+        return statements;
+    }
+
+    lowered_tail_fallback(
+        planner,
+        expression,
+        &return_ty,
+        &CallableReturnAbi::Tuple { arity },
+        Some("tup"),
+    )
+}
+
+fn emit_lowered_partial_tail(
+    planner: &mut Planner,
+    expression: &Expression,
+) -> Vec<LoweredStatement> {
+    use Expression;
+    let return_ty = planner.return_ctx().expect_ty();
+
+    if let Expression::Call {
+        expression: callee,
+        args,
+        ..
+    } = expression
+        && let Some(variant) = callee.as_partial_constructor()
+    {
+        let mut statements = Vec::new();
+        let ret = match variant {
+            "Ok" => {
+                let (setup, v) = planner
+                    .lower_composite_value(&args[0], ExpressionContext::value())
+                    .into_parts();
+                statements.extend(setup);
+                multi_value_return(vec![v, "nil".to_string()])
+            }
+            "Err" => {
+                let (setup, e) = planner
+                    .lower_composite_value(&args[0], ExpressionContext::value())
+                    .into_parts();
+                statements.extend(setup);
+                let ok_ty = planner.facts.peel_alias(&return_ty).ok_type();
+                multi_value_return(vec![lowered_zero(planner, &ok_ty), e])
+            }
+            "Both" => {
+                let (setup_v, v) = planner
+                    .lower_composite_value(&args[0], ExpressionContext::value())
+                    .into_parts();
+                statements.extend(setup_v);
+                let (setup_e, e) = planner
+                    .lower_composite_value(&args[1], ExpressionContext::value())
+                    .into_parts();
+                statements.extend(setup_e);
+                multi_value_return(vec![v, e])
+            }
+            _ => unreachable!("as_partial_constructor only returns Ok/Err/Both"),
+        };
+        statements.push(ret);
+        return statements;
+    }
+
+    lowered_tail_fallback(
+        planner,
+        expression,
+        &return_ty,
+        &CallableReturnAbi::Partial {
+            payload: PayloadLayout::Packed,
+        },
+        None,
+    )
+}
+
+/// `Some(x)`/`None` collapse to `x`/`nil`; other Option expressions
+/// project at runtime.
+fn lower_nullable_slot_value(
+    planner: &mut Planner,
+    expression: &Expression,
+    slot_ty: &Type,
+) -> ValuePlan {
+    use Expression;
+    if let Expression::Call {
+        expression: callee,
+        args,
+        ..
+    } = expression
+        && let Some(kind) = callee.as_option_constructor()
+    {
+        return match kind {
+            Ok(()) => {
+                debug_assert_eq!(args.len(), 1, "Some(...) takes exactly one arg");
+                planner
+                    .lower_composite_value(&args[0], ExpressionContext::value())
+                    .with_pure_constructor_evaluation()
+            }
+            Err(()) => ValuePlan::evaluated_literal(
+                Vec::new(),
+                "nil".to_string(),
+                EvaluationEffect::PureCall,
+            ),
+        };
+    }
+    if expression.is_none_literal() {
+        return ValuePlan::evaluated_literal(
+            Vec::new(),
+            "nil".to_string(),
+            EvaluationEffect::PureCall,
+        );
+    }
+    let value = planner.lower_value(expression, ExpressionContext::value());
+    let inner = planner.use_go_type(&slot_ty.ok_type());
+    value.map_rendered_as_computed(|setup, value, _contains_deferred_evaluation| {
+        let projected = planner.plan_option_projection(setup, &value, "unwrap", &inner, false);
+        GoExpression::opaque_with_deferred_evaluation(projected, true)
+    })
+}

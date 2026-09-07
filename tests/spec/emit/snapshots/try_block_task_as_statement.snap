@@ -1,6 +1,18 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn risky() -> Result<int, string> { Ok(1) }\nfn do_something() { }\n\nfn test() {\n  let r = try {\n    let x = risky()?;\n    task { do_something() };\n    x\n  };\n  let _ = r;\n}\n"
+description: |
+  
+  fn risky() -> Result<int, string> { Ok(1) }
+  fn do_something() { }
+  
+  fn test() {
+    let r = try {
+      let x = risky()?;
+      task { do_something() };
+      x
+    };
+    let _ = r;
+  }
 ---
 package main
 
@@ -10,7 +22,7 @@ func risky() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](1)
 }
 
-func do_something() {}
+func doSomething() {}
 
 func test() {
 	var r lisette.Result[int, string]
@@ -21,7 +33,7 @@ func test() {
 		}
 		x := check_2.OkVal
 		go func() {
-			do_something()
+			doSomething()
 		}()
 		return lisette.MakeResultOk[int, string](x)
 	}()

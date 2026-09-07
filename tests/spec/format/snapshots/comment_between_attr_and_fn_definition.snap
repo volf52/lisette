@@ -1,0 +1,10 @@
+---
+source: tests/spec/format/mod.rs
+description: |-
+  #[attr]
+  // between attr and fn
+  fn f() {}
+---
+#[attr]
+// between attr and fn
+fn f() {}

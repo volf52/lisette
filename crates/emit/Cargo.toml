@@ -10,9 +10,13 @@ repository.workspace = true
 
 [lib]
 doctest = false
-test = false
 
 [dependencies]
-syntax = { package = "lisette-syntax", version = "0.1.17", path = "../syntax" }
+syntax = { package = "lisette-syntax", version = "=0.12.1", path = "../syntax" }
+diagnostics = { package = "lisette-diagnostics", version = "=0.12.1", path = "../diagnostics" }
 ecow.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
+
+[lints]
+workspace = true

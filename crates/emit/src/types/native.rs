@@ -10,6 +10,7 @@ pub(crate) enum NativeGoType {
     Sender,
     Receiver,
     String,
+    Array,
 }
 
 impl NativeGoType {
@@ -22,15 +23,12 @@ impl NativeGoType {
             NativeTypeKind::Sender => Self::Sender,
             NativeTypeKind::Receiver => Self::Receiver,
             NativeTypeKind::String => Self::String,
+            NativeTypeKind::Array => Self::Array,
         }
     }
 
     pub(crate) fn from_type(ty: &Type) -> Option<Self> {
         NativeTypeKind::from_type(ty).map(Self::from_kind)
-    }
-
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        NativeTypeKind::from_name(name).map(Self::from_kind)
     }
 
     pub(crate) fn has_type_params(&self) -> bool {
@@ -46,6 +44,7 @@ impl NativeGoType {
             Self::Sender => format!("chan<- {}", type_args[0]),
             Self::Receiver => format!("<-chan {}", type_args[0]),
             Self::String => "string".to_string(),
+            Self::Array => unreachable!("Array types are lowered directly in go_type"),
         }
     }
 
@@ -58,6 +57,7 @@ impl NativeGoType {
             Self::Sender => "Sender",
             Self::Receiver => "Receiver",
             Self::String => "string",
+            Self::Array => "Array",
         }
     }
 
@@ -70,6 +70,7 @@ impl NativeGoType {
             Self::Sender => "Sender",
             Self::Receiver => "Receiver",
             Self::String => "String",
+            Self::Array => "Array",
         }
     }
 }

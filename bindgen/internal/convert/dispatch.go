@@ -3,6 +3,9 @@ package convert
 import (
 	"go/ast"
 	"go/token"
+	"go/types"
+	"maps"
+	"slices"
 
 	"github.com/ivov/lisette/bindgen/internal/config"
 	"github.com/ivov/lisette/bindgen/internal/extract"
@@ -17,79 +20,183 @@ type ConvertResult struct {
 	Params           []FunctionParameter
 	ReturnType       string
 	Receiver         *Receiver // for methods
-	TypeParams       []string
+	TypeParams       TypeParamSpecs
 	Fields           []StructField     // for structs
 	InterfaceMethods []InterfaceMethod // for interfaces
-	Variants         []EnumVariant     // for enums (via iota)
 	ConstValue       string            // for constants
 	SkipReason       *SkipReason
-	IsInterface      bool // true when this type should be emitted as `pub interface`
-	IsTypeAlias      bool // true for Go type aliases (type X = Y)
-	CommaOk          bool // true when return is from (T, bool) comma-ok with nilable T
-	ArrayReturn      bool // true when Go type is [N]T but Lisette type is Slice<T>
+	// SkipNote attaches a leading "SKIPPED returns-with"/"SKIPPED type-with"
+	// comment to a binding that still emits its signature. Used when the
+	// return type or declared type silently downgraded to Unknown.
+	SkipNote    *SkipReason
+	IsInterface bool // true when this type should be emitted as `pub interface`
+	IsTypeAlias bool // true for Go type aliases (type X = Y)
+	CommaOk     bool // true when return is from (T, bool) comma-ok with nilable T
+	// CollapsedTypeParamRecipe is non-empty when a type param was collapsed into
+	// its shape (`S ~[]E` -> `Slice<E>`), so the Lisette type-param list no
+	// longer lines up with Go's. It holds Go's full type-param list in order,
+	// each entry as a Lisette type, so emit can rebuild Go's type arguments when
+	// inference cannot. Emitted as `#[go(collapsed_type_params, "<recipe>")]`.
+	CollapsedTypeParamRecipe string
+	// SentinelInt is set when this function returns int but the bindgen
+	// config declares a magic value (e.g. -1) for "not found". Bindgen
+	// rewrites the return type to Option<int> and emits the matching
+	// flag-name annotation (e.g. `#[go(sentinel_minus_one)]`).
+	SentinelInt *int
+	// The successor to a superseded symbol, as "pkg.Name".
+	SupersededBy string
+	// BuilderMethod suppresses unused_value on fluent-chain returns the caller typically discards.
+	BuilderMethod bool
+	// AnonStruct emits `#[go(anon_struct)]` so the compiler renders the type as
+	// the underlying Go `struct{...}` rather than `pkg.Name`.
+	AnonStruct bool
+	// HasHiddenEmbed emits `#[go(hidden_embed)]` for a struct that looks flat but
+	// has an embed bindgen could not emit, so the resolver must refuse to embed it.
+	HasHiddenEmbed bool
+	SealId         string // non-empty for an unexported seal method: its seal identity
+	UnexportedType bool   // a Go unexported type emitted only as a faithful embed target
+	// Vouches for the zero value of a type with no visible fields, which is
+	// refused by default.
+	ZeroSafe bool
+	// Denies the zero value of a struct with visible fields, which is
+	// presumed usable by default.
+	ZeroUnsafe bool
+	// A real Go field went unrepresented in Fields.
+	HasHiddenFields bool
+}
+
+// HasReturn reports whether this function/method has a non-unit return type
+// the caller can observe (i.e. anything other than `()` or absent).
+func (r *ConvertResult) HasReturn() bool {
+	return r.ReturnType != "" && r.ReturnType != "()"
 }
 
 type FunctionParameter struct {
-	Name    string
-	Type    string
-	Mutable bool
+	Name string
+	Type string
 }
 
 type Receiver struct {
-	Name         string
-	Type         string
-	IsPointer    bool
-	BaseTypeName string
-	TypeParams   []string // Type parameters of the receiver type (for generic types)
+	Name      string
+	Type      string
+	IsPointer bool
+	Mutable   bool
+	// ProvenReadOnly: SSA analyzed the method and found no receiver write, so
+	// a pointer receiver may drop the worst-case `mut` qualifier.
+	ProvenReadOnly bool
+	BaseTypeName   string
+	TypeParams     TypeParamSpecs // Type parameters of the receiver type (for generic types)
 }
 
 type StructField struct {
-	Name string
-	Type string
-	Doc  string
+	Name       string
+	Type       string
+	Doc        string
+	SkipReason *SkipReason
+	IsEmbedded bool
 }
 
 type InterfaceMethod struct {
-	Name        string
-	Params      []FunctionParameter
-	ReturnType  string
-	CommaOk     bool
-	ArrayReturn bool
+	Name          string
+	Params        []FunctionParameter
+	ReturnType    string
+	CommaOk       bool
+	BuilderMethod bool
+	SealId        string // non-empty for a Go unexported method: its seal identity
 }
 
-type EnumVariant struct {
-	Name  string
-	Value string
+// HasReturn reports whether this interface method has a non-unit return type.
+func (m *InterfaceMethod) HasReturn() bool {
+	return m.ReturnType != "" && m.ReturnType != "()"
 }
 
 // ExternalPkgs maps package paths to package names (e.g., "time" -> "time").
 type ExternalPkgs map[string]string
 
-type Converter struct {
-	currentPkgPath       string
-	externalPkgs         ExternalPkgs
-	pkg                  *packages.Package
-	cfg                  *config.Config
-	uniformPointerTypes  map[string]bool              // lazily computed; types with 10+ single-pointer-return methods
-	manyToOneTypes       map[string]bool              // lazily computed; return types with 10+ free functions
-	majorityPointerTypes map[string]bool              // lazily computed; types where ≥20 methods return same *T (>90%)
-	funcDeclCache        map[token.Pos]*ast.FuncDecl  // lazily built; AST function declarations by name position
-	nonNilCache          map[token.Pos]nilCacheResult // lazily built; proven non-nil results
-	crossPkgConverters   map[string]*Converter        // lazily built; cached converters for imported packages
-	noCrossPkg           bool                         // when true, skip cross-package transitive analysis
+type ConstGroup struct {
+	Type      ConvertResult
+	Constants []ConvertResult
 }
 
-func NewConverter(pkgPath string, pkg *packages.Package, cfg *config.Config) *Converter {
+type PackageConversion struct {
+	Symbols             []ConvertResult
+	ConstGroups         []ConstGroup
+	SyntheticTypes      []ConvertResult
+	OpaqueTypes         []ConvertResult
+	ExternalPkgs        ExternalPkgs
+	BitFlagSetTypeNames map[string]bool
+}
+
+func (p PackageConversion) NeedsSelfQualification() bool {
+	for _, result := range p.Symbols {
+		if result.Kind == extract.ExportType && CollidesWithBuiltinType(result.Name, len(result.TypeParams)) {
+			return true
+		}
+	}
+	for _, group := range p.ConstGroups {
+		if CollidesWithBuiltinType(group.Type.Name, len(group.Type.TypeParams)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ASCII SOH/STX, used to wrap a package path in reference strings so the
+// emitter can substitute it with the resolved local prefix after collision
+// detection. Neither byte can appear in identifiers or doc text.
+const (
+	PkgRefStart = "\x01"
+	PkgRefEnd   = "\x02"
+)
+
+func PkgRef(path string) string {
+	return PkgRefStart + path + PkgRefEnd
+}
+
+type Converter struct {
+	currentPkgPath           string
+	externalPkgs             ExternalPkgs
+	pkg                      *packages.Package
+	cfg                      config.Config
+	nilness                  *NilnessAnalysis             // nil falls back to name heuristics
+	mutation                 *MutationAnalysis            // nil falls back to the curated map and name heuristics
+	divergence               *DivergenceAnalysis          // nil falls back to the curated never_return map
+	uniformPointerTypes      map[string]bool              // lazily computed; types with 10+ single-pointer-return methods
+	manyToOneTypes           map[string]bool              // lazily computed; return types with 10+ free functions
+	majorityPointerTypes     map[string]bool              // lazily computed; types where ≥20 methods return same *T (>90%)
+	funcDeclCache            map[token.Pos]*ast.FuncDecl  // lazily built; AST function declarations by name position
+	valueSpecIndex           map[token.Pos]valueSpecEntry // lazily built; const/var ValueSpecs by name position
+	reachableUnexportedTypes map[string]bool              // lazily computed; unexported type names reachable from an exported decl. nil = uncomputed
+	directProducers          map[string]bool              // lazily computed; names of unexported opaque-handle structs produced by a direct value-var. nil = uncomputed
+	ifaceCandidates          []*types.Named               // lazily computed; candidate named interfaces in scope (current pkg + direct imports). nil = uncomputed
+	ifaceRepresentable       map[*types.Named]bool        // memoized per-interface "bindgen can emit this" verdicts
+	ifaceProbing             map[*types.Named]bool        // interfaces with an in-flight representability probe, to break self-referential cycles
+	shallowUnderlyingCache   map[token.Pos]types.Type     // lazily built; spec-level wrapped type by Named.Obj().Pos(). nil sentinels cached.
+	// Stand-ins for Go anonymous struct types, in first-seen order.
+	synth []syntheticStruct
+}
+
+func NewConverter(pkgPath string, pkg *packages.Package, cfg *config.Config, nilness *NilnessAnalysis, mutation *MutationAnalysis, divergence *DivergenceAnalysis) *Converter {
+	var effectiveConfig config.Config
+	if cfg != nil {
+		effectiveConfig = *cfg
+	}
 	return &Converter{
 		currentPkgPath: pkgPath,
 		externalPkgs:   make(ExternalPkgs),
 		pkg:            pkg,
-		cfg:            cfg,
+		cfg:            effectiveConfig,
+		nilness:        nilness,
+		mutation:       mutation,
+		divergence:     divergence,
 	}
 }
 
-func (c *Converter) ExternalPkgs() ExternalPkgs {
-	return c.externalPkgs
+func (c *Converter) forkProbe() *Converter {
+	probe := *c
+	probe.externalPkgs = maps.Clone(c.externalPkgs)
+	probe.synth = slices.Clone(c.synth)
+	return &probe
 }
 
 func (c *Converter) trackExternalPkg(pkgPath, pkgName string) {
@@ -98,12 +205,83 @@ func (c *Converter) trackExternalPkg(pkgPath, pkgName string) {
 	}
 }
 
-func (c *Converter) Convert(symbolExport extract.SymbolExport) ConvertResult {
+// shallowUnderlying returns the immediate spec-level wrapped type of a Named
+// type by walking its declaring package's syntax. For `type NodeTimeout
+// time.Duration` it returns `time.Duration`, not the fully-resolved `int64`
+// that types.Type.Underlying would yield. Returns nil when the AST is
+// unreachable or the spec is itself a type alias.
+func (c *Converter) shallowUnderlying(named *types.Named) types.Type {
+	obj := named.Obj()
+	if obj == nil || obj.Pkg() == nil || c.pkg == nil {
+		return nil
+	}
+	pos := obj.Pos()
+	if c.shallowUnderlyingCache == nil {
+		c.shallowUnderlyingCache = make(map[token.Pos]types.Type)
+	} else if cached, ok := c.shallowUnderlyingCache[pos]; ok {
+		return cached
+	}
+	resolved := resolveShallowUnderlying(c.pkg.Imports[obj.Pkg().Path()], obj.Name())
+	c.shallowUnderlyingCache[pos] = resolved
+	return resolved
+}
+
+func resolveShallowUnderlying(declPkg *packages.Package, typeName string) types.Type {
+	if declPkg == nil || declPkg.TypesInfo == nil {
+		return nil
+	}
+	for _, file := range declPkg.Syntax {
+		for _, decl := range file.Decls {
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range genDecl.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.Name == nil || ts.Name.Name != typeName {
+					continue
+				}
+				if ts.Assign != token.NoPos {
+					return nil
+				}
+				return declPkg.TypesInfo.TypeOf(ts.Type)
+			}
+		}
+	}
+	return nil
+}
+
+// salvageInternalAlias rescues a type alias whose RHS is in an internal
+// package (Ginkgo's `type NodeTimeout = internal.NodeTimeout` pattern) by
+// exposing the immediate wrapped type as a Lisette newtype. Returns the
+// newtype payload and true on success.
+func (c *Converter) salvageInternalAlias(rhs types.Type, reason *SkipReason) (string, bool) {
+	if reason == nil || reason.Code != "internal-package-ref" {
+		return "", false
+	}
+	named, ok := rhs.(*types.Named)
+	if !ok {
+		return "", false
+	}
+	shallow := c.shallowUnderlying(named)
+	if shallow == nil {
+		return "", false
+	}
+	under := ToLisette(shallow, c)
+	if under.SkipReason != nil {
+		return "", false
+	}
+	return under.LisetteType, true
+}
+
+func (c *Converter) convert(symbolExport extract.SymbolExport) ConvertResult {
 	result := ConvertResult{
 		Name: symbolExport.Name,
 		Kind: symbolExport.Kind,
 		Doc:  symbolExport.Doc,
 	}
+
+	synthCheckpoint := c.synthMark()
 
 	switch symbolExport.Kind {
 	case extract.ExportFunction:
@@ -118,5 +296,43 @@ func (c *Converter) Convert(symbolExport extract.SymbolExport) ConvertResult {
 		c.convertVariable(&result, symbolExport)
 	}
 
+	if result.SkipReason != nil {
+		c.rollbackSynth(synthCheckpoint)
+	}
+
 	return result
+}
+
+func (c *Converter) ConvertAll(exports []extract.SymbolExport) PackageConversion {
+	converted := make([]convertedSymbol, 0, len(exports))
+	for _, exp := range exports {
+		result := c.convert(exp)
+		converted = append(converted, convertedSymbol{export: exp, result: result})
+	}
+
+	c.finalizeInterfaceBuilders(converted)
+
+	regular, groups, bitFlagSetTypeNames := classifyConstGroups(converted, &c.cfg, c.currentPkgPath)
+	emittedTypeNames := make(map[string]bool)
+	for _, symbol := range converted {
+		if symbol.result.Kind == extract.ExportType {
+			emittedTypeNames[symbol.result.Name] = true
+		}
+	}
+
+	var opaqueTypes []ConvertResult
+	for _, handle := range c.opaqueHandles() {
+		if !emittedTypeNames[handle.Name] {
+			opaqueTypes = append(opaqueTypes, handle)
+		}
+	}
+
+	return PackageConversion{
+		Symbols:             regular,
+		ConstGroups:         groups,
+		SyntheticTypes:      c.syntheticStructs(),
+		OpaqueTypes:         opaqueTypes,
+		ExternalPkgs:        maps.Clone(c.externalPkgs),
+		BitFlagSetTypeNames: bitFlagSetTypeNames,
+	}
 }

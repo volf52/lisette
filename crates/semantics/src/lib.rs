@@ -1,24 +1,18 @@
-pub mod analyze;
+mod analysis;
 pub mod cache;
-pub mod call_classification;
 pub mod checker;
+mod closed_domain;
+pub(crate) mod diagnostics;
 pub mod facts;
-pub mod lint;
+pub mod generics;
 pub mod loader;
-pub mod module_graph;
-pub mod pattern_analysis;
+pub mod package_graph;
+pub mod path;
 pub mod prelude;
 pub mod store;
+pub mod zero;
 
-use syntax::ast::Expression;
-
-pub(crate) fn is_trivial_expression(expression: &Expression) -> bool {
-    match expression {
-        Expression::Unit { .. } => true,
-        Expression::Block { items, .. } => {
-            items.is_empty() || (items.len() == 1 && matches!(items[0], Expression::Unit { .. }))
-        }
-        Expression::Tuple { elements, .. } => elements.is_empty(),
-        _ => false,
-    }
-}
+pub use analysis::{
+    AnalysisScope, AnalyzeInput, CompilePhase, EntryFile, InferenceOutput, PARALLEL_THRESHOLD,
+    ProjectKind, RecoverTarget, run_inference,
+};

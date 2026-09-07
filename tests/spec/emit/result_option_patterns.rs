@@ -31,6 +31,61 @@ fn test() -> Option<int> {
 }
 
 #[test]
+fn option_some_types_a_literal_of_another_default() {
+    let input = r#"
+fn halved(value: Option<float64>) -> float64 {
+  match value {
+    Some(v) => v / 4.0,
+    None => 0.0,
+  }
+}
+
+fn test() -> float64 {
+  let widened: Option<float64> = Some(1)
+  halved(widened)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn result_ok_types_a_literal_of_another_default() {
+    let input = r#"
+fn test() -> Result<float64, error> {
+  let widened: Result<float64, error> = Ok(1)
+  widened
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn option_some_types_a_literal_into_a_newtype() {
+    let input = r#"
+struct Flag(bool)
+struct Ticket(int)
+
+fn test() -> (Option<Flag>, Option<Ticket>) {
+  let armed: Option<Flag> = Some(true)
+  let ticket: Option<Ticket> = Some(1)
+  (armed, ticket)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn option_some_types_a_constant_builtin_result() {
+    let input = r#"
+fn test() -> Option<float64> {
+  let widened: Option<float64> = Some(min(1, 2))
+  widened
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn option_none_construction() {
     let input = r#"
 fn test() -> Option<int> {
@@ -123,6 +178,56 @@ fn option_of_slice() {
     let input = r#"
 fn test() -> Option<Slice<int>> {
   Some([1, 2, 3])
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn some_with_named_function_alias_arg() {
+    let input = r#"
+type Handler = fn(int) -> int
+
+fn double(x: int) -> int {
+  x * 2
+}
+
+struct Wrapper {
+  pub f: Option<Handler>,
+}
+
+fn main() {
+  let _w = Wrapper { f: Some(double) }
+  let _ = _w.f
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_call_with_named_function_alias_arg() {
+    let input = r#"
+type Handler = fn(int) -> int
+
+fn double(x: int) -> int {
+  x * 2
+}
+
+struct Box<T> {
+  pub v: T,
+}
+
+struct Wrap {
+  pub b: Box<Handler>,
+}
+
+fn make_box<T>(x: T) -> Box<T> {
+  Box { v: x }
+}
+
+fn main() {
+  let _w = Wrap { b: make_box(double) }
+  let _ = _w.b
 }
 "#;
     assert_emit_snapshot!(input);
@@ -596,6 +701,429 @@ fn test() {
 }
 
 #[test]
+fn fused_result_match_ok_wildcard() {
+    let input = r#"
+import "go:errors"
+
+fn fallible(ok: bool) -> Result<int, error> {
+  if ok { Ok(1) } else { Err(errors.New("nope")) }
+}
+
+fn test() {
+  match fallible(true) {
+    Ok(_) => {},
+    Err(e) => { let _ = e },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_result_match_ok_unused_named_payload() {
+    let input = r#"
+import "go:errors"
+
+fn fallible(ok: bool) -> Result<int, error> {
+  if ok { Ok(1) } else { Err(errors.New("nope")) }
+}
+
+fn test() {
+  match fallible(true) {
+    Ok(x) => {},
+    Err(e) => { let _ = e },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_result_match_err_unused_named_payload() {
+    let input = r#"
+import "go:errors"
+
+fn fallible(ok: bool) -> Result<int, error> {
+  if ok { Ok(1) } else { Err(errors.New("nope")) }
+}
+
+fn test() {
+  match fallible(true) {
+    Ok(x) => { let _ = x },
+    Err(e) => {},
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_pointer_result_match_unused_err() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test() {
+  let file = match os.Create("f") {
+    Ok(f) => f,
+    Err(e) => {
+      fmt.Println("error")
+      return
+    },
+  }
+  defer file.Close()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_pointer_result_match_used_err() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test() {
+  let file = match os.Create("f") {
+    Ok(f) => f,
+    Err(e) => {
+      fmt.Println(e)
+      return
+    },
+  }
+  defer file.Close()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_pointer_result_match_ok_wildcard() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test() {
+  match os.Create("f") {
+    Ok(_) => fmt.Println("made"),
+    Err(e) => fmt.Println(e),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_interface_result_match_uses_nil_interface_guard() {
+    let input = r#"
+import "go:net"
+import "go:fmt"
+
+fn test() {
+  match net.Dial("tcp", "addr") {
+    Ok(conn) => { let _ = conn },
+    Err(e) => fmt.Println(e),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_if_let_err() {
+    let input = r#"
+import "go:os"
+
+fn test(name: string) -> string {
+  if let Err(e) = os.Stat(name) {
+    return name
+  }
+  "found"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_if_let_err_reads_payload() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test(name: string) {
+  if let Err(e) = os.Stat(name) {
+    fmt.Println(e)
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_if_let_ok() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test(name: string) {
+  if let Ok(info) = os.Stat(name) {
+    fmt.Println(info.Name())
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_if_let_ok_with_else() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test(name: string) {
+  if let Ok(info) = os.Stat(name) {
+    fmt.Println(info.Name())
+  } else {
+    fmt.Println("missing")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_if_let_err_on_pointer_return() {
+    let input = r#"
+import "go:os"
+
+fn test(name: string) -> bool {
+  if let Err(e) = os.Open(name) {
+    return false
+  }
+  true
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_let_else_pointer_return() {
+    let input = r#"
+import "go:net/url"
+
+fn test(raw: string) -> string {
+  let Ok(parsed) = url.Parse(raw) else {
+    return "bad"
+  }
+  parsed.Scheme
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_let_else_interface_return() {
+    let input = r#"
+import "go:os"
+
+fn test(name: string) -> bool {
+  let Ok(info) = os.Stat(name) else {
+    return false
+  }
+  info.IsDir()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_let_else_discarded_payload() {
+    let input = r#"
+import "go:os"
+
+fn test(name: string) -> bool {
+  let Ok(_) = os.Stat(name) else {
+    return false
+  }
+  true
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_let_else_without_nil_guard() {
+    let input = r#"
+import "go:strconv"
+
+fn test(text: string) -> int {
+  let Ok(parsed) = strconv.Atoi(text) else {
+    return -1
+  }
+  parsed
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_let_else_shadows_outer_binding() {
+    let input = r#"
+import "go:strconv"
+import "go:fmt"
+
+fn test(text: string) -> int {
+  let parsed = "outer"
+  fmt.Println(parsed)
+  let Ok(parsed) = strconv.Atoi(text) else {
+    return -1
+  }
+  parsed
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_lisette_result_let_else() {
+    let input = r#"
+import "go:errors"
+
+fn fallible(ok: bool) -> Result<int, error> {
+  if ok { Ok(1) } else { Err(errors.New("nope")) }
+}
+
+fn test() -> int {
+  let Ok(x) = fallible(true) else {
+    return -1
+  }
+  x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_on_result_value_is_not_fused() {
+    let input = r#"
+fn test(res: Result<int, string>) -> int {
+  let Ok(x) = res else {
+    return -1
+  }
+  x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_go_result_match_both_arms_empty() {
+    let input = r#"
+import "go:strconv"
+
+fn test(text: string) {
+  match strconv.Atoi(text) {
+    Ok(_) => (),
+    Err(_) => (),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn fused_bare_error_match_binds_unit_payload() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test() {
+  match os.Remove("f") {
+    Ok(x) => { fmt.Println(x) },
+    Err(e) => { fmt.Println(e) },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_fused_go_result_match_binds_call_slot() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test(name: string) {
+  let file = match os.Open(name) {
+    Ok(f) => f,
+    Err(e) => {
+      fmt.Println("cannot open")
+      return
+    },
+  }
+  fmt.Println(file.Name())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_fused_go_result_match_binds_interface_call_slot() {
+    let input = r#"
+import "go:net"
+import "go:fmt"
+
+fn test(addr: string) {
+  let conn = match net.Dial("tcp", addr) {
+    Ok(c) => c,
+    Err(e) => {
+      fmt.Println("cannot dial")
+      return
+    },
+  }
+  let _ = conn
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_match_with_non_diverging_err_arm_keeps_declaration() {
+    let input = r#"
+import "go:strconv"
+
+fn test(text: string) -> int {
+  let parsed = match strconv.Atoi(text) {
+    Ok(n) => n,
+    Err(e) => -1,
+  }
+  parsed
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_match_with_computed_ok_arm_keeps_declaration() {
+    let input = r#"
+import "go:os"
+import "go:fmt"
+
+fn test(name: string) {
+  let label = match os.Open(name) {
+    Ok(f) => f.Name(),
+    Err(e) => {
+      fmt.Println("cannot open")
+      return
+    },
+  }
+  fmt.Println(label)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn while_let_option_function_call() {
     let input = r#"
 import "go:fmt"
@@ -828,7 +1356,7 @@ fn print_hello() -> Result<int, error> {
 fn option_with_interface_type_param() {
     let input = r#"
 interface Printable {
-  fn to_string(self) -> string
+  fn to_string() -> string
 }
 
 struct Text { content: string }
@@ -845,10 +1373,27 @@ fn test() {
 }
 
 #[test]
+fn option_with_unknown_type_param() {
+    let input = r#"
+fn take(value: Option<Unknown>) -> bool {
+  value.is_some()
+}
+
+fn test() {
+  let boxed: Option<Unknown> = Some(1)
+  if !take(boxed) {
+    panic("Option<Unknown> lost its widened type argument")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn slice_of_option_interface() {
     let input = r#"
 interface Printable {
-  fn to_string(self) -> string
+  fn to_string() -> string
 }
 
 struct Text { content: string }
@@ -887,6 +1432,28 @@ fn main() {
     Err(e) => {
       let _ = e
       ()
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lisette_function_returning_result_tuple_uses_packed_abi() {
+    let input = r#"
+fn pair<A, B>(a: A, b: B) -> Result<(A, B), error> {
+  Ok((a, b))
+}
+
+fn test() {
+  match pair<int, string>(1, "x") {
+    Ok((first, second)) => {
+      let _ = first
+      let _ = second
+    },
+    Err(e) => {
+      let _ = e
     },
   }
 }
@@ -1041,10 +1608,9 @@ fn test() -> Option<()> {
 fn wrapped_return_temp_no_collision() {
     let input = r#"
 fn foo() -> Option<int> {
-  return if true { Some(1) } else { None };
   let tmp_1 = 7;
   let _ = tmp_1;
-  None
+  return if true { Some(1) } else { None };
 }
 
 fn main() {
@@ -1293,6 +1859,16 @@ fn test() -> Option<int> {
 }
 
 #[test]
+fn tail_panic_in_result_returning_function() {
+    let input = r#"
+fn forbidden() -> Result<int, error> {
+  panic("boom")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn nested_try_in_if_arm_with_never_tail() {
     let input = r#"
 fn die() -> Never { panic("dead") }
@@ -1305,6 +1881,348 @@ fn test(flag: bool) -> Result<int, string> {
     }
   } else {
     Ok(42)
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_direct_err_lowered_result_tuple() {
+    let input = r#"
+import "go:errors"
+
+fn fail() -> Result<int, error> {
+  Err(errors.New("boom"))?
+  Ok(1)
+}
+
+fn main() {
+  let _ = fail()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_direct_none_lowered_option_comma_ok() {
+    let input = r#"
+fn missing() -> Option<int> {
+  None?
+  Some(1)
+}
+
+fn main() {
+  let _ = missing()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_direct_err_lowered_bare_error() {
+    let input = r#"
+import "go:errors"
+
+fn fail_unit() -> Result<(), error> {
+  Err(errors.New("boom"))?
+  Ok(())
+}
+
+fn main() {
+  let _ = fail_unit()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn wrap_err_propagation() {
+    let input = r#"
+fn load(r: Result<int, error>) -> Result<int, error> {
+  let n = r.wrap_err("loading config")?
+  Ok(n)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn wrap_err_runtime_wraps_message() {
+    let input = r#"
+import "go:errors"
+
+fn test() {
+  let r: Result<int, error> = Err(errors.New("boom"))
+  match r.wrap_err("loading config") {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "loading config: boom" {
+        panic("wrong wrapped message")
+      }
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_widens_concrete_error_in_lowered_return() {
+    let input = r#"
+struct ValidationError { field: string }
+
+impl ValidationError {
+  fn Error(self) -> string { f"{self.field}: required" }
+}
+
+fn validate(name: string) -> Result<string, ValidationError> {
+  if name == "" { return Err(ValidationError { field: "name" }) }
+  Ok(name)
+}
+
+fn load(name: string) -> Result<string, error> {
+  let n = validate(name)?
+  Ok(n)
+}
+
+fn test() {
+  match load("") {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "name: required" {
+        panic("wrong widened error")
+      }
+    },
+  }
+  match load("ada") {
+    Ok(v) => {
+      if v != "ada" {
+        panic("wrong ok value")
+      }
+    },
+    Err(_) => panic("expected ok"),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_widens_in_annotated_try_block() {
+    let input = r#"
+struct AError { }
+
+impl AError {
+  fn Error(self) -> string { "a failed" }
+}
+
+struct BError { }
+
+impl BError {
+  fn Error(self) -> string { "b failed" }
+}
+
+fn do_a(ok: bool) -> Result<int, AError> {
+  if ok { Ok(1) } else { Err(AError {}) }
+}
+
+fn do_b(ok: bool) -> Result<int, BError> {
+  if ok { Ok(2) } else { Err(BError {}) }
+}
+
+fn test() {
+  let r: Result<int, error> = try {
+    let a = do_a(true)?
+    let b = do_b(false)?
+    a + b
+  }
+  match r {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "b failed" {
+        panic("wrong try block error")
+      }
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_widens_in_prelude_callback_lambda() {
+    let input = r#"
+struct ParseError { text: string }
+
+impl ParseError {
+  fn Error(self) -> string { f"bad: {self.text}" }
+}
+
+fn parse_word(w: string) -> Result<int, ParseError> {
+  if w == "x" { Err(ParseError { text: w }) } else { Ok(w.length()) }
+}
+
+fn test() {
+  let words = ["one", "x"]
+  let parsed = words.map(|w| -> Result<int, error> {
+    let n = parse_word(w)?
+    Ok(n)
+  })
+  match parsed[0] {
+    Ok(n) => {
+      if n != 3 {
+        panic("wrong parsed length")
+      }
+    },
+    Err(_) => panic("expected ok"),
+  }
+  match parsed[1] {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "bad: x" {
+        panic("wrong lambda error")
+      }
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_widens_to_custom_interface_with_different_ok_types() {
+    let input = r#"
+pub interface AppError {
+  fn Error() -> string
+  fn status() -> int
+}
+
+struct DbError { }
+
+impl DbError {
+  fn Error(self) -> string { "db down" }
+  pub fn status(self) -> int { 500 }
+}
+
+fn query(ok: bool) -> Result<string, DbError> {
+  if ok { Ok("row") } else { Err(DbError {}) }
+}
+
+fn handler(ok: bool) -> Result<int, AppError> {
+  let row = query(ok)?
+  Ok(row.length())
+}
+
+fn test() {
+  match handler(false) {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.status() != 500 || e.Error() != "db down" {
+        panic("wrong app error")
+      }
+    },
+  }
+  match handler(true) {
+    Ok(n) => {
+      if n != 3 {
+        panic("wrong ok length")
+      }
+    },
+    Err(_) => panic("expected ok"),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn err_literal_propagate_widens() {
+    let input = r#"
+struct AError { }
+
+impl AError {
+  fn Error(self) -> string { "a failed" }
+}
+
+fn bail(flag: bool) -> Result<int, error> {
+  if flag { Err(AError {})? }
+  Ok(1)
+}
+
+fn test() {
+  match bail(true) {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "a failed" {
+        panic("wrong literal error")
+      }
+    },
+  }
+  match bail(false) {
+    Ok(v) => {
+      if v != 1 {
+        panic("wrong ok value")
+      }
+    },
+    Err(_) => panic("expected ok"),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn return_err_widens_concrete_error() {
+    let input = r#"
+struct AError { }
+
+impl AError {
+  fn Error(self) -> string { "a failed" }
+}
+
+fn bail() -> Result<int, error> {
+  return Err(AError {})
+}
+
+fn test() {
+  match bail() {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "a failed" {
+        panic("wrong returned error")
+      }
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagate_widens_ref_with_pointer_receiver_error_method() {
+    let input = r#"
+struct FileError { path: string }
+
+impl FileError {
+  fn Error(self: Ref<FileError>) -> string { f"cannot open {self.path}" }
+}
+
+fn read_value() -> Result<int, Ref<FileError>> { Err(&FileError { path: "a.txt" }) }
+
+fn load() -> Result<int, error> {
+  let n = read_value()?
+  Ok(n)
+}
+
+fn test() {
+  match load() {
+    Ok(_) => panic("expected error"),
+    Err(e) => {
+      if e.Error() != "cannot open a.txt" {
+        panic("wrong ref error")
+      }
+    },
   }
 }
 "#;

@@ -1,6 +1,11 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test(opt: Option<int>) -> int {\n  let Some(x) = opt else { return 0; };\n  x\n}\n"
+description: |
+  
+  fn test(opt: Option<int>) -> int {
+    let Some(x) = opt else { return 0; };
+    x
+  }
 ---
 package main
 
@@ -10,5 +15,6 @@ func test(opt lisette.Option[int]) int {
 	if opt.Tag != lisette.OptionSome {
 		return 0
 	}
-	return opt.SomeVal
+	x := opt.SomeVal
+	return x
 }

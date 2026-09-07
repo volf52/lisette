@@ -4,6 +4,10 @@
     "named": true,
     "subtypes": [
       {
+        "type": "assert_statement",
+        "named": true
+      },
+      {
         "type": "attribute_item",
         "named": true
       },
@@ -57,10 +61,6 @@
       },
       {
         "type": "type_item",
-        "named": true
-      },
-      {
-        "type": "value_enum_item",
         "named": true
       },
       {
@@ -252,6 +252,10 @@
         "named": true
       },
       {
+        "type": "raw_string_literal",
+        "named": true
+      },
+      {
         "type": "string_literal",
         "named": true
       }
@@ -279,6 +283,10 @@
       },
       {
         "type": "negative_literal",
+        "named": true
+      },
+      {
+        "type": "raw_string_literal",
         "named": true
       },
       {
@@ -313,6 +321,10 @@
       },
       {
         "type": "remaining_field_pattern",
+        "named": true
+      },
+      {
+        "type": "scoped_type_identifier",
         "named": true
       },
       {
@@ -364,6 +376,10 @@
       {
         "type": "unit_type",
         "named": true
+      },
+      {
+        "type": "writable_type",
+        "named": true
       }
     ]
   },
@@ -377,6 +393,10 @@
       "types": [
         {
           "type": "_expression",
+          "named": true
+        },
+        {
+          "type": "spread_argument",
           "named": true
         }
       ]
@@ -402,6 +422,22 @@
         "types": [
           {
             "type": "_pattern",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "assert_statement",
+    "named": true,
+    "fields": {
+      "condition": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_expression",
             "named": true
           }
         ]
@@ -540,7 +576,15 @@
             "named": false
           },
           {
+            "type": "&",
+            "named": false
+          },
+          {
             "type": "&&",
+            "named": false
+          },
+          {
+            "type": "&^",
             "named": false
           },
           {
@@ -564,6 +608,10 @@
             "named": false
           },
           {
+            "type": "<<",
+            "named": false
+          },
+          {
             "type": "<=",
             "named": false
           },
@@ -577,6 +625,18 @@
           },
           {
             "type": ">=",
+            "named": false
+          },
+          {
+            "type": ">>",
+            "named": false
+          },
+          {
+            "type": "^",
+            "named": false
+          },
+          {
+            "type": "|",
             "named": false
           },
           {
@@ -907,6 +967,14 @@
             "named": false
           },
           {
+            "type": "&=",
+            "named": false
+          },
+          {
+            "type": "&^=",
+            "named": false
+          },
+          {
             "type": "*=",
             "named": false
           },
@@ -920,6 +988,22 @@
           },
           {
             "type": "/=",
+            "named": false
+          },
+          {
+            "type": "<<=",
+            "named": false
+          },
+          {
+            "type": ">>=",
+            "named": false
+          },
+          {
+            "type": "^=",
+            "named": false
+          },
+          {
+            "type": "|=",
             "named": false
           }
         ]
@@ -1230,6 +1314,10 @@
         {
           "type": "field_declaration",
           "named": true
+        },
+        {
+          "type": "struct_embedding",
+          "named": true
         }
       ]
     }
@@ -1313,6 +1401,10 @@
         {
           "type": "shorthand_field_initializer",
           "named": true
+        },
+        {
+          "type": "zero_fill_initializer",
+          "named": true
         }
       ]
     }
@@ -1381,6 +1473,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "mutable_specifier",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -1533,7 +1635,7 @@
         "required": true,
         "types": [
           {
-            "type": "parameters",
+            "type": "parameter_types",
             "named": true
           }
         ]
@@ -1750,6 +1852,10 @@
           {
             "type": "type_identifier",
             "named": true
+          },
+          {
+            "type": "writable_type",
+            "named": true
           }
         ]
       },
@@ -1818,6 +1924,10 @@
       "multiple": true,
       "required": false,
       "types": [
+        {
+          "type": "attribute_item",
+          "named": true
+        },
         {
           "type": "function_signature_item",
           "named": true
@@ -2163,13 +2273,18 @@
           }
         ]
       }
-    },
+    }
+  },
+  {
+    "type": "parameter_types",
+    "named": true,
+    "fields": {},
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
         {
-          "type": "mutable_specifier",
+          "type": "_type",
           "named": true
         }
       ]
@@ -2183,10 +2298,6 @@
       "multiple": true,
       "required": false,
       "types": [
-        {
-          "type": "_type",
-          "named": true
-        },
         {
           "type": "attribute_item",
           "named": true
@@ -2559,6 +2670,25 @@
         {
           "type": "expression_statement",
           "named": true
+        },
+        {
+          "type": "shebang",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "spread_argument",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "_expression",
+          "named": true
         }
       ]
     }
@@ -2580,6 +2710,22 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "struct_embedding",
+    "named": true,
+    "fields": {
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "_type",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -2997,105 +3143,6 @@
     "fields": {}
   },
   {
-    "type": "value_enum_item",
-    "named": true,
-    "fields": {
-      "body": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "value_enum_variant_list",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "type_identifier",
-            "named": true
-          }
-        ]
-      },
-      "underlying_type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "_type",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": false,
-      "required": false,
-      "types": [
-        {
-          "type": "visibility_modifier",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "value_enum_variant",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "identifier",
-            "named": true
-          }
-        ]
-      },
-      "value": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "integer_literal",
-            "named": true
-          },
-          {
-            "type": "negative_literal",
-            "named": true
-          },
-          {
-            "type": "string_literal",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "value_enum_variant_list",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "doc_comment",
-          "named": true
-        },
-        {
-          "type": "value_enum_variant",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
     "type": "var_declaration",
     "named": true,
     "fields": {
@@ -3194,6 +3241,38 @@
     }
   },
   {
+    "type": "writable_type",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "generic_type",
+          "named": true
+        },
+        {
+          "type": "mutable_specifier",
+          "named": true
+        },
+        {
+          "type": "scoped_type_identifier",
+          "named": true
+        },
+        {
+          "type": "type_identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "zero_fill_initializer",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "!",
     "named": false
   },
@@ -3223,6 +3302,18 @@
   },
   {
     "type": "&&",
+    "named": false
+  },
+  {
+    "type": "&=",
+    "named": false
+  },
+  {
+    "type": "&^",
+    "named": false
+  },
+  {
+    "type": "&^=",
     "named": false
   },
   {
@@ -3274,6 +3365,10 @@
     "named": false
   },
   {
+    "type": "...",
+    "named": false
+  },
+  {
     "type": "..=",
     "named": false
   },
@@ -3295,6 +3390,14 @@
   },
   {
     "type": "<",
+    "named": false
+  },
+  {
+    "type": "<<",
+    "named": false
+  },
+  {
+    "type": "<<=",
     "named": false
   },
   {
@@ -3322,6 +3425,14 @@
     "named": false
   },
   {
+    "type": ">>",
+    "named": false
+  },
+  {
+    "type": ">>=",
+    "named": false
+  },
+  {
     "type": "?",
     "named": false
   },
@@ -3338,11 +3449,23 @@
     "named": false
   },
   {
+    "type": "^",
+    "named": false
+  },
+  {
+    "type": "^=",
+    "named": false
+  },
+  {
     "type": "_",
     "named": false
   },
   {
     "type": "as",
+    "named": false
+  },
+  {
+    "type": "assert",
     "named": false
   },
   {
@@ -3378,6 +3501,10 @@
     "named": false
   },
   {
+    "type": "embed",
+    "named": false
+  },
+  {
     "type": "enum",
     "named": false
   },
@@ -3396,6 +3523,11 @@
   {
     "type": "field_identifier",
     "named": true
+  },
+  {
+    "type": "file_comment",
+    "named": true,
+    "extra": true
   },
   {
     "type": "float_literal",
@@ -3447,7 +3579,8 @@
   },
   {
     "type": "line_comment",
-    "named": true
+    "named": true,
+    "extra": true
   },
   {
     "type": "loop",
@@ -3466,6 +3599,10 @@
     "named": true
   },
   {
+    "type": "raw_string_literal",
+    "named": true
+  },
+  {
     "type": "recover",
     "named": false
   },
@@ -3480,6 +3617,10 @@
   {
     "type": "self",
     "named": false
+  },
+  {
+    "type": "shebang",
+    "named": true
   },
   {
     "type": "shorthand_field_identifier",
@@ -3531,6 +3672,10 @@
   },
   {
     "type": "|",
+    "named": false
+  },
+  {
+    "type": "|=",
     "named": false
   },
   {

@@ -7,16 +7,27 @@
 pub fn Validate(s: string) -> Result<(), error>
 
 /// Empty interface alias
-pub interface Any {}
+pub type Any = Unknown
 
 /// Nilable comma-ok method on interface
 pub interface Cache {
   #[go(comma_ok)]
-  fn Get(key: string) -> Option<Ref<Node>>
+  fn Get(key: string) -> Option<mut Ref<Node>>
   fn Set(key: string, value: Ref<Node>)
 }
 
-pub interface Empty {}
+pub type Empty = Unknown
+
+/// Empty named interface used as a struct field — alias must resolve to
+/// Unknown end-to-end so any value can be assigned.
+pub struct Holder {
+  pub Hook: Any,
+}
+
+/// Variadic method on interface
+pub interface Logger {
+  fn Logf(format: string, args: VarArgs<Unknown>)
+}
 
 /// Error interface - should be detected as error
 pub struct MyError(error)
@@ -30,14 +41,14 @@ pub struct NotFoundError(string)
 
 /// Embedding standard interfaces
 pub interface ReadWriteSeeker {
-  fn Read(mut p: Slice<uint8>) -> Partial<int, error>
+  fn Read(p: mut Slice<byte>) -> Partial<int, error>
   fn Seek(offset: int64, whence: int) -> Result<int64, error>
-  fn Write(p: Slice<uint8>) -> Partial<int, error>
+  fn Write(p: Slice<byte>) -> Partial<int, error>
 }
 
 pub interface ReadWriter {
-  fn Read(mut arg0: Slice<uint8>) -> Partial<int, error>
-  fn Write(arg0: Slice<uint8>) -> Partial<int, error>
+  fn Read(b: mut Slice<byte>) -> Partial<int, error>
+  fn Write(b: Slice<byte>) -> Partial<int, error>
 }
 
 /// Error-like but with extra method - not an error

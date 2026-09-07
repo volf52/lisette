@@ -1,13 +1,17 @@
-use std::cell::Cell;
-
-use crate::checker::scopes::{CarrierKind, DepthCounter, RecoverBlockContext, TryBlockContext};
+use crate::checker::EnvResolve;
+use crate::checker::scopes::{RecoverBlockContext, TryBlockContext, TryCarrier, TryUsage};
 use syntax::ast::{Expression, Span};
-use syntax::program::Visibility;
 use syntax::types::Type;
 
-use super::super::Checker;
+use crate::checker::infer::InferCtx;
+use crate::checker::infer::unify::UnifyError;
 
-impl Checker<'_, '_> {
+struct TryBlockTypes {
+    ok: Type,
+    error: Type,
+}
+
+impl InferCtx<'_> {
     pub(super) fn infer_propagate(
         &mut self,
         expression: Box<Expression>,
@@ -23,36 +27,37 @@ impl Checker<'_, '_> {
 
         let tried_ty = self.new_type_var();
         let new_expression = self.infer_expression(*expression, &tried_ty);
-        let resolved_tried_ty = new_expression.get_type().resolve();
+        let resolved_tried_ty = self.resolve_carrier(&new_expression.get_type());
 
         if resolved_tried_ty.is_partial() {
             self.sink
                 .push(diagnostics::infer::propagate_on_partial(span));
         }
 
-        let try_block_types = if let Some(ctx) = self.scopes.lookup_try_block_context() {
+        let try_block_types = if self.scopes.lookup_try_block_context().is_some() {
             let is_result = resolved_tried_ty.is_result();
             let is_option = resolved_tried_ty.is_option();
-
-            ctx.has_question_mark.set(true);
-
-            let has_mismatch = match (is_result, is_option, ctx.carrier.get()) {
-                (true, _, None) => {
-                    ctx.carrier.set(Some(CarrierKind::Result));
-                    false
-                }
-                (_, true, None) => {
-                    ctx.carrier.set(Some(CarrierKind::Option));
-                    false
-                }
-                (true, _, Some(CarrierKind::Option)) | (_, true, Some(CarrierKind::Result)) => true,
-                _ => false,
+            let observed = if is_result {
+                Some(TryCarrier::Result)
+            } else if is_option {
+                Some(TryCarrier::Option)
+            } else {
+                None
+            };
+            let (ok_ty, err_ty, has_mismatch) = {
+                let ctx = self
+                    .scopes
+                    .lookup_try_block_context_mut()
+                    .expect("try block context was just found");
+                let has_mismatch = ctx.usage.observe(observed);
+                (ctx.ok_ty.clone(), ctx.err_ty.clone(), has_mismatch)
             };
 
-            let ok_ty = ctx.ok_ty.clone();
-            let err_ty = ctx.err_ty.clone();
-
-            if !is_result && !is_option && !resolved_tried_ty.is_partial() {
+            if !is_result
+                && !is_option
+                && !resolved_tried_ty.is_partial()
+                && !resolved_tried_ty.is_error()
+            {
                 self.sink
                     .push(diagnostics::infer::try_requires_result_or_option(span));
             }
@@ -61,17 +66,19 @@ impl Checker<'_, '_> {
                     .push(diagnostics::infer::mixed_carriers_in_try_block(span));
             }
 
-            Some((ok_ty, err_ty))
+            Some(TryBlockTypes {
+                ok: ok_ty,
+                error: err_ty,
+            })
         } else {
             None
         };
 
-        if let Some((try_ok_ty, try_err_ty)) = try_block_types {
+        if let Some(try_types) = try_block_types {
             return self.infer_propagate_in_block(
                 new_expression,
                 &resolved_tried_ty,
-                &try_ok_ty,
-                &try_err_ty,
+                &try_types,
                 span,
                 expected_ty,
             );
@@ -80,32 +87,38 @@ impl Checker<'_, '_> {
         self.infer_propagate_in_function(new_expression, &resolved_tried_ty, span, expected_ty)
     }
 
+    fn propagate_as_error(&mut self, expected_ty: &Type, span: Span) -> Type {
+        self.unify(expected_ty, &Type::Error, &span);
+        Type::Error
+    }
+
     fn infer_propagate_in_block(
         &mut self,
         new_expression: Expression,
         tried_ty: &Type,
-        try_ok_ty: &Type,
-        try_err_ty: &Type,
+        try_types: &TryBlockTypes,
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
-        let ty = if tried_ty.is_result() {
+        let ty = if tried_ty.is_error() {
+            self.propagate_as_error(expected_ty, span)
+        } else if tried_ty.is_result() {
             let ok_ty = tried_ty.ok_type();
-            self.unify(try_err_ty, &tried_ty.err_type(), &span);
-            if ok_ty.resolve().is_variable() {
-                self.unify(try_ok_ty, &ok_ty, &span);
+            self.check_propagated_error(&try_types.error, &tried_ty.err_type(), &span);
+            if ok_ty.resolve_in(&self.env).is_variable() {
+                self.unify(&try_types.ok, &ok_ty, &span);
             }
             self.unify(expected_ty, &ok_ty, &span);
             ok_ty
         } else if tried_ty.is_option() {
             let some_ty = tried_ty.ok_type();
-            if some_ty.resolve().is_variable() {
-                self.unify(try_ok_ty, &some_ty, &span);
+            if some_ty.resolve_in(&self.env).is_variable() {
+                self.unify(&try_types.ok, &some_ty, &span);
             }
             self.unify(expected_ty, &some_ty, &span);
             some_ty
         } else {
-            Type::Error
+            self.propagate_as_error(expected_ty, span)
         };
 
         Expression::Propagate {
@@ -122,6 +135,7 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
+        let store = self.store;
         let fn_return_ty = self
             .scopes
             .lookup_fn_return_type()
@@ -132,51 +146,79 @@ impl Checker<'_, '_> {
                 Type::Error
             });
 
-        let ty = if tried_ty.is_result() {
+        let ty = if tried_ty.is_error() {
+            self.propagate_as_error(expected_ty, span)
+        } else if tried_ty.is_result() {
             let ok_ty = tried_ty.ok_type();
-            let err_ty = tried_ty.err_type();
-            let new_ok = self.new_type_var();
-            let expected_return = self.type_result(new_ok, err_ty);
+            let resolved_fn_return = self.resolve_carrier(&fn_return_ty);
 
-            if !fn_return_ty.resolve().is_result() {
+            if resolved_fn_return.is_result() {
+                self.check_propagated_error(
+                    &resolved_fn_return.err_type(),
+                    &tried_ty.err_type(),
+                    &span,
+                );
+            } else {
                 self.sink.push(diagnostics::infer::try_return_type_mismatch(
                     "Result<T, E>",
-                    &fn_return_ty.resolve(),
+                    &resolved_fn_return,
                     span,
                 ));
             }
 
-            self.unify(&expected_return, &fn_return_ty, &span);
             self.unify(expected_ty, &ok_ty, &span);
             ok_ty
         } else if tried_ty.is_option() {
             let some_ty = tried_ty.ok_type();
-            let new_some = self.new_type_var();
-            let expected_return = self.type_option(new_some);
+            let resolved_fn_return = self.resolve_carrier(&fn_return_ty);
 
-            if !fn_return_ty.resolve().is_option() {
+            if resolved_fn_return.is_option() {
+                let new_some = self.new_type_var();
+                let expected_return = self.type_option(store, new_some);
+                self.unify(&expected_return, &resolved_fn_return, &span);
+            } else {
                 self.sink.push(diagnostics::infer::try_return_type_mismatch(
                     "Option<T>",
-                    &fn_return_ty.resolve(),
+                    &resolved_fn_return,
                     span,
                 ));
             }
 
-            self.unify(&expected_return, &fn_return_ty, &span);
             self.unify(expected_ty, &some_ty, &span);
             some_ty
         } else if tried_ty.is_partial() {
-            Type::Error
+            self.propagate_as_error(expected_ty, span)
         } else {
             self.sink
                 .push(diagnostics::infer::try_requires_result_or_option(span));
-            Type::Error
+            self.propagate_as_error(expected_ty, span)
         };
 
         Expression::Propagate {
             expression: new_expression.into(),
             ty,
             span,
+        }
+    }
+
+    fn resolve_carrier(&self, ty: &Type) -> Type {
+        self.store.peel_alias(&ty.resolve_in(&self.env))
+    }
+
+    fn check_propagated_error(&mut self, declared_err: &Type, operand_err: &Type, span: &Span) {
+        match self.try_unify(declared_err, operand_err, span) {
+            Ok(()) | Err(UnifyError::AlreadyReported) => {}
+            Err(_) => {
+                let declared = declared_err.resolve_in(&self.env);
+                let operand = operand_err.resolve_in(&self.env);
+                let (types, _) = Type::remove_vars(&[&declared, &operand]);
+                let (declared_name, operand_name) = Type::stringify_pair(&types[0], &types[1]);
+                self.sink.push(diagnostics::infer::cannot_propagate_error(
+                    &declared_name,
+                    &operand_name,
+                    *span,
+                ));
+            }
         }
     }
 
@@ -187,12 +229,13 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
+        let store = self.store;
         if items.is_empty() {
             self.sink
                 .push(diagnostics::infer::try_block_empty(try_keyword_span));
             let unit_ty = self.type_unit();
             let err_ty = self.new_type_var();
-            let block_ty = self.type_result(unit_ty, err_ty);
+            let block_ty = self.type_result(store, unit_ty, err_ty);
             self.unify(expected_ty, &block_ty, &span);
             return Expression::TryBlock {
                 items: vec![],
@@ -205,34 +248,30 @@ impl Checker<'_, '_> {
         let ok_ty = self.new_type_var();
         let err_ty = self.new_type_var();
 
-        self.scopes.push();
-        {
-            let scope = self.scopes.current_mut();
-            scope.try_block_context = Some(TryBlockContext {
-                ok_ty: ok_ty.clone(),
-                err_ty: err_ty.clone(),
-                carrier: Cell::new(None),
-                has_question_mark: Cell::new(false),
-                try_span: span,
-                loop_depth: DepthCounter::new(),
-            });
+        let expected_resolved = self.resolve_carrier(expected_ty);
+        if expected_resolved.is_result() {
+            self.unify(&err_ty, &expected_resolved.err_type(), &try_keyword_span);
         }
 
-        self.register_types_and_values(&items, &Visibility::Local);
-
-        let new_items = self.infer_block_items(items, ok_ty.clone());
-
-        let (has_question_mark, carrier) = {
-            let ctx = self
+        let (new_items, usage) = self.with_scope(|this| {
+            let entry_loop_depth = this.loop_depth();
+            this.scopes.set_try_block_context(TryBlockContext {
+                ok_ty: ok_ty.clone(),
+                err_ty: err_ty.clone(),
+                usage: TryUsage::default(),
+                entry_loop_depth,
+            });
+            this.register_block_local_items(&items);
+            let new_items = this.infer_block_items(items, ok_ty.clone());
+            let usage = this
                 .scopes
-                .current()
-                .try_block_context
-                .as_ref()
-                .expect("try_block_context must exist");
-            (ctx.has_question_mark.get(), ctx.carrier.get())
-        };
+                .current_try_block_context()
+                .expect("try block scope must carry its context")
+                .usage;
+            (new_items, usage)
+        });
 
-        if !has_question_mark {
+        if !usage.was_used() {
             self.sink
                 .push(diagnostics::infer::try_block_no_question_mark(
                     try_keyword_span,
@@ -266,42 +305,33 @@ impl Checker<'_, '_> {
         }
 
         let inner_ty = last_item.get_type();
+        let inner_ty = if inner_ty.is_ignored() {
+            self.type_unit()
+        } else {
+            inner_ty
+        };
 
-        let block_ty = match carrier {
-            Some(CarrierKind::Result) => {
+        let block_ty = match usage {
+            TryUsage::Carrier(TryCarrier::Result) => {
                 self.unify(&ok_ty, &inner_ty, &span);
-                self.type_result(inner_ty, err_ty)
+                self.type_result(store, inner_ty, err_ty)
             }
-            Some(CarrierKind::Option) => {
+            TryUsage::Carrier(TryCarrier::Option) => {
                 self.unify(&ok_ty, &inner_ty, &span);
-                self.type_option(inner_ty)
+                self.type_option(store, inner_ty)
             }
-            None => {
+            TryUsage::Unused | TryUsage::Unknown => {
                 let new_err_ty = self.new_type_var();
-                self.type_result(inner_ty, new_err_ty)
+                self.type_result(store, inner_ty, new_err_ty)
             }
         };
 
         self.unify(expected_ty, &block_ty, &try_keyword_span);
-        self.scopes.pop();
-
         Expression::TryBlock {
             items: new_items,
             ty: block_ty,
             try_keyword_span,
             span,
-        }
-    }
-
-    pub(super) fn increment_try_block_loop_depth(&mut self) {
-        if let Some(ctx) = self.scopes.lookup_try_block_context() {
-            ctx.loop_depth.increment();
-        }
-    }
-
-    pub(super) fn decrement_try_block_loop_depth(&mut self) {
-        if let Some(ctx) = self.scopes.lookup_try_block_context() {
-            ctx.loop_depth.decrement();
         }
     }
 
@@ -312,6 +342,7 @@ impl Checker<'_, '_> {
         span: Span,
         expected_ty: &Type,
     ) -> Expression {
+        let store = self.store;
         let inner_ty = self.new_type_var();
 
         if items.is_empty() {
@@ -319,8 +350,8 @@ impl Checker<'_, '_> {
                 recover_keyword_span,
             ));
             let unit_ty = self.type_unit();
-            let panic_value_ty = self.type_panic_value();
-            let block_ty = self.type_result(unit_ty, panic_value_ty);
+            let panic_value_ty = self.type_panic_value(store);
+            let block_ty = self.type_result(store, unit_ty, panic_value_ty);
             self.unify(expected_ty, &block_ty, &span);
             return Expression::RecoverBlock {
                 items: vec![],
@@ -330,27 +361,24 @@ impl Checker<'_, '_> {
             };
         }
 
-        self.scopes.push();
-        {
-            let scope = self.scopes.current_mut();
-            scope.recover_block_context = Some(RecoverBlockContext {
-                inner_ty: inner_ty.clone(),
-                recover_span: span,
-                loop_depth: DepthCounter::new(),
-            });
-        }
-
-        self.register_types_and_values(&items, &Visibility::Local);
-
-        let new_items = self.infer_block_items(items, inner_ty.clone());
-
-        self.scopes.pop();
+        let new_items = self.with_scope(|this| {
+            let entry_loop_depth = this.loop_depth();
+            this.scopes
+                .set_recover_block_context(RecoverBlockContext { entry_loop_depth });
+            this.register_block_local_items(&items);
+            this.infer_block_items(items, inner_ty)
+        });
 
         let last_item = new_items.last().expect("block must have at least one item");
         let result_inner_ty = last_item.get_type();
+        let result_inner_ty = if result_inner_ty.is_ignored() {
+            self.type_unit()
+        } else {
+            result_inner_ty
+        };
 
-        let panic_value_ty = self.type_panic_value();
-        let block_ty = self.type_result(result_inner_ty, panic_value_ty);
+        let panic_value_ty = self.type_panic_value(store);
+        let block_ty = self.type_result(store, result_inner_ty, panic_value_ty);
 
         self.unify(expected_ty, &block_ty, &recover_keyword_span);
 
@@ -359,18 +387,6 @@ impl Checker<'_, '_> {
             ty: block_ty,
             recover_keyword_span,
             span,
-        }
-    }
-
-    pub(super) fn increment_recover_block_loop_depth(&mut self) {
-        if let Some(ctx) = self.scopes.lookup_recover_block_context() {
-            ctx.loop_depth.increment();
-        }
-    }
-
-    pub(super) fn decrement_recover_block_loop_depth(&mut self) {
-        if let Some(ctx) = self.scopes.lookup_recover_block_context() {
-            ctx.loop_depth.decrement();
         }
     }
 }

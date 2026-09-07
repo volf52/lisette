@@ -1,6 +1,8 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: \ntype UserId = int;\n"
+description: |
+  
+  type UserId = int;
 ---
 LexResult {
     tokens: [
@@ -42,9 +44,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

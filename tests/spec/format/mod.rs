@@ -6,6 +6,16 @@ fn assignment_simple() {
 }
 
 #[test]
+fn assert_statement() {
+    assert_format_snapshot!("fn test() { assert 2 + 2 == 5 }");
+}
+
+#[test]
+fn let_assert_statement() {
+    assert_format_snapshot!("fn test() { let assert Ok(h) = parse(x) }");
+}
+
+#[test]
 fn binary_addition() {
     assert_format_snapshot!("fn test() { 1 + 2 }");
 }
@@ -153,6 +163,13 @@ fn call_with_multiple_type_args() {
 }
 
 #[test]
+fn type_argument_integer_formats_like_value_literal() {
+    assert_format_snapshot!(
+        "fn test(a: Array<byte, 0x10>, b: Array<byte, 1_000>, c: Array<byte, 16>) {}"
+    );
+}
+
+#[test]
 fn call_with_single_closure_arg() {
     assert_format_snapshot!("fn test() { map(|x| x + 1) }");
 }
@@ -175,6 +192,18 @@ fn comment_between_statements() {
         r#"fn foo() {
   let x = 1;
   // comment between
+  let y = 2;
+}"#
+    );
+}
+
+#[test]
+fn comment_and_blank_line_before_statement_remain_idempotent() {
+    assert_format_snapshot!(
+        r#"fn foo() {
+  let x = 1;
+  // explanation
+
   let y = 2;
 }"#
     );
@@ -213,6 +242,27 @@ fn comment_on_struct_field() {
 }
 
 #[test]
+fn leading_comment_on_struct_field() {
+    assert_format_snapshot!(
+        "struct Point {\n  // documentation for x\n  x: int,\n  // documentation for y\n  y: int,\n}"
+    );
+}
+
+#[test]
+fn standalone_comment_between_struct_fields() {
+    assert_format_snapshot!(
+        "struct Foo {\n  a: int,\n  // a standalone note about the missing field\n  c: string,\n}"
+    );
+}
+
+#[test]
+fn mixed_trailing_and_leading_struct_field_comments() {
+    assert_format_snapshot!(
+        "struct Mix {\n  a: int, // trailing on a\n  // leading for b\n  b: string,\n}"
+    );
+}
+
+#[test]
 fn comment_trailing() {
     assert_format_snapshot!(
         r#"fn test() {
@@ -234,6 +284,11 @@ fn const_with_type() {
 #[test]
 fn const_public() {
     assert_format_snapshot!("pub const MAX: int = 100");
+}
+
+#[test]
+fn const_declaration_without_value() {
+    assert_format_snapshot!("pub const NoError: Unknown");
 }
 
 #[test]
@@ -277,9 +332,19 @@ fn enum_empty() {
 }
 
 #[test]
-fn value_enum_with_underlying_type() {
+fn enum_variant_attribute_moves_to_its_own_line() {
+    assert_format_snapshot!("enum Colour { #[json(\"x\")] Red, Green }");
+}
+
+#[test]
+fn enum_default_variant_moves_to_its_own_line() {
+    assert_format_snapshot!("enum Colour { #[default] Red, Green }");
+}
+
+#[test]
+fn enum_default_variant_keeps_its_doc_comment() {
     assert_format_snapshot!(
-        "pub enum ParameterSizes: int { L1024N160 = 0, L2048N224 = 1, L2048N256 = 2, L3072N256 = 3 }"
+        "enum Colour {\n  /// The zero value.\n  #[default]\n  Red,\n  Green,\n}"
     );
 }
 
@@ -496,6 +561,52 @@ fn import_user_grouping_overridden() {
 }
 
 #[test]
+fn import_comment_between_imports() {
+    assert_format_snapshot!(
+        "// http helpers\nimport \"go:net/http\"\n// json helpers\nimport \"go:encoding/json\"\n\nfn main() {}"
+    );
+}
+
+#[test]
+fn import_comment_on_import_line() {
+    assert_format_snapshot!(
+        "import \"go:os\" // needed for Exit\nimport \"go:fmt\"\n\nfn main() {}"
+    );
+}
+
+#[test]
+fn import_after_item_is_hoisted() {
+    assert_format_snapshot!(
+        "// leading note\nimport \"go:os\"\n\n// section note\nfn main() {}\n\n// note before late import\nimport \"go:fmt\""
+    );
+}
+
+#[test]
+fn import_after_item_alone_is_hoisted() {
+    assert_format_snapshot!("fn main() {}\n\nimport alias \"go:fmt\"");
+}
+
+#[test]
+fn import_after_item_keeps_its_line_comment() {
+    assert_format_snapshot!("fn main() {}\n\nimport \"go:fmt\" // why");
+}
+
+#[test]
+fn import_line_comment_stays_with_its_own_import() {
+    assert_format_snapshot!("import \"go:a\"; import \"go:b\" // b\nfn main() {}");
+}
+
+#[test]
+fn import_split_across_lines_keeps_its_line_comment() {
+    assert_format_snapshot!("import\n  \"go:fmt\" // why\nfn main() {}");
+}
+
+#[test]
+fn import_after_item_keeps_line_comments_on_both_imports() {
+    assert_format_snapshot!("import \"go:os\" // for Exit\nfn f() {}\nimport \"go:fmt\" // why");
+}
+
+#[test]
 fn import_only_local() {
     assert_format_snapshot!("import \"display\"\nimport \"commands\"\nimport \"store\"");
 }
@@ -539,7 +650,7 @@ fn interface_method_with_attribute() {
 fn interface_with_parent() {
     assert_format_snapshot!(
         r#"interface Reader {
-  impl Closable;
+  embed Closable;
   fn read() -> string;
 }"#
     );
@@ -587,9 +698,65 @@ fn line_breaking_long_binary_chain() {
 }
 
 #[test]
+fn line_breaking_long_if_condition() {
+    assert_format_snapshot!(
+        "fn check(n: int, label: string) -> string { if n > 10 && n < 100 && label != \"\" && n % 2 == 0 && n != 42 && n != 7 && n > 0 { return \"yes\" } \"no\" }"
+    );
+}
+
+#[test]
+fn line_breaking_long_while_condition() {
+    assert_format_snapshot!(
+        "fn test(n: int) { while n > 10 && n < 100 && n % 2 == 0 && n != 42 && n != 7 && n > 0 && n < 9999 { n = n + 1 } }"
+    );
+}
+
+#[test]
+fn line_breaking_long_else_if_condition() {
+    assert_format_snapshot!(
+        "fn test(n: int, m: int) -> string { if n == 1 { \"one\" } else if n > 10 && n < 100 && m != 42 && n % 2 == 0 && m != 7 && n > 0 && m > 3 { \"two\" } else { \"three\" } }"
+    );
+}
+
+#[test]
+fn line_breaking_long_if_let_scrutinee() {
+    assert_format_snapshot!(
+        "fn test() -> int { if let Some(v) = first_value + second_value + third_value + fourth_value + fifth_value { v } else { 0 } }"
+    );
+}
+
+#[test]
+fn line_breaking_long_match_subject() {
+    assert_format_snapshot!(
+        "fn test(n: int) -> string { match n > 10 && n < 100 && n % 2 == 0 && n != 42 && n != 7 && n > 0 && n < 9999 { true => \"t\", false => \"f\" } }"
+    );
+}
+
+#[test]
+fn line_breaking_long_for_iterable() {
+    assert_format_snapshot!(
+        "fn test() { for x in first_sequence + second_sequence + third_sequence + fourth_sequence_here { print(x) } }"
+    );
+}
+
+#[test]
+fn line_breaking_long_if_condition_call_still_breaks() {
+    assert_format_snapshot!(
+        "fn test() -> int { if some_function(first_argument, second_argument, third_argument, fourth_argument) { 1 } else { 2 } }"
+    );
+}
+
+#[test]
 fn line_breaking_long_slice() {
     assert_format_snapshot!(
         "fn test() { [first_element, second_element, third_element, fourth_element, fifth_element, sixth_element] }"
+    );
+}
+
+#[test]
+fn line_breaking_wide_character_slice() {
+    assert_format_snapshot!(
+        "fn main() {\n  let weekdays = [\"日曜日\", \"月曜日\", \"火曜日\", \"水曜日\", \"木曜日\", \"金曜日\", \"土曜日\"]\n  let ascii = [\"aaaaaaa\", \"bbbbbbb\", \"ccccccc\", \"ddddddd\", \"eeeeeee\", \"fffffff\", \"ggggggg\"]\n}"
     );
 }
 
@@ -678,6 +845,63 @@ fn lambda_as_last_arg() {
 #[test]
 fn lambda_with_block() {
     assert_format_snapshot!("fn test() { let f = |x| { let y = x + 1; y * 2 }; }");
+}
+
+#[test]
+fn lambda_arg_keeps_params_intact_in_overlong_call() {
+    assert_format_snapshot!(
+        "fn main() {\n  let handler = some_quite_long_method_name_which_causes_weird_formatting(|a_rather_long_parameter_name| a_rather_long_parameter_name + 1)\n}"
+    );
+}
+
+#[test]
+fn lambda_block_arg_keeps_params_intact_in_overlong_call() {
+    assert_format_snapshot!(
+        "fn main() {\n  let handler = some_quite_long_method_name_which_causes_weird_formatting(|a_rather_long_parameter_name| { a_rather_long_parameter_name + 1 })\n}"
+    );
+}
+
+#[test]
+fn lambda_block_arg_keeps_params_intact_after_leading_args() {
+    assert_format_snapshot!(
+        "fn main() {\n  let handler = some_quite_long_method_name(items, |a_rather_long_parameter_name| { a_rather_long_parameter_name + 1 })\n}"
+    );
+}
+
+#[test]
+fn lambda_arg_expands_call_instead_of_wrapping_body() {
+    assert_format_snapshot!(
+        "fn main() {\n  let z = f(first_arg, |x| a_very_long_name_one_here + a_very_long_name_two_here_x)\n}"
+    );
+}
+
+#[test]
+fn match_arg_expands_call_instead_of_wrapping_subject() {
+    assert_format_snapshot!(
+        "fn main() {\n  let z = f(first_arg, match a_scrutinee_name_one + a_scrutinee_name_two_here_long { 1 => 2, _ => 3 })\n}"
+    );
+}
+
+#[test]
+fn lambda_arg_hugs_through_nested_call() {
+    assert_format_snapshot!(
+        "fn f(items: Slice<int>, id: int) -> Result<Slice<int>, string> {\n  Ok(items.map(|t| if t.id == id { models.Task { status: models.Status.Done, ..t } } else { t }))\n}"
+    );
+}
+
+#[test]
+fn lambda_match_body_arg_hugs_call_parens() {
+    assert_format_snapshot!("fn test() { items.map(|x| match x { Some(v) => v, None => 0 }) }");
+}
+
+#[test]
+fn lambda_block_arg_hugs_call_parens() {
+    assert_format_snapshot!("fn test() { foo(|x| { x + 1 }) }");
+}
+
+#[test]
+fn lambda_block_arg_hugs_call_parens_after_leading_args() {
+    assert_format_snapshot!("fn test() { foo(a, b, |x| { x + 1 }) }");
 }
 
 #[test]
@@ -788,26 +1012,26 @@ fn method_call() {
 }
 
 #[test]
-fn module_multiple_definitions() {
+fn package_multiple_definitions() {
     assert_format_snapshot!(
         "struct Point { x: int, y: int }\n\nfn origin() -> Point { Point { x: 0, y: 0 } }\n\nfn add(a: Point, b: Point) -> Point { Point { x: a.x + b.x, y: a.y + b.y } }"
     );
 }
 
 #[test]
-fn module_imports_and_definitions() {
+fn package_imports_and_definitions() {
     assert_format_snapshot!(
         "import \"go:os\"\nimport \"go:fmt\"\n\nfn main() { fmt.Println(\"hello\") }"
     );
 }
 
 #[test]
-fn module_only_comments() {
+fn package_only_comments() {
     assert_format_snapshot!("// Generated by bindgen\n// Source: crypto/hkdf");
 }
 
 #[test]
-fn module_trailing_comment() {
+fn package_trailing_comment() {
     assert_format_snapshot!(
         r#"fn main() {}
 
@@ -945,6 +1169,11 @@ fn attribute_on_struct() {
 #[test]
 fn attribute_multiple_on_struct() {
     assert_format_snapshot!("#[json]\n#[xml]\nstruct Config { value: int }");
+}
+
+#[test]
+fn attribute_on_enum() {
+    assert_format_snapshot!("#[json]\nenum Shape { Circle, Square }");
 }
 
 #[test]
@@ -1197,6 +1426,21 @@ fn type_alias_function() {
 }
 
 #[test]
+fn type_alias_function_without_return() {
+    assert_format_snapshot!("type Handler = fn(int, string)");
+}
+
+#[test]
+fn function_type_param_without_return() {
+    assert_format_snapshot!("fn a(f: fn(int)) {}");
+}
+
+#[test]
+fn function_type_param_with_unit_return() {
+    assert_format_snapshot!("fn a(f: fn(int) -> ()) {}");
+}
+
+#[test]
 fn type_alias_opaque() {
     assert_format_snapshot!("type   Point");
 }
@@ -1306,6 +1550,36 @@ fn compound_assignment_rem() {
 }
 
 #[test]
+fn compound_assignment_bitand() {
+    assert_format_snapshot!("fn test() { x &= 3 }");
+}
+
+#[test]
+fn compound_assignment_bitor() {
+    assert_format_snapshot!("fn test() { x |= 3 }");
+}
+
+#[test]
+fn compound_assignment_bitxor() {
+    assert_format_snapshot!("fn test() { x ^= 3 }");
+}
+
+#[test]
+fn compound_assignment_bitandnot() {
+    assert_format_snapshot!("fn test() { x &^= 3 }");
+}
+
+#[test]
+fn compound_assignment_shiftleft() {
+    assert_format_snapshot!("fn test() { x <<= 2 }");
+}
+
+#[test]
+fn compound_assignment_shiftright() {
+    assert_format_snapshot!("fn test() { x >>= 2 }");
+}
+
+#[test]
 fn method_chain_two_calls() {
     assert_format_snapshot!(
         "fn test() { let result = Some(42).map(|x: int| -> int { x * 2 }).unwrap_or(0) }"
@@ -1315,6 +1589,34 @@ fn method_chain_two_calls() {
 #[test]
 fn method_chain_short_stays_inline() {
     assert_format_snapshot!("fn test() { foo.bar().baz() }");
+}
+
+#[test]
+fn method_chain_comment_between_segments() {
+    assert_format_snapshot!(
+        "fn test() { let foo = [5, 5, 5].map(|x| x * 2) // .filter(|x| x % 2 == 0)\n.fold(0, |acc, x| acc + x) }"
+    );
+}
+
+#[test]
+fn method_chain_comment_before_single_segment() {
+    assert_format_snapshot!(
+        "fn test() { let foo = [5, 5, 5] // .map(|x| x * 2)\n// .filter(|x| x % 2 == 0)\n.fold(0, |acc, x| acc + x) }"
+    );
+}
+
+#[test]
+fn method_chain_comment_inside_receiver_slice() {
+    assert_format_snapshot!(
+        "fn test() { [\"Lilian\", // comment\n\"Lisette\", // comment\n\"Lisa\"].length() }"
+    );
+}
+
+#[test]
+fn method_chain_comment_inside_parenthesized_receiver() {
+    assert_format_snapshot!(
+        "fn test() { (first_value + // receiver detail\nsecond_value).combine() }"
+    );
 }
 
 #[test]
@@ -1335,16 +1637,508 @@ fn unit_in_option_type_param() {
 #[test]
 fn function_with_mut_parameter() {
     assert_format_snapshot!(
-        "fn process(mut items: Slice<int>, count: int) -> Slice<int> { items }"
+        "fn process(items: mut Slice<int>, count: int) -> Slice<int> { items }"
     );
 }
 
 #[test]
 fn call_with_spread_arg() {
-    assert_format_snapshot!("fn test() { foo(..args) }");
+    assert_format_snapshot!("fn test() { foo(args...) }");
 }
 
 #[test]
 fn call_with_leading_args_and_spread_arg() {
-    assert_format_snapshot!("fn test() { foo(a, b, ..args) }");
+    assert_format_snapshot!("fn test() { foo(a, b, args...) }");
+}
+
+#[test]
+fn raw_string_roundtrip() {
+    assert_format_snapshot!(r#"fn test() { let x = r"a\nb" }"#);
+}
+
+#[test]
+fn raw_string_with_regex_roundtrip() {
+    assert_format_snapshot!(r#"fn test() { let re = r"([a-zA-Z])(\d)" }"#);
+}
+
+#[test]
+fn raw_string_with_windows_path_roundtrip() {
+    assert_format_snapshot!(r#"fn test() { let p = r"C:\Users\me" }"#);
+}
+
+#[test]
+fn format_string_multiline_roundtrip() {
+    assert_format_snapshot!("fn test() { let s = \"a\nb\"; foo(s) }");
+}
+
+#[test]
+fn format_raw_string_multiline_roundtrip() {
+    assert_format_snapshot!("fn test() { let s = r\"a\nb\"; foo(s) }");
+}
+
+#[test]
+fn format_fstring_multiline_text_roundtrip() {
+    assert_format_snapshot!("fn test() { let s = f\"hello\n{name}\nworld\" }");
+}
+
+#[test]
+fn format_multiline_string_in_call_forces_arg_wrap() {
+    assert_format_snapshot!(
+        "fn test() { foo(\"a\nb\", very_long_argument_name_that_should_force_wrapping_because_it_is_extremely_long, another_argument_name_that_is_also_long) }"
+    );
+}
+
+#[test]
+fn format_fstring_long_interpolation_stays_single_line() {
+    assert_format_snapshot!(
+        "fn test() { let msg = f\"You cannot use another ender pearl for {shared.format_duration(remaining)}.\" }"
+    );
+}
+
+#[test]
+fn format_fstring_interpolation_many_args_stays_single_line() {
+    assert_format_snapshot!(
+        "fn test() { let msg = f\"result {compute(first_argument, second_argument, third_argument, fourth_argument)}\" }"
+    );
+}
+
+#[test]
+fn format_fstring_struct_call_interpolation_stays_single_line() {
+    assert_format_snapshot!(
+        "fn test() { let msg = f\"point {Point { x: some_long_value_here, y: another_long_value_here, z: third_value }}\" }"
+    );
+}
+
+#[test]
+fn format_fstring_match_interpolation_stays_single_line() {
+    assert_format_snapshot!("fn test() { let m = f\"v {match x { 1 => \"a\", _ => \"b\" }}\" }");
+}
+
+#[test]
+fn format_fstring_block_interpolation_stays_single_line() {
+    assert_format_snapshot!("fn test() { let b = f\"v { { let a = 1; a } }\" }");
+}
+
+#[test]
+fn format_fstring_empty_block_interpolation_stays_single_line() {
+    assert_format_snapshot!("fn test() { let e = f\"v { {} }\" }");
+}
+
+#[test]
+fn comment_inside_or_pattern() {
+    assert_format_snapshot!(
+        "fn f(x: int) -> int {\n  match x {\n    1 |\n    // standalone comment\n    2 |\n    3 => 1,\n    _ => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_between_select_arms() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0,\n    },\n    // between select arms\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_between_fn_params() {
+    assert_format_snapshot!("fn f(\n  a: int,\n  // between params\n  b: int,\n) -> int { a + b }");
+}
+
+#[test]
+fn comment_before_first_fn_param() {
+    assert_format_snapshot!(
+        "fn f(\n  // before first param\n  a: int,\n  b: int,\n) -> int { a + b }"
+    );
+}
+
+#[test]
+fn comment_between_lambda_params() {
+    assert_format_snapshot!(
+        "fn f() -> int {\n  let g = |\n    a: int,\n    // between lambda params\n    b: int,\n  | a + b\n  g(1, 2)\n}"
+    );
+}
+
+#[test]
+fn comment_between_enum_variants() {
+    assert_format_snapshot!("enum E {\n  A,\n  // between variants\n  B,\n  C,\n}");
+}
+
+#[test]
+fn comment_trailing_in_enum_body() {
+    assert_format_snapshot!("enum E {\n  A,\n  B,\n  // trailing\n}");
+}
+
+#[test]
+fn comment_before_first_enum_variant() {
+    assert_format_snapshot!("enum E {\n  // before A\n  A,\n  B,\n}");
+}
+
+#[test]
+fn doc_comment_on_enum_variant() {
+    assert_format_snapshot!(
+        "/// Enum doc\nenum Color {\n  /// Doc for R\n  R,\n  /// Doc for G\n  G,\n  /// Doc for B\n  B,\n}"
+    );
+}
+
+#[test]
+fn comment_between_interface_methods() {
+    assert_format_snapshot!("interface I {\n  fn first()\n  // between methods\n  fn second()\n}");
+}
+
+#[test]
+fn comment_trailing_in_interface_body() {
+    assert_format_snapshot!("interface I {\n  fn first()\n  fn second()\n  // trailing\n}");
+}
+
+#[test]
+fn comment_before_first_interface_method() {
+    assert_format_snapshot!("interface I {\n  // before first method\n  fn first()\n}");
+}
+
+#[test]
+fn comment_between_field_attributes() {
+    assert_format_snapshot!(
+        "struct S {\n  #[a]\n  // between attributes\n  #[b]\n  pub name: string,\n}"
+    );
+}
+
+#[test]
+fn comment_between_attr_and_struct_definition() {
+    assert_format_snapshot!("struct A {}\n\n#[attr]\n// between attr and struct decl\nstruct B {}");
+}
+
+#[test]
+fn comment_between_attribute_and_type_alias_definition() {
+    assert_format_snapshot!("#[go(alias)]\n// alias detail\ntype UserId = int");
+}
+
+#[test]
+fn comment_between_attr_and_fn_definition() {
+    assert_format_snapshot!("#[attr]\n// between attr and fn\nfn f() {}");
+}
+
+#[test]
+fn comment_trailing_in_fn_body() {
+    assert_format_snapshot!("fn f() {\n  let x = 1\n  x\n  // trailing in fn body\n}");
+}
+
+#[test]
+fn comment_trailing_in_match_block() {
+    assert_format_snapshot!(
+        "fn f(x: int) -> int {\n  match x {\n    1 => 1,\n    _ => 0,\n    // trailing in match block\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_trailing_in_block_body() {
+    assert_format_snapshot!("fn f() -> int {\n  let x = 1\n  // trailing in block\n}");
+}
+
+#[test]
+fn comment_trailing_in_loop_body() {
+    assert_format_snapshot!("fn f() {\n  loop {\n    break\n    // trailing in loop body\n  }\n}");
+}
+
+#[test]
+fn comment_trailing_in_select_block() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0,\n    },\n    _ => 1,\n    // trailing\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_trailing_same_line_on_top_level_item() {
+    assert_format_snapshot!("fn h() {} // trailing\nfn i() {}");
+}
+
+#[test]
+fn comment_between_attr_and_struct_field() {
+    assert_format_snapshot!("struct S {\n  #[a]\n  // between attr and field\n  x: int,\n}");
+}
+
+#[test]
+fn comment_between_attr_and_interface_method() {
+    assert_format_snapshot!("interface I {\n  #[a]\n  // between attr and method\n  fn first()\n}");
+}
+
+#[test]
+fn comment_blank_line_preserved_between_top_level_comments() {
+    assert_format_snapshot!("fn a() {}\n// first\n\n// second\nfn b() {}");
+}
+
+#[test]
+fn comment_before_interface_parent() {
+    assert_format_snapshot!("interface I {\n  // before parent\n  embed A\n  fn first()\n}");
+}
+
+#[test]
+fn comment_between_interface_parents() {
+    assert_format_snapshot!(
+        "interface I {\n  embed A\n  // between parents\n  embed B\n  fn first()\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_match_arm() {
+    assert_format_snapshot!(
+        "fn f(x: int) -> int {\n  match x {\n    1 => 1, // trailing arm\n    2 => 2,\n    _ => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_select_arm() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0,\n    }, // trailing arm\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_enum_variant() {
+    assert_format_snapshot!("enum E {\n  A, // trailing variant\n  B,\n  C,\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_on_interface_parent() {
+    assert_format_snapshot!(
+        "interface I {\n  embed A // trailing parent\n  embed B\n  fn first()\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_interface_method() {
+    assert_format_snapshot!("interface I {\n  fn first() // trailing method\n  fn second()\n}");
+}
+
+#[test]
+fn comment_blank_line_preserved_between_struct_field_groups() {
+    assert_format_snapshot!("struct S {\n  x: int, // trailing\n\n  // second\n  y: int,\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_on_nested_match_arm_in_select() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v, // trailing nested arm\n      None => 0,\n    },\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_blank_line_below_leading_in_enum() {
+    assert_format_snapshot!("enum E {\n  A,\n  // about B\n\n  B,\n}");
+}
+
+#[test]
+fn comment_blank_line_below_leading_in_match() {
+    assert_format_snapshot!(
+        "fn f(x: int) -> int {\n  match x {\n    1 => 1,\n    // about 2\n\n    2 => 2,\n    _ => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_blank_line_below_leading_in_interface() {
+    assert_format_snapshot!("interface I {\n  fn first()\n  // about second\n\n  fn second()\n}");
+}
+
+#[test]
+fn comment_blank_line_below_leading_in_struct() {
+    assert_format_snapshot!("struct S {\n  a: int,\n  // about b\n\n  b: int,\n}");
+}
+
+#[test]
+fn comment_trailing_inside_struct_no_blank() {
+    assert_format_snapshot!("struct S {\n  a: int,\n  // trailing\n}");
+}
+
+#[test]
+fn comment_trailing_inside_struct_with_blank() {
+    assert_format_snapshot!("struct S {\n  a: int,\n\n  // trailing\n}");
+}
+
+#[test]
+fn comment_trailing_inside_nested_match_in_select() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0,\n      // trailing nested block\n    },\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_last_nested_match_arm_in_select() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0, // trailing last nested arm\n    },\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_with_close_brace_inside_nested_match_in_select() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0,\n      // contains } early\n      // still nested\n    },\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_with_close_brace_on_last_nested_match_arm() {
+    assert_format_snapshot!(
+        "fn f(c: Channel<int>) -> int {\n  select {\n    match c.receive() {\n      Some(v) => v,\n      None => 0, // contains } early\n    },\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_impl_method() {
+    assert_format_snapshot!("struct Foo {}\n\nimpl Foo {\n  fn a() {} // trailing\n  fn b() {}\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_on_tuple_pattern_element() {
+    assert_format_snapshot!(
+        "fn f(x: (int, int)) -> int {\n  match x {\n    (1, // trailing tuple elem\n    2) => 0,\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_struct_pattern_field() {
+    assert_format_snapshot!(
+        "struct Point { x: int, y: int }\n\nfn f(p: Point) -> int {\n  match p {\n    Point { x: 1, // trailing struct field\n    y: 2 } => 0,\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_slice_pattern_element() {
+    assert_format_snapshot!(
+        "fn f() -> int {\n  match [1, 2] {\n    [a, // trailing slice elem\n    b] => a + b,\n    _ => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_enum_variant_pattern_element() {
+    assert_format_snapshot!(
+        "enum E { Pair(int, int), Other }\n\nfn f(e: E) -> int {\n  match e {\n    Pair(a, // trailing variant payload\n    b) => a + b,\n    Other => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_before_slice_rest_bind() {
+    assert_format_snapshot!(
+        "fn test() {\n  match items {\n    [first, // trailing\n    ..rest] => first,\n    [] => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_before_slice_rest_discard() {
+    assert_format_snapshot!(
+        "fn test() {\n  match items {\n    [first, // trailing\n    ..] => first,\n    [] => 0,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_before_struct_pattern_rest() {
+    assert_format_snapshot!(
+        "struct Point { x: int, y: int, z: int }\n\nfn f(p: Point) -> int {\n  match p {\n    Point { x: 1, // trailing\n    .. } => 0,\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_before_enum_variant_pattern_rest() {
+    assert_format_snapshot!(
+        "enum E { Triple(int, int, int), Other }\n\nfn f(e: E) -> int {\n  match e {\n    Triple(1, // trailing\n    ..) => 0,\n    _ => 1,\n  }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_on_only_struct_field() {
+    assert_format_snapshot!("struct S {\n  x: int, // trailing\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_on_last_struct_field() {
+    assert_format_snapshot!("struct S {\n  a: int,\n  b: int, // trailing\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_before_call_spread_arg() {
+    assert_format_snapshot!("fn f(args: Slice<int>) {\n  foo(1, // trailing\n  args...)\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_before_struct_spread() {
+    assert_format_snapshot!(
+        "struct Point { x: int, y: int }\n\nfn f(other: Point) -> Point {\n  Point { x: 1, // trailing\n  ..other }\n}"
+    );
+}
+
+#[test]
+fn comment_same_line_trailing_between_call_args() {
+    assert_format_snapshot!("fn f() {\n  foo(a, // trailing\n  b, c)\n}");
+}
+
+#[test]
+fn comment_same_line_trailing_before_inlinable_last_arg() {
+    assert_format_snapshot!("fn f() {\n  foo(a, b, // trailing\n  |x| { x + 1 })\n}");
+}
+
+#[test]
+fn struct_embedded_field() {
+    assert_format_snapshot!("struct Outer {\n  embed Base,\n  embed Ref<Other>,\n  extra: int,\n}");
+}
+
+#[test]
+fn file_comment_block() {
+    assert_format_snapshot!(
+        "//! Copyright 2026 Acme Corp.\n//! SPDX-License-Identifier: Apache-2.0\n\nimport \"go:fmt\"\n\nfn main() {\n  fmt.Println(1)\n}"
+    );
+}
+
+#[test]
+fn file_comment_only() {
+    assert_format_snapshot!("//! Header only.");
+}
+
+#[test]
+fn file_comment_with_bare_line() {
+    assert_format_snapshot!(
+        "//! Copyright 2026 Acme Corp.\n//!\n//! Second paragraph.\n\nfn main() {\n  let _ = 1\n}"
+    );
+}
+
+#[test]
+fn file_comment_before_item_without_imports() {
+    assert_format_snapshot!("//! Header.\nfn main() {\n  let _ = 1\n}");
+}
+
+#[test]
+fn file_comment_followed_by_regular_comment() {
+    assert_format_snapshot!("//! Header.\n\n// section note\nfn main() {\n  let _ = 1\n}");
+}
+
+#[test]
+fn shebang_with_imports() {
+    assert_format_snapshot!(
+        "#!/usr/bin/env -S lis run\n\nimport \"go:fmt\"\n\nfn main() {\n  fmt.Println(1)\n}"
+    );
+}
+
+#[test]
+fn shebang_gains_a_blank_line_below() {
+    assert_format_snapshot!("#!/usr/bin/env -S lis run\nfn main() {\n  let _ = 1\n}");
+}
+
+#[test]
+fn shebang_above_a_file_comment() {
+    assert_format_snapshot!(
+        "#!/usr/bin/env -S lis run\n//! A tool.\n\nimport \"go:fmt\"\n\nfn main() {\n  fmt.Println(1)\n}"
+    );
+}
+
+#[test]
+fn shebang_only() {
+    assert_format_snapshot!("#!/usr/bin/env -S lis run");
+}
+
+#[test]
+fn writable_qualifier_types() {
+    assert_format_snapshot!(
+        "struct Batch { items: mut Slice<int>, tags: Slice<string> }\nfn fill(data: mut Slice<int>) -> mut Slice<int> { data }"
+    );
+}
+
+#[test]
+fn writable_qualifier_nested_type_argument() {
+    assert_format_snapshot!("fn rows(data: mut Slice<mut Slice<int>>) -> int { 0 }");
 }

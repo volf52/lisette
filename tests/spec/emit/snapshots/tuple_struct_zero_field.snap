@@ -1,14 +1,16 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Marker()\n\nfn test() -> Marker {\n  Marker()\n}\n"
+description: |
+  
+  struct Marker()
+  
+  fn test() -> Marker {
+    Marker()
+  }
 ---
 package main
 
 type Marker struct{}
-
-func (m Marker) String() string {
-	return "Marker"
-}
 
 func test() Marker {
 	return Marker{}

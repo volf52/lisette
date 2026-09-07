@@ -2,6 +2,48 @@ use crate::assert_emit_snapshot;
 use crate::assert_emit_snapshot_with_go_typedefs;
 
 #[test]
+fn or_pattern_let_else_failure_sees_outer_binding() {
+    let input = r#"
+enum E { A(int), B(int), C }
+
+fn read(e: E) -> int {
+  let value = 40
+  let E.A(value) | E.B(value) = e else {
+    let fallback = value + 2
+    return fallback
+  }
+  value
+}
+
+fn main() {
+  if read(E.C) != 42 { panic("failure must see the outer value") }
+  if read(E.B(7)) != 7 { panic("success must see the new value") }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn guarded_pattern_restores_outer_binding_for_fallback() {
+    let input = r#"
+fn read(option: Option<int>) -> string {
+  let value = "outer"
+  match option {
+    Some(value) if value > 0 => if value == 7 { "seven" } else { "positive" },
+    _ => value,
+  }
+}
+
+fn main() {
+  if read(Some(-1)) != "outer" { panic("guard failure must restore the outer value") }
+  if read(Some(7)) != "seven" { panic("guard success must see the pattern value") }
+  if read(None) != "outer" { panic("fallback must see the outer value") }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn tuple_struct_pattern_in_match() {
     let input = r#"
 struct Pair(int, int)
@@ -9,6 +51,21 @@ struct Pair(int, int)
 fn test(p: Pair) -> int {
   match p {
     Pair(a, b) => a + b,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_struct_refutable_field_pattern_keeps_literal_test() {
+    let input = r#"
+struct MP(int, string)
+
+fn test(p: MP) -> int {
+  match p {
+    MP(0, _) => 1,
+    MP(n, _) => n,
   }
 }
 "#;
@@ -36,7 +93,7 @@ struct Handler<T> { callback: fn(T) -> int }
 enum E { A(Handler<string>), B(Handler<string>) }
 
 fn test(e: E) -> int {
-  let A(Handler { callback }) | B(Handler { callback }) = e else { return 0; };
+  let E.A(Handler { callback }) | E.B(Handler { callback }) = e else { return 0; };
   callback("test")
 }
 "#;
@@ -50,7 +107,7 @@ struct Pair<T> { coords: (T, T) }
 enum E { A(Pair<int>), B(Pair<int>) }
 
 fn test(e: E) -> int {
-  let A(Pair { coords: (x, y) }) | B(Pair { coords: (x, y) }) = e else { return 0; };
+  let E.A(Pair { coords: (x, y) }) | E.B(Pair { coords: (x, y) }) = e else { return 0; };
   x + y
 }
 "#;
@@ -63,7 +120,7 @@ fn slice_pattern_rest_or_pattern() {
 enum E { A(Slice<int>), B(Slice<int>) }
 
 fn test(e: E) -> int {
-  let A([first, ..rest]) | B([first, ..rest]) = e else { return 0; };
+  let E.A([first, ..rest]) | E.B([first, ..rest]) = e else { return 0; };
   first
 }
 "#;
@@ -125,7 +182,7 @@ enum Message {
 }
 
 fn make_move() -> Message {
-  Move { x: 10, y: 20 }
+  Message.Move { x: 10, y: 20 }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -524,11 +581,162 @@ fn test(uid: UserId) -> int {
 }
 
 #[test]
+fn newtype_ref_struct_pattern_match() {
+    let input = r#"
+struct Wrap(Ref<int>)
+
+fn test(w: Wrap) -> int {
+  match w {
+    Wrap(r) => r.*,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_over_result_less_func_pattern_match() {
+    let input = r#"
+struct Cb(fn(int) -> ())
+
+fn test(c: Cb) {
+  match c {
+    Cb(f) => f(1),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_over_receive_only_channel_pattern_match() {
+    let input = r#"
+struct Ticks(Receiver<int>)
+
+fn test(t: Ticks) -> Receiver<int> {
+  match t {
+    Ticks(r) => r,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn pattern_unicode_escape_conversion() {
     let input = r#"
 fn test(s: string) -> int {
   match s {
     "\u{00E9}" => 1,
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_in_arm_drops_the_test_the_arm_made() {
+    let input = r#"
+enum Event {
+  Click { x: int, y: int },
+  Close,
+}
+
+fn test(e: Event) -> int {
+  match e {
+    Event.Click { x, y } => {
+      let Event.Click { x: a, y: b } = e else { return 0 }
+      a + b + x + y
+    },
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_in_switch_case_drops_the_test_the_case_made() {
+    let input = r#"
+enum Event {
+  Click { x: int, y: int },
+  Move { dx: int },
+  Close,
+}
+
+fn test(e: Event) -> int {
+  match e {
+    Event.Click { x, y } => {
+      let Event.Click { x: a, y: b } = e else { return 0 }
+      a + b + x + y
+    },
+    Event.Move { dx } => dx,
+    Event.Close => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_on_reassigned_subject_keeps_its_test() {
+    let input = r#"
+enum Event {
+  Click { x: int, y: int },
+  Close,
+}
+
+fn test(start: Event) -> int {
+  let mut e = start
+  match e {
+    Event.Click { x, y } => {
+      e = Event.Close
+      let Event.Click { x: a, y: b } = e else { return 7 }
+      a + b + x + y
+    },
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_in_the_else_arm_keeps_its_test() {
+    let input = r#"
+enum Event {
+  Click { x: int, y: int },
+  Close,
+}
+
+fn test(e: Event) -> int {
+  match e {
+    Event.Click { x, y } => x + y,
+    _ => {
+      let Event.Click { x: a, y: b } = e else { return 5 }
+      a + b
+    },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_else_on_another_variant_keeps_its_test() {
+    let input = r#"
+enum Event {
+  Click { x: int, y: int },
+  Close,
+}
+
+fn test(e: Event) -> int {
+  match e {
+    Event.Click { x, y } => {
+      let Event.Close = e else { return x + y }
+      1
+    },
     _ => 0,
   }
 }
@@ -543,7 +751,7 @@ enum E { A(int), B(int), C }
 
 fn test(e: E) -> int {
   let x = 1
-  let A(x) | B(x) = e else { return 0; };
+  let E.A(x) | E.B(x) = e else { return 0; };
   x
 }
 "#;
@@ -560,6 +768,23 @@ fn main() {
   let _ = x;
   let x = 2;
   let _ = x;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn or_pattern_let_else_rest_shadow() {
+    let input = r#"
+import "go:fmt"
+
+fn main() {
+  let rest = [99]
+  fmt.Println(rest[0])
+  let [x, ..rest] | [x, ..rest] = [1, 2] else {
+    return
+  }
+  fmt.Println(x, rest[0])
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1083,16 +1308,14 @@ fn test(s: Status) -> int {
 #[test]
 fn match_arm_binding_shadows_outer_name() {
     let input = r#"
-import "go:fmt"
-
 struct Point { x: int, y: int }
 
 fn test(p: Point) -> int {
+  let outer = 100
   let result = match p {
-    Point { x, .. } as fmt => fmt.x + x,
+    Point { x, .. } as outer => outer.x + x,
   }
-  fmt.Println(result)
-  result
+  result + outer
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1106,6 +1329,554 @@ struct Point { x: int, y: int }
 fn test(p: Point) -> int {
   match p {
     Point { x, .. } as _pt => x,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn match_subject_var_discard_ignores_string_literal_lookalike() {
+    let input = r#"
+struct Point { x: int }
+
+fn make() -> Point {
+  Point { x: 1 }
+}
+
+fn test() -> string {
+  match make() {
+    _ => "subject_1",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_pattern_on_go_interface_emits_type_switch() {
+    let input = r#"
+import "go:example.com/events"
+
+fn describe(e: events.Event) -> int {
+  match e {
+    events.Token(s) => s.length(),
+    _ => 0,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Event {}
+pub struct Token(string)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/events", typedef)]);
+}
+
+#[test]
+fn tuple_element_go_interface_pattern_emits_type_switch() {
+    let input = r#"
+import "go:example.com/events"
+
+fn describe(pair: (events.Event, int)) -> int {
+  match pair {
+    (events.Token(s), _) => s.length(),
+    _ => 0,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Event {}
+pub struct Token(string)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/events", typedef)]);
+}
+
+#[test]
+fn struct_field_go_interface_pattern_emits_type_switch() {
+    let input = r#"
+import "go:example.com/events"
+
+struct Box {
+  e: events.Event,
+}
+
+fn describe(b: Box) -> int {
+  match b {
+    Box { e: events.Token(s) } => s.length(),
+    _ => 0,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Event {}
+pub struct Token(string)
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/events", typedef)]);
+}
+
+#[test]
+fn let_struct_pattern_on_go_interface_asserts_type() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn area(s: shapes.Shape) -> int {
+  let shapes.Rect { W: w, H: h } = s
+  w * h
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn let_else_struct_pattern_on_go_interface_uses_comma_ok() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn try_area(s: shapes.Shape) -> int {
+  let shapes.Rect { W: w, H: h } = s else { return -1 }
+  w * h
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn param_struct_pattern_on_go_interface_asserts_type() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn area(shapes.Rect { W: w, H: h }: shapes.Shape) -> int {
+  w * h
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn for_struct_pattern_on_go_interface_asserts_type() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn sum(items: Slice<shapes.Shape>) -> int {
+  let mut total = 0
+  for shapes.Rect { W: w, H: h } in items {
+    total = total + w * h
+  }
+  total
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn select_struct_pattern_on_go_interface_uses_comma_ok() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn drain(ch: Receiver<shapes.Shape>) -> int {
+  select {
+    let Some(shapes.Rect { W: w, H: h }) = ch.receive() => w * h,
+    _ => 0,
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn select_match_receive_on_go_interface_uses_comma_ok() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn drain(ch: Receiver<shapes.Shape>) -> int {
+  select {
+    match ch.receive() {
+      Some(shapes.Rect { W: w, H: h }) => w * h,
+      None => -1,
+    },
+  }
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn or_pattern_let_else_on_go_interface_per_alternative_comma_ok() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn area_or_neg(s: shapes.Shape) -> int {
+  let shapes.Rect { W: w, H: h } | shapes.Box { width: w, height: h } = s else { return -1 }
+  w * h
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+pub struct Box { pub width: int, pub height: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn for_pair_pattern_on_go_interface_asserts_value_type() {
+    let input = r#"
+import "go:example.com/shapes"
+
+fn sum_areas(items: Map<string, shapes.Shape>) -> int {
+  let mut total = 0
+  for (_, shapes.Rect { W: w, H: h }) in items {
+    total = total + w * h
+  }
+  total
+}
+"#;
+    let typedef = r#"
+pub interface Shape {}
+pub struct Rect { pub W: int, pub H: int }
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/shapes", typedef)]);
+}
+
+#[test]
+fn tuple_subject_of_calls_reads_each_once() {
+    let input = r#"
+fn left() -> int { 1 }
+
+fn right() -> int { 2 }
+
+fn test() -> string {
+  match (left(), right()) {
+    (1, 2) => "one two",
+    _ => "other",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_element_no_arm_reads_still_runs() {
+    let input = r#"
+fn left() -> int { 1 }
+
+fn test(b: bool) -> string {
+  match (left(), b) {
+    (_, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_unit_element_runs_as_a_statement() {
+    let input = r#"
+import "go:fmt"
+
+fn ping() {
+  fmt.Println("ping")
+}
+
+fn test(b: bool) -> string {
+  match (ping(), b) {
+    (_, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_untested_literal_keeps_its_call() {
+    let input = r#"
+struct Box { value: int }
+
+fn source() -> int { 1 }
+
+fn test(b: bool) -> string {
+  match (Box { value: source() }, b) {
+    (_, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_with_a_tuple_struct_pattern_keeps_its_tuple() {
+    let input = r#"
+struct Pair(int, int)
+
+fn make_pair() -> Pair { Pair(1, 2) }
+
+fn test(b: bool) -> string {
+  match (make_pair(), b) {
+    (Pair(_, _), true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_or_arm_reading_different_elements_keeps_its_tuple() {
+    let input = r#"
+fn left() -> int { 2 }
+
+fn right() -> int { 1 }
+
+fn test() -> string {
+  match (left(), right()) {
+    (_, 1) | (2, _) => "hit",
+    _ => "miss",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_with_a_variant_binding_keeps_its_tuple() {
+    let input = r#"
+enum Event {
+  Click(int, int),
+  Close,
+}
+
+fn test(e: Event, b: bool) -> int {
+  match (e, b) {
+    (Event.Click(x, y), true) => x + y,
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_single_variant_enum_reads_its_tag() {
+    let input = r#"
+enum Only { Single }
+
+fn test(o: Only, b: bool) -> string {
+  match (o, b) {
+    (Only.Single, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_with_a_struct_pattern_keeps_its_tuple() {
+    let input = r#"
+struct Box {}
+
+fn make_box() -> Box { Box {} }
+
+fn test(b: bool) -> string {
+  match (make_box(), b) {
+    (Box {}, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_untested_literal_keeps_its_division() {
+    let input = r#"
+struct Box { value: int }
+
+fn test(n: int, b: bool) -> string {
+  match (Box { value: 1 / n }, b) {
+    (_, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_unit_access_keeps_its_bounds_check() {
+    let input = r#"
+fn units() -> Slice<()> {
+  []
+}
+
+fn test(b: bool) -> string {
+  match (units()[0], b) {
+    (_, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_with_a_binding_keeps_its_tuple() {
+    let input = r#"
+fn source() -> int { 1 }
+
+fn test(b: bool) -> string {
+  match (source(), b) {
+    (x, true) => "yes",
+    _ => "no",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_bound_whole_keeps_its_tuple() {
+    let input = r#"
+fn test(a: int, b: int) -> int {
+  match (a, b) {
+    pair => pair.0 + pair.1,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_subject_with_a_guard_keeps_its_tuple() {
+    let input = r#"
+fn bump(n: int) -> bool {
+  let mut n = n
+  n = n + 1
+  true
+}
+
+fn test(start: int, b: int) -> string {
+  let mut a = start
+  a = a + 1
+  match (a, b) {
+    (1, _) if bump(a) => "first",
+    (2, _) => "second",
+    _ => "none",
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_enum_match_checks_every_element() {
+    let input = r#"
+pub enum Hand {
+  Left,
+  Right,
+}
+
+impl Hand {
+  pub fn left_right(self, other: Hand) -> bool {
+    match (self, other) {
+      (Hand.Left, Hand.Right) => true,
+      _ => false,
+    }
+  }
+
+  pub fn left_left(self, other: Hand) -> bool {
+    match (self, other) {
+      (Hand.Left, Hand.Left) => true,
+      _ => false,
+    }
+  }
+
+  pub fn eq(self, other: Hand) -> bool {
+    match (self, other) {
+      (Hand.Left, Hand.Left) => true,
+      (Hand.Right, Hand.Right) => true,
+      _ => false,
+    }
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn switch_case_with_remaining_enum_check_routes_to_catchall() {
+    let input = r#"
+enum Side { Left, Right }
+struct Pair { a: Side, b: Side }
+
+fn classify(p: Pair) -> int {
+  match p {
+    Pair { a: Side.Left, b: Side.Left } => 1,
+    Pair { a: Side.Right, b: Side.Right } => 2,
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_const_pattern_against_interface_scrutinee() {
+    let input = r#"
+interface Shape {}
+
+struct Token(int)
+
+const ZERO: Token = 0
+
+fn test(s: Shape) -> int {
+  match s {
+    ZERO => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_const_pattern_uses_go_constant_name() {
+    let input = r#"
+const MAX_SIZE = 1024
+const RETRY_LIMIT = 3
+
+fn classify(n: int) -> string {
+  match n {
+    MAX_SIZE => "max",
+    RETRY_LIMIT => "retry",
+    _ => "other",
   }
 }
 "#;

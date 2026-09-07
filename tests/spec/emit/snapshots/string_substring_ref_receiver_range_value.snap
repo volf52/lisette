@@ -1,0 +1,15 @@
+---
+source: tests/spec/emit/prelude.rs
+description: |
+  
+  fn test(r: Ref<string>, range: Range<int>) -> string {
+    r.substring(range)
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func test(r *string, range_ lisette.Range[int]) string {
+	return lisette.Substring(*r, range_.Start, range_.End)
+}

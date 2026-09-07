@@ -1,6 +1,30 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nimport \"go:fmt\"\n\ntype MyInt = int\ntype MyString = string\n\nenum Either<L, R> {\n  Left(L),\n  Right(R),\n}\n\nimpl Either<MyInt, MyString> {\n  fn describe(self) -> MyString {\n    match self {\n      Either.Left(n) => fmt.Sprintf(\"int(%d)\", n),\n      Either.Right(s) => fmt.Sprintf(\"str(%s)\", s),\n    }\n  }\n}\n\nfn test() -> MyString {\n  let e: Either<MyInt, MyString> = Either.Left(42)\n  e.describe()\n}\n"
+description: |
+  
+  import "go:fmt"
+  
+  type MyInt = int
+  type MyString = string
+  
+  enum Either<L, R> {
+    Left(L),
+    Right(R),
+  }
+  
+  impl Either<MyInt, MyString> {
+    fn describe(self) -> MyString {
+      match self {
+        Either.Left(n) => fmt.Sprintf("int(%d)", n),
+        Either.Right(s) => fmt.Sprintf("str(%s)", s),
+      }
+    }
+  }
+  
+  fn test() -> MyString {
+    let e: Either<MyInt, MyString> = Either.Left(42)
+    e.describe()
+  }
 ---
 package main
 
@@ -18,7 +42,7 @@ type MyInt = int
 
 type MyString = string
 
-type EitherTag int
+type EitherTag uint8
 
 const (
 	EitherLeft EitherTag = iota
@@ -31,27 +55,14 @@ type Either[L any, R any] struct {
 	Right R
 }
 
-func (e Either[L, R]) String() string {
-	switch e.Tag {
-	case EitherLeft:
-		return fmt.Sprintf("Either.Left(%v)", e.Left)
-	case EitherRight:
-		return fmt.Sprintf("Either.Right(%v)", e.Right)
-	default:
-		return fmt.Sprintf("Either(%d)", e.Tag)
-	}
-}
-
 func Either_describe(self Either[MyInt, MyString]) MyString {
 	if self.Tag == EitherLeft {
-		n := self.Left
-		return fmt.Sprintf("int(%d)", n)
+		return fmt.Sprintf("int(%d)", self.Left)
 	}
-	s := self.Right
-	return fmt.Sprintf("str(%s)", s)
+	return fmt.Sprintf("str(%s)", self.Right)
 }
 
 func test() MyString {
-	e := MakeEitherLeft[int, MyString](42)
+	e := MakeEitherLeft[MyInt, MyString](42)
 	return Either_describe(e)
 }

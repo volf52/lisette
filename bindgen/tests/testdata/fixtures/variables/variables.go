@@ -29,3 +29,10 @@ var Counter int
 
 // ConfigMap holds configuration.
 var ConfigMap map[string]string
+
+// Counters has an anonymous-struct type; bindgen synthesizes a named struct so
+// the var stays reachable from Lisette.
+var Counters struct {
+	Hits   int64
+	Misses int64
+}

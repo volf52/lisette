@@ -1,20 +1,45 @@
 pub use token::{Token, TokenKind};
-pub use types::{LexResult, Trivia};
+pub use types::LexResult;
 
 use crate::parse::ParseError;
+use std::borrow::Cow;
+use std::iter::Peekable;
+use std::str::Chars;
 
 mod errors;
 mod token;
 mod types;
 
+pub(crate) fn bom_len(source: &str) -> usize {
+    const BOM: char = '\u{feff}';
+    if source.starts_with(BOM) {
+        BOM.len_utf8()
+    } else {
+        0
+    }
+}
+
+pub(crate) fn shebang_len(source: &str) -> Option<usize> {
+    let rest = source.strip_prefix("#!")?;
+    if matches!(rest.as_bytes().first()?, b'[' | b'\r' | b'\n') {
+        return None;
+    }
+
+    let length = rest
+        .as_bytes()
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+        .unwrap_or(rest.len());
+
+    Some("#!".len() + length)
+}
+
 pub struct Lexer<'source> {
     input: &'source str,
-    input_bytes: &'source [u8],
     current_offset: usize,
     file_id: u32,
     errors: Vec<ParseError>,
-    pending_tokens: Vec<Token<'source>>,
-    trivia: Trivia,
+    blank_lines: Vec<u32>,
     last_newline_offset: Option<usize>,
 }
 
@@ -22,25 +47,23 @@ impl<'source> Lexer<'source> {
     pub fn new(input: &'source str, file_id: u32) -> Lexer<'source> {
         Lexer {
             input,
-            input_bytes: input.as_bytes(),
             current_offset: 0,
             file_id,
             errors: vec![],
-            pending_tokens: vec![],
-            trivia: Trivia::default(),
+            blank_lines: Vec::new(),
             last_newline_offset: None,
         }
     }
 
     pub fn lex(mut self) -> LexResult<'source> {
         let mut tokens = Vec::new();
+        self.current_offset = bom_len(self.input);
+
+        if let Some(shebang) = self.lex_shebang() {
+            tokens.push(shebang);
+        }
 
         loop {
-            if let Some(token) = self.pending_tokens.pop() {
-                tokens.push(token);
-                continue;
-            }
-
             self.skip_whitespace();
 
             if self.at_eof() {
@@ -48,10 +71,12 @@ impl<'source> Lexer<'source> {
                 break;
             }
 
+            if self.try_consume_unsupported_raw_variant(self.input.len()) {
+                continue;
+            }
+
             if self.current_byte() == b'f' && self.peek_byte() == b'"' {
-                let mut fstring_tokens = self.lex_format_string_tokens();
-                fstring_tokens.reverse();
-                self.pending_tokens = fstring_tokens;
+                tokens.extend(self.lex_format_string_tokens());
                 continue;
             }
 
@@ -64,7 +89,7 @@ impl<'source> Lexer<'source> {
         LexResult {
             tokens,
             errors: self.errors,
-            trivia: self.trivia,
+            blank_lines: self.blank_lines,
         }
     }
 
@@ -102,6 +127,7 @@ impl<'source> Lexer<'source> {
                 | TokenKind::Imaginary
                 | TokenKind::Float
                 | TokenKind::String
+                | TokenKind::RawString
                 | TokenKind::Char
                 | TokenKind::Boolean
                 | TokenKind::RightParen
@@ -138,6 +164,12 @@ impl<'source> Lexer<'source> {
                 | TokenKind::MinusEqual
                 | TokenKind::StarEqual
                 | TokenKind::SlashEqual
+                | TokenKind::AmpersandEqual
+                | TokenKind::PipeEqual
+                | TokenKind::CaretEqual
+                | TokenKind::AndNotEqual
+                | TokenKind::ShiftLeftEqual
+                | TokenKind::ShiftRightEqual
                 | TokenKind::Else
                 | TokenKind::LeftCurlyBrace
                 | TokenKind::RightCurlyBrace
@@ -152,10 +184,12 @@ impl<'source> Lexer<'source> {
         tokens: &'a [Token<'source>],
         start_index: usize,
     ) -> Option<&'a Token<'source>> {
-        tokens
-            .iter()
-            .skip(start_index)
-            .find(|&token| token.kind != TokenKind::Comment && token.kind != TokenKind::DocComment)
+        tokens.iter().skip(start_index).find(|&token| {
+            !matches!(
+                token.kind,
+                TokenKind::Comment | TokenKind::DocComment | TokenKind::FileComment
+            )
+        })
     }
 
     fn has_newline_between(&self, start: usize, end: usize) -> bool {
@@ -179,6 +213,7 @@ impl<'source> Lexer<'source> {
         let c = self.current_char();
         match c {
             '0'..='9' => self.lex_number(),
+            'r' if self.peek_byte() == b'"' => self.lex_raw_string_literal(),
             _ if c.is_alphabetic() || c == '_' => self.lex_identifier(),
             '"' => self.lex_string_literal(),
             '`' => self.lex_backtick_literal(),
@@ -192,11 +227,11 @@ impl<'source> Lexer<'source> {
 
     #[inline]
     fn current_byte(&self) -> u8 {
-        if self.current_offset < self.input_bytes.len() {
-            self.input_bytes[self.current_offset]
-        } else {
-            0
-        }
+        self.input
+            .as_bytes()
+            .get(self.current_offset)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -209,11 +244,17 @@ impl<'source> Lexer<'source> {
 
     #[inline]
     fn peek_byte(&self) -> u8 {
-        if self.current_offset + 1 < self.input_bytes.len() {
-            self.input_bytes[self.current_offset + 1]
-        } else {
-            0
-        }
+        self.input
+            .as_bytes()
+            .get(self.current_offset + 1)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    fn peek_byte_at(&self, n: usize) -> u8 {
+        let offset = self.current_offset + n;
+        self.input.as_bytes().get(offset).copied().unwrap_or(0)
     }
 
     #[inline]
@@ -280,7 +321,7 @@ impl<'source> Lexer<'source> {
                     .chars()
                     .all(|c| c.is_ascii_whitespace() && c != '\n');
             if is_blank {
-                self.trivia.blank_lines.push(offset as u32);
+                self.blank_lines.push(offset as u32);
             }
         }
 
@@ -377,41 +418,16 @@ impl<'source> Lexer<'source> {
                     self.next(); // consume 'b'
                     return self.lex_binary_number(start_offset);
                 }
-                b'0'..=b'7' => {
-                    return self.lex_legacy_octal_number(start_offset);
-                }
-                _ => {} // decimal zero or float
+                _ => {} // decimal zero, leading-zero literal, or float
             }
         }
 
         let mut kind = TokenKind::Integer;
 
-        while !self.at_eof() {
-            let byte = self.current_byte();
-            if byte.is_ascii_digit() || byte == b'_' {
-                if byte == b'_' && self.previous_char() == '_' {
-                    let underscore_start = self.current_offset - 1;
-                    self.error_consecutive_underscores(underscore_start);
-                }
-                self.next();
-            } else {
-                break;
-            }
-        }
+        self.scan_digits(|byte| byte.is_ascii_digit());
+        self.check_trailing_underscore();
 
-        if self.previous_char() == '_' {
-            self.error_number_trailing_underscore(
-                self.current_offset - self.previous_char().len_utf8(),
-            );
-        }
-
-        // Skip decimal part if preceded by single `.` (e.g., `tuple.0.0` — don't lex `0.0` as float).
-        // Don't skip if preceded by `..` (range operator), e.g. `0..1.5` should lex `1.5` as float.
-        let preceded_by_dot = start_offset > 0
-            && self.input_bytes[start_offset - 1] == b'.'
-            && !(start_offset > 1 && self.input_bytes[start_offset - 2] == b'.');
-
-        if !preceded_by_dot
+        if !self.preceded_by_single_dot(start_offset)
             && self.current_byte() == b'.'
             && self.peek_byte() != b'.'
             && (self.peek_byte().is_ascii_digit() || self.peek_byte() == b'_')
@@ -423,24 +439,8 @@ impl<'source> Lexer<'source> {
                 self.error_decimal_leading_underscore(self.current_offset);
             }
 
-            while !self.at_eof() {
-                let byte = self.current_byte();
-                if byte.is_ascii_digit() || byte == b'_' {
-                    if byte == b'_' && self.previous_char() == '_' {
-                        let underscore_start = self.current_offset - 1;
-                        self.error_consecutive_underscores(underscore_start);
-                    }
-                    self.next();
-                } else {
-                    break;
-                }
-            }
-
-            if self.previous_char() == '_' {
-                self.error_number_trailing_underscore(
-                    self.current_offset - self.previous_char().len_utf8(),
-                );
-            }
+            self.scan_digits(|byte| byte.is_ascii_digit());
+            self.check_trailing_underscore();
         }
 
         if self.current_byte() == b'e' || self.current_byte() == b'E' {
@@ -459,24 +459,8 @@ impl<'source> Lexer<'source> {
                 );
             }
 
-            while !self.at_eof() {
-                let byte = self.current_byte();
-                if byte.is_ascii_digit() || byte == b'_' {
-                    if byte == b'_' && self.previous_char() == '_' {
-                        let underscore_start = self.current_offset - 1;
-                        self.error_consecutive_underscores(underscore_start);
-                    }
-                    self.next();
-                } else {
-                    break;
-                }
-            }
-
-            if self.previous_char() == '_' {
-                self.error_number_trailing_underscore(
-                    self.current_offset - self.previous_char().len_utf8(),
-                );
-            }
+            self.scan_digits(|byte| byte.is_ascii_digit());
+            self.check_trailing_underscore();
         }
 
         if self.current_byte() == b'i' && !self.peek_byte().is_ascii_alphanumeric() {
@@ -499,12 +483,11 @@ impl<'source> Lexer<'source> {
         }
     }
 
-    fn lex_hex_number(&mut self, start_offset: usize) -> Token<'source> {
-        let digits_start = self.current_offset;
-
+    /// Consume digit and underscore bytes, reporting consecutive underscores.
+    fn scan_digits(&mut self, is_digit: impl Fn(u8) -> bool) {
         while !self.at_eof() {
             let byte = self.current_byte();
-            if byte.is_ascii_hexdigit() || byte == b'_' {
+            if is_digit(byte) || byte == b'_' {
                 if byte == b'_' && self.previous_char() == '_' {
                     let underscore_start = self.current_offset - 1;
                     self.error_consecutive_underscores(underscore_start);
@@ -514,21 +497,41 @@ impl<'source> Lexer<'source> {
                 break;
             }
         }
+    }
 
-        if self.current_offset == digits_start {
-            self.error_missing_hex_digits(start_offset, 2);
-        }
-
+    fn check_trailing_underscore(&mut self) {
         if self.previous_char() == '_' {
             self.error_number_trailing_underscore(
                 self.current_offset - self.previous_char().len_utf8(),
             );
         }
+    }
+
+    // A single preceding `.` is field access (e.g. `tuple.0.0`), so do not lex `0.0` as float.
+    // A preceding `..` is the range operator, so e.g. `0..1.5` should lex `1.5` as float.
+    fn preceded_by_single_dot(&self, start_offset: usize) -> bool {
+        start_offset > 0
+            && self.input.as_bytes()[start_offset - 1] == b'.'
+            && !(start_offset > 1 && self.input.as_bytes()[start_offset - 2] == b'.')
+    }
+
+    fn finish_radix_number(
+        &mut self,
+        start_offset: usize,
+        digits_start: usize,
+        base: &str,
+        error_missing_digits: fn(&mut Self, usize, usize),
+    ) -> Token<'source> {
+        if self.current_offset == digits_start {
+            error_missing_digits(self, start_offset, 2);
+        }
+
+        self.check_trailing_underscore();
 
         if self.current_byte() == b'i' && !self.peek_byte().is_ascii_alphanumeric() {
-            self.next(); // consume 'i'
+            self.next();
             let end_offset = self.current_offset;
-            self.error_non_decimal_imaginary("hex", start_offset, end_offset - start_offset);
+            self.error_non_decimal_imaginary(base, start_offset, end_offset - start_offset);
             return Token {
                 kind: TokenKind::Imaginary,
                 text: &self.input[start_offset..end_offset],
@@ -544,20 +547,27 @@ impl<'source> Lexer<'source> {
             byte_offset: start_offset as u32,
             byte_length: (end_offset - start_offset) as u32,
         }
+    }
+
+    fn lex_hex_number(&mut self, start_offset: usize) -> Token<'source> {
+        let digits_start = self.current_offset;
+
+        self.scan_digits(|byte| byte.is_ascii_hexdigit());
+
+        self.finish_radix_number(
+            start_offset,
+            digits_start,
+            "hex",
+            Self::error_missing_hex_digits,
+        )
     }
 
     fn lex_octal_number(&mut self, start_offset: usize) -> Token<'source> {
         let digits_start = self.current_offset;
 
-        while !self.at_eof() {
-            let byte = self.current_byte();
-            if (b'0'..=b'7').contains(&byte) || byte == b'_' {
-                if byte == b'_' && self.previous_char() == '_' {
-                    let underscore_start = self.current_offset - 1;
-                    self.error_consecutive_underscores(underscore_start);
-                }
-                self.next();
-            } else if byte == b'8' || byte == b'9' {
+        loop {
+            self.scan_digits(|byte| (b'0'..=b'7').contains(&byte));
+            if matches!(self.current_byte(), b'8' | b'9') {
                 self.error_invalid_octal_digit(self.current_offset);
                 self.next();
             } else {
@@ -565,95 +575,20 @@ impl<'source> Lexer<'source> {
             }
         }
 
-        if self.current_offset == digits_start {
-            self.error_missing_octal_digits(start_offset, 2);
-        }
-
-        if self.previous_char() == '_' {
-            self.error_number_trailing_underscore(
-                self.current_offset - self.previous_char().len_utf8(),
-            );
-        }
-
-        if self.current_byte() == b'i' && !self.peek_byte().is_ascii_alphanumeric() {
-            self.next(); // consume 'i'
-            let end_offset = self.current_offset;
-            self.error_non_decimal_imaginary("octal", start_offset, end_offset - start_offset);
-            return Token {
-                kind: TokenKind::Imaginary,
-                text: &self.input[start_offset..end_offset],
-                byte_offset: start_offset as u32,
-                byte_length: (end_offset - start_offset) as u32,
-            };
-        }
-
-        let end_offset = self.current_offset;
-        Token {
-            kind: TokenKind::Integer,
-            text: &self.input[start_offset..end_offset],
-            byte_offset: start_offset as u32,
-            byte_length: (end_offset - start_offset) as u32,
-        }
-    }
-
-    fn lex_legacy_octal_number(&mut self, start_offset: usize) -> Token<'source> {
-        self.next();
-
-        while !self.at_eof() {
-            let byte = self.current_byte();
-            if (b'0'..=b'7').contains(&byte) || byte == b'_' {
-                if byte == b'_' && self.previous_char() == '_' {
-                    let underscore_start = self.current_offset - 1;
-                    self.error_consecutive_underscores(underscore_start);
-                }
-                self.next();
-            } else if byte == b'8' || byte == b'9' {
-                self.error_invalid_octal_digit(self.current_offset);
-                self.next();
-            } else {
-                break;
-            }
-        }
-
-        if self.previous_char() == '_' {
-            self.error_number_trailing_underscore(
-                self.current_offset - self.previous_char().len_utf8(),
-            );
-        }
-
-        if self.current_byte() == b'i' && !self.peek_byte().is_ascii_alphanumeric() {
-            self.next();
-            let end_offset = self.current_offset;
-            self.error_non_decimal_imaginary("octal", start_offset, end_offset - start_offset);
-            return Token {
-                kind: TokenKind::Imaginary,
-                text: &self.input[start_offset..end_offset],
-                byte_offset: start_offset as u32,
-                byte_length: (end_offset - start_offset) as u32,
-            };
-        }
-
-        let end_offset = self.current_offset;
-        Token {
-            kind: TokenKind::Integer,
-            text: &self.input[start_offset..end_offset],
-            byte_offset: start_offset as u32,
-            byte_length: (end_offset - start_offset) as u32,
-        }
+        self.finish_radix_number(
+            start_offset,
+            digits_start,
+            "octal",
+            Self::error_missing_octal_digits,
+        )
     }
 
     fn lex_binary_number(&mut self, start_offset: usize) -> Token<'source> {
         let digits_start = self.current_offset;
 
-        while !self.at_eof() {
-            let byte = self.current_byte();
-            if byte == b'0' || byte == b'1' || byte == b'_' {
-                if byte == b'_' && self.previous_char() == '_' {
-                    let underscore_start = self.current_offset - 1;
-                    self.error_consecutive_underscores(underscore_start);
-                }
-                self.next();
-            } else if (b'2'..=b'9').contains(&byte) {
+        loop {
+            self.scan_digits(|byte| byte == b'0' || byte == b'1');
+            if (b'2'..=b'9').contains(&self.current_byte()) {
                 self.error_invalid_binary_digit(self.current_offset);
                 self.next();
             } else {
@@ -661,35 +596,12 @@ impl<'source> Lexer<'source> {
             }
         }
 
-        if self.current_offset == digits_start {
-            self.error_missing_binary_digits(start_offset, 2);
-        }
-
-        if self.previous_char() == '_' {
-            self.error_number_trailing_underscore(
-                self.current_offset - self.previous_char().len_utf8(),
-            );
-        }
-
-        if self.current_byte() == b'i' && !self.peek_byte().is_ascii_alphanumeric() {
-            self.next();
-            let end_offset = self.current_offset;
-            self.error_non_decimal_imaginary("binary", start_offset, end_offset - start_offset);
-            return Token {
-                kind: TokenKind::Imaginary,
-                text: &self.input[start_offset..end_offset],
-                byte_offset: start_offset as u32,
-                byte_length: (end_offset - start_offset) as u32,
-            };
-        }
-
-        let end_offset = self.current_offset;
-        Token {
-            kind: TokenKind::Integer,
-            text: &self.input[start_offset..end_offset],
-            byte_offset: start_offset as u32,
-            byte_length: (end_offset - start_offset) as u32,
-        }
+        self.finish_radix_number(
+            start_offset,
+            digits_start,
+            "binary",
+            Self::error_missing_binary_digits,
+        )
     }
 
     fn lex_identifier(&mut self) -> Token<'source> {
@@ -733,8 +645,6 @@ impl<'source> Lexer<'source> {
                 terminated = true;
                 self.next();
                 break;
-            } else if byte == b'\n' {
-                break;
             }
             self.next();
         }
@@ -754,10 +664,92 @@ impl<'source> Lexer<'source> {
         }
     }
 
-    fn consume_unicode_escape(&mut self, escape_start: usize) {
+    fn consume_escape(&mut self, literal_start: usize, closing_quote: u8) -> bool {
+        let escape_start = self.current_offset;
+        self.next();
+
+        if self.at_eof() {
+            self.error_unterminated_escape(literal_start);
+            return false;
+        }
+
+        match self.current_byte() {
+            first @ b'0'..=b'7' => {
+                self.next();
+                let value = self.consume_octal_escape(first);
+                if value > 255 {
+                    self.error_octal_escape_out_of_range(
+                        escape_start,
+                        self.current_offset - escape_start,
+                    );
+                    return false;
+                }
+                true
+            }
+            b'x' => {
+                self.next();
+                self.consume_hex_escape(escape_start, 2).is_some()
+            }
+            b'u' => {
+                self.next();
+                match self.consume_unicode_escape(escape_start) {
+                    Some(codepoint) => self.check_scalar_value(codepoint, escape_start),
+                    None => false,
+                }
+            }
+            b'U' => {
+                self.next();
+                match self.consume_hex_escape(escape_start, 8) {
+                    Some(codepoint) => self.check_scalar_value(codepoint, escape_start),
+                    None => false,
+                }
+            }
+            b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' => {
+                self.next();
+                true
+            }
+            byte if byte == closing_quote => {
+                self.next();
+                true
+            }
+            _ => {
+                self.error_invalid_escape(self.current_char(), escape_start, closing_quote);
+                self.next();
+                false
+            }
+        }
+    }
+
+    fn check_scalar_value(&mut self, codepoint: u32, escape_start: usize) -> bool {
+        if char::from_u32(codepoint).is_some() {
+            return true;
+        }
+        self.error_unicode_escape_out_of_range(escape_start, self.current_offset - escape_start);
+        false
+    }
+
+    fn consume_hex_escape(&mut self, escape_start: usize, digits: usize) -> Option<u32> {
+        let mut value: u32 = 0;
+        for _ in 0..digits {
+            // At end of input `current_byte` yields 0, which is not a hex digit.
+            let Some(digit) = (self.current_byte() as char).to_digit(16) else {
+                self.error_invalid_hex_escape(
+                    escape_start,
+                    self.current_offset - escape_start,
+                    digits,
+                );
+                return None;
+            };
+            value = value * 16 + digit;
+            self.next();
+        }
+        Some(value)
+    }
+
+    fn consume_unicode_escape(&mut self, escape_start: usize) -> Option<u32> {
         if self.at_eof() || self.current_byte() != b'{' {
             self.error_invalid_unicode_escape(escape_start, self.current_offset - escape_start);
-            return;
+            return None;
         }
         self.next();
 
@@ -765,7 +757,7 @@ impl<'source> Lexer<'source> {
         let mut all_hex = true;
         while !self.at_eof() {
             let byte = self.current_byte();
-            if byte == b'}' || byte == b'"' || byte == b'\n' {
+            if byte == b'}' || byte == b'"' || byte == b'\'' || byte == b'\n' {
                 break;
             }
             if !byte.is_ascii_hexdigit() {
@@ -781,18 +773,16 @@ impl<'source> Lexer<'source> {
         }
 
         let hex_len = hex_end - hex_start;
-        let total_len = self.current_offset - escape_start;
 
         if !closed || !all_hex || hex_len == 0 || hex_len > 6 {
-            self.error_invalid_unicode_escape(escape_start, total_len);
-            return;
+            self.error_invalid_unicode_escape(escape_start, self.current_offset - escape_start);
+            return None;
         }
 
-        let codepoint = u32::from_str_radix(&self.input[hex_start..hex_end], 16)
-            .expect("hex digits validated above");
-        if char::from_u32(codepoint).is_none() {
-            self.error_unicode_escape_out_of_range(escape_start, total_len);
-        }
+        Some(
+            u32::from_str_radix(&self.input[hex_start..hex_end], 16)
+                .expect("hex digits validated above"),
+        )
     }
 
     /// Consume up to 2 more octal digits after the first has already been read.
@@ -818,61 +808,27 @@ impl<'source> Lexer<'source> {
 
         self.next();
 
-        let mut escaped = false;
         let mut terminated = false;
 
-        while !self.at_eof() && !terminated {
+        while !self.at_eof() {
             let byte = self.current_byte();
-            if escaped {
-                match byte {
-                    b'0'..=b'7' => {
-                        let escape_start = self.current_offset - 1;
-                        self.next();
-                        let value = self.consume_octal_escape(byte);
-                        if value > 255 {
-                            let escape_len = self.current_offset - escape_start;
-                            self.error_octal_escape_out_of_range(escape_start, escape_len);
-                        }
-                        escaped = false;
-                        continue;
-                    }
-                    b'u' => {
-                        let escape_start = self.current_offset - 1;
-                        self.next();
-                        self.consume_unicode_escape(escape_start);
-                        escaped = false;
-                        continue;
-                    }
-                    b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' | b'"' | b'x' | b'U' => {
-                    }
-                    b'\'' => {}
-                    _ => {
-                        self.error_invalid_escape(self.current_char());
-                    }
-                }
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
+            if byte == b'\\' {
+                self.consume_escape(start_offset, b'"');
+                continue;
+            }
+            if byte == b'"' {
                 terminated = true;
                 self.next();
                 break;
-            } else if byte == b'\n' {
-                break; // unterminated string literal across newline, handled below
             }
-
             self.next();
         }
 
         let end_offset = self.current_offset;
         let length = end_offset - start_offset;
 
-        if escaped {
-            self.error_unterminated_escape(start_offset);
-        }
-
         if !terminated {
-            self.error_unterminated_string(start_offset, length);
+            self.error_unterminated_string(start_offset, 1);
         }
 
         Token {
@@ -880,6 +836,120 @@ impl<'source> Lexer<'source> {
             text: &self.input[start_offset..end_offset],
             byte_offset: start_offset as u32,
             byte_length: length as u32,
+        }
+    }
+
+    fn lex_raw_string_literal(&mut self) -> Token<'source> {
+        let start_offset = self.current_offset;
+        self.next(); // consume 'r'
+        self.next(); // consume opening '"'
+
+        let mut terminated = false;
+        while !self.at_eof() {
+            let byte = self.current_byte();
+            if byte == b'"' {
+                terminated = true;
+                self.next();
+                break;
+            } else if byte == 0 {
+                self.error_disallowed_byte_in_raw_string(self.current_offset, byte);
+                self.next();
+                continue;
+            }
+            self.next();
+        }
+
+        let end_offset = self.current_offset;
+        let length = end_offset - start_offset;
+
+        if !terminated {
+            self.error_unterminated_raw_string(start_offset, 2);
+        }
+
+        Token {
+            kind: TokenKind::RawString,
+            text: &self.input[start_offset..end_offset],
+            byte_offset: start_offset as u32,
+            byte_length: length as u32,
+        }
+    }
+
+    fn try_consume_unsupported_raw_variant(&mut self, end: usize) -> bool {
+        let raw_format_prefix = if self.current_byte() == b'r'
+            && self.peek_byte() == b'f'
+            && self.peek_byte_at(2) == b'"'
+        {
+            Some("rf")
+        } else if self.current_byte() == b'f'
+            && self.peek_byte() == b'r'
+            && self.peek_byte_at(2) == b'"'
+        {
+            Some("fr")
+        } else {
+            None
+        };
+        if let Some(prefix) = raw_format_prefix {
+            let start = self.current_offset;
+            self.skip(3);
+            while self.current_offset < end
+                && self.current_byte() != b'"'
+                && self.current_byte() != b'\n'
+            {
+                self.next();
+            }
+            if self.current_offset < end && self.current_byte() == b'"' {
+                self.next();
+            }
+            let length = self.current_offset - start;
+            self.error_unsupported_raw_format_string(start, length, prefix);
+            return true;
+        }
+
+        if self.current_byte() == b'r' && self.peek_byte() == b'#' {
+            let mut hash_count = 0usize;
+            let mut probe = self.current_offset + 1;
+            while probe < self.input.len() && self.input.as_bytes()[probe] == b'#' {
+                hash_count += 1;
+                probe += 1;
+            }
+            if hash_count > 0 && probe < self.input.len() && self.input.as_bytes()[probe] == b'"' {
+                let start = self.current_offset;
+                self.skip(1 + hash_count + 1);
+                loop {
+                    if self.current_offset >= end || self.current_byte() == b'\n' {
+                        break;
+                    }
+                    if self.at_hash_delimited_terminator(hash_count) {
+                        self.skip(1 + hash_count);
+                        break;
+                    }
+                    self.next();
+                }
+                let length = self.current_offset - start;
+                self.error_unsupported_hash_delimited_raw_string(start, length);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn at_hash_delimited_terminator(&self, hash_count: usize) -> bool {
+        self.current_byte() == b'"' && (1..=hash_count).all(|i| self.peek_byte_at(i) == b'#')
+    }
+
+    fn skip_past_quoted_string(&mut self) {
+        while !self.at_eof() && self.current_byte() != b'"' {
+            if self.current_byte() == b'\\' {
+                self.next();
+                if self.at_eof() {
+                    break;
+                }
+            }
+            self.next();
+        }
+        if !self.at_eof() {
+            self.next();
         }
     }
 
@@ -932,12 +1002,28 @@ impl<'source> Lexer<'source> {
                 break;
             }
 
+            if self.try_consume_unsupported_raw_variant(interpolation_end) {
+                continue;
+            }
+
             if self.current_byte() == b'f' && self.peek_byte() == b'"' {
                 let mut fstring_tokens = self.lex_format_string_tokens();
                 tokens.append(&mut fstring_tokens);
             } else if self.current_byte() == b'\\' && self.peek_byte() == b'"' {
                 self.error_escaped_quote_in_interpolation(self.current_offset);
                 self.skip(2);
+            } else if self.current_byte() == b'r' && self.peek_byte() == b'"' {
+                self.error_raw_string_in_interpolation(self.current_offset);
+                self.skip(2);
+                while self.current_offset < interpolation_end
+                    && self.current_byte() != b'"'
+                    && self.current_byte() != b'\n'
+                {
+                    self.next();
+                }
+                if self.current_offset < interpolation_end && self.current_byte() == b'"' {
+                    self.next();
+                }
             } else {
                 let token = self.create_token();
                 tokens.push(token);
@@ -1025,14 +1111,38 @@ impl<'source> Lexer<'source> {
         None
     }
 
+    // Caller has just consumed `{` of the broken interpolation, so we start
+    // inside it (depth=1). Newlines are not a recovery boundary now that
+    // f-string text spans them, so we balance braces and skip past quoted
+    // strings to avoid stopping at the first inner `"`.
     fn skip_to_format_string_end(&mut self) {
+        let mut depth = 1;
         while !self.at_eof() {
             match self.current_byte() {
-                b'"' => {
+                b'\\' => {
+                    self.next();
+                    if !self.at_eof() {
+                        self.next();
+                    }
+                }
+                b'"' if depth == 0 => {
                     self.next();
                     return;
                 }
-                b'\n' => return,
+                b'"' => {
+                    self.next();
+                    self.skip_past_quoted_string();
+                }
+                b'{' => {
+                    depth += 1;
+                    self.next();
+                }
+                b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    self.next();
+                }
                 _ => self.next(),
             }
         }
@@ -1058,22 +1168,8 @@ impl<'source> Lexer<'source> {
             let byte = self.current_byte();
 
             match byte {
-                b'\\' if !self.at_eof() => {
-                    let escape_start = self.current_offset;
-                    self.next();
-                    if !self.at_eof() {
-                        let b = self.current_byte();
-                        self.next();
-                        if matches!(b, b'0'..=b'7') {
-                            let value = self.consume_octal_escape(b);
-                            if value > 255 {
-                                let escape_len = self.current_offset - escape_start;
-                                self.error_octal_escape_out_of_range(escape_start, escape_len);
-                            }
-                        } else if b == b'u' {
-                            self.consume_unicode_escape(escape_start);
-                        }
-                    }
+                b'\\' => {
+                    self.consume_escape(start_offset, b'"');
                 }
                 b'{' if self.peek_byte() == b'{' => {
                     self.skip(2);
@@ -1096,12 +1192,6 @@ impl<'source> Lexer<'source> {
                     return tokens;
                 }
 
-                b'\n' => {
-                    let length = self.current_offset.saturating_sub(start_offset);
-                    self.error_unterminated_format_string(start_offset, length);
-                    return tokens;
-                }
-
                 b'{' => {
                     self.push_format_string_text_if_needed(&mut tokens, text_segment_start);
 
@@ -1120,8 +1210,7 @@ impl<'source> Lexer<'source> {
             }
         }
 
-        let length = self.current_offset.saturating_sub(start_offset);
-        self.error_unterminated_format_string(start_offset, length);
+        self.error_unterminated_format_string(start_offset, 2);
         tokens
     }
 
@@ -1129,78 +1218,7 @@ impl<'source> Lexer<'source> {
         let start_offset = self.current_offset;
 
         self.next();
-
-        if self.at_eof() || self.current_byte() == b'\'' {
-            self.error_empty_rune_literal(start_offset);
-            let end_offset = self.current_offset;
-            return Token {
-                kind: TokenKind::Char,
-                text: &self.input[start_offset..end_offset],
-                byte_offset: start_offset as u32,
-                byte_length: (end_offset - start_offset) as u32,
-            };
-        }
-
-        if self.current_byte() != b'\\' {
-            self.next();
-        } else {
-            self.next();
-
-            if self.at_eof() {
-                self.error_unterminated_escape(start_offset);
-                let end_offset = self.current_offset;
-                return Token {
-                    kind: TokenKind::Char,
-                    text: &self.input[start_offset..end_offset],
-                    byte_offset: start_offset as u32,
-                    byte_length: (end_offset - start_offset) as u32,
-                };
-            }
-
-            match self.current_byte() {
-                b'0'..=b'7' => {
-                    let escape_start = self.current_offset - 1;
-                    let first = self.current_byte();
-                    self.next();
-                    let value = self.consume_octal_escape(first);
-                    if value > 255 {
-                        let escape_len = self.current_offset - escape_start;
-                        self.error_octal_escape_out_of_range(escape_start, escape_len);
-                    }
-                }
-                b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'\\' | b'\'' | b'x' => {
-                    self.next();
-                }
-                _ => {
-                    self.error_invalid_escape(self.current_char());
-
-                    while !self.at_eof() && self.current_byte() != b'\'' {
-                        self.next();
-                    }
-
-                    if !self.at_eof() && self.current_byte() == b'\'' {
-                        self.next();
-                    }
-
-                    let end_offset = self.current_offset;
-                    return Token {
-                        kind: TokenKind::Char,
-                        text: &self.input[start_offset..end_offset],
-                        byte_offset: start_offset as u32,
-                        byte_length: (end_offset - start_offset) as u32,
-                    };
-                }
-            }
-        }
-
-        if self.at_eof() || self.current_byte() != b'\'' {
-            let length = self.current_offset - start_offset;
-            self.error_unterminated_rune(start_offset, length);
-        }
-
-        if !self.at_eof() && self.current_byte() == b'\'' {
-            self.next();
-        }
+        self.scan_rune_body(start_offset);
 
         let end_offset = self.current_offset;
         Token {
@@ -1209,6 +1227,45 @@ impl<'source> Lexer<'source> {
             byte_offset: start_offset as u32,
             byte_length: (end_offset - start_offset) as u32,
         }
+    }
+
+    fn scan_rune_body(&mut self, start_offset: usize) {
+        if self.at_eof() || self.current_byte() == b'\'' {
+            self.error_empty_rune_literal(start_offset);
+            return;
+        }
+
+        if self.current_byte() != b'\\' {
+            self.next();
+        } else if !self.consume_escape(start_offset, b'\'') {
+            // Resync, else a mid-literal cursor also reports unterminated_rune.
+            while !self.at_eof() && self.current_byte() != b'\'' {
+                self.next();
+            }
+            if !self.at_eof() {
+                self.next();
+            }
+            return;
+        }
+
+        if !self.at_eof() && self.current_byte() == b'\'' {
+            self.next();
+        } else {
+            self.error_unterminated_rune(start_offset, self.current_offset - start_offset);
+        }
+    }
+
+    fn lex_shebang(&mut self) -> Option<Token<'source>> {
+        let start = self.current_offset;
+        let length = shebang_len(&self.input[start..])?;
+        self.current_offset = start + length;
+
+        Some(Token {
+            kind: TokenKind::Shebang,
+            text: &self.input[start..start + length],
+            byte_offset: start as u32,
+            byte_length: length as u32,
+        })
     }
 
     fn lex_slash(&mut self) -> Token<'source> {
@@ -1232,7 +1289,8 @@ impl<'source> Lexer<'source> {
 
         self.skip(slash_count);
 
-        if slash_count == 3 {
+        if slash_count == 2 && self.current_byte() == b'!' {
+            self.next();
             if self.current_byte() == b' ' {
                 self.next();
             }
@@ -1240,9 +1298,21 @@ impl<'source> Lexer<'source> {
             self.skip_to_eol();
             let end_offset = self.current_offset;
 
-            self.trivia
-                .doc_comments
-                .push((start_offset as u32, end_offset as u32));
+            return Token {
+                kind: TokenKind::FileComment,
+                text: &self.input[text_start..end_offset],
+                byte_offset: start_offset as u32,
+                byte_length: (end_offset - start_offset) as u32,
+            };
+        }
+
+        if slash_count == 3 {
+            if self.current_byte() == b' ' {
+                self.next();
+            }
+            let text_start = self.current_offset;
+            self.skip_to_eol();
+            let end_offset = self.current_offset;
 
             return Token {
                 kind: TokenKind::DocComment,
@@ -1255,10 +1325,6 @@ impl<'source> Lexer<'source> {
         self.skip_to_eol();
         let end_offset = self.current_offset;
 
-        self.trivia
-            .comments
-            .push((start_offset as u32, end_offset as u32));
-
         Token {
             kind: TokenKind::Comment,
             text: &self.input[start_offset..end_offset],
@@ -1270,7 +1336,7 @@ impl<'source> Lexer<'source> {
     fn count_consecutive(&self, byte: u8) -> usize {
         let mut count = 0;
         let mut offset = self.current_offset;
-        while offset < self.input_bytes.len() && self.input_bytes[offset] == byte {
+        while offset < self.input.len() && self.input.as_bytes()[offset] == byte {
             count += 1;
             offset += 1;
         }
@@ -1343,5 +1409,243 @@ impl<'source> Lexer<'source> {
             byte_offset: start_offset as u32,
             byte_length: (self.current_offset - start_offset) as u32,
         }
+    }
+}
+
+/// Decodes a quote-stripped rune literal, covering every escape the lexer takes.
+pub fn rune_codepoint(text: &str) -> Option<u32> {
+    let Some(rest) = text.strip_prefix('\\') else {
+        return text.chars().next().map(|c| c as u32);
+    };
+    match rest.as_bytes().first()? {
+        b'a' => Some(7),
+        b'b' => Some(8),
+        b'f' => Some(12),
+        b'n' => Some(10),
+        b'r' => Some(13),
+        b't' => Some(9),
+        b'v' => Some(11),
+        b'\\' => Some(92),
+        b'\'' => Some(39),
+        b'x' | b'U' => u32::from_str_radix(&rest[1..], 16).ok(),
+        b'u' => {
+            let braced = rest[1..].strip_prefix('{')?.strip_suffix('}')?;
+            u32::from_str_radix(braced, 16).ok()
+        }
+        b'0'..=b'7' => u32::from_str_radix(rest, 8).ok(),
+        _ => None,
+    }
+}
+
+pub fn interpolation_holes(value: &str) -> Option<Vec<&str>> {
+    let bytes = value.as_bytes();
+    let mut names = Vec::new();
+    let mut at = 0;
+
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at = skip_escape(value, at)?,
+            b'{' if bytes.get(at + 1) == Some(&b'{') => return None,
+            b'{' => {
+                let start = at + 1;
+                let close = start + value[start..].find('}')?;
+                let name = &value[start..close];
+                if !is_bare_identifier(name) {
+                    return None;
+                }
+                names.push(name);
+                at = close + 1;
+            }
+            b'}' => return None,
+            _ => at += 1,
+        }
+    }
+
+    (!names.is_empty()).then_some(names)
+}
+
+fn skip_escape(value: &str, at: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if bytes.get(at + 1) == Some(&b'u') && bytes.get(at + 2) == Some(&b'{') {
+        return Some(at + 4 + value[at + 3..].find('}')?);
+    }
+    let escaped = value[at + 1..].chars().next()?;
+    Some(at + 1 + escaped.len_utf8())
+}
+
+fn is_bare_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Decodes a quote-stripped string literal to the bytes it holds at runtime,
+/// covering every escape the lexer takes. `None` for a malformed escape.
+pub fn string_bytes(text: &str, raw: bool) -> Option<Cow<'_, [u8]>> {
+    if raw || !text.contains('\\') {
+        return Some(Cow::Borrowed(text.as_bytes()));
+    }
+
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            push_char(&mut decoded, ch);
+            continue;
+        }
+        match chars.next()? {
+            'a' => decoded.push(0x07),
+            'b' => decoded.push(0x08),
+            'f' => decoded.push(0x0c),
+            'n' => decoded.push(b'\n'),
+            'r' => decoded.push(b'\r'),
+            't' => decoded.push(b'\t'),
+            'v' => decoded.push(0x0b),
+            '\\' => decoded.push(b'\\'),
+            '"' => decoded.push(b'"'),
+            '\'' => decoded.push(b'\''),
+            'x' => decoded.push(byte_from_hex(&mut chars)?),
+            'u' => push_char(&mut decoded, char_from_braced_hex(&mut chars)?),
+            'U' => push_char(&mut decoded, char_from_eight_hex(&mut chars)?),
+            first @ '0'..='7' => decoded.push(byte_from_octal(&mut chars, first)?),
+            _ => return None,
+        }
+    }
+
+    Some(Cow::Owned(decoded))
+}
+
+fn push_char(decoded: &mut Vec<u8>, ch: char) {
+    let mut buffer = [0u8; 4];
+    decoded.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+}
+
+fn byte_from_hex(chars: &mut Peekable<Chars<'_>>) -> Option<u8> {
+    let high = chars.next()?.to_digit(16)?;
+    let low = chars.next()?.to_digit(16)?;
+    Some((high * 16 + low) as u8)
+}
+
+fn byte_from_octal(chars: &mut Peekable<Chars<'_>>, first: char) -> Option<u8> {
+    let mut value = first.to_digit(8)?;
+    for _ in 0..2 {
+        let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(8)) else {
+            break;
+        };
+        chars.next();
+        value = value * 8 + digit;
+    }
+    u8::try_from(value).ok()
+}
+
+fn char_from_eight_hex(chars: &mut Peekable<Chars<'_>>) -> Option<char> {
+    let mut value = 0u32;
+    for _ in 0..8 {
+        value = value * 16 + chars.next()?.to_digit(16)?;
+    }
+    char::from_u32(value)
+}
+
+fn char_from_braced_hex(chars: &mut Peekable<Chars<'_>>) -> Option<char> {
+    if chars.next()? != '{' {
+        return None;
+    }
+    let mut value = 0u32;
+    let mut digits = 0;
+    while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(16)) {
+        chars.next();
+        value = value * 16 + digit;
+        digits += 1;
+        if digits > 6 {
+            return None;
+        }
+    }
+    if digits == 0 || chars.next()? != '}' {
+        return None;
+    }
+    char::from_u32(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lexer, rune_codepoint, string_bytes};
+
+    #[test]
+    fn rune_codepoint_decodes_every_escape_the_lexer_accepts() {
+        let cases = [
+            ("'a'", 97),
+            ("'中'", 0x4E2D),
+            ("'\\a'", 7),
+            ("'\\b'", 8),
+            ("'\\f'", 12),
+            ("'\\n'", 10),
+            ("'\\r'", 13),
+            ("'\\t'", 9),
+            ("'\\v'", 11),
+            ("'\\\\'", 92),
+            ("'\\''", 39),
+            ("'\\x41'", 65),
+            ("'\\xFF'", 255),
+            ("'\\101'", 65),
+            ("'\\377'", 255),
+            ("'\\u{41}'", 65),
+            ("'\\u{e9}'", 233),
+            ("'\\U0001F600'", 0x1F600),
+        ];
+
+        for (source, expected) in cases {
+            let result = Lexer::new(source, 0).lex();
+            assert!(result.errors.is_empty(), "{source} should lex cleanly");
+            let inner = &source[1..source.len() - 1];
+            assert_eq!(rune_codepoint(inner), Some(expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn string_bytes_decodes_every_escape_the_lexer_accepts() {
+        let cases: [(&str, &[u8]); 17] = [
+            ("\"ab\"", b"ab"),
+            ("\"\\a\"", &[7]),
+            ("\"\\b\"", &[8]),
+            ("\"\\f\"", &[12]),
+            ("\"\\n\"", b"\n"),
+            ("\"\\r\"", b"\r"),
+            ("\"\\t\"", b"\t"),
+            ("\"\\v\"", &[11]),
+            ("\"\\\\\"", b"\\"),
+            ("\"\\\"\"", b"\""),
+            ("\"\\x41\"", b"A"),
+            ("\"\\xff\"", &[255]),
+            ("\"\\101\"", b"A"),
+            ("\"\\377\"", &[255]),
+            ("\"\\u{41}\"", b"A"),
+            ("\"\\u{e9}\"", "é".as_bytes()),
+            ("\"\\U0001F600\"", "😀".as_bytes()),
+        ];
+
+        for (source, expected) in cases {
+            let result = Lexer::new(source, 0).lex();
+            assert!(result.errors.is_empty(), "{source} should lex cleanly");
+            let inner = &source[1..source.len() - 1];
+            assert_eq!(
+                string_bytes(inner, false).as_deref(),
+                Some(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_bytes_keeps_raw_backslashes() {
+        assert_eq!(string_bytes("a\\nb", true).as_deref(), Some(&b"a\\nb"[..]));
+    }
+
+    #[test]
+    fn string_bytes_rejects_malformed_escapes() {
+        assert!(string_bytes("\\q", false).is_none());
+        assert!(string_bytes("\\x4", false).is_none());
+        assert!(string_bytes("\\u0041", false).is_none());
+        assert!(string_bytes("\\400", false).is_none());
     }
 }

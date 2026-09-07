@@ -1,6 +1,20 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn risky() -> Result<int, string> {\n  Ok(42)\n}\n\nfn test() -> int {\n  let result: Result<int, string> = try {\n    risky()?\n  };\n  match result {\n    Ok(x) => x,\n    Err(_) => 0,\n  }\n}\n"
+description: |
+  
+  fn risky() -> Result<int, string> {
+    Ok(42)
+  }
+  
+  fn test() -> int {
+    let result: Result<int, string> = try {
+      risky()?
+    };
+    match result {
+      Ok(x) => x,
+      Err(_) => 0,
+    }
+  }
 ---
 package main
 
@@ -17,8 +31,7 @@ func test() int {
 		if check_2.Tag != lisette.ResultOk {
 			return lisette.MakeResultErr[int, string](check_2.ErrVal)
 		}
-		result_3 := check_2.OkVal
-		return lisette.MakeResultOk[int, string](result_3)
+		return lisette.MakeResultOk[int, string](check_2.OkVal)
 	}()
 	result = tryResult_1
 	if result.Tag == lisette.ResultOk {

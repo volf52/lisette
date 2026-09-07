@@ -1,10 +1,14 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum MyResult<T> { Success(T), Failure }\n\nfn test() -> MyResult<int> {\n  Success(42)\n}\n"
+description: |
+  
+  enum MyResult<T> { Success(T), Failure }
+  
+  fn test() -> MyResult<int> {
+    MyResult.Success(42)
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeMyResultSuccess[T any](arg0 T) MyResult[T] {
 	return MyResult[T]{Tag: MyResultSuccess, Success: arg0}
@@ -14,7 +18,7 @@ func MakeMyResultFailure[T any]() MyResult[T] {
 	return MyResult[T]{Tag: MyResultFailure}
 }
 
-type MyResultTag int
+type MyResultTag uint8
 
 const (
 	MyResultSuccess MyResultTag = iota
@@ -24,17 +28,6 @@ const (
 type MyResult[T any] struct {
 	Tag     MyResultTag
 	Success T
-}
-
-func (m MyResult[T]) String() string {
-	switch m.Tag {
-	case MyResultSuccess:
-		return fmt.Sprintf("MyResult.Success(%v)", m.Success)
-	case MyResultFailure:
-		return "MyResult.Failure"
-	default:
-		return fmt.Sprintf("MyResult(%d)", m.Tag)
-	}
 }
 
 func test() MyResult[int] {

@@ -1,36 +1,102 @@
 use syntax::ast::{Attribute, AttributeArg, StructFieldDefinition};
+use syntax::attributes::{is_serialization_key, struct_attribute_forces_field_export};
+
+pub(super) struct TagConfig {
+    key: String,
+    value: TagValue,
+}
+
+enum TagValue {
+    Structured(StructuredTag),
+    Raw(String),
+}
 
 #[derive(Default)]
-pub(super) struct TagConfig {
-    pub(super) key: String,
-    pub(super) name_override: Option<String>,
-    pub(super) case_transform: Option<CaseTransform>,
-    pub(super) omitempty: bool,
-    pub(super) skip: bool,
-    pub(super) string_encoding: bool,
-    pub(super) raw_value: Option<String>,
+struct StructuredTag {
+    name_override: Option<String>,
+    case_transform: Option<CaseTransform>,
+    omitempty: Option<bool>,
+    omitzero: Option<bool>,
+    skip: bool,
+    string_encoding: bool,
 }
 
 impl TagConfig {
+    fn structured(key: String) -> Self {
+        Self {
+            key,
+            value: TagValue::Structured(StructuredTag::default()),
+        }
+    }
+
+    fn raw(key: String, value: String) -> Self {
+        Self {
+            key,
+            value: TagValue::Raw(value),
+        }
+    }
+
+    fn settings(&self) -> Option<&StructuredTag> {
+        match &self.value {
+            TagValue::Structured(settings) => Some(settings),
+            TagValue::Raw(_) => None,
+        }
+    }
+
+    fn settings_mut(&mut self) -> Option<&mut StructuredTag> {
+        match &mut self.value {
+            TagValue::Structured(settings) => Some(settings),
+            TagValue::Raw(_) => None,
+        }
+    }
+
     fn merge_from(&mut self, other: TagConfig) {
-        if other.case_transform.is_some() {
-            self.case_transform = other.case_transform;
+        debug_assert_eq!(self.key, other.key);
+        match other.value {
+            TagValue::Raw(raw) => self.value = TagValue::Raw(raw),
+            TagValue::Structured(other) => {
+                let Some(current) = self.settings_mut() else {
+                    return;
+                };
+                if other.case_transform.is_some() {
+                    current.case_transform = other.case_transform;
+                }
+                if other.omitempty.is_some() {
+                    current.omitempty = other.omitempty;
+                }
+                if other.omitzero.is_some() {
+                    current.omitzero = other.omitzero;
+                }
+                current.skip |= other.skip;
+                current.string_encoding |= other.string_encoding;
+                if other.name_override.is_some() {
+                    current.name_override = other.name_override;
+                }
+            }
         }
-        if other.omitempty {
-            self.omitempty = true;
+    }
+}
+
+impl StructuredTag {
+    /// Apply options shared by struct-level and field-level tag attributes.
+    fn apply_common_arg(&mut self, arg: &AttributeArg) -> bool {
+        match arg {
+            AttributeArg::Flag(flag) => match flag.as_str() {
+                "snake_case" => self.case_transform = Some(CaseTransform::SnakeCase),
+                "camel_case" => self.case_transform = Some(CaseTransform::CamelCase),
+                "omitempty" => self.omitempty = Some(true),
+                "omitzero" => self.omitzero = Some(true),
+                _ => return false,
+            },
+            AttributeArg::NegatedFlag(flag) if flag == "omitempty" => {
+                self.omitempty = Some(false);
+            }
+            AttributeArg::NegatedFlag(flag) if flag == "omitzero" => {
+                self.omitzero = Some(false);
+            }
+            _ => return false,
         }
-        if other.skip {
-            self.skip = true;
-        }
-        if other.string_encoding {
-            self.string_encoding = true;
-        }
-        if other.name_override.is_some() {
-            self.name_override = other.name_override;
-        }
-        if other.raw_value.is_some() {
-            self.raw_value = other.raw_value;
-        }
+        true
     }
 }
 
@@ -57,7 +123,7 @@ pub(super) fn interpret_field_attributes(
         }
     }
 
-    for attribute in &field.attributes {
+    for attribute in field.attributes() {
         if let Some(config) = interpret_field_attribute(attribute, &struct_defaults) {
             configs.push(config);
         }
@@ -65,7 +131,9 @@ pub(super) fn interpret_field_attributes(
 
     for mut default in struct_defaults {
         if !configs.iter().any(|c| c.key == default.key) {
-            default.name_override = None;
+            if let Some(settings) = default.settings_mut() {
+                settings.name_override = None;
+            }
             configs.push(default);
         }
     }
@@ -74,36 +142,22 @@ pub(super) fn interpret_field_attributes(
 }
 
 fn interpret_struct_attribute(attribute: &Attribute) -> Option<TagConfig> {
-    let key = &attribute.name;
+    if !struct_attribute_forces_field_export(attribute) {
+        return None;
+    }
 
+    let key = &attribute.name;
     if key == "tag" {
         return interpret_struct_tag_attribute(attribute);
     }
 
-    if !is_serialization_key(key) {
-        return None;
-    }
-
-    let mut config = TagConfig {
-        key: key.clone(),
-        ..Default::default()
-    };
+    let mut config = TagConfig::structured(key.clone());
 
     for arg in &attribute.args {
-        match arg {
-            AttributeArg::Flag(flag) => match flag.as_str() {
-                "snake_case" => config.case_transform = Some(CaseTransform::SnakeCase),
-                "camel_case" => config.case_transform = Some(CaseTransform::CamelCase),
-                "omitempty" => config.omitempty = true,
-                _ => {}
-            },
-            AttributeArg::NegatedFlag(flag) => {
-                if flag == "omitempty" {
-                    config.omitempty = false;
-                }
-            }
-            _ => {}
-        }
+        let _ = config
+            .settings_mut()
+            .expect("structured tag config")
+            .apply_common_arg(arg);
     }
 
     Some(config)
@@ -118,26 +172,13 @@ fn interpret_struct_tag_attribute(attribute: &Attribute) -> Option<TagConfig> {
         return None;
     };
 
-    let mut config = TagConfig {
-        key: key.clone(),
-        ..Default::default()
-    };
+    let mut config = TagConfig::structured(key.clone());
 
     for arg in attribute.args.iter().skip(1) {
-        match arg {
-            AttributeArg::Flag(flag) => match flag.as_str() {
-                "snake_case" => config.case_transform = Some(CaseTransform::SnakeCase),
-                "camel_case" => config.case_transform = Some(CaseTransform::CamelCase),
-                "omitempty" => config.omitempty = true,
-                _ => {}
-            },
-            AttributeArg::NegatedFlag(flag) => {
-                if flag == "omitempty" {
-                    config.omitempty = false;
-                }
-            }
-            _ => {}
-        }
+        let _ = config
+            .settings_mut()
+            .expect("structured tag config")
+            .apply_common_arg(arg);
     }
 
     Some(config)
@@ -157,41 +198,39 @@ fn interpret_field_attribute(
         return None;
     }
 
-    let mut config = struct_defaults
+    let mut config = TagConfig::structured(key.clone());
+    if let Some(default) = struct_defaults
         .iter()
-        .find(|c| c.key == *key)
-        .map(|c| TagConfig {
-            key: c.key.clone(),
-            case_transform: c.case_transform,
-            omitempty: c.omitempty,
-            ..Default::default()
-        })
-        .unwrap_or_else(|| TagConfig {
-            key: key.clone(),
-            ..Default::default()
-        });
+        .find(|config| config.key == *key)
+        .and_then(TagConfig::settings)
+    {
+        let settings = config.settings_mut().expect("structured tag config");
+        settings.case_transform = default.case_transform;
+        settings.omitempty = default.omitempty;
+        settings.omitzero = default.omitzero;
+    }
 
     for arg in &attribute.args {
+        if let AttributeArg::Raw(raw) = arg {
+            config.value = TagValue::Raw(raw.clone());
+            continue;
+        }
+        let Some(settings) = config.settings_mut() else {
+            continue;
+        };
+        if settings.apply_common_arg(arg) {
+            continue;
+        }
         match arg {
             AttributeArg::Flag(flag) => match flag.as_str() {
-                "snake_case" => config.case_transform = Some(CaseTransform::SnakeCase),
-                "camel_case" => config.case_transform = Some(CaseTransform::CamelCase),
-                "omitempty" => config.omitempty = true,
-                "skip" => config.skip = true,
-                "string" => config.string_encoding = true,
+                "skip" => settings.skip = true,
+                "string" => settings.string_encoding = true,
                 _ => {}
             },
-            AttributeArg::NegatedFlag(flag) => {
-                if flag == "omitempty" {
-                    config.omitempty = false;
-                }
-            }
             AttributeArg::String(name) => {
-                config.name_override = Some(name.clone());
+                settings.name_override = Some(name.clone());
             }
-            AttributeArg::Raw(raw) => {
-                config.raw_value = Some(raw.clone());
-            }
+            AttributeArg::NegatedFlag(_) | AttributeArg::Raw(_) => {}
         }
     }
 
@@ -213,35 +252,23 @@ fn interpret_tag_attribute(attribute: &Attribute) -> Option<TagConfig> {
                 .filter(|k| !k.is_empty())
                 .unwrap_or("tag")
                 .to_string();
-            Some(TagConfig {
-                key,
-                raw_value: Some(raw.clone()),
-                ..Default::default()
-            })
+            Some(TagConfig::raw(key, raw.clone()))
         }
 
         AttributeArg::String(key) => {
-            let mut config = TagConfig {
-                key: key.clone(),
-                ..Default::default()
-            };
+            let mut config = TagConfig::structured(key.clone());
 
             for (i, arg) in attribute.args.iter().enumerate().skip(1) {
+                let settings = config.settings_mut().expect("structured tag config");
+                if settings.apply_common_arg(arg) {
+                    continue;
+                }
                 match arg {
                     AttributeArg::String(name) if i == 1 => {
-                        config.name_override = Some(name.clone());
+                        settings.name_override = Some(name.clone());
                     }
-                    AttributeArg::Flag(flag) => match flag.as_str() {
-                        "snake_case" => config.case_transform = Some(CaseTransform::SnakeCase),
-                        "camel_case" => config.case_transform = Some(CaseTransform::CamelCase),
-                        "omitempty" => config.omitempty = true,
-                        "skip" => config.skip = true,
-                        _ => {}
-                    },
-                    AttributeArg::NegatedFlag(flag) => {
-                        if flag == "omitempty" {
-                            config.omitempty = false;
-                        }
+                    AttributeArg::Flag(flag) if flag == "skip" => {
+                        settings.skip = true;
                     }
                     _ => {}
                 }
@@ -254,17 +281,10 @@ fn interpret_tag_attribute(attribute: &Attribute) -> Option<TagConfig> {
     }
 }
 
-fn is_serialization_key(key: &str) -> bool {
-    matches!(
-        key,
-        "json" | "xml" | "yaml" | "toml" | "db" | "bson" | "mapstructure" | "msgpack"
-    )
-}
-
 pub(super) fn format_tag_string(
     field_name: &str,
     configs: &[TagConfig],
-    needs_omitzero: bool,
+    is_option: bool,
 ) -> Option<String> {
     if configs.is_empty() {
         return None;
@@ -275,7 +295,7 @@ pub(super) fn format_tag_string(
 
     let parts: Vec<String> = sorted_configs
         .iter()
-        .filter_map(|config| format_single_tag(field_name, config, needs_omitzero))
+        .filter_map(|config| format_single_tag(field_name, config, is_option))
         .collect();
 
     if parts.is_empty() {
@@ -286,7 +306,7 @@ pub(super) fn format_tag_string(
 }
 
 fn tag_sort_key(config: &TagConfig) -> (u8, &str) {
-    if config.raw_value.is_some() {
+    if matches!(&config.value, TagValue::Raw(_)) {
         return (3, &config.key);
     }
 
@@ -297,33 +317,37 @@ fn tag_sort_key(config: &TagConfig) -> (u8, &str) {
     }
 }
 
-fn format_single_tag(field_name: &str, config: &TagConfig, needs_omitzero: bool) -> Option<String> {
-    if let Some(ref raw) = config.raw_value {
-        let key_prefix = format!("{}:", config.key);
-        if raw.starts_with(&key_prefix) {
-            return Some(raw.clone());
+fn format_single_tag(field_name: &str, config: &TagConfig, is_option: bool) -> Option<String> {
+    let settings = match &config.value {
+        TagValue::Raw(raw) => {
+            let key_prefix = format!("{}:", config.key);
+            if raw.starts_with(&key_prefix) {
+                return Some(raw.clone());
+            }
+            return Some(format!("{}:{}", config.key, raw));
         }
-        return Some(format!("{}:{}", config.key, raw));
-    }
+        TagValue::Structured(settings) => settings,
+    };
 
-    if config.skip {
+    if settings.skip {
         return Some(format!("{}:\"-\"", config.key));
     }
 
-    let name = if let Some(ref override_name) = config.name_override {
+    let name = if let Some(ref override_name) = settings.name_override {
         override_name.clone()
     } else {
-        apply_case_transform(field_name, config.case_transform)
+        apply_case_transform(field_name, settings.case_transform)
     };
 
     let mut options = Vec::new();
-    if config.omitempty {
-        options.push("omitempty");
-        if needs_omitzero {
-            options.push("omitzero");
-        }
+    if settings.omitempty == Some(true) {
+        let as_omitzero = is_option && config.key == "json" && settings.omitzero != Some(false);
+        options.push(if as_omitzero { "omitzero" } else { "omitempty" });
     }
-    if config.string_encoding {
+    if settings.omitzero == Some(true) && !options.contains(&"omitzero") {
+        options.push("omitzero");
+    }
+    if settings.string_encoding {
         options.push("string");
     }
 
@@ -362,10 +386,11 @@ fn to_snake_case(s: &str) -> String {
         }
 
         if c.is_uppercase() {
-            let prev_upper = i > 0 && chars[i - 1].is_uppercase();
-            let next_lower = i + 1 < len && chars[i + 1].is_lowercase();
-
-            if (i > 0 && !prev_upper) || (i > 1 && prev_upper && next_lower) {
+            let previous_is_upper = i > 0 && chars[i - 1].is_uppercase();
+            let next_is_lower = i + 1 < len && chars[i + 1].is_lowercase();
+            let follows_lowercase = i > 0 && !previous_is_upper;
+            let ends_acronym = i > 1 && previous_is_upper && next_is_lower;
+            if follows_lowercase || ends_acronym {
                 result.push('_');
             }
 

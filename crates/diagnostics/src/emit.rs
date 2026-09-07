@@ -1,0 +1,83 @@
+use crate::LisetteDiagnostic;
+use crate::pattern;
+use syntax::ast::Span;
+
+pub fn go_name_collision(
+    go_name: &str,
+    first: &Span,
+    second: &Span,
+    rest: &[Span],
+    detail: Option<&str>,
+) -> LisetteDiagnostic {
+    let mut diagnostic = LisetteDiagnostic::error(format!("Go name collision on `{}`", go_name));
+    for (index, span) in [first, second].into_iter().chain(rest).enumerate() {
+        let label = format!("becomes `{}` in Go", go_name);
+        diagnostic = if index == 0 {
+            diagnostic.with_span_primary_label(span, label)
+        } else {
+            diagnostic.with_span_label(span, label)
+        };
+    }
+    let mut help = format!(
+        "These declarations all become `{}` in generated Go, but Go requires \
+         package-level names to be distinct. Rename all but one.",
+        go_name
+    );
+    if let Some(detail) = detail {
+        help.push(' ');
+        help.push_str(detail);
+    }
+    diagnostic
+        .with_emit_code("go_name_collision")
+        .with_help(help)
+}
+
+pub fn reserved_go_prefix(name: &str, prefix: &str, span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Reserved Go name prefix")
+        .with_emit_code("reserved_go_prefix")
+        .with_span_primary_label(span, "uses a reserved prefix")
+        .with_help(format!(
+            "`{}` starts with `{}`, which is reserved for compiler-generated \
+             code. Rename the declaration.",
+            name, prefix
+        ))
+}
+
+pub fn reserved_go_qualifier(name: &str, span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Reserved Go name")
+        .with_emit_code("reserved_go_qualifier")
+        .with_span_primary_label(span, "reserved for generated imports")
+        .with_help(format!(
+            "`{}` is the qualifier of a Go package that generated code may \
+             import implicitly. Rename the type.",
+            name
+        ))
+}
+
+pub fn go_import_collision(
+    alias: &str,
+    first: &str,
+    second: &str,
+    rest: &[&str],
+) -> LisetteDiagnostic {
+    let mut sorted = vec![first, second];
+    sorted.extend_from_slice(rest);
+    sorted.sort();
+
+    let packages: Vec<String> = sorted.iter().map(|p| format!("`go:{}`", p)).collect();
+    let suggestion_target = sorted[sorted.len() - 1];
+
+    LisetteDiagnostic::error("Go import collision")
+        .with_emit_code("go_import_collision")
+        .with_help(format!(
+            "{} {} default to `{}` in generated code. \
+             Add an alias to at least one of them in your source: \
+             `import my_{} \"go:{}\"`. \
+             One of these may have been pulled in transitively by a typedef.",
+            pattern::join_and(&packages),
+            if packages.len() == 2 { "both" } else { "all" },
+            alias,
+            alias,
+            suggestion_target,
+        ))
+}

@@ -1,0 +1,12 @@
+---
+source: tests/ui/lint/mod.rs
+---
+  ▲ Lost query mutation
+   ╭─[test.lis:8:3]
+ 7 │   let u: MyURL = url.URL { Scheme: "https", Host: "example.com", .. }
+ 8 │   u.Query().Set("b", "2")
+   ·   ───────────┬───────────
+   ·              ╰── mutates a discarded copy
+ 9 │ }
+   ╰────
+  help: `URL.Query` returns a fresh copy, so this `Set` has no effect. Bind it, mutate it, then assign `values.Encode()` to `RawQuery` · code: [lint.lost_query_mutation]

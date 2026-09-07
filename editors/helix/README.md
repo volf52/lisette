@@ -4,6 +4,7 @@
 
 - Syntax highlighting
 - Diagnostics
+- Quick fixes (lint autofixes)
 - Hover
 - Completions
 - Go-to-definition
@@ -19,7 +20,7 @@
 
     ```bash
     cargo install lisette
-    lis version # -> lisette 0.1.0 (go 1.25.5)
+    lis version # -> lisette 0.2.1 (go 1.25.10)
     ```
 
 2. Add to your `languages.toml` config:
@@ -36,7 +37,7 @@
     file-types = ["lis"]
     roots = ["lisette.toml"]
     auto-format = true
-    comment-tokens = ["//", "///"]
+    comment-tokens = ["//", "///", "//!"]
     language-servers = ["lisette-lsp"]
     indent = { tab-width = 2, unit = "  " }
 

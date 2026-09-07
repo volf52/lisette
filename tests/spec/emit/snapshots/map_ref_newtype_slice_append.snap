@@ -1,21 +1,32 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Wrap(Slice<int>)\n\nfn main() {\n  let mut w = Wrap([1])\n  let mut m = Map.new<string, Ref<Wrap>>()\n  m[\"a\"] = &w\n  m[\"a\"].* = Wrap(m[\"a\"].0.append(2))\n  let _ = w\n}\n"
+description: |
+  
+  struct Wrap(Slice<int>)
+  
+  fn main() {
+    let mut w = Wrap([1])
+    let mut m = Map.new<string, mut Ref<Wrap>>()
+    m["a"] = &w
+    let Some(r) = m.get("a") else { return; };
+    r.* = Wrap(r.0.append(2))
+    let _ = w
+  }
 ---
 package main
 
-import "fmt"
-
 type Wrap []int
-
-func (w Wrap) String() string {
-	return fmt.Sprintf("Wrap(%v)", []int(w))
-}
 
 func main() {
 	w := Wrap([]int{1})
 	m := make(map[string]*Wrap)
 	m["a"] = &w
-	*m["a"] = Wrap(append([]int(*m["a"]), 2))
+	r, ok_1 := m["a"]
+	if !ok_1 {
+		return
+	}
+	ref_3 := r
+	recv_2 := ([]int)(*r)
+	*ref_3 = Wrap(append(recv_2[:len(recv_2):len(recv_2)], 2))
 	_ = w
 }

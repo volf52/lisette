@@ -1,28 +1,33 @@
 use crate::LisetteDiagnostic;
 use syntax::ast::Span;
 
-use crate::IssueKind;
-
-#[derive(Debug, Clone)]
-pub struct PatternIssue {
-    pub span: Span,
-    pub kind: IssueKind,
-}
-
-pub fn non_exhaustive(match_span: Span, case: &str) -> LisetteDiagnostic {
+pub fn non_exhaustive(match_span: Span, cases: &[String]) -> LisetteDiagnostic {
+    let help = match cases {
+        [only] => format!("Handle the missing case `{only}`, e.g. `{only} => {{ ... }}`"),
+        _ => {
+            let names: Vec<String> = cases.iter().map(|case| format!("`{case}`")).collect();
+            format!("Handle the missing cases {}", join_and(&names))
+        }
+    };
     LisetteDiagnostic::error("`match` is not exhaustive")
         .with_infer_code("non_exhaustive")
         .with_span_label(&match_span, "not all patterns covered")
-        .with_help(format!(
-            "Handle the missing case `{}`, e.g. `{} => {{ ... }}`",
-            case, case
-        ))
+        .with_help(help)
+}
+
+pub(crate) fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{} and {}", first, second),
+        [rest @ .., last] => format!("{}, and {}", rest.join(", "), last),
+    }
 }
 
 pub fn irrefutable_while_let(pattern_span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Pattern always matches")
         .with_infer_code("irrefutable_while_let")
-        .with_span_label(&pattern_span, "always matches")
+        .with_span_label(&pattern_span, "matches every value, so the loop never ends")
         .with_help("Use `loop` with `let` binding instead")
 }
 
@@ -37,13 +42,18 @@ pub fn redundant_arm(
         .with_help(help)
 }
 
-pub fn refutable_pattern(
-    pattern_span: Span,
-    witness: &str,
-    slice_info: Option<(usize, bool)>,
-) -> LisetteDiagnostic {
-    let label = describe_pattern_expectation(witness, slice_info);
-    let help = build_refutability_help(witness);
+#[derive(Debug, Clone, Copy)]
+pub enum RefutablePattern<'a> {
+    ExactSlice(usize),
+    SlicePrefix(usize),
+    Some,
+    Ok,
+    Other(&'a str),
+}
+
+pub fn refutable_pattern(pattern_span: Span, pattern: RefutablePattern<'_>) -> LisetteDiagnostic {
+    let label = describe_pattern_expectation(pattern);
+    let help = build_refutability_help(pattern);
 
     LisetteDiagnostic::error("Pattern might not match")
         .with_infer_code("refutable_pattern")
@@ -51,68 +61,51 @@ pub fn refutable_pattern(
         .with_help(help)
 }
 
-fn describe_pattern_expectation(witness: &str, slice_info: Option<(usize, bool)>) -> String {
-    if witness.starts_with('[') {
-        if let Some((len, has_rest)) = slice_info {
-            if has_rest {
-                return format!("only matches {} or more elements", len);
-            }
+fn describe_pattern_expectation(pattern: RefutablePattern<'_>) -> String {
+    match pattern {
+        RefutablePattern::ExactSlice(len) => {
             let word = if len == 1 { "element" } else { "elements" };
-            return format!("only matches {} {}", len, word);
+            format!("only matches {} {}", len, word)
         }
-
-        return "only matches specific length".to_string();
+        RefutablePattern::SlicePrefix(len) => {
+            format!("only matches {} or more elements", len)
+        }
+        RefutablePattern::Some => "only matches `Some`".to_string(),
+        RefutablePattern::Ok => "only matches `Ok`".to_string(),
+        RefutablePattern::Other(witness) => format!("does not match `{}`", witness),
     }
-
-    if witness.contains("None") {
-        return "only matches `Some`".to_string();
-    }
-
-    if witness.contains("Err") {
-        return "only matches `Ok`".to_string();
-    }
-
-    format!("does not match `{}`", witness)
 }
 
-fn build_refutability_help(witness: &str) -> String {
-    if witness.starts_with('[') {
-        return r#"Use `match` to handle slices of any length:
-    match slice {
-        [a, b] => ...,
-        _ => ...,
-    }"#
-        .to_string();
+fn build_refutability_help(pattern: RefutablePattern<'_>) -> String {
+    match pattern {
+        RefutablePattern::ExactSlice(_) | RefutablePattern::SlicePrefix(_) => {
+            "Handle slices of any length with `match slice { [a, b] => ..., _ => ... }`".to_string()
+        }
+        RefutablePattern::Some => {
+            "Use `if let Some(x) = opt { ... }` to handle only `Some`, or `match opt { Some(x) => ..., None => ... }` to also handle `None`".to_string()
+        }
+        RefutablePattern::Ok => {
+            "Use `if let Ok(x) = result { ... }` to handle only `Ok`, or `match result { Ok(x) => ..., Err(e) => ... }` to also handle `Err`".to_string()
+        }
+        RefutablePattern::Other(witness) => format!(
+            "Handle all cases with `match value {{ {} => ..., _ => ... }}`",
+            witness
+        ),
     }
+}
 
-    if witness.contains("None") {
-        return r#"Use `if let` to handle only `Some`:
-    if let Some(x) = opt {
-        ...
-    }
-Or use `match` to also handle `None`:
-    match opt {
-        Some(x) => ...,
-        None => ...,
-    }"#
-        .to_string();
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if witness.contains("Err") {
-        return r#"Use `if let` to handle only `Ok`:
-    if let Ok(x) = result {
-        ...
-    }
-Or use `match` to also handle `Err`:
-    match result {
-        Ok(x) => ...,
-        Err(e) => ...,
-    }"#
-        .to_string();
-    }
+    #[test]
+    fn other_refutable_patterns_do_not_infer_kind_from_witness_text() {
+        let diagnostic =
+            refutable_pattern(Span::new(0, 0, 1), RefutablePattern::Other("MyNoneVariant"));
 
-    format!(
-        "Use `match` to handle all cases:\n    match value {{\n        {} => ...,\n        _ => ...,\n    }}",
-        witness
-    )
+        assert_eq!(
+            diagnostic.plain_label(),
+            Some("does not match `MyNoneVariant`")
+        );
+    }
 }

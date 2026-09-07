@@ -1,13 +1,26 @@
 ---
 source: tests/spec/emit/prelude.rs
-description: "input: \nfn test(s: Slice<int>) -> Option<int> {\n  s.find(|x| x > 0)\n}\n"
+description: |
+  
+  fn test(s: Slice<int>) -> Option<int> {
+    s.find(|x| x > 0)
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func test(s []int) lisette.Option[int] {
-	return lisette.SliceFind(s, func(x int) bool {
-		return x > 0
-	})
+func test(s []int) (int, bool) {
+	result_1 := lisette.MakeOptionNone[int]()
+	for _, x := range s {
+		if x > 0 {
+			result_1 = lisette.MakeOptionSome[int](x)
+			break
+		}
+	}
+	v_2 := result_1
+	if v_2.Tag == lisette.OptionSome {
+		return v_2.SomeVal, true
+	}
+	return 0, false
 }

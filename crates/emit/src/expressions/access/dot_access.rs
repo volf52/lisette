@@ -1,30 +1,67 @@
-use syntax::ast::{Expression, Span, StructKind, UnaryOperator};
-use syntax::program::{Definition, DotAccessKind as SemanticDotKind, ReceiverCoercion};
-use syntax::types::Type;
+use syntax::ast::{Expression, StructFields};
+use syntax::parse;
+use syntax::program::{
+    Definition, DefinitionBody, DotAccessKind as SemanticDotKind, ReceiverCoercion,
+};
+use syntax::types::{Symbol, Type};
 
-use crate::Emitter;
+use crate::Planner;
+use crate::abi::coercion::CoercionPlan;
+use crate::abi::layout::SlotOrigin;
+use crate::context::expression::ExpressionContext;
 use crate::go_name;
-use crate::write_line;
+use crate::plan::bodies::LoweredStatement;
+use crate::plan::values::{EvaluationEffect, GoExpression, ValuePlan};
+use crate::types::go_type::render_conversion;
 
-impl Emitter<'_> {
-    pub(crate) fn emit_dot_access(
+struct NullableFieldAccess<'a> {
+    expression_string: &'a str,
+    member: &'a str,
+    field: &'a str,
+    expression_ty: &'a Type,
+    declaring_type: Option<&'a Symbol>,
+    result_ty: &'a Type,
+}
+
+impl Planner<'_> {
+    pub(crate) fn plan_dot_access(
         &mut self,
-        output: &mut String,
-        expression: &Expression,
-        member: &str,
-        result_ty: &Type,
-        span: Span,
-    ) -> String {
-        let dot_access_kind = self.ctx.resolutions.get_dot_access(span);
+        dot_access: &Expression,
+        ctx: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        let Expression::DotAccess {
+            expression,
+            member,
+            ty: result_ty,
+            resolution,
+            ..
+        } = dot_access
+        else {
+            unreachable!("plan_dot_access requires a DotAccess expression");
+        };
+        let dot_access_kind = resolution.kind();
+        let receiver_coercion = resolution.receiver_coercion();
 
         if let Some(s) =
-            self.try_emit_pre_receiver_dot(expression, member, result_ty, dot_access_kind)
+            self.try_emit_pre_receiver_dot(expression, member, result_ty, dot_access_kind, ctx)
         {
-            return s;
+            return ValuePlan::computed(
+                Vec::new(),
+                GoExpression::opaque(s),
+                EvaluationEffect::Pure,
+            );
         }
 
-        let expression_string = self.emit_coerced_expression(output, expression);
         let expression_ty = expression.get_type();
+
+        let base_plan = if let Some(package) = expression_ty.as_import_namespace() {
+            ValuePlan::captured(Vec::new(), self.require_package_import(package))
+        } else {
+            self.plan_coerced_expression(expression, receiver_coercion, ctx)
+        };
+        let effect = base_plan.evaluation.effect;
+        let base_contains_deferred_evaluation = base_plan.expression.contains_deferred_evaluation();
+        let (mut setup, expression_string) = base_plan.into_parts();
 
         if let Some(s) = self.try_emit_tuple_member_dot(
             &expression_string,
@@ -32,48 +69,79 @@ impl Emitter<'_> {
             member,
             dot_access_kind,
         ) {
-            return s;
+            let is_newtype_conversion = matches!(
+                dot_access_kind,
+                Some(SemanticDotKind::TupleStructField { is_newtype: true })
+            );
+            return ValuePlan::computed(
+                setup,
+                GoExpression::opaque_with_deferred_evaluation(
+                    s,
+                    base_contains_deferred_evaluation || is_newtype_conversion,
+                ),
+                effect,
+            );
         }
 
         let is_exported =
             self.resolve_is_exported(expression, &expression_ty, member, dot_access_kind);
-        let field = go_field_name(&expression_ty, member, is_exported);
+        let is_embedded = self.field_is_embedded(&expression_ty, member);
+        let field = self
+            .try_resolve_cross_package_const(&expression_ty, member)
+            .unwrap_or_else(|| go_field_name(&expression_ty, member, is_exported, is_embedded));
 
-        if let Some(s) = self.try_emit_nullable_field_access(
-            output,
-            &expression_string,
-            &field,
-            &expression_ty,
-            result_ty,
+        if let Some(s) = self.plan_nullable_field_access(
+            &mut setup,
+            NullableFieldAccess {
+                expression_string: &expression_string,
+                member,
+                field: &field,
+                expression_ty: &expression_ty,
+                declaring_type: resolution.declaring_type(),
+                result_ty,
+            },
         ) {
-            return s;
+            return ValuePlan::computed(setup, GoExpression::opaque(s), effect);
         }
 
-        let result = format!("{}.{}", expression_string, field);
-        self.append_cross_module_type_args(result, &expression_ty, member, result_ty)
+        let selector = GoExpression::selector(
+            GoExpression::opaque_with_deferred_evaluation(
+                expression_string,
+                base_contains_deferred_evaluation,
+            ),
+            field,
+        );
+        let rendered_selector = selector.rendered();
+        let result = self.append_cross_package_type_args(
+            rendered_selector.clone(),
+            &expression_ty,
+            member,
+            result_ty,
+            ctx,
+        );
+        let expression = if result == rendered_selector {
+            selector
+        } else {
+            GoExpression::opaque_with_deferred_evaluation(result, base_contains_deferred_evaluation)
+        };
+        ValuePlan::computed(setup, expression, effect)
     }
 
-    /// Phase 1 dispatch: the semantic kind may resolve without needing the
-    /// receiver emitted first (value-enum variant, enum constructor, static
-    /// method, instance-method value). `ModuleMember` and unresolved kinds
-    /// may still resolve as an enum variant or static method under a cross-
-    /// module/alias rename, so both helpers are tried in order.
+    /// Dispatch kinds that can resolve without the receiver emitted first.
+    /// `PackageMember` and unresolved kinds may still resolve under a
+    /// cross-package/alias rename.
     fn try_emit_pre_receiver_dot(
         &mut self,
         expression: &Expression,
         member: &str,
         result_ty: &Type,
         dot_access_kind: Option<SemanticDotKind>,
+        ctx: ExpressionContext<'_>,
     ) -> Option<String> {
         match dot_access_kind {
-            Some(SemanticDotKind::ValueEnumVariant) => {
-                self.emit_value_enum_variant(expression, member)
-            }
-            Some(SemanticDotKind::EnumVariant) => {
-                self.emit_enum_variant_dot(expression, member, result_ty)
-            }
+            Some(SemanticDotKind::EnumVariant) => self.emit_enum_variant_dot(member, result_ty),
             Some(SemanticDotKind::StaticMethod { .. }) => {
-                self.emit_static_method_dot(expression, member, result_ty)
+                self.emit_static_method_dot(expression, member, result_ty, ctx)
             }
             Some(SemanticDotKind::InstanceMethodValue {
                 is_exported,
@@ -85,9 +153,13 @@ impl Emitter<'_> {
                 is_exported,
                 is_pointer_receiver,
             ),
-            Some(SemanticDotKind::ModuleMember) | None => self
-                .emit_enum_variant_dot(expression, member, result_ty)
-                .or_else(|| self.emit_static_method_dot(expression, member, result_ty)),
+            Some(SemanticDotKind::PackageMember) | None => {
+                if let Some(s) = self.emit_enum_variant_dot(member, result_ty) {
+                    Some(s)
+                } else {
+                    self.emit_static_method_dot(expression, member, result_ty, ctx)
+                }
+            }
             _ => None,
         }
     }
@@ -107,7 +179,7 @@ impl Emitter<'_> {
         };
         match dot_access_kind {
             Some(SemanticDotKind::TupleElement) => {
-                let field = syntax::parse::TUPLE_FIELDS
+                let field = parse::TUPLE_FIELDS
                     .get(index)
                     .expect("oversize tuple arity");
                 Some(format!("{}.{}", expression_string, field))
@@ -124,10 +196,8 @@ impl Emitter<'_> {
         }
     }
 
-    /// Decide whether the Go member name needs exporting (capitalization).
-    /// Semantic `is_exported` covers cross-module + public visibility; the
-    /// emit-side checks additionally cover Go-specific concerns like
-    /// `#[json]`-tagged fields and interface-method capitalization.
+    /// Whether the Go member name must be capitalized. Adds emit-side checks
+    /// on top of semantic `is_exported` (`#[json]`, interface methods).
     fn resolve_is_exported(
         &self,
         expression: &Expression,
@@ -137,15 +207,18 @@ impl Emitter<'_> {
     ) -> bool {
         match dot_access_kind {
             Some(SemanticDotKind::StructField { is_exported }) => {
-                is_exported || self.field_is_public(expression_ty, member)
+                is_exported || self.struct_field_is_exported(expression_ty, member)
             }
             Some(SemanticDotKind::InstanceMethod { is_exported }) => {
                 is_exported || self.method_needs_export(member)
             }
             _ => {
-                self.compute_is_exported_context(expression, expression_ty)
+                if self.compute_is_exported_context(expression, expression_ty)
                     || self.field_is_public(expression_ty, member)
-                    || (!self.has_field(expression_ty, member) && self.method_needs_export(member))
+                {
+                    return true;
+                }
+                !self.has_field(expression_ty, member) && self.method_needs_export(member)
             }
         }
     }
@@ -153,222 +226,235 @@ impl Emitter<'_> {
     /// Accessing a nullable field on a Go-imported type: capture the raw
     /// access into a temp and wrap in the Some/None nullable shape expected
     /// downstream. Returns `None` when no wrapping is needed.
-    fn try_emit_nullable_field_access(
+    fn plan_nullable_field_access(
         &mut self,
-        output: &mut String,
-        expression_string: &str,
-        field: &str,
-        expression_ty: &Type,
-        result_ty: &Type,
+        setup: &mut Vec<LoweredStatement>,
+        access: NullableFieldAccess<'_>,
     ) -> Option<String> {
-        if !Self::is_go_imported_type(expression_ty) || !self.is_go_nullable(result_ty) {
+        let NullableFieldAccess {
+            expression_string,
+            member,
+            field,
+            expression_ty,
+            declaring_type,
+            result_ty,
+        } = access;
+        let source_layout =
+            self.field_slot_layout(expression_ty, declaring_type, member, result_ty)?;
+        let target_layout = self.value_layout(result_ty, SlotOrigin::Lisette);
+        let coercion = CoercionPlan::bridge(self, &source_layout, &target_layout);
+        if coercion.is_identity() {
             return None;
         }
         let raw_access = format!("{}.{}", expression_string, field);
-        let raw_var = self.fresh_var(Some("raw"));
-        self.declare(&raw_var);
-        write_line!(output, "{} := {}", raw_var, raw_access);
-        Some(self.maybe_wrap_go_nullable(output, &raw_var, result_ty))
+        let raw_var = self.hoist_tmp_value_statement(setup, "raw", &raw_access);
+        let (coercion_setup, coerced) = coercion.lower(self, raw_var);
+        setup.extend(coercion_setup);
+        Some(coerced)
     }
 
-    /// When accessing a cross-module generic member by value (not as a callee),
+    /// When accessing a cross-package generic member by value (not as a callee),
     /// look up the instantiation's type args and append them to the expression.
     /// Callee-position accesses skip this because the call site re-instantiates.
-    fn append_cross_module_type_args(
+    fn append_cross_package_type_args(
         &mut self,
         base_access: String,
         expression_ty: &Type,
         member: &str,
         result_ty: &Type,
+        ctx: ExpressionContext<'_>,
     ) -> String {
-        if self.emitting_call_callee {
+        if ctx.is_callee() {
             return base_access;
         }
-        let resolved_expression_ty = expression_ty.resolve();
-        let Type::Constructor { ref id, .. } = resolved_expression_ty else {
+        let Some(package) = expression_ty.as_import_namespace() else {
             return base_access;
         };
-        let Some(module) = id.strip_prefix(go_name::IMPORT_PREFIX) else {
-            return base_access;
-        };
-        let qualified = format!("{}.{}", module, member);
-        match self.format_cross_module_type_args(&qualified, result_ty) {
+        let qualified = format!("{}.{}", package, member);
+        match self.format_cross_package_type_args(&qualified, result_ty) {
             Some(type_args) => format!("{}{}", base_access, type_args),
             None => base_access,
         }
     }
 
-    /// Emit a newtype cast like `MyType(inner)` for single-field tuple struct access.
-    /// Returns None if the struct shape doesn't match (no single field, non-struct type).
+    /// Emit `.0` on a newtype as a Go conversion to the field type, `int(n)`.
+    /// Peels type aliases, so `.0` through `type Alias = New` also converts.
+    /// Returns None when the type is not a newtype.
     fn try_emit_newtype_cast(
         &mut self,
         expression_ty: &Type,
         expression_string: &str,
     ) -> Option<String> {
-        let deref_ty = expression_ty.resolve().strip_refs();
-        let Type::Constructor { id, .. } = &deref_ty else {
-            return None;
-        };
-        let Some(Definition::Struct { fields, .. }) = self.ctx.definitions.get(id.as_str()) else {
-            return None;
-        };
-        let field_ty = fields.first()?.ty.clone();
-        let go_type = self.go_type_as_string(&field_ty);
-        let operand = if expression_ty.resolve().is_ref() {
+        let field_ty = self.get_newtype_underlying(expression_ty)?;
+        let go_type = self.use_go_type(&field_ty);
+        let operand = if expression_ty.is_ref() {
             format!("*{}", expression_string)
         } else {
             expression_string.to_string()
         };
-        Some(if go_type.starts_with('*') {
-            format!("({})({})", go_type, operand)
-        } else {
-            format!("{}({})", go_type, operand)
-        })
+        Some(render_conversion(&go_type, &operand))
     }
 
     /// Compute whether a dot access context requires exported (capitalized) Go names.
     /// Used as fallback when semantic DotAccessKind doesn't carry `is_exported`.
     fn compute_is_exported_context(&self, expression: &Expression, expression_ty: &Type) -> bool {
-        matches!(
+        let is_import_namespace_identifier = matches!(
             expression,
-            Expression::Identifier { ty: Type::Constructor { id, .. }, .. } if id.starts_with(go_name::IMPORT_PREFIX)
-        ) || self.is_from_prelude(expression_ty)
-            || if let Type::Constructor { id, .. } = expression_ty.resolve().strip_refs() {
-                id.split_once('.')
-                    .is_some_and(|(m, _)| m != self.current_module && m != go_name::PRELUDE_MODULE)
-            } else {
-                false
-            }
+            Expression::Identifier { ty, .. } if ty.as_import_namespace().is_some()
+        );
+        is_import_namespace_identifier || self.type_uses_exported_members(expression_ty)
     }
 
     /// Emit the base expression with receiver coercion applied.
     ///
     /// Handles explicit deref (`.*`), absorbed `Ref<T>` generics, and auto-address/auto-deref
     /// coercions. Returns the Go expression string ready for member access.
-    fn emit_coerced_expression(&mut self, output: &mut String, expression: &Expression) -> String {
-        let coercion = self.ctx.coercions.get_coercion(expression.get_span());
-
-        let (expression_string, had_explicit_deref) = if let Expression::Unary {
-            operator: UnaryOperator::Deref,
-            expression: inner,
-            ..
-        } = expression
-        {
-            (self.emit_operand(output, inner), true)
+    fn plan_coerced_expression(
+        &mut self,
+        expression: &Expression,
+        coercion: Option<ReceiverCoercion>,
+        ctx: ExpressionContext<'_>,
+    ) -> ValuePlan {
+        let (staged, had_explicit_deref) = if let Some(inner) = expression.deref_inner() {
+            (self.plan_operand(inner, ctx), true)
         } else {
-            (self.emit_operand(output, expression), false)
+            (self.plan_operand(expression, ctx), false)
         };
-
         let is_absorbed_ref = self.is_absorbed_ref_generic(expression);
-
-        match (coercion, had_explicit_deref) {
-            _ if is_absorbed_ref => expression_string,
-            (Some(ReceiverCoercion::AutoAddress), true) => expression_string,
-            (Some(ReceiverCoercion::AutoAddress), false) => match expression.unwrap_parens() {
-                Expression::Call { .. } => {
-                    let tmp = self.fresh_var(Some("ref"));
-                    self.declare(&tmp);
-                    write_line!(output, "{} := {}", tmp, expression_string);
-                    tmp
-                }
-                Expression::StructCall { .. } => format!("(&{})", expression_string),
-                _ => expression_string,
+        staged.map_rendered(
+            |setup, expression_string, mut contains_deferred_evaluation| {
+                let value = match (coercion, had_explicit_deref) {
+                    _ if is_absorbed_ref => expression_string,
+                    (Some(ReceiverCoercion::AutoAddress), true) => expression_string,
+                    (Some(ReceiverCoercion::AutoAddress), false) => {
+                        match expression.unwrap_parens() {
+                            Expression::Call { .. } => {
+                                contains_deferred_evaluation = false;
+                                self.hoist_tmp_value_statement(setup, "ref", &expression_string)
+                            }
+                            Expression::StructCall { .. } => {
+                                contains_deferred_evaluation = true;
+                                format!("(&{})", expression_string)
+                            }
+                            _ => expression_string,
+                        }
+                    }
+                    (Some(ReceiverCoercion::AutoDeref), _) => expression_string,
+                    (None, true) => expression_string,
+                    (None, false) => expression_string,
+                };
+                GoExpression::opaque_with_deferred_evaluation(value, contains_deferred_evaluation)
             },
-            (Some(ReceiverCoercion::AutoDeref), _) => expression_string,
-            (None, true) => expression_string,
-            (None, false) => expression_string,
-        }
+        )
     }
 
     /// Check if expression has an absorbed `Ref<T>` generic (T already emitted as `*Concrete`).
-    /// When true, suppress auto-deref coercion — the pointer is already the right type.
+    /// When true, suppress auto-deref coercion: the pointer is already the right type.
     fn is_absorbed_ref_generic(&self, expression: &Expression) -> bool {
-        let check_expression = if let Expression::Unary {
-            operator: UnaryOperator::Deref,
-            expression: inner,
-            ..
-        } = expression
-        {
-            inner.as_ref()
-        } else {
-            expression
-        };
-        let expression_ty = check_expression.get_type().resolve();
-        expression_ty.is_ref()
-            && expression_ty.inner().is_some_and(|inner| {
-                matches!(inner.resolve(), Type::Parameter(name)
-                    if self.module.absorbed_ref_generics.contains(name.as_ref()))
-            })
+        let check_expression = expression.deref_inner().unwrap_or(expression);
+        let expression_ty = check_expression.get_type();
+        self.current_function_context()
+            .and_then(|context| context.absorbed_ref_inner(&expression_ty))
+            .is_some()
     }
 
     pub(crate) fn try_emit_tuple_struct_field_access(
-        &mut self,
+        &self,
         expression_string: &str,
         expression_ty: &Type,
         index: usize,
     ) -> Option<String> {
-        let deref_ty = expression_ty.resolve().strip_refs();
-        let Type::Constructor { ref id, .. } = deref_ty else {
+        let deref_ty = expression_ty.strip_refs();
+        let Type::Nominal { ref id, .. } = deref_ty else {
             return None;
         };
 
-        let Some(Definition::Struct {
-            kind,
-            fields,
-            generics,
+        let Some(Definition {
+            body:
+                DefinitionBody::Struct {
+                    fields: StructFields::Tuple(_),
+                    ..
+                },
             ..
-        }) = self.ctx.definitions.get(id.as_str())
+        }) = self.facts.definition(id.as_str())
         else {
             return None;
         };
 
-        if *kind != StructKind::Tuple {
-            return None;
-        }
-
-        if fields.len() == 1 && generics.is_empty() {
-            let underlying_ty = self.go_type_as_string(&fields[0].ty);
-            let expression = if expression_ty.resolve().is_ref() {
-                format!("*{}", expression_string)
-            } else {
-                expression_string.to_string()
-            };
-            return Some(format!("{}({})", underlying_ty, expression));
-        }
-
         Some(format!("{}.F{}", expression_string, index))
     }
 
-    /// Whether the type resolves to a prelude-module declaration. Shared with
-    /// the struct-call path, which also uses prelude-ness to decide field
-    /// naming and type formatting.
-    pub(super) fn is_from_prelude(&self, ty: &Type) -> bool {
-        let Type::Constructor { id, .. } = ty.resolve().strip_refs() else {
-            return false;
-        };
-        // Only return true if the type actually comes from the prelude module.
-        // User-defined types with the same name should NOT be treated as prelude types.
-        id.starts_with(go_name::PRELUDE_PREFIX)
+    fn try_resolve_cross_package_const(
+        &self,
+        expression_ty: &Type,
+        member: &str,
+    ) -> Option<String> {
+        let package = expression_ty.as_import_namespace()?;
+        if go_name::is_go_import(package) {
+            return None;
+        }
+        let qualified_name = format!("{}.{}", package, member);
+        let definition = self.facts.definition(qualified_name.as_str())?;
+        if !definition.visibility.is_public() {
+            return None;
+        }
+        if !matches!(definition.body, DefinitionBody::Value { .. }) {
+            return None;
+        }
+        let ty = &definition.ty;
+        let is_function = matches!(ty, Type::Function(_))
+            || matches!(ty, Type::Forall { body, .. } if matches!(body.as_ref(), Type::Function(_)));
+        if is_function {
+            return None;
+        }
+        Some(go_name::screaming_snake_to_camel(member))
     }
 }
 
 /// Pick the Go-side name for a struct field or method. Exported members on
 /// prelude types follow snake_case → camelCase (matching the stdlib
 /// convention); exported members elsewhere get first-letter capitalization;
-/// non-exported members are escaped to avoid Go keywords.
-fn go_field_name(expression_ty: &Type, member: &str, is_exported: bool) -> String {
+/// non-exported members become lower camelCase, embedded fields keep their
+/// type's name.
+fn go_field_name(
+    expression_ty: &Type,
+    member: &str,
+    is_exported: bool,
+    is_embedded: bool,
+) -> String {
+    if expression_ty
+        .as_import_namespace()
+        .is_some_and(go_name::is_go_import)
+    {
+        return member.to_string();
+    }
+
     let is_prelude_type = expression_ty
-        .resolve()
         .strip_refs()
         .get_qualified_id()
         .is_some_and(|id| id.starts_with(go_name::PRELUDE_PREFIX));
 
     if !is_exported {
-        return go_name::escape_keyword(member).into_owned();
+        if is_embedded {
+            return go_name::escape_keyword(member).into_owned();
+        }
+        return go_name::unexported_method_go_name(member);
     }
     if is_prelude_type {
         go_name::snake_to_camel(member)
     } else {
-        go_name::make_exported(member)
+        go_name::exported_member(expression_ty, member)
     }
+}
+
+/// Whether the type resolves to a prelude-package declaration. Shared with
+/// the struct-call path, which also uses prelude-ness to decide field
+/// naming and type formatting.
+pub(super) fn is_from_prelude(ty: &Type) -> bool {
+    let Type::Nominal { id, .. } = ty.strip_refs() else {
+        return false;
+    };
+    // Only return true if the type actually comes from the prelude package.
+    // User-defined types with the same name should NOT be treated as prelude types.
+    id.starts_with(go_name::PRELUDE_PREFIX)
 }

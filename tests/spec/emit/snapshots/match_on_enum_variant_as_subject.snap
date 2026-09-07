@@ -1,10 +1,18 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nenum Dir { North, South, East }\n\nfn test() -> string {\n  match Dir.North {\n    Dir.North => \"north\",\n    Dir.South => \"south\",\n    _ => \"other\",\n  }\n}\n"
+description: |
+  
+  enum Dir { North, South, East }
+  
+  fn test() -> string {
+    match Dir.North {
+      Dir.North => "north",
+      Dir.South => "south",
+      _ => "other",
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeDirNorth() Dir {
 	return Dir{Tag: DirNorth}
@@ -18,7 +26,7 @@ func MakeDirEast() Dir {
 	return Dir{Tag: DirEast}
 }
 
-type DirTag int
+type DirTag uint8
 
 const (
 	DirNorth DirTag = iota
@@ -28,19 +36,6 @@ const (
 
 type Dir struct {
 	Tag DirTag
-}
-
-func (d Dir) String() string {
-	switch d.Tag {
-	case DirNorth:
-		return "Dir.North"
-	case DirSouth:
-		return "Dir.South"
-	case DirEast:
-		return "Dir.East"
-	default:
-		return fmt.Sprintf("Dir(%d)", d.Tag)
-	}
 }
 
 func test() string {

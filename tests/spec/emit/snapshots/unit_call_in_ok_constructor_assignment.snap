@@ -1,6 +1,13 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn noop() {}\n\nfn test() -> Result<(), string> {\n  let r: Result<(), string> = if true { Ok(noop()) } else { Ok(()) }\n  r\n}\n"
+description: |
+  
+  fn noop() {}
+  
+  fn test() -> Result<(), string> {
+    let r: Result<(), string> = if true { Ok(noop()) } else { Ok(()) }
+    r
+  }
 ---
 package main
 
@@ -9,9 +16,12 @@ import lisette "github.com/ivov/lisette/prelude"
 func noop() {}
 
 func test() lisette.Result[struct{}, string] {
+	var r lisette.Result[struct{}, string]
 	if true {
 		noop()
-		return lisette.MakeResultOk[struct{}, string](struct{}{})
+		r = lisette.MakeResultOk[struct{}, string](struct{}{})
+	} else {
+		r = lisette.MakeResultOk[struct{}, string](struct{}{})
 	}
-	return lisette.MakeResultOk[struct{}, string](struct{}{})
+	return r
 }

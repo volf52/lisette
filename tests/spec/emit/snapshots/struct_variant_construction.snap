@@ -1,16 +1,22 @@
 ---
 source: tests/spec/emit/patterns.rs
-description: "input: \nenum Message {\n  Move { x: int, y: int },\n}\n\nfn make_move() -> Message {\n  Move { x: 10, y: 20 }\n}\n"
+description: |
+  
+  enum Message {
+    Move { x: int, y: int },
+  }
+  
+  fn make_move() -> Message {
+    Message.Move { x: 10, y: 20 }
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeMessageMove(arg0 int, arg1 int) Message {
 	return Message{Tag: MessageMove, X: arg0, Y: arg1}
 }
 
-type MessageTag int
+type MessageTag uint8
 
 const (
 	MessageMove MessageTag = iota
@@ -22,16 +28,7 @@ type Message struct {
 	Y   int
 }
 
-func (m Message) String() string {
-	switch m.Tag {
-	case MessageMove:
-		return fmt.Sprintf("Message.Move { x: %v, y: %v }", m.X, m.Y)
-	default:
-		return fmt.Sprintf("Message(%d)", m.Tag)
-	}
-}
-
-func make_move() Message {
+func makeMove() Message {
 	return Message{
 		Tag: MessageMove,
 		X:   10,

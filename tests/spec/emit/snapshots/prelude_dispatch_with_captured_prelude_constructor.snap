@@ -1,0 +1,32 @@
+---
+source: tests/spec/emit/prelude.rs
+description: |
+  
+  fn main() {
+    let g = Some
+    let opt: Option<int> = Some(1)
+    let r = opt.and_then(g)
+    let _ = r
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func main() {
+	cb_1 := lisette.MakeOptionSome[int]
+	g := func(arg0 int) (int, bool) {
+		opt_2 := cb_1(arg0)
+		if opt_2.Tag == lisette.OptionSome {
+			return opt_2.SomeVal, true
+		}
+		return 0, false
+	}
+	opt := lisette.MakeOptionSome(1)
+	cb_3 := g
+	tagged_4 := func(arg0 int) lisette.Option[int] {
+		return lisette.OptionFromCommaOk[int](cb_3(arg0))
+	}
+	r := lisette.OptionAndThen(opt, tagged_4)
+	_ = r
+}

@@ -1,14 +1,55 @@
 use crate::LisetteDiagnostic;
-use syntax::ast::{Annotation, BinaryOperator, Span};
-use syntax::types::Type;
+use crate::pattern;
+use std::fmt::Display;
+use std::mem;
+use syntax::ast::{Annotation, BinaryOperator, BindingKind, Span};
+use syntax::types::{SimpleKind, Type};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchedTailKind {
+    Result,
+    Option,
+    Partial,
+    Value,
+}
+
+impl MismatchedTailKind {
+    pub fn allow_alias(&self) -> &'static str {
+        match self {
+            Self::Result => "unused_result",
+            Self::Option => "unused_option",
+            Self::Partial => "unused_partial",
+            Self::Value => "unused_value",
+        }
+    }
+}
+
+pub fn mismatched_tail_value(
+    actual_span: &Span,
+    actual_ty: &str,
+    expected_span: &Span,
+    expected_ty: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Mismatch between return type and return value")
+        .with_infer_code("mismatched_return_value")
+        .with_span_primary_label(actual_span, format!("returns `{}`", actual_ty))
+        .with_span_label(
+            expected_span,
+            format!("has `{}` as implicit return type", expected_ty),
+        )
+        .with_help(format!(
+            "If the `{}` return type is intended, discard the return value with `let _ = ...`. If the `{}` return value is intended, add `-> {}` to the function signature.",
+            expected_ty, actual_ty, actual_ty
+        ))
+}
 
 pub fn blank_import_non_go(blank_span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid import")
         .with_resolve_code("blank_import_non_go")
-        .with_span_label(&blank_span, "only allowed for Go modules")
+        .with_span_label(&blank_span, "only allowed for Go packages")
         .with_help(
             "Remove the underscore. Blank imports are allowed only for Go imports, \
-             because Lisette modules have no `init()` side effects.",
+             because Lisette packages have no `init()` side effects.",
         )
 }
 
@@ -47,37 +88,74 @@ pub fn duplicate_import_path(path: &str, name_span: Span) -> LisetteDiagnostic {
         .with_resolve_code("duplicate_import")
         .with_span_label(&name_span, "already imported above")
         .with_help(format!(
-            "Module `{}` is already imported. Remove the duplicate import.",
+            "Package `{}` is already imported. Remove the duplicate import.",
             path
         ))
 }
 
-pub fn definition_shadows_import(
-    name: &str,
-    import_path: &str,
-    name_span: Span,
-) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Definition shadows import")
-        .with_resolve_code("definition_shadows_import")
-        .with_span_label(
-            &name_span,
-            format!("conflicts with imported module `{}`", import_path),
-        )
+pub fn name_shadows_import(name: &str, import_path: &str, name_span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Name shadows import")
+        .with_resolve_code("name_shadows_import")
+        .with_span_label(&name_span, format!("conflicts with `{}`", import_path))
         .with_help(format!(
-            "`{}` is already used as a module alias for `{}`. \
-             Rename this definition or use a different import alias.",
-            name, import_path
+            "`{}` shadows the package alias `{}`. \
+             Rename `{}` or re-alias the package, e.g. `import {} \"{}\"`.",
+            name,
+            import_path,
+            name,
+            suggested_import_alias(import_path, name),
+            import_path
         ))
 }
 
-pub fn statement_as_tail(span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Statement used as value")
-        .with_infer_code("statement_as_tail")
-        .with_span_label(&span, "this is a statement, not an expression")
-        .with_help(
-            "The last item in this block must be an expression that produces a value. \
-             Statements like `let`, `=`, `task`, and `defer` do not produce values.",
+fn suggested_import_alias(import_path: &str, name: &str) -> String {
+    let path = import_path.strip_prefix("go:").unwrap_or(import_path);
+    let mut alias = match path.rsplit_once('/') {
+        Some((head, last)) => {
+            let parent = head.rsplit_once('/').map_or(head, |(_, parent)| parent);
+            format!("{}_{}", alias_segment(parent), alias_segment(last))
+        }
+        None => format!("{}_pkg", alias_segment(path)),
+    };
+    if alias == name {
+        alias.push_str("_pkg");
+    }
+    alias
+}
+
+fn alias_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+pub fn statement_as_tail(span: Span, expected: &Type) -> LisetteDiagnostic {
+    let fix = if expected.is_result() {
+        let success = match expected.get_type_params() {
+            Some([ok, ..]) if ok.is_unit() => "Ok(())",
+            _ => "Ok(value)",
+        };
+        format!("End the block with `{}` or `Err(...)`.", success)
+    } else if expected.is_option() {
+        "End the block with `Some(value)` or `None`.".to_string()
+    } else {
+        format!(
+            "End the block with an expression that produces `{}`.",
+            expected
         )
+    };
+
+    let help = format!(
+        "This block is of type `()` because its last expression produces `()`, \
+         but the block was expected to be of type `{}`. {}",
+        expected, fix
+    );
+
+    LisetteDiagnostic::error("Missing value at end of block")
+        .with_infer_code("statement_as_tail")
+        .with_span_label(&span, "produces `()`")
+        .with_help(help)
 }
 
 pub fn invalid_map_initialization(key: &Type, value: &Type, span: Span) -> LisetteDiagnostic {
@@ -90,23 +168,42 @@ pub fn invalid_map_initialization(key: &Type, value: &Type, span: Span) -> Liset
         ))
 }
 
-pub fn self_type_not_supported(span: Span) -> LisetteDiagnostic {
+pub fn self_type_not_supported(span: Span, impl_receiver: Option<&str>) -> LisetteDiagnostic {
     let name_span = Span::new(span.file_id, span.byte_offset, 4); // "Self" is 4 chars
+    let help = match impl_receiver {
+        Some(name) => format!("Replace `Self` with `{}`.", name),
+        None => "Use a type parameter instead, e.g. `interface Comparable<T> { fn compare(other: T) -> int }`".to_string(),
+    };
     LisetteDiagnostic::error("Use of `Self` type")
         .with_resolve_code("self_type_not_supported")
         .with_span_label(&name_span, "invalid type")
-        .with_help(
-            "Use a type parameter instead, e.g. `interface Comparable<T> { fn compare(self, other: T) -> int }`",
-        )
+        .with_help(help)
+}
+
+pub fn self_in_interface_method(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Receiver on interface method")
+        .with_resolve_code("self_in_interface_method")
+        .with_span_label(&span, "not allowed here")
+        .with_help("Remove `self` from the signature. Interface methods declare no receiver")
 }
 
 pub fn type_not_found(type_name: &str, annotation_span: Span) -> LisetteDiagnostic {
     let simple_name = type_name.rsplit('.').next().unwrap_or(type_name);
+    let qualifier_offset = (type_name.len() - simple_name.len()) as u32;
     let name_span = Span::new(
         annotation_span.file_id,
-        annotation_span.byte_offset,
+        annotation_span.byte_offset + qualifier_offset,
         simple_name.len() as u32,
     );
+
+    if simple_name == "TestContext" {
+        return LisetteDiagnostic::error("Type not found")
+            .with_resolve_code("type_not_found")
+            .with_span_label(&name_span, "only available in test files")
+            .with_help(
+                "`TestContext` is given to `#[test]` functions in `.test.lis` files and is not available in production code",
+            );
+    }
 
     let looks_like_type_param = simple_name.len() == 1
         && simple_name.chars().next().is_some_and(|c| c.is_uppercase())
@@ -115,17 +212,71 @@ pub fn type_not_found(type_name: &str, annotation_span: Span) -> LisetteDiagnost
     if looks_like_type_param {
         return LisetteDiagnostic::error("Undeclared type parameter")
             .with_resolve_code("type_not_found")
-            .with_span_label(&name_span, "undeclared")
+            .with_span_label(&name_span, "looks like a type parameter")
             .with_help(format!(
                 "Declare the type parameter, e.g. `impl<{t}>` or `fn foo<{t}>`",
                 t = simple_name
             ));
     }
 
-    LisetteDiagnostic::error("Type not found")
+    let diagnostic = LisetteDiagnostic::error("Type not found")
         .with_resolve_code("type_not_found")
-        .with_span_label(&name_span, "type not found in scope")
-        .with_help("Define or import this type")
+        .with_span_label(&name_span, "not declared or imported");
+
+    match foreign_type_alias(simple_name) {
+        Some(suggestion) => diagnostic.with_help(format!("Did you mean `{}`?", suggestion)),
+        None => diagnostic.with_help("Define or import this type"),
+    }
+}
+
+fn foreign_type_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "float" | "double" | "f64" => "float64",
+        "f32" => "float32",
+        "i8" => "int8",
+        "i16" => "int16",
+        "i32" => "int32",
+        "i64" => "int64",
+        "u8" => "uint8",
+        "u16" => "uint16",
+        "u32" => "uint32",
+        "u64" => "uint64",
+        "usize" | "isize" => "int",
+        "str" | "String" => "string",
+        "Vec" => "Slice",
+        "HashMap" => "Map",
+        _ => return None,
+    })
+}
+
+pub fn value_in_type_position(
+    name: &str,
+    kind: &str,
+    annotation_span: Span,
+    help: Option<String>,
+) -> LisetteDiagnostic {
+    let name_span = Span::new(
+        annotation_span.file_id,
+        annotation_span.byte_offset,
+        name.len() as u32,
+    );
+
+    let mut diag = LisetteDiagnostic::error("Value in type position")
+        .with_resolve_code("value_in_type_position")
+        .with_span_label(&name_span, format!("expected type, found {}", kind));
+
+    if let Some(help) = help {
+        diag = diag.with_help(help);
+    }
+
+    diag
+}
+
+pub fn integer_in_type_position(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Integer in type position")
+        .with_infer_code("integer_in_type_position")
+        .with_span_label(&span, "expected a type, found an integer literal")
+        .with_help("Integer literals are not valid type arguments.")
 }
 
 pub fn undeclared_impl_type_param(
@@ -141,7 +292,7 @@ pub fn undeclared_impl_type_param(
 
     LisetteDiagnostic::error("Undeclared type parameter")
         .with_resolve_code("type_not_found")
-        .with_span_label(&name_span, "undeclared")
+        .with_span_label(&name_span, "not declared by this `impl`")
         .with_help(format!(
             "Declare the type parameter: `impl<{t}> {r}<{t}>`",
             t = type_name,
@@ -182,28 +333,63 @@ pub fn circular_type_alias(type_name: &str, span: Span) -> LisetteDiagnostic {
         .with_help("Type aliases cannot be recursive")
 }
 
+pub fn const_disallows_composite(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Composite value in `const`")
+        .with_infer_code("const_disallows_composite")
+        .with_span_label(&span, "not allowed")
+        .with_help(
+            "`const` only accepts primitive values: `bool`, `int`, `float`, and `string`. Use a function that returns the value instead",
+        )
+}
+
+pub fn const_cycle(cycle: &[String], span: Span) -> LisetteDiagnostic {
+    let mut diagnostic = LisetteDiagnostic::error("`const` init cycle")
+        .with_infer_code("const_cycle")
+        .with_help(
+            "`const` initializers cannot refer to themselves, either directly or transitively",
+        );
+    diagnostic = if cycle.len() == 1 {
+        diagnostic.with_span_label(&span, "self-reference")
+    } else {
+        let chain = cycle
+            .iter()
+            .map(|name| format!("`{}`", name))
+            .collect::<Vec<_>>()
+            .join(" → ");
+        diagnostic.with_span_label(&span, format!("cycle: {} → `{}`", chain, cycle[0]))
+    };
+    diagnostic
+}
+
 pub fn name_not_found(
     variable_name: &str,
     span: Span,
     available_names: &[String],
+    expected_ty: Option<&Type>,
+    qualified: Option<&str>,
+    test_fn_name: Option<&str>,
 ) -> LisetteDiagnostic {
     if matches!(variable_name, "nil" | "null" | "Nil" | "undefined") {
+        let help = nil_help_for(expected_ty);
         return LisetteDiagnostic::error(format!("`{}` is not supported", variable_name))
             .with_resolve_code("nil_not_supported")
             .with_span_label(&span, "does not exist")
-            .with_help("Absence is encoded with `Option<T>` in Lisette. Use `None` to represent absent values.");
+            .with_help(help);
     }
 
     if let Some(hint) = go_builtin_hint(variable_name) {
         return LisetteDiagnostic::error("Name not found")
             .with_resolve_code("name_not_found")
-            .with_span_label(&span, "name not found in scope")
+            .with_span_label(&span, "not a Lisette builtin")
             .with_help(hint);
     }
 
-    let mut diagnostic = LisetteDiagnostic::error("Name not found")
-        .with_resolve_code("name_not_found")
-        .with_span_label(&span, "name not found in scope");
+    if let Some(qualified) = qualified {
+        return LisetteDiagnostic::error("Name not found")
+            .with_resolve_code("name_not_found")
+            .with_span_label(&span, "not declared or imported")
+            .with_help(format!("Did you mean `{qualified}`?"));
+    }
 
     let suggestion = available_names
         .iter()
@@ -214,13 +400,43 @@ pub fn name_not_found(
         .min_by_key(|(_, d)| *d)
         .map(|(c, _)| c.clone());
 
+    // `t` is the conventional name for the handle a `#[test]` receives, but it is an
+    // ordinary parameter the test must declare, not an implicit binding. A close-name
+    // suggestion takes precedence, since then the real fix is the typo, not a new param.
+    if suggestion.is_none()
+        && let Some(function) = test_fn_name.filter(|_| variable_name == "t")
+    {
+        return LisetteDiagnostic::error("Undeclared test handle")
+            .with_resolve_code("undeclared_test_handle")
+            .with_span_label(&span, format!("`{function}` declares no `t` parameter"))
+            .with_help(format!(
+                "Declare a `t` parameter to receive the test handle: `fn {function}(t)`"
+            ));
+    }
+
+    let mut diagnostic = LisetteDiagnostic::error("Name not found")
+        .with_resolve_code("name_not_found")
+        .with_span_label(&span, "not declared or imported");
+
     if let Some(suggestion) = suggestion {
         diagnostic = diagnostic.with_help(format!("Did you mean `{}`?", suggestion));
     } else {
-        diagnostic = diagnostic.with_help(format!("Define or import `{}`.", variable_name));
+        diagnostic = diagnostic.with_help(format!("Define or import `{}`", variable_name));
     }
 
     diagnostic
+}
+
+/// Pick a `nil`-replacement hint tailored to the expected type.
+fn nil_help_for(expected_ty: Option<&Type>) -> String {
+    match expected_ty {
+        Some(ty) if ty.is_slice() => format!("For an empty `{}`, use `[]`.", ty),
+        Some(ty) if ty.is_map() => format!("For an empty `{}`, use `Map.new()`.", ty),
+        _ => {
+            "Absence is encoded with `Option<T>` in Lisette. Use `None` to represent absent values."
+                .to_string()
+        }
+    }
 }
 
 pub fn self_in_static_method(span: Span) -> LisetteDiagnostic {
@@ -244,10 +460,17 @@ pub fn static_method_called_on_instance(
         ))
 }
 
-pub fn function_or_value_not_found_in_module(name: &str, span: Span) -> LisetteDiagnostic {
+pub fn function_or_value_not_found_in_package(
+    name: &str,
+    package: &str,
+    span: Span,
+) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Name not found")
-        .with_resolve_code("not_found_in_module")
-        .with_span_label(&span, format!("`{}` not found in module", name))
+        .with_resolve_code("not_found_in_package")
+        .with_span_label(
+            &span,
+            format!("`{}` not found in package `{}`", name, package),
+        )
         .with_help("Ensure the name is exported and spelled correctly")
 }
 
@@ -261,13 +484,14 @@ pub fn receiver_type_mismatch(
         .with_span_label(
             &span,
             format!(
-                "expected `{}` or `Ref<{}>`, found `{}`",
-                impl_type, impl_type, receiver_type
+                "expected `{}`, `Ref<{}>`, or `mut Ref<{}>`, found `{}`",
+                impl_type, impl_type, impl_type, receiver_type
             ),
         )
         .with_help(format!(
-            "Change the receiver type to `{}` or `Ref<{}>`",
-            impl_type, impl_type
+            "Change the receiver type to `{}` for a copy, `Ref<{}>` to point at it, \
+             or `mut Ref<{}>` to write through it",
+            impl_type, impl_type, impl_type
         ))
 }
 
@@ -281,40 +505,513 @@ pub fn receiver_must_be_named_self(actual_name: &str, span: Span) -> LisetteDiag
         ))
 }
 
+pub fn stringer_signature_mismatch(method_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Reserved method signature")
+        .with_infer_code("stringer_signature_mismatch")
+        .with_span_label(
+            &span,
+            format!("`{}` must have signature `(self) -> string`", method_name),
+        )
+        .with_help(format!(
+            "`{}` is reserved for the Go `fmt.Stringer` (or `fmt.GoStringer`) interface and is auto-emitted by Lisette. Either change the signature to `(self) -> string`, or rename the method",
+            method_name
+        ))
+}
+
+pub fn json_method_override(method_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Reserved JSON method")
+        .with_infer_code("json_method_override")
+        .with_span_label(
+            &span,
+            format!("`{}` collides with the method generated by `#[json]`", method_name),
+        )
+        .with_help(
+            "`#[json]` already generates `MarshalJSON` and `UnmarshalJSON`. Remove this method, or drop `#[json]` and write both yourself",
+        )
+}
+
+pub fn json_non_serializable_field(span: &Span, kind: &str, skippable: bool) -> LisetteDiagnostic {
+    let fix = if skippable {
+        " Drop the field, or exclude it with `#[json(skip)]`."
+    } else {
+        " Remove it from the variant."
+    };
+    LisetteDiagnostic::error("Non-serializable field in a `#[json]` type")
+        .with_infer_code("json_non_serializable_field")
+        .with_span_label(span, format!("a {kind} cannot be JSON-encoded"))
+        .with_help(format!("Go's `encoding/json` cannot marshal {kind}s.{fix}"))
+}
+
+pub fn cast_grants_permission(source: &str, target: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing write permission")
+        .with_infer_code("needs_writable")
+        .with_span_label(
+            &span,
+            format!("cannot convert `{source}` to the more permissive `{target}`"),
+        )
+        .with_help(
+            "A cast may drop `mut`, never restore it. Keep the value writable \
+             where it is created, or cast a `.clone()`",
+        )
+}
+
+pub fn immutable_loop_binding(
+    variable_name: &str,
+    collection: Option<&str>,
+    span: Span,
+) -> LisetteDiagnostic {
+    let target = match collection {
+        Some(collection) => format!("`{collection}[i]`"),
+        None => "the collection by index".to_string(),
+    };
+    LisetteDiagnostic::error("Immutable loop binding")
+        .with_infer_code("immutable")
+        .with_span_label(
+            &span,
+            format!("`{variable_name}` binds a copy of each element"),
+        )
+        .with_help(format!(
+            "Bind with `for mut {variable_name}` to write to the copy, \
+             or write through {target} to update the collection"
+        ))
+}
+
+pub fn loop_copy_write(
+    variable_name: &str,
+    collection: Option<&str>,
+    span: Span,
+) -> LisetteDiagnostic {
+    let help = match collection {
+        Some(collection) => format!(
+            "`{variable_name}` is a copy of the element, and the loop body does not read it \
+             after this write, so the collection keeps its old value. \
+             Write through `{collection}[i]` to update it"
+        ),
+        None => format!(
+            "`{variable_name}` is a copy of the element, and the loop body does not read it \
+             after this write, so the write is lost"
+        ),
+    };
+    LisetteDiagnostic::warn("Write to a loop copy")
+        .with_infer_code("loop_copy_write")
+        .with_span_label(&span, format!("only changes `{variable_name}`"))
+        .with_help(help)
+}
+
+pub fn loop_binding_read_only(variable_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Immutable loop binding")
+        .with_infer_code("immutable")
+        .with_span_label(&span, format!("`{variable_name}` binds read-only elements"))
+        .with_help(format!(
+            "Bind with `for mut {variable_name}` to keep the elements writable"
+        ))
+}
+
+pub fn mut_without_effect(target: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`mut` has no effect")
+        .with_infer_code("mut_without_effect")
+        .with_span_label(&span, format!("`{target}` cannot carry write permission"))
+        .with_help(
+            "Only `Slice`, `Map`, `Ref`, and `Unknown` can carry write permission, \
+             directly or through their contents. Remove `mut`",
+        )
+}
+
+pub fn mut_under_read_only_wrapper(
+    wrapper: &str,
+    wrapper_span: Span,
+    contents_span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`mut` has no effect")
+        .with_infer_code("mut_without_effect")
+        .with_span_label(&wrapper_span, "read-only")
+        .with_span_label(&contents_span, "`mut` has no effect")
+        .with_help(format!(
+            "A read-only container makes its contents read-only. \
+             Write `mut` before `{wrapper}`, or remove the inner `mut`"
+        ))
+}
+
+pub fn assert_type_needs_concrete(target: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot assert to a type parameter")
+        .with_infer_code("needs_writable")
+        .with_span_label(&span, format!("`{target}` is not a concrete type"))
+        .with_help(
+            "A type parameter could stand for a writable type, and an assertion \
+             from `Unknown` never grants permission. Assert to a concrete read-only type",
+        )
+}
+
+pub fn assert_type_grants_permission(target: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing write permission")
+        .with_infer_code("needs_writable")
+        .with_span_label(
+            &span,
+            format!("cannot assert to the more permissive `{target}`"),
+        )
+        .with_help(
+            "An assertion may narrow `Unknown` to a read-only type, never a writable \
+             one. Assert to the read-only type, then write to a `.clone()`",
+        )
+}
+
+pub fn spread_needs_writable(element_ty: &str, actual_ty: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing write permission")
+        .with_infer_code("needs_writable")
+        .with_span_label(
+            &span,
+            format!("spreads read-only elements where `{element_ty}` is expected"),
+        )
+        .with_help(format!(
+            "Each spread element becomes a `{element_ty}` argument, and `{actual_ty}` \
+             holds read-only elements. Keep the elements writable where they are \
+             created, or pass clones"
+        ))
+}
+
+pub fn aliased_writable_argument(place: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Aliased writable argument")
+        .with_infer_code("aliased_writable_argument")
+        .with_span_label(
+            &span,
+            format!("`{place}` is passed writably and again in the same call"),
+        )
+        .with_help(format!(
+            "The callee's other view of `{place}` would change under it. \
+             Pass `{place}.clone()` in one position"
+        ))
+}
+
+#[derive(Debug, Clone)]
+pub enum WriteContext {
+    Element(ElementDeclaration),
+    Parameter(String),
+    Field(String),
+    LoopElement {
+        binding: String,
+        collection: Option<String>,
+    },
+    LoopCopy {
+        binding: String,
+        collection: Option<String>,
+    },
+    AliasOf {
+        binding: String,
+        source: String,
+    },
+    CallResult(String),
+    ReadOnlyOwner {
+        owner: String,
+        field: String,
+        origin: Option<String>,
+    },
+    ImmutableBinding(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadOnlyComponent {
+    pub kind: ReadOnlyComponentKind,
+    pub declared: String,
+    pub actual: String,
+    pub span: Span,
+    pub context: Option<WriteContext>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReadOnlyComponentKind {
+    Field(String),
+    Spread(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ElementDeclaration {
+    pub name: String,
+    pub replacement_type: String,
+    pub place: String,
+    /// `i` for a slice, `k` for a map.
+    pub index: &'static str,
+    /// None when the declaration sits in another file.
+    pub declaration_span: Option<Span>,
+}
+
+pub fn needs_writable_help(expected: &str, actual: &str, context: Option<WriteContext>) -> String {
+    let remedy = needs_writable_remedy(expected, actual, context);
+    format!("`{expected}` permits writes, `{actual}` does not. {remedy}")
+}
+
+pub fn needs_writable_remedy(
+    expected: &str,
+    actual: &str,
+    context: Option<WriteContext>,
+) -> String {
+    match context {
+        Some(WriteContext::ImmutableBinding(name)) => format!("Declare `let mut {name}`"),
+        Some(WriteContext::Parameter(name)) => {
+            format!("Declare the parameter `{name}` as `{expected}`")
+        }
+        Some(WriteContext::Field(name)) => format!("Declare the field `{name}` as `{expected}`"),
+        Some(WriteContext::ReadOnlyOwner { owner, field, .. }) => format!(
+            "`{field}` is declared writable, but `{owner}` is read-only, so its fields are too. \
+             Make `{owner}` writable where it is created"
+        ),
+        Some(WriteContext::AliasOf { binding, source }) => format!(
+            "`{binding}` shares storage with `{source}`, which is read-only. \
+             Make `{source}` writable, or pass a `.clone()`"
+        ),
+        Some(WriteContext::CallResult(callee)) => {
+            format!("`{callee}` returns `{actual}`. Declare its return type `{expected}`")
+        }
+        Some(WriteContext::LoopElement {
+            binding,
+            collection,
+        }) => match collection {
+            Some(collection) => format!(
+                "`{binding}` binds elements of `{collection}`, which is read-only. \
+                 Declare `let mut {collection}`"
+            ),
+            None => format!("`{binding}` binds read-only elements"),
+        },
+        Some(WriteContext::LoopCopy {
+            binding,
+            collection,
+        }) => match collection {
+            Some(collection) => format!(
+                "`{binding}` binds a copy of each element. Bind with `for mut {binding}` \
+                 to write to the copy, or write through `{collection}[i]` to update the collection"
+            ),
+            None => format!(
+                "`{binding}` binds a copy of each element. Bind with `for mut {binding}` \
+                 to write to the copy"
+            ),
+        },
+        _ => "Make the value writable where it is created, or pass a `.clone()`".to_string(),
+    }
+}
+
+pub fn read_only_construction(
+    expected: &str,
+    actual: &str,
+    constructed: &str,
+    behind_ref: bool,
+    components: &[ReadOnlyComponent],
+) -> LisetteDiagnostic {
+    let mut diagnostic =
+        LisetteDiagnostic::error("Missing write permission").with_infer_code("needs_writable");
+    let mut fields: Vec<&str> = vec![];
+    let mut remedies: Vec<String> = vec![];
+    for component in components {
+        let ReadOnlyComponent {
+            kind,
+            declared,
+            actual,
+            span,
+            context,
+        } = component;
+        let label = match kind {
+            ReadOnlyComponentKind::Field(name) => {
+                fields.push(name);
+                format!("`{name}` is declared `{declared}`, but receives `{actual}`")
+            }
+            ReadOnlyComponentKind::Spread(supplied) => {
+                fields.extend(supplied.iter().map(String::as_str));
+                let verb = if supplied.len() == 1 { "comes" } else { "come" };
+                format!(
+                    "`{}` {verb} from a read-only `{actual}`",
+                    supplied.join("`, `")
+                )
+            }
+        };
+        diagnostic = diagnostic.with_span_label(span, label);
+        let remedy = needs_writable_remedy(declared, actual, context.clone());
+        if !remedies.contains(&remedy) {
+            remedies.push(remedy);
+        }
+    }
+    let subject = match fields.as_slice() {
+        [field] => format!("`{field}`"),
+        [init @ .., last] => format!("`{}` and `{last}`", init.join("`, `")),
+        [] => unreachable!("a read-only construction names at least one component"),
+    };
+    let outcome = if behind_ref {
+        format!(
+            "so the new `{constructed}` is read-only. A reference to it is `{actual}` \
+             where `{expected}` is expected."
+        )
+    } else {
+        format!("so the new `{constructed}` is read-only where `{expected}` is expected.")
+    };
+    diagnostic.with_help(format!(
+        "{subject} received less `mut` than declared, {outcome} {}",
+        remedies.join(". ")
+    ))
+}
+
+pub fn write_through_read_only(
+    place: &str,
+    hop: &str,
+    governing_type: &str,
+    span: Span,
+    context: Option<WriteContext>,
+) -> LisetteDiagnostic {
+    let diagnostic = LisetteDiagnostic::error(format!("Cannot write to `{place}`"))
+        .with_infer_code("write_through_read_only");
+    let element = match context {
+        Some(WriteContext::Element(element)) => element,
+        other => {
+            let help = match other {
+                Some(WriteContext::Parameter(name)) => {
+                    format!("Declare the parameter `{name}` as `mut {governing_type}`")
+                }
+                Some(WriteContext::Field(name)) => {
+                    format!("Declare the field `{name}` as `mut {governing_type}`")
+                }
+                Some(WriteContext::LoopElement {
+                    binding,
+                    collection: Some(collection),
+                }) => format!(
+                    "`{binding}` binds elements of `{collection}`, which is read-only. \
+                     Declare `let mut {collection}`"
+                ),
+                Some(WriteContext::LoopElement { binding, .. }) => format!(
+                    "`{binding}` binds read-only elements. \
+                     Declare the collection with `let mut`"
+                ),
+                Some(WriteContext::LoopCopy { binding, .. }) => format!(
+                    "`{binding}` binds a copy of each element. Bind with `for mut {binding}` \
+                     to write to the copy"
+                ),
+                Some(WriteContext::AliasOf { binding, source }) => format!(
+                    "`{binding}` shares storage with `{source}`, which is read-only. \
+                     Make `{source}` writable, or write to a `.clone()` for an independent copy"
+                ),
+                Some(WriteContext::ReadOnlyOwner {
+                    owner,
+                    field,
+                    origin,
+                }) => {
+                    let source = match origin {
+                        Some(callee) => format!(
+                            "`{owner}` comes from `{callee}`, so declare that function's return type `mut`"
+                        ),
+                        None => format!("Make `{owner}` writable where it is created"),
+                    };
+                    format!(
+                        "`{field}` is declared writable, but `{owner}` is read-only, \
+                         so its fields are too. {source}"
+                    )
+                }
+                Some(WriteContext::CallResult(callee)) => format!(
+                    "`{callee}` returns `{governing_type}`. \
+                     Declare its return type `mut {governing_type}`, or bind the result and write to a `.clone()`"
+                ),
+                _ => format!(
+                    "Make it `mut {governing_type}` where it is created, \
+                     or write to a `.clone()` for an independent copy"
+                ),
+            };
+            let label = if hop.is_empty() {
+                format!("`{governing_type}` permits no write")
+            } else {
+                format!("`{hop}` is read-only")
+            };
+            return diagnostic.with_span_label(&span, label).with_help(help);
+        }
+    };
+    let ElementDeclaration {
+        name,
+        replacement_type,
+        place,
+        index,
+        declaration_span,
+    } = element;
+    let rule = format!("`mut` makes `{name}` writable, but `{name}[{index}]` is still read-only");
+    let remedy = format!(
+        "Declare `{name}` as `{replacement_type}` to make both `{name}` and `{name}[{index}]` writable"
+    );
+    let mut diagnostic =
+        diagnostic.with_span_label(&span, format!("this write goes through `{place}`"));
+    let help = match declaration_span {
+        Some(declaration_span) => {
+            diagnostic = diagnostic.with_span_label(&declaration_span, &rule);
+            remedy
+        }
+        None => format!("{rule}. {remedy}"),
+    };
+    diagnostic.with_help(help)
+}
+
+pub enum MutationHint<'a> {
+    Pointer(&'a str),
+    WritingCallee(&'a str),
+}
+
 pub fn disallowed_mutation(
     variable_name: &str,
     span: Span,
     self_type_name: Option<&str>,
-    is_match_arm_binding: bool,
+    binding_kind: Option<BindingKind>,
+    is_const_binding: bool,
+    hint: Option<MutationHint<'_>>,
 ) -> LisetteDiagnostic {
+    if let Some(MutationHint::Pointer(ref_type)) = hint {
+        return LisetteDiagnostic::error("Missing `.*` on a pointer write")
+            .with_infer_code("immutable")
+            .with_span_label(&span, format!("`{variable_name}` is a `{ref_type}`"))
+            .with_help(format!(
+                "Write through the pointer with `{variable_name}.*`"
+            ));
+    }
     if variable_name == "self" {
         if let Some(type_name) = self_type_name {
             LisetteDiagnostic::error("Immutable receiver")
                 .with_infer_code("value_receiver_immutable")
                 .with_span_label(&span, "receiver is immutable")
                 .with_help(format!(
-                    "Use `self: Ref<{type_name}>` to make the receiver mutable"
+                    "Use `self: mut Ref<{type_name}>` to make the receiver mutable"
                 ))
         } else {
             LisetteDiagnostic::error("Immutable receiver")
                 .with_infer_code("value_receiver_immutable")
                 .with_span_label(&span, "receiver is immutable")
-                .with_help("Use `self: Ref<Self>` to make the receiver mutable")
+                .with_help(
+                    "Use `self: mut Ref<T>` to make the receiver mutable, \
+                     where `T` is the type this `impl` targets",
+                )
         }
-    } else if is_match_arm_binding {
+    } else if is_const_binding {
+        LisetteDiagnostic::error("Cannot mutate `const`")
+            .with_infer_code("immutable")
+            .with_span_label(&span, "cannot mutate a `const`")
+            .with_help(format!(
+                "`const` bindings are immutable. Rebind with `let mut {variable_name} = {variable_name}` to mutate a local copy"
+            ))
+    } else if binding_kind.is_some_and(|kind| kind.is_pattern_position()) {
         LisetteDiagnostic::error("Immutable variable")
             .with_infer_code("immutable")
-            .with_span_label(&span, "cannot mutate an immutable variable")
+            .with_span_label(&span, "patterns cannot bind with `mut`")
             .with_help(format!(
-                "Pattern bindings are immutable; rebind with `let mut {variable_name} = {variable_name}` to mutate"
+                "Rebind with `let mut {variable_name} = {variable_name}`, then mutate that"
             ))
     } else {
+        let help = if binding_kind.is_some_and(|kind| kind.is_param()) {
+            format!(
+                "Parameters are immutable. Rebind with `let mut {variable_name} = {variable_name}` to mutate a local copy"
+            )
+        } else if let Some(MutationHint::WritingCallee(callee)) = hint {
+            format!(
+                "{callee} writes to `{variable_name}`. \
+                 Declare using `let mut {variable_name}` to mark the variable mutable"
+            )
+        } else {
+            format!("Declare using `let mut {variable_name}` to mark the variable mutable")
+        };
         LisetteDiagnostic::error("Immutable variable")
             .with_infer_code("immutable")
-            .with_span_label(&span, "cannot mutate an immutable variable")
-            .with_help(format!(
-                "Declare using `let mut {variable_name}` to make the variable mutable"
-            ))
+            .with_span_label(
+                &span,
+                format!("`{variable_name}` was declared without `mut`"),
+            )
+            .with_help(help)
     }
 }
 
@@ -335,45 +1032,96 @@ pub fn uppercase_binding(span: Span, name: &str) -> LisetteDiagnostic {
 pub fn enum_variant_constructor_not_found(
     span: Span,
     enum_info: Option<(&str, &[String])>,
-    variant_name: &str,
+    written_path: &str,
+    bare_allowed: bool,
 ) -> LisetteDiagnostic {
-    let help = if let Some((enum_name, variants)) = enum_info {
+    let variant_name = written_path.rsplit('.').next().unwrap_or(written_path);
+    let qualifier = written_path
+        .rsplit_once('.')
+        .map(|(qualifier, _)| qualifier);
+
+    let (label, help) = if let Some((enum_name, variants)) = enum_info {
         if variants.iter().any(|v| v == variant_name) {
-            format!("Use `{}.{}` to match this variant", enum_name, variant_name)
-        } else if let Some(closest) = variants
-            .iter()
-            .filter_map(|v| {
-                let d = levenshtein_distance(variant_name, v);
-                (d <= 2).then_some((v, d))
-            })
-            .min_by_key(|(_, d)| *d)
-            .map(|(v, _)| v)
-        {
-            format!("Did you mean `{}.{}`?", enum_name, closest)
+            // A written qualifier can be unbound or can be another enum that is in scope, so
+            // the fact covering both is the enum's own path.
+            let qualified = format!("{}.{}", enum_name, variant_name);
+            match (qualifier, bare_allowed) {
+                (Some(_), true) => (
+                    format!("the enum is `{}`", enum_name),
+                    format!("Use `{}`, or just `{}`", qualified, variant_name),
+                ),
+                (Some(_), false) => (
+                    format!("the enum is `{}`", enum_name),
+                    format!("Use `{}` to match this variant", qualified),
+                ),
+                (None, false) => (
+                    "bare variants work only in match arms".to_string(),
+                    format!("Use `{}` to match this variant", qualified),
+                ),
+                (None, true) => (
+                    format!("the enum is `{}`", enum_name),
+                    format!("Use `{}` to match this variant", variant_name),
+                ),
+            }
         } else {
-            let variants_fmt = format_list(variants, |v| format!("`{}.{}`", enum_name, v));
-            format!(
-                "Available variants for `{}` are {}",
-                enum_name, variants_fmt
-            )
+            let label = format!("no variant `{}` on `{}`", variant_name, enum_name);
+            let help = if let Some(closest) = variants
+                .iter()
+                .filter_map(|v| {
+                    let d = levenshtein_distance(variant_name, v);
+                    (d <= 2).then_some((v, d))
+                })
+                .min_by_key(|(_, d)| *d)
+                .map(|(v, _)| v)
+            {
+                if bare_allowed {
+                    format!("Did you mean `{}`?", closest)
+                } else {
+                    format!("Did you mean `{}.{}`?", enum_name, closest)
+                }
+            } else {
+                let variants_fmt = if bare_allowed {
+                    format_list(variants, |v| format!("`{}`", v))
+                } else {
+                    format_list(variants, |v| format!("`{}.{}`", enum_name, v))
+                };
+                format!(
+                    "Available variants for `{}` are {}",
+                    enum_name, variants_fmt
+                )
+            };
+            (label, help)
         }
     } else {
-        "Check that the variant is defined in the enum and spelled correctly".to_string()
+        (
+            "not a variant of any enum in scope".to_string(),
+            "Check that the variant is defined in the enum and spelled correctly".to_string(),
+        )
     };
 
     LisetteDiagnostic::error("Variant not found")
         .with_resolve_code("variant_not_found")
-        .with_span_label(&span, "not found")
+        .with_span_label(&span, label)
         .with_help(help)
 }
 
-pub fn value_enum_in_source_file(enum_name: &str, span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Invalid value enum")
-        .with_infer_code("value_enum_outside_typedef")
-        .with_span_label(&span, "not allowed in .lis files")
+pub fn const_pattern_not_eligible(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Pattern target is not a matchable value")
+        .with_infer_code("const_pattern_not_eligible")
+        .with_span_label(&span, "a function cannot be a match pattern")
         .with_help(format!(
-            "Use a regular enum instead: `enum {} {{ A, B, C }}`. Value enums exist only to represent Go's enums in typedefs.",
-            enum_name
+            "`{}` is a function or method value. Const patterns match named constants or package-level values that the compiler can emit as a Go `case`, not callables.",
+            name
+        ))
+}
+
+pub fn const_pattern_outside_match_arm(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Const pattern outside a match arm")
+        .with_infer_code("const_pattern_outside_match_arm")
+        .with_span_label(&span, "const patterns are only allowed in match arms")
+        .with_help(format!(
+            "`{}` is a constant, so this pattern is refutable. Match on it inside a `match` expression, or compare with `==` in a `let` or function parameter.",
+            name
         ))
 }
 
@@ -407,6 +1155,11 @@ pub fn arity_mismatch(
     } else {
         "arguments"
     };
+    let actual_word = if actual_count == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
 
     LisetteDiagnostic::error("Wrong argument count")
         .with_infer_code("arg_count_mismatch")
@@ -415,7 +1168,7 @@ pub fn arity_mismatch(
             format!("expected `({})`, found `({})`", expected_str, actual_str),
         )
         .with_help(format!(
-            "This {} expects {} {} but received {} arguments",
+            "This {} expects {} {} but received {} {}",
             if is_constructor {
                 "constructor"
             } else {
@@ -423,7 +1176,8 @@ pub fn arity_mismatch(
             },
             expected_count,
             expected_word,
-            actual_count
+            actual_count,
+            actual_word
         ))
 }
 
@@ -435,7 +1189,7 @@ pub fn generics_arity_mismatch(
 ) -> LisetteDiagnostic {
     let expected: Vec<Type> = expected_generic_params
         .iter()
-        .map(|param| Type::nominal(param))
+        .map(|param| Type::Parameter(param.as_str().into()))
         .collect();
 
     let expected_str = expected
@@ -453,6 +1207,11 @@ pub fn generics_arity_mismatch(
     let expected_count = expected.len();
     let actual_count = actual_types.len();
     let expected_word = if expected_count == 1 {
+        "type parameter"
+    } else {
+        "type parameters"
+    };
+    let actual_word = if actual_count == 1 {
         "type parameter"
     } else {
         "type parameters"
@@ -479,8 +1238,8 @@ pub fn generics_arity_mismatch(
             format!("expected `<{}>`, found `<{}>`", expected_str, actual_str),
         )
         .with_help(format!(
-            "This type expects {} {} but received {} type parameters",
-            expected_count, expected_word, actual_count
+            "This type expects {} {} but received {} {}",
+            expected_count, expected_word, actual_count, actual_word
         ))
 }
 
@@ -489,13 +1248,23 @@ pub fn tuple_arity_mismatch(
     expected_arity: usize,
     span: Span,
 ) -> LisetteDiagnostic {
+    let expected_word = if expected_arity == 1 {
+        "element"
+    } else {
+        "elements"
+    };
+    let actual_word = if pattern_arity == 1 {
+        "element"
+    } else {
+        "elements"
+    };
     LisetteDiagnostic::error("Tuple arity mismatch")
         .with_infer_code("tuple_element_count_mismatch")
         .with_span_label(
             &span,
             format!(
-                "expected {} elements, found {} elements",
-                expected_arity, pattern_arity
+                "expected {} {}, found {} {}",
+                expected_arity, expected_word, pattern_arity, actual_word
             ),
         )
         .with_help("Adjust the pattern to match the number of elements in the tuple.")
@@ -503,11 +1272,16 @@ pub fn tuple_arity_mismatch(
 
 pub fn struct_not_found(identifier: &str, span: Span) -> LisetteDiagnostic {
     let simple_name = identifier.rsplit('.').next().unwrap_or(identifier);
-    let name_span = Span::new(span.file_id, span.byte_offset, simple_name.len() as u32);
+    let qualifier_offset = (identifier.len() - simple_name.len()) as u32;
+    let name_span = Span::new(
+        span.file_id,
+        span.byte_offset + qualifier_offset,
+        simple_name.len() as u32,
+    );
 
     LisetteDiagnostic::error("Struct not found")
         .with_resolve_code("struct_not_found")
-        .with_span_label(&name_span, "struct not found in scope")
+        .with_span_label(&name_span, "not declared or imported")
         .with_help("Define or import this struct")
 }
 
@@ -519,12 +1293,17 @@ pub fn struct_missing_fields(
     let fields_list = missing.join(", ");
 
     let simple_name = struct_name.rsplit('.').next().unwrap_or(struct_name);
-    let name_span = Span::new(span.file_id, span.byte_offset, simple_name.len() as u32);
+    let qualifier_offset = (struct_name.len() - simple_name.len()) as u32;
+    let name_span = Span::new(
+        span.file_id,
+        span.byte_offset + qualifier_offset,
+        simple_name.len() as u32,
+    );
 
     LisetteDiagnostic::error(format!("Struct `{}` is missing fields", simple_name))
         .with_infer_code("missing_struct_fields")
         .with_span_label(&name_span, format!("missing fields: {}", fields_list))
-        .with_help("Initialize all fields in this struct literal")
+        .with_help("Initialize all fields, or add `..` to autofill the rest")
 }
 
 pub fn pattern_missing_fields(missing: &[String], span: Span) -> LisetteDiagnostic {
@@ -546,21 +1325,32 @@ pub fn pattern_missing_fields(missing: &[String], span: Span) -> LisetteDiagnost
         ))
 }
 
-pub fn private_field_access(field_name: &str, struct_name: &str, span: Span) -> LisetteDiagnostic {
+pub fn private_field_access(
+    field_name: &str,
+    struct_name: &str,
+    owning_package: &str,
+    span: Span,
+) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Private field")
-        .with_resolve_code("private_field_spread")
-        .with_span_label(&span, "private")
+        .with_resolve_code("private_field_access")
+        .with_span_label(&span, format!("private to `{}`", owning_package))
         .with_help(format!(
-            "Cannot access private field `{}` of struct `{}`. Mark the field as `pub`.",
+            "Cannot access private field `{}` of struct `{}`. Mark the field as `pub`",
             field_name, struct_name
         ))
 }
 
-pub fn private_method_access(method_name: &str, type_name: &str, span: Span) -> LisetteDiagnostic {
+pub fn private_method_access(
+    method_name: &str,
+    type_name: &str,
+    owning_package: &str,
+    span: Span,
+) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Private method")
-        .with_span_label(&span, "private")
+        .with_resolve_code("private_method_access")
+        .with_span_label(&span, format!("private to `{}`", owning_package))
         .with_help(format!(
-            "Cannot access private method `{}` of type `{}`. Mark the method as `pub`.",
+            "Cannot access private method `{}` of type `{}`. Mark the method as `pub`",
             method_name, type_name
         ))
 }
@@ -568,15 +1358,177 @@ pub fn private_method_access(method_name: &str, type_name: &str, span: Span) -> 
 pub fn private_field_in_spread(
     field_name: &str,
     struct_name: &str,
+    owning_package: &str,
     span: Span,
 ) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Private field")
         .with_resolve_code("private_field_spread")
-        .with_span_label(&span, "private")
+        .with_span_label(
+            &span,
+            format!("`{}` is private to `{}`", field_name, owning_package),
+        )
         .with_help(format!(
-            "Cannot spread `{}` because field `{}` is private. Mark the field as `pub`.",
+            "Cannot spread `{}` because field `{}` is private. Mark the field as `pub`",
             struct_name, field_name
         ))
+}
+
+pub fn private_field_in_autofill(
+    field_name: &str,
+    struct_name: &str,
+    owning_package: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Private field")
+        .with_resolve_code("private_field_autofill")
+        .with_span_label(
+            &span,
+            format!("`{}` is private to `{}`", field_name, owning_package),
+        )
+        .with_help(format!(
+            "`{}` of `{}` cannot be autofilled because `{}` is private to package `{}`. \
+             Provide an explicit value, or have `{}` expose `{}` as `pub` or offer a \
+             constructor.",
+            field_name, struct_name, field_name, owning_package, owning_package, field_name
+        ))
+}
+
+pub enum FieldNoZeroCause<'a> {
+    Type,
+    PrivateField {
+        struct_name: &'a str,
+        field: &'a str,
+        owning_package: &'a str,
+    },
+    HiddenGoState {
+        go_type: &'a str,
+    },
+}
+
+pub fn field_no_zero(
+    struct_name: &str,
+    field_name: &str,
+    field_ty: &Type,
+    chain: &[&str],
+    cause: FieldNoZeroCause<'_>,
+    span: Span,
+) -> LisetteDiagnostic {
+    let path = if chain.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{}.{}", field_name, chain.join("."))
+    };
+    let main = match cause {
+        FieldNoZeroCause::PrivateField {
+            struct_name: priv_struct,
+            field: priv_field,
+            owning_package: priv_package,
+        } => format!(
+            "`{}` of `{}` cannot be autofilled because `{}.{}` is private to package `{}`. \
+             Provide an explicit value for `{}`, or have `{}` expose `{}` as `pub`.",
+            field_name,
+            struct_name,
+            priv_struct,
+            priv_field,
+            priv_package,
+            field_name,
+            priv_package,
+            priv_field
+        ),
+        FieldNoZeroCause::HiddenGoState { go_type } => format!(
+            "Field `{}` is `{}`, which has Go-side state hidden from Lisette, so it has no \
+             zero value. Obtain one from its documented Go constructor and pass it explicitly, \
+             or wrap the field type in `Option<T>`.",
+            path, go_type
+        ),
+        FieldNoZeroCause::Type if chain.is_empty() => format!(
+            "Field `{}` of type `{}` has no zero value. Provide an explicit value, \
+             or wrap the field type in `Option<T>`.",
+            field_name, field_ty
+        ),
+        FieldNoZeroCause::Type => format!(
+            "Field `{}` of type `{}` has no zero value. Provide an explicit value for \
+             `{}`, or wrap the field type in `Option<T>`.",
+            path, field_ty, field_name
+        ),
+    };
+    LisetteDiagnostic::error("Field has no zero value")
+        .with_infer_code("field_no_zero")
+        .with_span_label(&span, "no zero available")
+        .with_help(main)
+}
+
+pub enum MapReadNoZeroCause<'a> {
+    NilMap,
+    ContainsNilMap(&'a Type),
+    NoZero,
+}
+
+pub fn map_read_no_zero(
+    value_ty: &Type,
+    receiver: &str,
+    cause: MapReadNoZeroCause<'_>,
+    span: Span,
+) -> LisetteDiagnostic {
+    let (title, label, help) = match cause {
+        MapReadNoZeroCause::NilMap => (
+            "Nil map for missing key",
+            format!("`{value_ty}` is nil when the key is missing"),
+            format!(
+                "Bracket reads return a zero value when the key is missing, and the zero value \
+                 of `{value_ty}` is a nil map, which panics on write, so this bracket read is \
+                 disallowed. Use `{receiver}.get(key)` instead"
+            ),
+        ),
+        MapReadNoZeroCause::ContainsNilMap(leaf_ty) => (
+            "Nil map for missing key",
+            format!("`{value_ty}` contains `{leaf_ty}`, which is nil when the key is missing"),
+            format!(
+                "Bracket reads return a zero value when the key is missing, and the zero value \
+                 of `{value_ty}` contains a nil `{leaf_ty}`, which panics on write, so this \
+                 bracket read is disallowed. Use `{receiver}.get(key)` instead"
+            ),
+        ),
+        MapReadNoZeroCause::NoZero if matches!(value_ty, Type::Parameter(_)) => (
+            "No zero value for missing key",
+            format!("`{value_ty}` is not guaranteed to have a zero value"),
+            format!(
+                "Bracket reads can return a zero value when the key is missing, but the type \
+                 parameter `{value_ty}` can be instantiated with a type that has no zero value, \
+                 such as `Ref<T>`, so this bracket read is disallowed. Use \
+                 `{receiver}.get(key)` instead"
+            ),
+        ),
+        MapReadNoZeroCause::NoZero => (
+            "No zero value for missing key",
+            format!("`{value_ty}` has no zero value"),
+            format!(
+                "Bracket reads can return a zero value when the key is missing, but \
+                 `{value_ty}` has no zero value, so this bracket read is disallowed. Use \
+                 `{receiver}.get(key)` instead"
+            ),
+        ),
+    };
+    LisetteDiagnostic::error(title)
+        .with_infer_code("map_read_no_zero")
+        .with_span_label(&span, label)
+        .with_help(help)
+}
+
+pub fn unresolved_receiver_type(member: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot infer receiver type")
+        .with_infer_code("unresolved_receiver_type")
+        .with_span_label(
+            &span,
+            format!(
+                "cannot resolve `.{}` because the receiver type is unknown",
+                member
+            ),
+        )
+        .with_help(
+            "Annotate the receiver's binding, e.g. `let x: SomeType = ...` or \
+             `|param: SomeType| ...`.",
+        )
 }
 
 pub fn member_not_found(
@@ -584,15 +1536,75 @@ pub fn member_not_found(
     field: &str,
     span: Span,
     available_fields: Option<&[String]>,
+    unwrap_hint: Option<UnwrapHint>,
+    is_call_target: bool,
 ) -> LisetteDiagnostic {
     let mut diagnostic = LisetteDiagnostic::error("Member not found")
         .with_infer_code("member_not_found")
         .with_span_label(&span, format!("no member `{}` on type `{}`", field, ty));
 
+    if matches!(field, "unwrap" | "expect") && (ty.is_option() || ty.is_result() || ty.is_partial())
+    {
+        let help = if ty.is_option() {
+            format!(
+                "Lisette does not provide `{}()`. Use `?` to propagate, `match` to handle both \
+                 cases (e.g. `match <expr> {{ Some(x) => x, None => ... }}`), `let else` for \
+                 early exit, or `unwrap_or(default)` for a fallback.",
+                field
+            )
+        } else if ty.is_result() {
+            format!(
+                "Lisette does not provide `{}()`. Use `?` to propagate, `match` to handle both \
+                 cases (e.g. `match <expr> {{ Ok(x) => x, Err(e) => ... }}`), `let else` for \
+                 early exit, or `unwrap_or(default)` for a fallback.",
+                field
+            )
+        } else {
+            format!(
+                "Lisette does not provide `{}()`. The `?` operator is not supported on \
+                 `Partial`; use `match` to handle all three cases (e.g. `match <expr> \
+                 {{ Ok(x) => ..., Err(e) => ..., Both(x, e) => ... }}`) or `unwrap_or(default)` \
+                 for a fallback.",
+                field
+            )
+        };
+        diagnostic = diagnostic.with_help(help);
+        return diagnostic;
+    }
+
+    if let Some(hint) = unwrap_hint {
+        let (wrapper_name, pattern) = match hint.wrapper {
+            UnwrapWrapper::Option => (
+                "Option",
+                format!(
+                    "match <expr> {{ Some(x) => x.{}(...), None => ... }}",
+                    field
+                ),
+            ),
+            UnwrapWrapper::Result => (
+                "Result",
+                format!(
+                    "match <expr> {{ Ok(x) => x.{}(...), Err(e) => ... }}",
+                    field
+                ),
+            ),
+        };
+        diagnostic = diagnostic.with_help(format!(
+            "Unwrap the `{}` to extract the `{}` value, then call `{}` on it, e.g. `{}`",
+            wrapper_name, hint.inner_ty, field, pattern
+        ));
+        return diagnostic;
+    }
+
     let suggestion = available_fields.and_then(|fields| find_similar_name(field, fields));
 
     if let Some(suggestion) = suggestion {
-        diagnostic = diagnostic.with_help(format!("Did you mean `{}`?", suggestion));
+        let rendered = if is_call_target {
+            format!("{}()", suggestion)
+        } else {
+            suggestion
+        };
+        diagnostic = diagnostic.with_help(format!("Did you mean `{}`?", rendered));
     } else {
         diagnostic = diagnostic.with_help("Ensure the field or method is defined on this type");
     }
@@ -600,11 +1612,50 @@ pub fn member_not_found(
     diagnostic
 }
 
+pub fn ambiguous_selector(
+    ty: &Type,
+    member: &str,
+    sources: &[String],
+    span: Span,
+) -> LisetteDiagnostic {
+    let from = sources.join("` and `");
+    LisetteDiagnostic::error("Ambiguous member")
+        .with_infer_code("ambiguous_selector")
+        .with_span_label(
+            &span,
+            format!("`{}` is promoted from more than one embed", member),
+        )
+        .with_help(format!(
+            "`{}` is promoted into `{}` from `{}`, so the selection is ambiguous. \
+             Reach it through the embedded field that declares the one you want.",
+            member, ty, from
+        ))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnwrapWrapper {
+    Option,
+    Result,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnwrapHint {
+    pub wrapper: UnwrapWrapper,
+    pub inner_ty: Type,
+}
+
 pub fn not_numeric(ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Type mismatch")
         .with_infer_code("type_mismatch")
         .with_span_label(&span, format!("expected `int` or `float`, found `{}`", ty))
         .with_help("The negation operator `-` can only be used with `int` or `float`")
+}
+
+pub fn not_integer(ty: &Type, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Type mismatch")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("expected integer type, found `{}`", ty))
+        .with_help("The bitwise complement operator `^` can only be used with integer types")
 }
 
 pub fn not_numeric_for_binary(
@@ -621,17 +1672,32 @@ pub fn not_numeric_for_binary(
         ))
 }
 
+pub fn not_integer_for_binary(
+    operator: &BinaryOperator,
+    ty: &Type,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Type mismatch")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("expected integer type, found `{}`", ty))
+        .with_help(format!(
+            "The `{}` operator can only be used with integer types",
+            operator
+        ))
+}
+
 pub fn binary_operator_type_mismatch(
     operator: &BinaryOperator,
     left_ty: &Type,
     right_ty: &Type,
     span: Span,
 ) -> LisetteDiagnostic {
+    let (left_name, right_name) = Type::stringify_pair(left_ty, right_ty);
     let label_msg = format!(
         "cannot {} `{}` and `{}`",
         operator_verb(operator),
-        left_ty.resolve(),
-        right_ty.resolve()
+        left_name,
+        right_name
     );
 
     LisetteDiagnostic::error("Type mismatch")
@@ -647,8 +1713,18 @@ pub fn binary_operator_type_mismatch(
 pub fn not_orderable(ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Type mismatch")
         .with_infer_code("type_mismatch")
-        .with_span_label(&span, format!("expected comparable, found `{}`", ty))
+        .with_span_label(&span, format!("expected orderable, found `{}`", ty))
         .with_help("Use comparison operators only with numeric, string, or boolean types")
+}
+
+pub fn param_needs_ordered_bound(param: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Type mismatch")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("expected orderable, found `{}`", param))
+        .with_help(format!(
+            "`{param}` is an unconstrained type parameter. Add the bound where `{param}` is \
+             declared: `<{param}: Ordered>`"
+        ))
 }
 
 pub fn not_comparable(ty: &Type, reason: &str, span: Span) -> LisetteDiagnostic {
@@ -656,26 +1732,239 @@ pub fn not_comparable(ty: &Type, reason: &str, span: Span) -> LisetteDiagnostic 
         .with_infer_code("type_mismatch")
         .with_span_label(&span, format!("`{}` cannot be compared with `==`", ty))
         .with_help(format!(
-            "The `==` and `!=` operators cannot be used on {} because they are not comparable in Go",
-            reason
+            "The `==` and `!=` operators cannot be used on {reason} because they are not comparable in Go"
         ))
 }
 
-pub fn division_by_zero(span: Span) -> LisetteDiagnostic {
+pub fn not_comparable_use_equals(ty: &Type, reason: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid comparison")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("`{}` cannot be compared with `==`", ty))
+        .with_help(format!("Use `.equals()` to compare {reason}"))
+}
+
+pub fn not_comparable_no_equals(ty: &Type, reason: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid comparison")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("`{}` cannot be compared with `==`", ty))
+        .with_help(format!(
+            "`.equals()` will not help either, because {reason} cannot be compared"
+        ))
+}
+
+pub fn not_comparable_interface(ty: &Type, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Type mismatch")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("`{}` cannot be compared with `==`", ty))
+        .with_help(
+            "An interface value's comparability depends on its runtime type, so `==` and `!=` \
+             are not allowed here. Compare the concrete values instead",
+        )
+}
+
+pub fn not_equatable(ty: &Type, reason: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid comparison")
+        .with_infer_code("not_equatable")
+        .with_span_label(&span, "cannot be compared")
+        .with_help(format!(
+            "`{ty}` cannot be compared because {reason} cannot be compared"
+        ))
+}
+
+/// `<T: Comparable>` for one parameter, `<A: Comparable, B: Comparable>` for several.
+fn comparable_bound_list(parameters: &[String]) -> String {
+    let bounds = parameters
+        .iter()
+        .map(|parameter| format!("{parameter}: Comparable"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{bounds}>")
+}
+
+fn declared_where(parameters: &[String]) -> String {
+    match parameters {
+        [one] => format!("where `{one}` is declared"),
+        _ => "where they are declared".to_string(),
+    }
+}
+
+pub fn param_needs_comparable_bound(
+    ty: &Type,
+    parameters: &[String],
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing comparable bound")
+        .with_infer_code("param_needs_comparable_bound")
+        .with_span_label(&span, format!("`{ty}` cannot be compared with `==`"))
+        .with_help(format!(
+            "Add the bound {}: `{}`",
+            declared_where(parameters),
+            comparable_bound_list(parameters)
+        ))
+}
+
+pub fn param_needs_comparable_bound_for_equals(
+    ty: &Type,
+    parameters: &[String],
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing comparable bound")
+        .with_infer_code("param_needs_comparable_bound")
+        .with_span_label(&span, format!("`{ty}` cannot be compared"))
+        .with_help(format!(
+            "Add the bound {}: `{}`",
+            declared_where(parameters),
+            comparable_bound_list(parameters)
+        ))
+}
+
+pub fn param_needs_comparable_bound_then_equals(
+    ty: &Type,
+    parameters: &[String],
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing comparable bound")
+        .with_infer_code("param_needs_comparable_bound")
+        .with_span_label(&span, format!("`{ty}` cannot be compared with `==`"))
+        .with_help(format!(
+            "Add the bound {}: `{}`, then use `.equals()`",
+            declared_where(parameters),
+            comparable_bound_list(parameters)
+        ))
+}
+
+pub fn not_comparable_value_use_equals(ty: &Type, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid comparison")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("`{ty}` cannot be compared with `==`"))
+        .with_help(format!("Use `.equals()` to compare `{ty}`"))
+}
+
+pub fn not_comparable_derive_equality(ty: &Type, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid comparison")
+        .with_infer_code("type_mismatch")
+        .with_span_label(&span, format!("`{ty}` cannot be compared with `==`"))
+        .with_help(format!(
+            "Mark `{ty}` with `#[equality]` to compare it with `.equals()`"
+        ))
+}
+
+pub fn not_orderable_bound(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Bound not satisfied")
+        .with_infer_code("not_orderable_bound")
+        .with_span_label(&span, "does not satisfy `cmp.Ordered`")
+        .with_help(
+            "The type parameter must be `cmp.Ordered` but the argument is not orderable. \
+             Relax the bound or pass an argument that satisfies it",
+        )
+}
+
+pub struct EquatableFieldHint<'a> {
+    pub type_name: &'a str,
+    pub param_name: &'a str,
+}
+
+pub fn not_comparable_bound(
+    reason: &str,
+    hint: Option<EquatableFieldHint<'_>>,
+    span: Span,
+) -> LisetteDiagnostic {
+    let help = match hint {
+        Some(EquatableFieldHint {
+            type_name,
+            param_name,
+        }) => format!(
+            "`Comparable` requires `==`, and {reason} cannot be compared with `==` in Go. \
+             `{type_name}` already has its own `equals`, so declare `{param_name}`'s bound as an \
+             interface holding `fn equals(other: {param_name}) -> bool`"
+        ),
+        None => format!(
+            "`Comparable` requires `==`, and {reason} cannot be compared with `==` in Go. \
+             If you own this bound, relax it, or accept the comparison as an explicit argument \
+             instead"
+        ),
+    };
+    LisetteDiagnostic::error("Bound not satisfied")
+        .with_infer_code("not_comparable_bound")
+        .with_span_label(&span, "does not satisfy `Comparable`")
+        .with_help(help)
+}
+
+pub fn bound_only_in_value_position(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{}` is a bound, not a value type", name))
+        .with_infer_code("bound_only_in_value_position")
+        .with_span_label(&span, "not allowed here")
+        .with_help(format!(
+            "Use `{}` only as a bound to constrain a generic parameter, e.g. `fn f<T: {}>(x: T)`",
+            name, name
+        ))
+}
+
+pub fn missing_bound_on_param(
+    param_name: &str,
+    required_bound: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    let short = required_bound.rsplit('.').next().unwrap_or(required_bound);
+    LisetteDiagnostic::error("Missing bound on type parameter")
+        .with_infer_code("missing_bound_on_param")
+        .with_span_label(&span, format!("does not satisfy `{}`", short))
+        .with_help(format!(
+            "The parameter must be `{}` but the argument is unbounded. \
+             Add this bound to the enclosing function: `<{}: {}>`",
+            required_bound, param_name, required_bound
+        ))
+}
+
+pub fn missing_transitive_bound(
+    param_name: &str,
+    required_bound: &str,
+    referenced_type: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing bound on type parameter")
+        .with_infer_code("missing_transitive_bound")
+        .with_span_label(&span, format!("must satisfy `{required_bound}`"))
+        .with_help(format!(
+            "`{}` requires its type argument to satisfy `{}`. Add the bound: `{}: {}`",
+            referenced_type, required_bound, param_name, required_bound
+        ))
+}
+
+pub fn division_by_zero(span: Span, ieee: bool) -> LisetteDiagnostic {
+    let help = if ieee {
+        "This operation evaluates to `+Inf`, `-Inf`, or `NaN` at runtime, which is almost never intended"
+    } else {
+        "This operation will panic at runtime"
+    };
     LisetteDiagnostic::error("Division by zero")
         .with_infer_code("division_by_zero")
         .with_span_label(&span, "cannot divide by zero")
-        .with_help("This operation will panic at runtime")
+        .with_help(help)
 }
 
-pub fn incompatible_named_numeric_types(underlying_ty: &Type, span: Span) -> LisetteDiagnostic {
+pub fn incompatible_named_types(underlying_ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Type mismatch")
-        .with_infer_code("incompatible_named_numeric_types")
+        .with_infer_code("incompatible_named_types")
         .with_span_label(&span, "cannot compute")
         .with_help(format!(
-            "Cast one to the other's type, or convert both to `{}`",
+            "Convert one to the other's type, or convert both to `{}`",
             underlying_ty
         ))
+}
+
+pub fn named_primitive_needs_cast(
+    primitive_ty: &Type,
+    named_ty: &Type,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Type mismatch")
+        .with_infer_code("type_mismatch")
+        .with_span_label(
+            &span,
+            format!("cannot compute `{}` with `{}`", primitive_ty, named_ty),
+        )
+        .with_help(format!("Convert with `as`, e.g. `value as {}`", named_ty))
 }
 
 pub fn invalid_division_order(
@@ -712,29 +2001,22 @@ pub fn invalid_division_order(
 }
 
 pub fn branch_type_mismatch(
-    consequence_ty: &Type,
-    consequence_span: Span,
-    alternative_ty: &Type,
-    alternative_span: Span,
+    branch_ty: &Type,
+    branch_span: Span,
+    result_ty: &Type,
 ) -> LisetteDiagnostic {
+    let (branch_name, result_name) = Type::stringify_pair(branch_ty, result_ty);
+
     LisetteDiagnostic::error("Type mismatch")
         .with_infer_code("type_mismatch")
         .with_span_label(
-            &consequence_span,
-            format!("this branch returns `{}`", consequence_ty),
+            &branch_span,
+            format!(
+                "this branch produces `{}`, not `{}`",
+                branch_name, result_name
+            ),
         )
-        .with_span_label(
-            &alternative_span,
-            format!("this branch returns `{}`", alternative_ty),
-        )
-        .with_help("All branches must return the same type")
-}
-
-pub fn missing_else_branch(span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Missing `else` branch")
-        .with_infer_code("missing_else_branch")
-        .with_span_label(&span, "`else` branch required")
-        .with_help("Add an `else` branch")
+        .with_help("All branches must produce the same type when used as a value")
 }
 
 pub fn let_else_must_diverge(span: Span) -> LisetteDiagnostic {
@@ -892,14 +2174,16 @@ pub fn not_iterable(ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Not iterable")
         .with_infer_code("not_iterable")
         .with_span_label(&span, format!("`{}` is not iterable", ty))
-        .with_help("Use `Slice`, `Map`, `Range`, or `string`")
+        .with_help("Use `Slice`, `Array`, `Map`, `Range`, `Channel`, or `string`")
 }
 
 pub fn tuple_literal_required_in_loop(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid loop pattern")
         .with_infer_code("invalid_pattern")
         .with_span_label(&span, "tuple literal required here")
-        .with_help("Use `(key, value)` destructuring pattern for map or enumerated iteration")
+        .with_help(
+            "Use a `(key, value)` destructuring pattern for map, enumerated, or paired-iterator iteration",
+        )
 }
 
 pub fn propagate_on_partial(span: Span) -> LisetteDiagnostic {
@@ -946,7 +2230,7 @@ pub fn try_return_type_mismatch(expected: &str, actual_ty: &Type, span: Span) ->
 pub fn try_block_empty(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Empty `try` block")
         .with_infer_code("try_block_empty")
-        .with_span_label(&span, "empty")
+        .with_span_label(&span, "no expressions to propagate from")
         .with_help("Ensure the `try` block contains at least one expression")
 }
 
@@ -992,7 +2276,7 @@ pub fn return_in_try_block(span: Span) -> LisetteDiagnostic {
         .with_infer_code("try_block_return")
         .with_span_label(&span, "not inside a function")
         .with_help(
-            "Use `return` inside a function, or use `Err(...)? ` to exit the `try` block early",
+            "Use `return` inside a function, or use `Err(...)?` to exit the `try` block early",
         )
 }
 
@@ -1000,22 +2284,27 @@ pub fn break_in_try_block(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("`break` in `try` block")
         .with_infer_code("try_block_break")
         .with_span_label(&span, "not inside a loop")
-        .with_help("Use `break` inside a loop, or use `Err(...)? ` to exit the `try` block early")
+        .with_help("Use `break` inside a loop, or use `Err(...)?` to exit the `try` block early")
 }
 
 pub fn continue_in_try_block(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("`continue` in `try` block")
         .with_infer_code("try_block_continue")
         .with_span_label(&span, "not inside a loop")
-        .with_help(
-            "Use `continue` inside a loop, or use `Err(...)? ` to exit the `try` block early",
-        )
+        .with_help("Use `continue` inside a loop, or use `Err(...)?` to exit the `try` block early")
+}
+
+pub fn defer_in_try_block(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`defer` in `try` block")
+        .with_infer_code("try_block_defer")
+        .with_span_label(&span, "not inside a function")
+        .with_help("Move the `defer` outside the `try` block, so it runs when the function returns")
 }
 
 pub fn recover_block_empty(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::warn("Empty `recover` block")
         .with_infer_code("recover_block_empty")
-        .with_span_label(&span, "empty")
+        .with_span_label(&span, "no expressions that could panic")
         .with_help("Ensure the `recover` block contains at least one expression that may panic")
 }
 
@@ -1049,6 +2338,15 @@ pub fn continue_in_recover_block(span: Span) -> LisetteDiagnostic {
         .with_help("Remove the `continue`, or move it inside a loop within the `recover` block")
 }
 
+pub fn defer_in_recover_block(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`defer` in `recover` block")
+        .with_infer_code("recover_block_defer")
+        .with_span_label(&span, "not inside a function")
+        .with_help(
+            "Move the `defer` outside the `recover` block, so it runs when the function returns",
+        )
+}
+
 pub fn expected_channel_receive(ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Expected channel receive")
         .with_infer_code("expected_channel_receive")
@@ -1072,17 +2370,17 @@ pub fn expected_channel_send(span: Span) -> LisetteDiagnostic {
         .with_help("Use `ch.send(value)` or `ch.receive()` in select arms")
 }
 
-pub fn bare_identifier_in_select_receive(span: &Span) -> LisetteDiagnostic {
+pub fn bare_identifier_in_select_receive(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid select case")
         .with_infer_code("bare_identifier_in_select_receive")
-        .with_span_label(span, "expected destructuring")
+        .with_span_label(&span, "expected destructuring")
         .with_help("`ch.receive()` returns an `Option`, so use `let Some(v) = ch.receive()` to bind the value")
 }
 
-pub fn none_pattern_in_select_receive(span: &Span) -> LisetteDiagnostic {
+pub fn none_pattern_in_select_receive(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid select case")
         .with_infer_code("none_pattern_in_select_receive")
-        .with_span_label(span, "expected match")
+        .with_span_label(&span, "expected match")
         .with_help(
             "To detect channel close, use `match ch.receive() { Some(v) => ..., None => ... }`",
         )
@@ -1152,6 +2450,14 @@ pub fn multiple_select_receives(first_span: Span, second_span: Span) -> LisetteD
         .with_help("Multiple shorthand receive arms can lead to unexpected behavior when a channel closes. Use `match ch.receive() { Some(v) => ..., None => ... }` to handle closes explicitly")
 }
 
+pub fn duplicate_map_keys(first_span: Span, duplicate_span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Duplicate map key")
+        .with_infer_code("duplicate_map_keys")
+        .with_span_label(&first_span, "key for first entry")
+        .with_span_label(&duplicate_span, "overwrites first")
+        .with_help("`Map.from` keeps the last entry for a key, so the earlier entry never reaches the map. Remove one of the two entries")
+}
+
 pub fn duplicate_select_default(first_span: Span, second_span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid select")
         .with_infer_code("duplicate_select_default")
@@ -1202,6 +2508,27 @@ pub fn unconstrained_type_param(param_name: &str, span: Span) -> LisetteDiagnost
         ))
 }
 
+pub fn instantiation_cycle(
+    param_name: &str,
+    type_arg: &Type,
+    target_fn_name: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Growing type argument")
+        .with_infer_code("instantiation_cycle")
+        .with_span_label(
+            &span,
+            format!(
+                "`{}` becomes `{}` in this recursive call",
+                param_name, type_arg
+            ),
+        )
+        .with_help(format!(
+            "Each recursive call would need a new version of `{}` at a larger type, so compilation would never finish. Keep type arguments fixed across recursive calls",
+            target_fn_name
+        ))
+}
+
 pub fn slice_index_type_mismatch(index_ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Type mismatch")
         .with_infer_code("slice_index_type_mismatch")
@@ -1211,11 +2538,14 @@ pub fn slice_index_type_mismatch(index_ty: &Type, span: Span) -> LisetteDiagnost
         )
 }
 
-pub fn only_slices_and_maps_indexable(ty: &Type, span: Span) -> LisetteDiagnostic {
+pub fn not_indexable(ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Not indexable")
         .with_infer_code("not_indexable")
-        .with_span_label(&span, format!("expected `Slice` or `Map`, found `{}`", ty))
-        .with_help("Only `Slice` and `Map` can be indexed into")
+        .with_span_label(
+            &span,
+            format!("expected `Array`, `Slice`, or `Map`, found `{}`", ty),
+        )
+        .with_help("Only `Array`, `Slice`, and `Map` can be indexed into")
 }
 
 pub fn string_not_indexable(span: Span, receiver: &str) -> LisetteDiagnostic {
@@ -1227,13 +2557,90 @@ pub fn string_not_indexable(span: Span, receiver: &str) -> LisetteDiagnostic {
         ))
 }
 
-pub fn not_callable(ty: &Type, span: Span) -> LisetteDiagnostic {
-    let help = match (ty.get_underlying(), ty.get_name()) {
-        (Some(_), Some(name)) => format!(
-            "Only functions can be called with `()`. To convert a value, use `value as {}`",
-            name
+pub fn string_not_sliceable(span: Span, receiver: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot slice into `string`")
+        .with_infer_code("string_not_sliceable")
+        .with_span_label(&span, "not sliceable")
+        .with_help(format!(
+            "Use `{receiver}.substring(a..b)` for a rune-indexed substring, or `{receiver}.bytes()[a..b]` for a range of bytes"
+        ))
+}
+
+pub fn string_not_iterable(span: Span, receiver: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot iterate over `string`")
+        .with_infer_code("string_not_iterable")
+        .with_span_label(&span, "not iterable")
+        .with_help(format!(
+            "Use `for r in {receiver}.runes()` for code points, or `for b in {receiver}.bytes()` for bytes"
+        ))
+}
+
+pub fn colon_in_subscript(
+    span: Span,
+    receiver: &str,
+    type_name: Option<&str>,
+) -> LisetteDiagnostic {
+    let (message, label, help) = match type_name {
+        Some("string") => (
+            "Invalid syntax for string slicing",
+            "expected a method call",
+            format!(
+                "Use `{receiver}.substring(a..b)` for a string, or `{receiver}.bytes()[a..b]` for a range of bytes"
+            ),
         ),
-        _ => "Only functions can be called with `()`".to_string(),
+        _ => (
+            "Invalid syntax for subslicing",
+            "expected `..`",
+            format!(
+                "Use `{receiver}[a..b]` or `{receiver}[a..=b]` for an exclusive or inclusive slice, respectively"
+            ),
+        ),
+    };
+    LisetteDiagnostic::error(message)
+        .with_parse_code("colon_in_subscript")
+        .with_span_label(&span, label)
+        .with_help(help)
+}
+
+pub fn test_function_not_callable(span: Span, name: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{name}` is a test, not a callable function"))
+        .with_infer_code("test_function_not_callable")
+        .with_span_label(&span, "a `#[test]` function cannot be called or used as a value")
+        .with_help(
+            "A `#[test]` function is an entry point run by `lis test`. Move shared logic into a separate function",
+        )
+}
+
+pub fn assert_without_test_context(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`assert` outside a test")
+        .with_infer_code("assert_without_test_context")
+        .with_span_label(&span, "no test context is in scope here")
+        .with_help(
+            "`assert` is only valid inside a `#[test]` function or a function that takes a `t: TestContext` parameter",
+        )
+}
+
+pub fn not_callable(
+    ty: &Type,
+    callee_name: Option<&str>,
+    arg_name: Option<&str>,
+    has_underlying_type: bool,
+    span: Span,
+) -> LisetteDiagnostic {
+    let type_name = ty.get_name();
+    let is_type_call = matches!((callee_name, type_name), (Some(c), Some(t)) if c == t);
+    let is_cast_target =
+        has_underlying_type || type_name.is_some_and(|n| SimpleKind::from_name(n).is_some());
+
+    let help = if is_type_call && is_cast_target {
+        let subject = arg_name.unwrap_or("value");
+        format!(
+            "Use `{} as {}` to convert between types",
+            subject,
+            type_name.unwrap()
+        )
+    } else {
+        "Only functions can be called with `()`".to_string()
     };
 
     LisetteDiagnostic::error("Not callable")
@@ -1254,7 +2661,7 @@ pub fn type_conversion_arity(
             format!("expected 1 argument, found {}", actual_count),
         )
         .with_help(format!(
-            "Type conversion `{}(value)` takes exactly one argument — the value to convert",
+            "Type conversion `{}(value)` takes exactly one argument, the value to convert",
             type_name
         ))
 }
@@ -1263,79 +2670,403 @@ pub fn type_conversion_arity(
 pub struct InterfaceViolation {
     pub interface_name: String,
     pub parent_of: Option<String>,
-    pub missing: Vec<(String, Type)>,
-    pub incompatible: Vec<(String, Type, Type)>,
+    pub methods: Vec<InterfaceMethodViolation>,
+}
+
+#[derive(Debug, Clone)]
+pub enum InterfaceMethodViolation {
+    Missing(MissingMethod),
+    Incompatible {
+        name: String,
+        expected: Type,
+        actual: Type,
+        impl_span: Option<Span>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MissingMethod {
+    pub name: String,
+    pub signature: Type,
+    /// A private method that would satisfy this requirement if it were `pub`.
+    pub private_candidate: Option<String>,
+}
+
+pub fn sealed_interface_not_satisfiable(
+    interface_name: &str,
+    type_name: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!(
+        "`{type_name}` cannot implement the sealed interface `{interface_name}`"
+    ))
+    .with_infer_code("sealed_interface")
+    .with_span_label(
+        &span,
+        format!("`{interface_name}` is sealed and cannot be implemented here"),
+    )
+    .with_help(format!(
+        "`{interface_name}` has an unexported method, so Go only lets types in its own package \
+         implement it. A Lisette type can satisfy `{interface_name}` only by embedding it (or by \
+         embedding an imported type that already implements it)."
+    ))
+}
+
+struct LabelledMethod<'a> {
+    interface: &'a str,
+    name: &'a str,
+    span: Span,
+    expected: &'a Type,
+    actual: &'a Type,
+}
+
+fn labelled_methods<'a>(
+    violations: &'a [InterfaceViolation],
+    file_id: u32,
+) -> Option<Vec<LabelledMethod<'a>>> {
+    let mut methods = Vec::new();
+    for violation in violations {
+        for method in &violation.methods {
+            let InterfaceMethodViolation::Incompatible {
+                name,
+                expected,
+                actual,
+                impl_span,
+            } = method
+            else {
+                return None;
+            };
+            let span = (*impl_span)?;
+            if span.file_id != file_id {
+                return None;
+            }
+            methods.push(LabelledMethod {
+                interface: &violation.interface_name,
+                name,
+                span,
+                expected,
+                actual,
+            });
+        }
+    }
+    (!methods.is_empty() && methods.len() <= 2).then_some(methods)
+}
+
+fn ordinal(index: usize) -> String {
+    match index {
+        0 => "first".to_string(),
+        1 => "second".to_string(),
+        2 => "third".to_string(),
+        3 => "fourth".to_string(),
+        4 => "fifth".to_string(),
+        other => format!("{}th", other + 1),
+    }
+}
+
+fn count_word(count: usize) -> String {
+    match count {
+        1 => "One".to_string(),
+        2 => "Two".to_string(),
+        3 => "Three".to_string(),
+        4 => "Four".to_string(),
+        5 => "Five".to_string(),
+        6 => "Six".to_string(),
+        7 => "Seven".to_string(),
+        8 => "Eight".to_string(),
+        9 => "Nine".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn change_sentence(method: &LabelledMethod<'_>) -> String {
+    let (Type::Function(expected), Type::Function(actual)) = (method.expected, method.actual)
+    else {
+        return format!("Change `{}` to `{}`", method.name, method.expected);
+    };
+
+    if expected.params.len() != actual.params.len() {
+        let plural = if expected.params.len() == 1 { "" } else { "s" };
+        return format!(
+            "`{}` requires `{}` to take {} parameter{}, not {}",
+            method.interface,
+            method.name,
+            expected.params.len(),
+            plural,
+            actual.params.len()
+        );
+    }
+
+    let diverged: Vec<usize> = expected
+        .params
+        .iter()
+        .zip(&actual.params)
+        .enumerate()
+        .filter(|(_, (expected, actual))| expected.ty != actual.ty)
+        .map(|(index, _)| index)
+        .collect();
+    let return_diverged = expected.return_type != actual.return_type;
+
+    match (diverged.as_slice(), return_diverged) {
+        ([], true) => format!(
+            "Change `{}` to return `{}`",
+            method.name, expected.return_type
+        ),
+        ([index], false) => {
+            let parameter = expected.params[*index].name.as_ref().map_or_else(
+                || format!("{} parameter", ordinal(*index)),
+                |name| format!("`{}` parameter", name),
+            );
+            let expected_ty = &expected.params[*index].ty;
+            let actual_ty = &actual.params[*index].ty;
+            if expected_ty.demoted() == actual_ty.demoted() {
+                format!(
+                    "Change the {} of `{}` to `{}`, or require `{}` in `{}`",
+                    parameter, method.name, expected_ty, actual_ty, method.interface
+                )
+            } else {
+                format!(
+                    "Change the {} of `{}` to `{}`",
+                    parameter, method.name, expected_ty
+                )
+            }
+        }
+        _ => format!("Change `{}` to `{}`", method.name, method.expected),
+    }
+}
+
+fn declaration(name: &str, signature: &Type, receiver: Option<&str>) -> String {
+    let Type::Function(function) = signature else {
+        return format!("{}: {}", name, signature);
+    };
+
+    let mut params: Vec<String> = receiver
+        .map(|receiver| format!("self: {}", receiver))
+        .into_iter()
+        .collect();
+    for (index, param) in function.params.iter().enumerate() {
+        let name = param
+            .name
+            .as_ref()
+            .map_or_else(|| format!("arg{}", index + 1), ToString::to_string);
+        params.push(format!("{}: {}", name, param.ty));
+    }
+
+    format!(
+        "fn {}({}) -> {}",
+        name,
+        params.join(", "),
+        function.return_type
+    )
+}
+
+fn attribution(violation: &InterfaceViolation) -> String {
+    match &violation.parent_of {
+        Some(parent) => format!(
+            "from `{}`, embedded in `{}`",
+            violation.interface_name, parent
+        ),
+        None => format!("from `{}`", violation.interface_name),
+    }
+}
+
+fn list_lead(
+    interface_name: &str,
+    type_name: &str,
+    violations: &[InterfaceViolation],
+    foreign_package: Option<&str>,
+) -> String {
+    let missing = violations
+        .iter()
+        .flat_map(|violation| &violation.methods)
+        .filter(|method| matches!(method, InterfaceMethodViolation::Missing(_)))
+        .count();
+    let total: usize = violations
+        .iter()
+        .map(|violation| violation.methods.len())
+        .sum();
+
+    if let Some(package) = foreign_package {
+        let noun = if missing > 0 { "missing" } else { "required" };
+        let plural = if total == 1 { "" } else { "s" };
+        return format!(
+            "`{}` comes from `{}`, so methods cannot be added to it. Wrap it in a local struct \
+             that embeds it and declares the {} method{}:",
+            type_name, package, noun, plural
+        );
+    }
+
+    let embedded: Vec<&str> = violations
+        .iter()
+        .filter(|violation| violation.interface_name != interface_name)
+        .map(|violation| violation.interface_name.as_str())
+        .collect();
+    match embedded.as_slice() {
+        [] => {
+            let plural = if total == 1 { " does" } else { "s do" };
+            format!(
+                "{} method{} not satisfy `{}`:",
+                count_word(total),
+                plural,
+                interface_name
+            )
+        }
+        [single] => format!(
+            "`{}` embeds `{}`, so both contracts apply:",
+            interface_name, single
+        ),
+        _ => format!(
+            "`{}` embeds other interfaces, so their requirements apply too:",
+            interface_name
+        ),
+    }
 }
 
 pub fn interface_not_implemented(
     interface_name: &str,
     type_name: &str,
     violations: &[InterfaceViolation],
+    foreign_package: Option<&str>,
     span: Span,
 ) -> LisetteDiagnostic {
-    let mut help_lines = Vec::new();
+    let mut diagnostic = LisetteDiagnostic::error(format!(
+        "`{}` does not implement `{}`",
+        type_name, interface_name
+    ))
+    .with_infer_code("interface_not_implemented")
+    .with_span_label(&span, format!("`{}` needed here", interface_name));
 
-    let mut missing_sections: Vec<(String, Vec<String>)> = Vec::new();
-    let mut incompatible_sections: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(methods) = labelled_methods(violations, span.file_id) {
+        let sentences: Vec<String> = methods.iter().map(change_sentence).collect();
+        for method in &methods {
+            diagnostic = diagnostic.with_span_label(
+                &method.span,
+                format!("`{}` requires `{}`", method.interface, method.expected),
+            );
+        }
+        return diagnostic.with_help(sentences.join(". "));
+    }
 
+    let receiver = foreign_package.is_none().then_some(type_name);
+    let attribute = violations
+        .iter()
+        .any(|violation| violation.interface_name != interface_name);
+
+    let mut missing: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut incompatible: Vec<(String, Option<String>)> = Vec::new();
     for violation in violations {
-        let header = if let Some(ref parent) = violation.parent_of {
-            format!(
-                "From `{}` (required by `{}`)",
-                violation.interface_name, parent
-            )
-        } else {
-            format!("From `{}`", violation.interface_name)
-        };
-
-        if !violation.missing.is_empty() {
-            let methods: Vec<String> = violation
-                .missing
-                .iter()
-                .map(|(name, sig)| format!("  - {}: {}", name, sig))
-                .collect();
-            missing_sections.push((header.clone(), methods));
-        }
-
-        if !violation.incompatible.is_empty() {
-            let methods: Vec<String> = violation
-                .incompatible
-                .iter()
-                .map(|(name, expected, actual)| {
-                    format!("  - {}: found `{}`, expected `{}`", name, actual, expected)
-                })
-                .collect();
-            incompatible_sections.push((header, methods));
-        }
-    }
-
-    if !missing_sections.is_empty() {
-        help_lines.push("Missing methods:".to_string());
-        for (header, methods) in &missing_sections {
-            help_lines.push(format!("  {}", header));
-            for method in methods {
-                help_lines.push(format!("  {}", method));
+        let attributed = attribute.then(|| attribution(violation));
+        for method in &violation.methods {
+            match method {
+                InterfaceMethodViolation::Missing(method) => missing.push((
+                    declaration(&method.name, &method.signature, receiver),
+                    method.private_candidate.clone(),
+                    attributed.clone(),
+                )),
+                InterfaceMethodViolation::Incompatible {
+                    name,
+                    expected,
+                    actual,
+                    ..
+                } => incompatible.push((
+                    format!("{}: expected `{}`, found `{}`", name, expected, actual),
+                    attributed.clone(),
+                )),
             }
         }
     }
 
-    if !incompatible_sections.is_empty() {
-        help_lines.push("Incompatible methods:".to_string());
-        for (header, methods) in &incompatible_sections {
-            help_lines.push(format!("  {}", header));
-            for method in methods {
-                help_lines.push(format!("  {}", method));
+    let width = missing
+        .iter()
+        .map(|(row, _, _)| row.chars().count())
+        .chain(incompatible.iter().map(|(row, _)| row.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let pad = |row: &str, attributed: &Option<String>| match attributed {
+        Some(attributed) => format!("  {:<width$}  {}", row, attributed, width = width),
+        None => format!("  {}", row),
+    };
+
+    let mut help = vec![list_lead(
+        interface_name,
+        type_name,
+        violations,
+        foreign_package,
+    )];
+    if !missing.is_empty() {
+        help.push("Missing:".to_string());
+        for (row, private_candidate, attributed) in &missing {
+            help.push(pad(row, attributed));
+            if let Some(private) = private_candidate {
+                help.push(format!(
+                    "    (add `pub` to the private method `{}` to satisfy this)",
+                    private
+                ));
             }
         }
     }
+    if !incompatible.is_empty() {
+        help.push("Incompatible:".to_string());
+        for (row, attributed) in &incompatible {
+            help.push(pad(row, attributed));
+        }
+    }
 
+    diagnostic.with_help(help.join("\n"))
+}
+
+pub fn cannot_propagate_error(declared: &str, operand: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot propagate error")
+        .with_infer_code("cannot_propagate_error")
+        .with_span_label(&span, format!("expected `{declared}`, found `{operand}`"))
+        .with_help(propagation_framing_help(declared, operand))
+}
+
+fn propagation_framing_help(declared: &str, operand: &str) -> String {
+    format!("cannot propagate `{operand}` as `{declared}`. Convert with `.map_err(...)`")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WrapperKind {
+    Result,
+    Option,
+    Partial,
+}
+
+pub fn wrapper_does_not_implement_interface(
+    interface_name: &str,
+    wrapper: WrapperKind,
+    wrapper_ty: &Type,
+    span: Span,
+) -> LisetteDiagnostic {
+    let help = match wrapper {
+        WrapperKind::Result => "Unwrap the `Result` with `match` or `if let` first.",
+        WrapperKind::Option => "Unwrap the `Option` with `match` or `if let` first.",
+        WrapperKind::Partial => "Unwrap the `Partial` with `match` first.",
+    };
     LisetteDiagnostic::error("Interface not implemented")
         .with_infer_code("interface_not_implemented")
         .with_span_label(
             &span,
-            format!("`{}` does not implement `{}`", type_name, interface_name),
+            format!("`{}` does not implement `{}`", wrapper_ty, interface_name),
         )
-        .with_help(help_lines.join("\n"))
+        .with_help(help)
+}
+
+pub fn builtin_type_cannot_implement_interface(
+    interface_name: &str,
+    type_name: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Interface not implemented")
+        .with_infer_code("interface_not_implemented")
+        .with_span_label(
+            &span,
+            format!("`{type_name}` cannot implement `{interface_name}`"),
+        )
+        .with_help(format!(
+            "Built-in types have no Go methods, so they cannot satisfy interfaces. Wrap the \
+             value in a struct that implements `{interface_name}`."
+        ))
 }
 
 pub fn pointer_receiver_interface_mismatch(
@@ -1349,10 +3080,10 @@ pub fn pointer_receiver_interface_mismatch(
         .map(|m| format!("`{}.{}`", type_name, m))
         .collect::<Vec<_>>()
         .join(", ");
-    let takes = if methods.len() == 1 {
-        format!("{} takes `self: Ref<{}>`", methods_str, type_name)
+    let mutates = if methods.len() == 1 {
+        format!("{} mutates through `self: Ref<{}>`", methods_str, type_name)
     } else {
-        format!("{} take `self: Ref<{}>`", methods_str, type_name)
+        format!("{} mutate through `self: Ref<{}>`", methods_str, type_name)
     };
     LisetteDiagnostic::error("Interface not implemented")
         .with_infer_code("interface_not_implemented")
@@ -1360,15 +3091,70 @@ pub fn pointer_receiver_interface_mismatch(
             &span,
             format!("`{}` does not implement `{}`", type_name, interface_name),
         )
-        .with_help(format!("{}, so pass a `Ref<{}>`.", takes, type_name))
+        .with_help(format!(
+            "{}, so `{}` is satisfied by a `Ref<{}>`, not a value. Take a reference with `&` (for example `&{} {{ ... }}`).",
+            mutates, interface_name, type_name, type_name
+        ))
 }
 
-pub fn unknown_outside_typedef(span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Invalid `Unknown` type")
-        .with_infer_code("unknown_outside_typedef")
-        .with_span_label(&span, "not allowed in `.lis` files")
-        .with_help("Remove the `Unknown` annotation.")
-        .with_note("`Unknown` can only be used in `.d.lis` files. This type exists only to represent Go's `any` in typedefs.")
+pub fn interface_needs_writable_receiver(
+    interface_name: &str,
+    type_name: &str,
+    methods: &[String],
+    span: Span,
+) -> LisetteDiagnostic {
+    let methods_str = methods
+        .iter()
+        .map(|m| format!("`{}.{}`", type_name, m))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let writes = if methods.len() == 1 {
+        format!(
+            "{} writes through `self: mut Ref<{}>`",
+            methods_str, type_name
+        )
+    } else {
+        format!(
+            "{} write through `self: mut Ref<{}>`",
+            methods_str, type_name
+        )
+    };
+    LisetteDiagnostic::error("Missing write permission")
+        .with_infer_code("needs_writable")
+        .with_span_label(
+            &span,
+            format!(
+                "expected `mut Ref<{}>`, found `Ref<{}>`",
+                type_name, type_name
+            ),
+        )
+        .with_help(format!(
+            "{}, so `{}` needs a writable reference. Make the value writable where it is created, \
+             or take the reference from a `let mut` binding",
+            writes, interface_name
+        ))
+}
+
+pub fn unknown_in_bound_position(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid `Unknown` bound")
+        .with_infer_code("unknown_in_bound_position")
+        .with_span_label(&span, "invalid bound")
+        .with_help("`Unknown` cannot constrain a generic")
+}
+
+pub fn unknown_in_const_annotation(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid `Unknown` in `const` annotation")
+        .with_infer_code("unknown_in_const_annotation")
+        .with_span_label(&span, "invalid annotation")
+        .with_help("`Unknown` cannot be used to annotate a constant")
+}
+
+pub fn unknown_as_map_key(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`Unknown` cannot be used as a map key")
+        .with_infer_code("unknown_as_map_key")
+        .with_span_label(&span, "key resolves to `any`")
+        .with_help("Use a concrete comparable key type.")
+        .with_note("Go's `map[any]V` admits non-comparable runtime values that panic on insertion.")
 }
 
 pub fn opaque_type_outside_typedef(span: Span) -> LisetteDiagnostic {
@@ -1399,15 +3185,16 @@ pub fn valueless_const_missing_annotation(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Missing const annotation")
         .with_infer_code("valueless_const_missing_annotation")
         .with_span_label(&span, "needs a type annotation")
-        .with_help("Value-less const declarations require a type annotation: `const MAX_SIZE: int`")
+        .with_help("Valueless const declarations require a type annotation: `const MAX_SIZE: int`")
 }
 
 pub fn variable_declaration_outside_typedef(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid variable declaration")
         .with_infer_code("variable_declaration_outside_typedef")
         .with_span_label(&span, "`var` is not allowed here")
-        .with_help("Use `let` to declare a variable: `let x: int = 0`.")
-        .with_note("`var` declarations are only allowed in `.d.lis` files.")
+        .with_help(
+            "Use `const` for a primitive, or a function that returns the value e.g. `fn origin() -> Point { ... }` for a composite",
+        )
 }
 
 pub fn range_full_not_valid_expression(span: Span) -> LisetteDiagnostic {
@@ -1438,7 +3225,7 @@ pub fn duplicate_definition(kind: &str, name: &str, span: Span) -> LisetteDiagno
         .with_infer_code("duplicate_definition")
         .with_span_label(&span, "already defined")
         .with_help(format!(
-            "`{}` is already defined in this module. Rename or remove this definition.",
+            "`{}` is already defined in this package. Rename or remove this definition.",
             name
         ))
 }
@@ -1489,14 +3276,18 @@ pub fn non_int_range_not_iterable(element_ty: &Type, span: Span) -> LisetteDiagn
         .with_help("Range iteration requires integer bounds")
 }
 
-pub fn only_slices_indexable_by_range(ty: &Type, span: &Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Type mismatch")
+pub fn only_slices_indexable_by_range(ty: &Type, span: Span) -> LisetteDiagnostic {
+    let diagnostic = LisetteDiagnostic::error("Type mismatch")
         .with_infer_code("range_index_not_slice")
-        .with_span_label(
-            span,
-            format!("expected `Slice` or `string`, found `{}`", ty),
+        .with_span_label(&span, format!("expected `Slice`, found `{}`", ty));
+
+    if matches!(ty, Type::Array { .. }) {
+        diagnostic.with_help(
+            "Call `.to_slice()` to copy the elements into a new slice before range indexing",
         )
-        .with_help("Range indexing only works on `Slice` and `string`")
+    } else {
+        diagnostic.with_help("Range indexing only works on `Slice`")
+    }
 }
 
 pub fn empty_body_return_mismatch(expected_ty: &Type, span: Span) -> LisetteDiagnostic {
@@ -1510,6 +3301,20 @@ pub fn empty_body_return_mismatch(expected_ty: &Type, span: Span) -> LisetteDiag
         .with_note("An empty function body implicitly returns `()`.")
 }
 
+pub fn propagate_in_pipeline(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid `?` in pipeline")
+        .with_parse_code("propagate_in_pipeline")
+        .with_span_label(&span, "propagate operator used here")
+        .with_help("Extract the `?` operation to a `let` binding: `let result = (... |> func)?`")
+}
+
+pub fn invalid_pipeline_target(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid pipeline")
+        .with_parse_code("invalid_pipeline_target")
+        .with_span_label(&span, "expected function")
+        .with_help("Pipeline only supports functions (not lambdas)")
+}
+
 fn operator_verb(operator: &BinaryOperator) -> &'static str {
     match operator {
         BinaryOperator::Addition => "add",
@@ -1517,6 +3322,11 @@ fn operator_verb(operator: &BinaryOperator) -> &'static str {
         BinaryOperator::Multiplication => "multiply",
         BinaryOperator::Division => "divide",
         BinaryOperator::Remainder => "get remainder of",
+        BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::BitwiseAndNot => "apply bitwise operator to",
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => "shift",
         BinaryOperator::Equal | BinaryOperator::NotEqual => "compare",
         BinaryOperator::LessThan
         | BinaryOperator::LessThanOrEqual
@@ -1530,10 +3340,17 @@ fn operator_verb(operator: &BinaryOperator) -> &'static str {
 fn operator_help(op: &BinaryOperator) -> &'static str {
     match op {
         BinaryOperator::Addition => "requires both operands to have the same type",
-        BinaryOperator::Subtraction
-        | BinaryOperator::Multiplication
-        | BinaryOperator::Division
-        | BinaryOperator::Remainder => "requires both operands to have the same numeric type",
+        BinaryOperator::Subtraction | BinaryOperator::Multiplication | BinaryOperator::Division => {
+            "requires both operands to have the same numeric type"
+        }
+        BinaryOperator::Remainder
+        | BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::BitwiseAndNot => "requires both operands to have the same integer type",
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
+            "requires integer operands (the result type comes from the left operand)"
+        }
         BinaryOperator::Equal | BinaryOperator::NotEqual => {
             "requires both operands to have the same type"
         }
@@ -1542,7 +3359,7 @@ fn operator_help(op: &BinaryOperator) -> &'static str {
         | BinaryOperator::GreaterThan
         | BinaryOperator::GreaterThanOrEqual => "requires both operands to have the same type",
         BinaryOperator::And | BinaryOperator::Or => "requires both operands to be bool",
-        BinaryOperator::Pipeline => "should have been desugared",
+        BinaryOperator::Pipeline => "is handled before binary inference",
     }
 }
 
@@ -1567,11 +3384,29 @@ pub fn non_addressable_expression(expression_kind: &str, span: Span) -> LisetteD
         .with_help("Assign the value to a variable first, then take its address")
 }
 
+pub fn non_addressable_const(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot take address of `const`")
+        .with_infer_code("non_addressable_const")
+        .with_span_label(&span, "not addressable")
+        .with_help(
+            "`const` bindings are not addressable. Copy the value into a local `let` first if you need a reference",
+        )
+}
+
 pub fn non_addressable_assignment(expression_kind: &str, span: Span) -> LisetteDiagnostic {
+    let help = if matches!(
+        expression_kind,
+        "map index expression" | "sub-slice expression"
+    ) {
+        "Indexing yields a copy of the element. Modify a local copy, then \
+         assign it back into the collection"
+    } else {
+        "Assign the value to a variable first, then modify it"
+    };
     LisetteDiagnostic::error("Cannot assign to non-addressable expression")
         .with_infer_code("non_addressable_assignment")
         .with_span_label(&span, format!("cannot assign to {}", expression_kind))
-        .with_help("Assign the value to a variable first, then modify it")
+        .with_help(help)
 }
 
 pub fn newtype_field_assignment(type_name: &str, span: Span) -> LisetteDiagnostic {
@@ -1583,6 +3418,22 @@ pub fn newtype_field_assignment(type_name: &str, span: Span) -> LisetteDiagnosti
         ))
 }
 
+pub fn interpolation_without_stringer(
+    type_name: &str,
+    span: Span,
+    pointer_newtype: bool,
+) -> LisetteDiagnostic {
+    let help = if pointer_newtype {
+        "Interpolate the inner value directly, or change the representation".to_string()
+    } else {
+        format!("Mark `{type_name}` with `#[display]`, or interpolate its fields directly.")
+    };
+    LisetteDiagnostic::error(format!("`{type_name}` cannot be interpolated"))
+        .with_infer_code("interpolation_without_stringer")
+        .with_span_label(&span, "has no display form")
+        .with_help(help)
+}
+
 pub fn complex_select_expression(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Complex expression in `select` arm")
         .with_infer_code("complex_select_expression")
@@ -1590,11 +3441,11 @@ pub fn complex_select_expression(span: Span) -> LisetteDiagnostic {
         .with_help("Hoist to a `let` binding before the `select`")
 }
 
-pub fn ref_slice_append(span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Cannot call append/extend on `Ref<Slice>`")
-        .with_infer_code("ref_slice_append")
+pub fn ref_slice_growth(method: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("Cannot call `{method}` on `Ref<Slice>`"))
+        .with_infer_code("ref_slice_growth")
         .with_span_label(&span, "dereference the ref first")
-        .with_help("Use `r.*.append(x)` to deref, then append")
+        .with_help(format!("Use `r.*.{method}(...)` to deref first"))
 }
 
 pub fn map_field_chain_assignment(span: Span) -> LisetteDiagnostic {
@@ -1611,14 +3462,71 @@ pub fn enum_field_type_conflict(
     type_a: &str,
     loc_b: &str,
     type_b: &str,
+    slot: &str,
     span: Span,
 ) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Conflicting field types across enum variants")
         .with_infer_code("enum_field_type_conflict")
         .with_span_label(&span, "field type mismatch")
         .with_help(format!(
-            "`{loc_a}` is `{type_a}` but `{loc_b}` is `{type_b}`. Rename one of the fields or align their types",
+            "`{loc_a}` is `{type_a}` but `{loc_b}` is `{type_b}`, and both become `{slot}` in Go. Rename one of the fields",
         ))
+}
+
+/// Why a field every variant declares still gets a per-variant Go slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeparateSlotReason {
+    BuiltinMember,
+    ConflictingTypes,
+    Mixed,
+}
+
+pub fn enum_spread_missing_fields(
+    enum_name: &str,
+    target_variant: &str,
+    missing: &[String],
+    counterexample: Option<(&str, &str)>,
+    reason: SeparateSlotReason,
+    span: Span,
+) -> LisetteDiagnostic {
+    let (noun, pronoun, fields_fmt) = if missing.len() == 1 {
+        ("field", "it", format!("`{}`", missing[0]))
+    } else {
+        let formatted: Vec<String> = missing.iter().map(|f| format!("`{}`", f)).collect();
+        ("fields", "them", pattern::join_and(&formatted))
+    };
+
+    let (label, help) = match counterexample {
+        Some((lacking_variant, lacked_field)) => (
+            format!("may be `{enum_name}.{lacking_variant}`, which has no field `{lacked_field}`"),
+            format!(
+                "A spread can only fill fields that exist in every `{enum_name}` variant. Assign {noun} {fields_fmt} explicitly, or bind {pronoun} first when the source is known to be `{enum_name}.{target_variant}`: `let {enum_name}.{target_variant} {{ {pattern}, .. }} = source else {{ ... }}`",
+                pattern = missing.join(", "),
+            ),
+        ),
+        None => (
+            format!("may hold any `{enum_name}` variant"),
+            format!(
+                "Every `{enum_name}` variant has {fields_fmt}, but {cause}, so each variant stores {pronoun} separately and a spread cannot fill {pronoun}. Assign {noun} {fields_fmt} explicitly",
+                cause = match (reason, missing.len()) {
+                    (SeparateSlotReason::BuiltinMember, 1) =>
+                        "the name collides with a built-in enum member",
+                    (SeparateSlotReason::BuiltinMember, _) =>
+                        "the names collide with built-in enum members",
+                    (SeparateSlotReason::ConflictingTypes, 1) =>
+                        "the variants give it conflicting types",
+                    (SeparateSlotReason::ConflictingTypes, _) =>
+                        "the variants give them conflicting types",
+                    (SeparateSlotReason::Mixed, _) => "they cannot share one slot across variants",
+                },
+            ),
+        ),
+    };
+
+    LisetteDiagnostic::error("Enum spread cannot fill variant-specific fields")
+        .with_infer_code("enum_spread_missing_fields")
+        .with_span_label(&span, label)
+        .with_help(help)
 }
 
 pub fn cannot_auto_address_receiver(
@@ -1658,6 +3566,19 @@ pub fn break_value_in_non_loop(span: Span) -> LisetteDiagnostic {
         .with_help("`break` with a value is only meaningful in `loop` expressions, which can return the value. In `for` and `while` loops, use `break` without a value.")
 }
 
+pub fn loop_produces_no_value(span: &Span, keyword: &str, expected_ty: &str) -> LisetteDiagnostic {
+    let keyword_span = Span::new(span.file_id, span.byte_offset, keyword.len() as u32);
+    LisetteDiagnostic::error("Type mismatch")
+        .with_infer_code("loop_produces_no_value")
+        .with_span_label(
+            &keyword_span,
+            format!("evaluates to `()`, but expected `{expected_ty}` here"),
+        )
+        .with_help(format!(
+            "`{keyword}` loops are for side effects and always evaluate to `()`. Use `loop` with `break <value>` to produce a value during iteration."
+        ))
+}
+
 pub fn defer_in_loop(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("`defer` inside loop")
         .with_infer_code("defer_in_loop")
@@ -1665,11 +3586,171 @@ pub fn defer_in_loop(span: Span) -> LisetteDiagnostic {
         .with_help("Wrap the loop body in a helper function, e.g. `fn process(file: File) { defer file.close(); ... }` and call it in the loop: `for f in files { process(f); }`")
 }
 
+pub fn empty_range(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Empty range")
+        .with_infer_code("empty_range")
+        .with_span_label(span, "start is greater than end")
+        .with_help("Swap the bounds.")
+}
+
+pub fn decimal_file_mode(span: &Span, value: u64) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("File permission written in decimal")
+        .with_infer_code("decimal_file_mode")
+        .with_span_label(span, format!("decimal {value} is octal 0o{value:o}"))
+        .with_help(
+            "File permissions are conventionally written in octal. Use a `0o` prefix (for example `0o644`) so the bits line up with the rwx triples.",
+        )
+}
+
+pub fn empty_infinite_loop(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Empty infinite loop")
+        .with_infer_code("empty_infinite_loop")
+        .with_span_label(span, "busy-spins")
+        .with_help(
+            "An empty `loop` spins forever at 100% CPU. Block on a channel, call `time.Sleep`, or add a `break`.",
+        )
+}
+
+pub fn empty_select_default(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Empty `select` default arm in a loop")
+        .with_infer_code("empty_select_default")
+        .with_span_label(span, "busy-spins")
+        .with_help("Drop the `_ =>` arm to block, or do work in it.")
+}
+
+pub fn repeated_if_condition(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`if` condition repeated in `else if`")
+        .with_infer_code("repeated_if_condition")
+        .with_span_label(span, "same as prior condition")
+        .with_help(
+            "This branch is unreachable because its condition duplicates the preceding condition. Did you mean a different condition?",
+        )
+}
+
+pub fn unchanging_loop_condition(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Loop condition never changes")
+        .with_infer_code("unchanging_loop_condition")
+        .with_span_label(span, "the loop either never runs or never ends")
+        .with_help(
+            "Nothing in the loop body changes this condition. Did you forget to update a variable, or mean to `break` out of the loop?",
+        )
+}
+
+pub fn index_out_of_bounds(span: &Span, index_text: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Index out of bounds")
+        .with_infer_code("index_out_of_bounds")
+        .with_span_label(span, format!("no element at `{index_text}`"))
+        .with_help(format!("Indexing at `{index_text}` will panic at runtime"))
+}
+
+pub fn negative_index(span: &Span, index_text: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Negative index")
+        .with_infer_code("negative_index")
+        .with_span_label(span, "index is negative")
+        .with_help(format!(
+            "`{index_text}` is negative, but indices must be zero or greater"
+        ))
+}
+
+pub fn oversized_shift(
+    span: &Span,
+    type_name: &str,
+    bit_width: u32,
+    shift_amount: i128,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Shift amount exceeds integer width")
+        .with_infer_code("oversized_shift")
+        .with_span_label(span, "shift exceeds width")
+        .with_help(format!(
+            "`{type_name}` is {bit_width} bits wide, so shifting by {shift_amount} discards every bit of the value."
+        ))
+}
+
+pub fn negative_shift(span: &Span, shift_amount: i128) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Negative shift amount")
+        .with_infer_code("negative_shift")
+        .with_span_label(span, format!("shifts by {shift_amount}"))
+        .with_help("A shift amount must be zero or greater. Shift the other way instead")
+}
+
+pub fn shift_amount_too_large(span: &Span, shift_amount: i128) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Shift amount too large")
+        .with_infer_code("shift_amount_too_large")
+        .with_span_label(span, format!("shifts by {shift_amount}"))
+        .with_help(format!(
+            "A shift amount must fit `uint`, so it cannot be more than {}",
+            u64::MAX
+        ))
+}
+
+pub fn impossible_comparison(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Impossible comparison")
+        .with_infer_code("impossible_comparison")
+        .with_span_label(span, "always `false`")
+        .with_help(
+            "No value satisfies both sides, so this `&&` is always `false`. Check the bounds, or did you mean `||`?",
+        )
+}
+
+pub fn always_true_disjunction(span: &Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Always-true comparison")
+        .with_infer_code("always_true_disjunction")
+        .with_span_label(span, "always `true`")
+        .with_help(
+            "Every value satisfies at least one side, so this `||` is always `true`. Check the bounds, or did you mean `&&`?",
+        )
+}
+
+pub fn nan_comparison(span: &Span, always_true: bool) -> LisetteDiagnostic {
+    let result = if always_true { "true" } else { "false" };
+
+    LisetteDiagnostic::error("Comparison with NaN")
+        .with_infer_code("nan_comparison")
+        .with_span_label(span, format!("always {result}"))
+        .with_help(
+            "NaN is unequal to every value including itself. Use `math.IsNaN(x)` to test for NaN.",
+        )
+}
+
+pub fn cast_nan_to_int(span: &Span, target: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Conversion of `NaN` to integer")
+        .with_infer_code("convert_nan_to_int")
+        .with_span_label(span, format!("`NaN` has no `{target}` value"))
+        .with_help(
+            "In Go, converting `NaN` to an integer produces an arbitrary, implementation-specific value rather than a meaningful one. Guard with `math.IsNaN(...)` before converting, or keep the value as a float.",
+        )
+}
+
+pub fn min_max(span: &Span, constant: i128) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Clamp always returns a constant")
+        .with_infer_code("min_max")
+        .with_span_label(span, format!("always `{constant}`"))
+        .with_help(format!(
+            "This clamp always returns `{constant}` regardless of its variable operand. Did you swap `min` and `max`?"
+        ))
+}
+
+pub fn deferred_lock(span: Span, locked: &str, unlock: &str) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("Deferred `{locked}` instead of `{unlock}`"))
+        .with_infer_code("deferred_lock")
+        .with_span_label(&span, "re-locks at function exit")
+        .with_help(format!(
+            "Deferring `{locked}` re-acquires the lock when the function returns, deadlocking the next caller. Did you mean `{unlock}`?"
+        ))
+}
+
 pub fn propagate_in_condition(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("`?` cannot be used inside a condition")
         .with_infer_code("propagate_in_condition")
         .with_span_label(&span, "`?` inside condition")
         .with_help("Bind the result first: `let val = expression?; if val { ... }`")
+}
+
+pub fn propagate_in_assert(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`?` cannot be used inside `assert`")
+        .with_infer_code("propagate_in_assert")
+        .with_span_label(&span, "`?` inside `assert`")
+        .with_help("Bind the result first: `let val = expression?; assert val`")
 }
 
 pub fn propagate_in_defer(span: Span) -> LisetteDiagnostic {
@@ -1700,7 +3781,20 @@ pub fn continue_in_defer_block(span: Span) -> LisetteDiagnostic {
         .with_help("Remove the `continue`, or move it inside a loop within the `defer` block")
 }
 
-pub fn invalid_cast(source_ty: &Type, target_ty: &Type, span: Span) -> LisetteDiagnostic {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidCastKind {
+    Complex,
+    RuneToByte,
+    ByteToString,
+    Other,
+}
+
+pub fn invalid_cast(
+    source_ty: &Type,
+    target_ty: &Type,
+    kind: InvalidCastKind,
+    span: Span,
+) -> LisetteDiagnostic {
     let same_constructor_with_unresolved = source_ty
         .get_qualified_id()
         .zip(target_ty.get_qualified_id())
@@ -1713,34 +3807,51 @@ pub fn invalid_cast(source_ty: &Type, target_ty: &Type, span: Span) -> LisetteDi
             target_ty,
         )
     } else if source_ty.is_string() {
-        "Strings cannot be cast to numbers and require explicit conversion. Use `strconv.Atoi()` to parse.".into()
-    } else if source_ty.is_complex() || target_ty.is_complex() {
-        "Complex numbers cannot be cast directly. Use `real(c)` or `imaginary(c)` to extract components.".into()
+        "Strings cannot be converted to numbers and require explicit parsing. Use `strconv.Atoi()` to parse.".into()
+    } else if kind == InvalidCastKind::Complex {
+        "Complex numbers cannot be converted directly. Use `real(c)` or `imaginary(c)` to extract components.".into()
+    } else if kind == InvalidCastKind::RuneToByte {
+        "rune (int32) is wider than byte (uint8) and may not fit. Use an intermediate variable to convert via int first: `let n = r as int; n as byte`".into()
+    } else if kind == InvalidCastKind::ByteToString {
+        "A byte has two readings as a string. Use `[b] as string` to preserve the byte (may be invalid UTF-8), or convert through a rune to encode as a codepoint: `let r = b as rune; r as string`".into()
     } else {
-        "Casts are supported between numeric types, strings and byte/rune slices, concrete types and interfaces, and values and their type aliases.".into()
+        "Conversions are supported between numeric types, between string and byte/rune slices, from rune to string, and from concrete types to interfaces.".into()
     };
 
-    LisetteDiagnostic::error("Invalid cast")
-        .with_infer_code("invalid_cast")
+    LisetteDiagnostic::error("Invalid conversion")
+        .with_infer_code("invalid_conversion")
         .with_span_label(
             &span,
-            format!("cannot cast `{}` to `{}`", source_ty, target_ty),
+            format!("cannot convert `{}` to `{}`", source_ty, target_ty),
         )
         .with_help(help)
 }
 
 pub fn chained_cast(span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Invalid cast")
-        .with_infer_code("chained_cast")
-        .with_span_label(&span, "chained cast not allowed")
-        .with_help("Use an intermediate variable if you need to cast through multiple types")
+    LisetteDiagnostic::error("Invalid conversion")
+        .with_infer_code("chained_conversion")
+        .with_span_label(&span, "chained conversion not allowed")
+        .with_help("Use an intermediate variable if you need to convert through multiple types")
 }
 
 pub fn redundant_cast(ty: &Type, span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::warn("Redundant cast")
-        .with_infer_code("redundant_cast")
-        .with_span_label(&span, format!("casting `{}` to itself has no effect", ty))
-        .with_help("Remove the unnecessary cast")
+    LisetteDiagnostic::info("Redundant conversion")
+        .with_infer_code("redundant_conversion")
+        .with_span_label(
+            &span,
+            format!("converting `{}` to itself has no effect", ty),
+        )
+        .with_help("Remove the unnecessary conversion")
+}
+
+pub fn redundant_assert_type(ty: &Type, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::info("Redundant type assertion")
+        .with_infer_code("redundant_assert_type")
+        .with_span_label(&span, format!("already of type `{}`", ty))
+        .with_help(format!(
+            "`assert_type` narrows an `Unknown` value, but this value is already `{}`, so the assertion always succeeds",
+            ty
+        ))
 }
 
 pub fn integer_literal_overflow(
@@ -1755,6 +3866,36 @@ pub fn integer_literal_overflow(
         .with_help(format!(
             "`{}` must be in range `{}` to `{}`",
             target_ty, min, max
+        ))
+}
+
+pub fn constant_cast_overflow(
+    span: &Span,
+    target_ty: &str,
+    value: i128,
+    min: i128,
+    max: i128,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Constant conversion overflow")
+        .with_infer_code("constant_conversion_overflow")
+        .with_span_label(span, format!("constant `{value}` overflows `{target_ty}`"))
+        .with_help(format!(
+            "This expression always evaluates to `{value}`, and `{target_ty}` must be in range `{min}` to `{max}`"
+        ))
+}
+
+pub fn constant_overflow(
+    span: &Span,
+    ty: &str,
+    value: i128,
+    min: i128,
+    max: i128,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Constant overflow")
+        .with_infer_code("constant_overflow")
+        .with_span_label(span, format!("constant `{value}` overflows `{ty}`"))
+        .with_help(format!(
+            "This expression always evaluates to `{value}`, and `{ty}` must be in range `{min}` to `{max}`"
         ))
 }
 
@@ -1777,32 +3918,20 @@ pub fn cannot_negate_unsigned(target_ty: &str, span: Span) -> LisetteDiagnostic 
 
 fn go_builtin_hint(name: &str) -> Option<&'static str> {
     match name {
-        "len" => Some(
-            "Lisette has no `len` builtin. Use the `.length()` method instead, e.g. `items.length()`.",
-        ),
-        "cap" => Some(
-            "Lisette has no `cap` builtin. Use the `.capacity()` method instead, e.g. `items.capacity()`.",
-        ),
+        "len" => Some("Lisette has no `len` builtin. Use `items.length()`"),
+        "cap" => Some("Lisette has no `cap` builtin. Use `items.capacity()`"),
         "make" => Some(
-            "Lisette has no `make` builtin. Use constructor methods instead, e.g. `Channel.new<int>()`, `Slice.new<int>()`, `Map.new<K, V>()`.",
+            "Lisette has no `make` builtin. Use `Slice.new<T>()`, `Map.new<K, V>()`, or `Channel.new<T>()`",
         ),
-        "append" => Some(
-            "Lisette has no `append` builtin. Use the `.append()` method instead, e.g. `items.append(1)`.",
-        ),
-        "close" => Some(
-            "Lisette has no `close` builtin. Use the `.close()` method instead, e.g. `ch.close()`.",
-        ),
-        "copy" => Some(
-            "Lisette has no `copy` builtin. Use the `.copy_from()` method instead, e.g. `dst.copy_from(src)`.",
-        ),
-        "delete" => Some(
-            "Lisette has no `delete` builtin. Use the `.delete()` method instead, e.g. `map.delete(key)`.",
-        ),
-        "new" => Some(
-            "Lisette has no `new` builtin. Use constructor methods instead, e.g. `MyStruct { field: value }` or `MyType.new()`.",
-        ),
+        "append" => Some("Lisette has no `append` builtin. Use `items.append(1)`"),
+        "close" => Some("Lisette has no `close` builtin. Use `ch.close()`"),
+        "copy" => Some("Lisette has no `copy` builtin. Use `dst.copy_from(src)`"),
+        "delete" => Some("Lisette has no `delete` builtin. Use `map.delete(key)`"),
+        "new" => {
+            Some("Lisette has no `new` builtin. Use `MyStruct { field: value }` or `MyType.new()`")
+        }
         "print" | "println" | "printf" => Some(
-            "Lisette has no `print` builtin. Use `fmt.Println`, `fmt.Printf`, etc. after `import \"go:fmt\"`.",
+            "Lisette has no `print` builtin. Use `fmt.Println`, `fmt.Printf`, etc. after `import \"go:fmt\"`",
         ),
         _ => None,
     }
@@ -1827,7 +3956,7 @@ pub fn levenshtein_distance(a: &str, b: &str) -> usize {
             let cost = if a_char == b_char { 0 } else { 1 };
             curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
-        std::mem::swap(&mut prev, &mut curr);
+        mem::swap(&mut prev, &mut curr);
     }
 
     prev[b_len]
@@ -1876,6 +4005,73 @@ pub fn cannot_infer_type_argument(span: Span) -> LisetteDiagnostic {
         .with_help("Supply a type argument for the call, e.g. `Channel.new<int>()`")
 }
 
+pub fn uninferable_generic_reference(
+    function: &str,
+    params: &[String],
+    span: Span,
+) -> LisetteDiagnostic {
+    let joined = format_list(params, |param| format!("`{param}`"));
+    let noun = if params.len() == 1 {
+        "type parameter"
+    } else {
+        "type parameters"
+    };
+    LisetteDiagnostic::error("Cannot infer type argument")
+        .with_infer_code("uninferable_generic_reference")
+        .with_span_label(
+            &span,
+            format!("cannot infer {joined} for `{function}` used as a value"),
+        )
+        .with_help(format!(
+            "A generic function used as a value cannot have its type arguments inferred. Give `{function}` a signature that uses {joined}, or remove the unused {noun}."
+        ))
+}
+
+pub fn cannot_infer_struct_type_argument(
+    struct_name: &str,
+    param_name: &str,
+    bound: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot infer type argument")
+        .with_infer_code("cannot_infer_struct_type_argument")
+        .with_span_label(
+            &span,
+            format!("cannot infer `{param_name}` (bound by `{bound}`) for `{struct_name}`"),
+        )
+        .with_help(format!(
+            "Annotate the binding so the type argument is known, e.g. `let x: {struct_name}<T> = ...`, where `T` satisfies `{bound}`"
+        ))
+}
+
+pub fn cannot_infer_bounded_function_reference(
+    function_name: &str,
+    param_name: &str,
+    bound: &str,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot infer type argument")
+        .with_infer_code("cannot_infer_bounded_function_reference")
+        .with_span_label(
+            &span,
+            format!(
+                "cannot infer `{param_name}` (bound by `{bound}`) for `{function_name}` used as a value"
+            ),
+        )
+        .with_help(format!(
+            "The type argument would default to `any`, which does not satisfy `{bound}`. Use `{function_name}` in a way that determines `{param_name}`, or call it directly."
+        ))
+}
+
+pub fn empty_slice_no_element_type(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot infer the element type of this empty slice")
+        .with_infer_code("empty_slice_no_element_type")
+        .with_span_label(&span, "`[]` needs an element type from context")
+        .with_help(
+            "Annotate the enclosing binding, e.g. `let xs: Slice<int> = []`, or write `Slice.new<int>()`",
+        )
+}
+
 fn format_list<T, F>(items: &[T], fmt: F) -> String
 where
     F: Fn(&T) -> String,
@@ -1921,6 +4117,19 @@ pub fn non_comparable_map_key(key_ty: &Type, reason: &str, span: Span) -> Lisett
         ))
 }
 
+pub fn missing_map_key_bound(parameter: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Missing map key bound")
+        .with_infer_code("missing_map_key_bound")
+        .with_span_label(
+            &span,
+            format!("`{parameter}` reaches this map key without `Comparable`"),
+        )
+        .with_help(format!(
+            "Map keys must be comparable. Add the bound where `{parameter}` is declared: \
+             `<{parameter}: Comparable>`"
+        ))
+}
+
 pub fn ref_of_interface_type(inner_ty: &Type, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid use of `Ref` with interface")
         .with_infer_code("ref_of_interface")
@@ -1929,6 +4138,34 @@ pub fn ref_of_interface_type(inner_ty: &Type, span: Span) -> LisetteDiagnostic {
             "Use `{}` instead of `Ref<{}>`. Interfaces are already reference types in Go.",
             inner_ty, inner_ty
         ))
+}
+
+pub fn ref_of_interface_value(inner_ty: &Type, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid use of `&` with interface")
+        .with_infer_code("ref_of_interface")
+        .with_span_label(
+            &span,
+            format!("cannot take a reference to a `{inner_ty}` value"),
+        )
+        .with_help(
+            "Use the value directly, without `&`. Interfaces are already reference types in Go.",
+        )
+}
+
+pub fn ref_to_interface_does_not_implement(
+    interface_name: &str,
+    ref_ty: &Type,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid use of `Ref` with interface")
+        .with_infer_code("ref_of_interface")
+        .with_span_label(
+            &span,
+            format!("`{ref_ty}` does not implement `{interface_name}`"),
+        )
+        .with_help(
+            "A reference to an interface does not implement the interface. Dereference with `.*` until reaching the interface value.",
+        )
 }
 
 pub fn float_modulo_not_supported(span: Span) -> LisetteDiagnostic {
@@ -1986,27 +4223,82 @@ pub fn interface_method_conflict(
         ))
 }
 
-pub fn impl_on_foreign_type(type_name: &str, module_name: &str, span: Span) -> LisetteDiagnostic {
+pub fn impl_on_foreign_type(type_name: &str, package_name: &str, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Cannot implement methods on foreign type")
         .with_infer_code("impl_on_foreign_type")
         .with_span_label(
             &span,
-            format!("`{}` is defined in module `{}`", type_name, module_name),
+            format!("`{}` is defined in package `{}`", type_name, package_name),
         )
         .with_help(format!(
-            "Methods can only be defined on types in the same module. \
+            "Methods can only be defined on types in the same package. \
              Use a standalone function instead: `fn my_method(w: {}) {{ ... }}`",
             type_name
         ))
 }
 
-pub fn prelude_type_shadowed(name: &str, span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Cannot shadow prelude type")
-        .with_infer_code("prelude_type_shadowed")
-        .with_span_label(&span, format!("`{}` is a prelude type", name))
+pub fn impl_bound_strengthens_type(type_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`impl` cannot strengthen receiver bounds")
+        .with_infer_code("impl_bound_strengthens_type")
+        .with_span_label(
+            &span,
+            format!("this bound is not guaranteed by `{type_name}`'s declaration"),
+        )
         .with_help(format!(
-            "Choose a different name — `{}` is defined in the prelude and cannot be redefined",
+            "Declare this bound on `{type_name}`, or remove it from the `impl`"
+        ))
+}
+
+pub fn impl_on_type_alias(_type_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot implement methods on type alias")
+        .with_infer_code("impl_on_type_alias")
+        .with_span_label(&span, "not a distinct type")
+        .with_help(
+            "A type alias cannot carry its own methods. Either add methods to the underlying \
+             type directly or define a tuple struct instead",
+        )
+}
+
+pub fn test_impl_on_production_type(type_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot implement methods on a production type from a test file")
+        .with_infer_code("test_impl_on_production_type")
+        .with_span_label(
+            &span,
+            format!("`{}` is not declared in a test file", type_name),
+        )
+        .with_help(
+            "A test file may only add methods to types it declares. Move the method onto the \
+             production type, or define a test-only type to carry it",
+        )
+}
+
+pub fn prelude_type_shadowed(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot shadow built-in type")
+        .with_infer_code("prelude_type_shadowed")
+        .with_span_label(&span, format!("`{}` is a built-in type", name))
+        .with_help(format!(
+            "Choose a different name. `{}` is built in and cannot be redefined",
             name
+        ))
+}
+
+pub fn prelude_function_shadowed(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot shadow prelude function")
+        .with_infer_code("prelude_function_shadowed")
+        .with_span_label(&span, format!("`{}` is a prelude function", name))
+        .with_help(format!(
+            "Choose a different name. `{}` is defined in the prelude and cannot be redefined",
+            name
+        ))
+}
+
+pub fn pub_type_not_exportable(name: &str, suggested: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Public type is not exportable")
+        .with_infer_code("pub_type_not_exportable")
+        .with_span_label(&span, format!("`{}` cannot be exported from Go", name))
+        .with_help(format!(
+            "Public types become exported Go identifiers, which must start with an uppercase letter. Rename to `{}`",
+            suggested
         ))
 }
 
@@ -2043,7 +4335,7 @@ pub fn missing_constraint_on_generic_return_type(
             format!(
                 "Constrain the generic: `{}<{}: {}>()`",
                 fn_name, param_name, constraint
-            ) + ". The function returns a type whose methods depend on the constraint",
+            ) + ". The function returns a type that requires this constraint",
         )
 }
 
@@ -2078,14 +4370,24 @@ pub fn specialized_impl_cannot_satisfy_interface(
         ))
 }
 
-pub fn native_method_value(method: &str, span: Span) -> LisetteDiagnostic {
+pub enum NativeMethodForm {
+    Instance,
+    Static,
+}
+
+pub fn native_method_value(method: &str, form: NativeMethodForm, span: Span) -> LisetteDiagnostic {
+    let help = match form {
+        NativeMethodForm::Instance => format!(
+            "Call it directly: `receiver.{method}()`. To use it as a value, wrap in a closure: `|args| receiver.{method}(args)`"
+        ),
+        NativeMethodForm::Static => {
+            format!("Use a closure instead: `|args| receiver.{method}(args)`")
+        }
+    };
     LisetteDiagnostic::error("Cannot use native method as a value")
         .with_infer_code("native_method_value")
         .with_span_label(&span, "native methods must be called directly")
-        .with_help(format!(
-            "Use a closure instead: `|args| receiver.{}(args)`",
-            method
-        ))
+        .with_help(help)
 }
 
 pub fn native_constructor_value(name: &str, span: Span) -> LisetteDiagnostic {
@@ -2093,6 +4395,15 @@ pub fn native_constructor_value(name: &str, span: Span) -> LisetteDiagnostic {
         .with_infer_code("native_constructor_value")
         .with_span_label(&span, "native constructors must be called directly")
         .with_help(format!("Use a closure instead: `|args| {name}(args)`"))
+}
+
+pub fn enum_variant_constructor_value(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot use enum variant as value")
+        .with_infer_code("enum_variant_constructor_value")
+        .with_span_label(&span, "used as value")
+        .with_help(format!(
+            "Instantiate the variant: `{name} {{ field: value, ... }}`"
+        ))
 }
 
 pub fn record_struct_value(name: &str, span: Span) -> LisetteDiagnostic {
@@ -2104,6 +4415,39 @@ pub fn record_struct_value(name: &str, span: Span) -> LisetteDiagnostic {
         ))
 }
 
+pub fn type_used_as_value(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot use a type as a value")
+        .with_infer_code("type_used_as_value")
+        .with_span_label(&span, "type names are not runtime values")
+        .with_help(format!("`{name}` refers to a type, not a value"))
+}
+
+pub fn namespace_alias_used_as_value(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot use a package or enum-type alias as a value")
+        .with_infer_code("namespace_alias_used_as_value")
+        .with_span_label(
+            &span,
+            "this alias refers to a type or package, not a runtime value",
+        )
+        .with_help("Access a member instead, e.g. `alias.VariantName`")
+}
+
+pub fn package_namespace_used_as_value(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot use a package namespace as a value")
+        .with_infer_code("package_namespace_used_as_value")
+        .with_span_label(&span, "package namespaces are not runtime values")
+        .with_help(format!("Access a member instead, e.g. `{name}.Member`"))
+}
+
+pub fn let_binding_enum_type(type_name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot bind an enum type to a variable")
+        .with_infer_code("let_binding_enum_type")
+        .with_span_label(&span, "enum types are not runtime values")
+        .with_help(format!(
+            "Use a type alias instead: `type Alias = {type_name}`"
+        ))
+}
+
 pub fn private_method_expression(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Cannot use private method as a value")
         .with_infer_code("private_method_expression")
@@ -2112,9 +4456,9 @@ pub fn private_method_expression(span: Span) -> LisetteDiagnostic {
 }
 
 pub fn float_literal_int_cast(span: Span) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Cannot cast float literal to integer directly")
-        .with_infer_code("float_literal_int_cast")
-        .with_span_label(&span, "unsupported cast")
+    LisetteDiagnostic::error("Cannot convert float literal to integer directly")
+        .with_infer_code("float_literal_int_conversion")
+        .with_span_label(&span, "unsupported conversion")
         .with_help("Bind to a variable first: `let f = 1.0; f as int`")
 }
 
@@ -2137,29 +4481,6 @@ pub fn reference_through_newtype(span: Span) -> LisetteDiagnostic {
         .with_infer_code("reference_through_newtype")
         .with_span_label(&span, "newtype `.0` inside `&`")
         .with_help("Bind the inner value first: `let inner = val.0; &inner`")
-}
-
-pub fn immutable_argument_to_mut_param(
-    var_name: &str,
-    span: Span,
-    is_external: bool,
-) -> LisetteDiagnostic {
-    let help = if is_external {
-        format!(
-            "Bindings in Lisette are immutable by default. Use `let mut {} = ...` to allow mutation",
-            var_name
-        )
-    } else {
-        format!(
-            "Bindings in Lisette are immutable by default. Use `let mut {} = ...` to allow mutation, \
-             or make the parameter immutable by removing `mut` from the function signature",
-            var_name
-        )
-    };
-    LisetteDiagnostic::error("Immutable argument passed to `mut` parameter")
-        .with_infer_code("immutable_arg_to_mut_param")
-        .with_span_label(&span, "expected mutable, found immutable")
-        .with_help(help)
 }
 
 pub fn failure_propagation_in_expression(span: Span) -> LisetteDiagnostic {
@@ -2214,6 +4535,26 @@ pub fn type_alias_as_qualifier(
         ))
 }
 
+pub fn ref_qualifier(member: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Invalid `Ref` construction")
+        .with_infer_code("ref_qualifier")
+        .with_span_label(&span, format!("`Ref` has no `{}`", member))
+        .with_help("To take a reference, use `&value`")
+}
+
+pub fn unknown_native_static(type_name: &str, member: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{type_name}` has no `{member}`"))
+        .with_infer_code("unknown_native_static")
+        .with_span_label(
+            &span,
+            format!("no static method `{member}` on `{type_name}`"),
+        )
+        .with_help(format!(
+            "A native type offers only its own constructors and methods. \
+             Run `lis doc {type_name}` to list them"
+        ))
+}
+
 pub fn control_flow_in_expression(keyword: &str, span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error(format!(
         "`{}` cannot be used in expression position",
@@ -2230,25 +4571,274 @@ pub fn control_flow_in_expression(keyword: &str, span: Span) -> LisetteDiagnosti
     ))
 }
 
+pub fn variadic_param_not_last(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Variadic parameter must be last")
+        .with_infer_code("variadic_param_not_last")
+        .with_span_label(&span, "a `VarArgs<T>` must be the last function parameter")
+        .with_help("Move this `VarArgs<T>` parameter to the end of the parameter list")
+}
+
+pub fn variadic_type_not_allowed(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Variadic type not allowed here")
+        .with_infer_code("variadic_type_not_allowed")
+        .with_span_label(
+            &span,
+            "`VarArgs<T>` is only valid as a function's final parameter",
+        )
+        .with_help("Use `Slice<T>` to hold a collection of values")
+}
+
+pub fn array_type_arity(actual: usize, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`Array` takes exactly two type arguments")
+        .with_infer_code("array_type_arity")
+        .with_span_label(
+            &span,
+            format!("expected `Array<T, N>`, found {actual} argument(s)"),
+        )
+        .with_help("Write `Array<ElementType, Length>`, e.g. `Array<int, 3>`")
+}
+
+pub fn array_size_not_literal(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Array size must be an integer literal")
+        .with_infer_code("array_size_not_literal")
+        .with_span_label(&span, "expected an integer literal here")
+        .with_help(
+            "Array sizes are part of the type and must be constant, \
+             e.g. `Array<int, 3>` or `Array<int, SIZE>`",
+        )
+}
+
+pub fn array_size_unknown_constant(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("Cannot find constant `{name}`"))
+        .with_infer_code("array_size_unknown_constant")
+        .with_span_label(&span, "not found in this scope")
+        .with_help("An array size is an integer literal or the name of an integer constant")
+}
+
+pub fn array_size_not_constant(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{name}` is not a constant"))
+        .with_infer_code("array_size_not_constant")
+        .with_span_label(&span, "expected a constant here")
+        .with_help("An array size is part of the type, so it cannot come from a runtime value")
+}
+
+pub fn array_size_local_constant(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{name}` is not a package-level constant"))
+        .with_infer_code("array_size_local_constant")
+        .with_span_label(&span, "declared inside a function")
+        .with_help(format!(
+            "Move `{name}` out of the function body to use it as an array size"
+        ))
+}
+
+pub fn array_size_not_integer_constant(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{name}` is not an integer constant"))
+        .with_infer_code("array_size_not_integer_constant")
+        .with_span_label(&span, "expected an integer constant here")
+        .with_help("An array size must be a whole number, e.g. `const SIZE = 3`")
+}
+
+pub fn array_size_computed_constant(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{name}` is not a literal constant"))
+        .with_infer_code("array_size_computed_constant")
+        .with_span_label(&span, "its initializer is computed, not a literal")
+        .with_help(format!(
+            "An array size reads the constant's literal value, so `{name}` must be \
+             written as a single integer literal"
+        ))
+}
+
+pub fn array_size_negative_constant(name: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{name}` is negative"))
+        .with_infer_code("array_size_negative_constant")
+        .with_span_label(&span, "an array size cannot be negative")
+        .with_help("Array sizes count elements, so they start at zero")
+}
+
+pub fn array_size_too_large(size: u64, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Array size too large")
+        .with_infer_code("array_size_too_large")
+        .with_span_label(&span, "size exceeds the maximum")
+        .with_help(format!(
+            "An array size must fit in Go's `int` type, at most {}, but found {size}",
+            i64::MAX
+        ))
+}
+
+pub fn array_length_mismatch(expected: u64, actual: u64, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Array length mismatch")
+        .with_infer_code("array_length_mismatch")
+        .with_span_label(
+            &span,
+            format!("expected an array of length {expected}, found length {actual}"),
+        )
+        .with_help("Fixed-size arrays of different lengths are distinct types")
+}
+
+pub fn array_pattern_length_mismatch(
+    expected: u64,
+    actual: usize,
+    has_rest: bool,
+    span: Span,
+) -> LisetteDiagnostic {
+    let label = if has_rest {
+        format!("found {actual} elements, expected at most {expected}")
+    } else {
+        format!("found {actual} elements, expected {expected}")
+    };
+    LisetteDiagnostic::error("Array pattern length mismatch")
+        .with_infer_code("array_pattern_length_mismatch")
+        .with_span_label(&span, label)
+        .with_help("Bind every element in the array, or use `..` to ignore the rest")
+}
+
+pub fn array_literal_length_mismatch(
+    expected: u64,
+    actual: usize,
+    span: Span,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Array literal has the wrong number of elements")
+        .with_infer_code("array_literal_length_mismatch")
+        .with_span_label(
+            &span,
+            format!("expected {expected} element(s), found {actual}"),
+        )
+        .with_help("An `Array<T, N>` literal must list exactly `N` elements")
+}
+
+pub fn array_new_cannot_infer_size(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot infer the array element type and length")
+        .with_infer_code("array_new_cannot_infer_size")
+        .with_span_label(&span, "`Array.new` needs an element type and a length here")
+        .with_help("Write the type arguments, e.g. `Array.new<int, 3>()`, or annotate the binding")
+}
+
+pub fn array_from_cannot_infer_size(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Cannot infer the array element type and length")
+        .with_infer_code("array_from_cannot_infer_size")
+        .with_span_label(
+            &span,
+            "`Array.from` needs an element type and a length here",
+        )
+        .with_help(
+            "Write the type arguments, e.g. `Array.from<int, 3>(xs)`, or annotate the binding \
+             as `Option<Array<int, 3>>`",
+        )
+}
+
+pub fn array_new_no_zero(element: &dyn Display, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{element}` has no zero value"))
+        .with_infer_code("array_new_no_zero")
+        .with_span_label(
+            &span,
+            format!("`Array.new` zero-fills every element, but `{element}` has none"),
+        )
+        .with_help(
+            "Build the array from a list literal instead, e.g. `let xs: Array<int, 3> = [1, 2, 3]`",
+        )
+}
+
+pub fn negative_size_literal(what: &str, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("Negative {what}"))
+        .with_infer_code("negative_size_literal")
+        .with_span_label(&span, format!("a {what} cannot be negative"))
+        .with_help("This would always fail at runtime, so it is rejected here")
+}
+
+pub fn map_no_make_constructor(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`Map` has no `make` constructor")
+        .with_infer_code("no_make_constructor")
+        .with_span_label(&span, "`Map` has no capacity-taking constructor")
+        .with_help(
+            "Use `Map.new<K, V>()`. Go's map size hint only pre-sizes the initial allocation",
+        )
+}
+
+pub fn channel_no_make_constructor(span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`Channel` has no `make` constructor")
+        .with_infer_code("no_make_constructor")
+        .with_span_label(&span, "a channel's only size is its buffer")
+        .with_help("Use `Channel.new<T>()` for an unbuffered channel, or `Channel.buffered<T>(n)` for a buffered one")
+}
+
+pub fn slice_make_no_zero(
+    element: &dyn Display,
+    hidden_go_state: Option<&str>,
+    span: Span,
+) -> LisetteDiagnostic {
+    let help = match hidden_go_state {
+        Some(go_type) => format!(
+            "`{go_type}` has Go-side state hidden from Lisette, so it has no zero value. Build \
+             the slice from a list literal of values obtained from its documented Go constructor."
+        ),
+        None => {
+            "Build the slice from a list literal instead, e.g. `let xs = [a, b, c]`".to_string()
+        }
+    };
+    LisetteDiagnostic::error(format!("`{element}` has no zero value"))
+        .with_infer_code("slice_make_no_zero")
+        .with_span_label(
+            &span,
+            format!("`Slice.make` zero-fills every element, but `{element}` has none"),
+        )
+        .with_help(help)
+}
+
+pub fn hidden_state_no_zero(type_name: &dyn Display, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error(format!("`{type_name}` has no zero value"))
+        .with_infer_code("hidden_state_no_zero")
+        .with_span_label(&span, "no zero available")
+        .with_help(format!(
+            "`{type_name}` has Go-side state hidden from Lisette whose zero value is not safe \
+             to use directly. Construct it through its documented Go constructor instead."
+        ))
+}
+
+pub fn array_new_takes_no_arguments(actual: usize, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`Array.new` takes no value arguments")
+        .with_infer_code("array_new_takes_no_arguments")
+        .with_span_label(&span, format!("found {actual} argument(s)"))
+        .with_help("The element type and length are type arguments: `Array.new<int, 3>()`")
+}
+
+pub fn array_from_takes_one_argument(actual: usize, span: Span) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("`Array.from` takes exactly one value argument")
+        .with_infer_code("array_from_takes_one_argument")
+        .with_span_label(&span, format!("found {actual} argument(s)"))
+        .with_help("Pass the source slice: `Array.from<int, 3>(xs)`")
+}
+
 pub fn spread_on_non_variadic(span: Span) -> LisetteDiagnostic {
     LisetteDiagnostic::error("Invalid spread argument")
         .with_infer_code("spread_on_non_variadic")
         .with_span_label(&span, "this function does not accept variadic arguments")
-        .with_help("Only functions with a `VarArgs<T>` parameter accept a spread argument")
+        .with_help("Only functions with a `VarArgs<T>` parameter accept a `xs...` spread")
 }
 
-pub fn reference_aliases_sibling(ref_span: Span, var_name: &str) -> LisetteDiagnostic {
-    LisetteDiagnostic::error("Reference aliases sibling expression")
+pub fn range_to_for_variadic(span: Span, var_name: Option<&str>) -> LisetteDiagnostic {
+    let suggestion = match var_name {
+        Some(name) => format!("Use postfix: `{}...`", name),
+        None => "Use postfix `...` for variadic spread".to_string(),
+    };
+    LisetteDiagnostic::error("Invalid range argument")
+        .with_infer_code("range_to_for_variadic")
+        .with_span_label(&span, "this is a range, not a spread")
+        .with_help(suggestion)
+}
+
+pub fn reference_aliases_sibling(
+    ref_span: Span,
+    read_span: Span,
+    var_name: &str,
+) -> LisetteDiagnostic {
+    LisetteDiagnostic::error("Reference may mutate a value read in the same expression")
         .with_infer_code("reference_aliases_sibling")
-        .with_span_label(
-            &ref_span,
-            format!(
-                "`&{}` could mutate `{}` used by a sibling",
-                var_name, var_name
-            ),
-        )
+        .with_span_label(&ref_span, format!("may mutate `{}`", var_name))
+        .with_span_label(&read_span, "may see the mutated value")
         .with_help(format!(
-            "Bind `{}` to a `let` before this expression to make evaluation order explicit",
+            "Make evaluation order explicit: to read the value before `&{0}` runs, copy it first \
+             with `let before = {0}`, and to read the value after, bind the reference-taking \
+             operand to a variable first",
             var_name
         ))
 }

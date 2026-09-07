@@ -1,17 +1,21 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nstruct P { v: int }\nfn mk() -> P { P { v: 1 } }\n\nfn test() {\n  let P { v: _ } = mk() else {\n    panic(\"no\")\n  }\n  ()\n}\n"
+description: |
+  
+  struct P { v: int }
+  fn mk() -> P { P { v: 1 } }
+  
+  fn test() {
+    let P { v: _ } = mk() else {
+      panic("no")
+    }
+    ()
+  }
 ---
 package main
 
-import "fmt"
-
 type P struct {
 	v int
-}
-
-func (p P) String() string {
-	return fmt.Sprintf("P { v: %v }", p.v)
 }
 
 func mk() P {

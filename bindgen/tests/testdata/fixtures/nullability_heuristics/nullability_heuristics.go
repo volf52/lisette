@@ -23,7 +23,10 @@ type Builder struct{ buf []byte }
 
 func (b *Builder) Reset() *Builder                 { b.buf = nil; return b }
 func (b *Builder) Append(data []byte) *Builder     { b.buf = append(b.buf, data...); return b }
-func (b *Builder) SetTag(key, val string) *Builder { return b }
+func (b *Builder) SetTag(key, val string) *Builder {
+	b.buf = append(b.buf, []byte(key+"="+val)...)
+	return b
+}
 
 var defaultBuilder = &Builder{}
 
@@ -50,3 +53,19 @@ func (s *Store) Fetch(key string) *Result { return nil }
 type Result struct{ Value string }
 
 func Fetch(key string) *Result { return nil }
+
+type Knob struct{ name string }
+
+func MakeKnob() *Knob {
+	p := new(Knob)
+	return p
+}
+
+func DirectMakeKnob(name string) *Knob {
+	return MakeKnob()
+}
+
+func IndirectMakeKnob(name string) *Knob {
+	k := MakeKnob()
+	return k
+}

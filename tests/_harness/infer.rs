@@ -1,16 +1,36 @@
-use diagnostics::{DiagnosticSink, LisetteDiagnostic};
+use diagnostics::{LisetteDiagnostic, LocalSink};
+use rustc_hash::FxHashMap as HashMap;
+use semantics::loader::Loader;
 use semantics::{
-    checker::Checker, module_graph::build_module_graph, pattern_analysis, store::Store,
+    checker::TaskState,
+    package_graph::Roots,
+    package_graph::{PackageGraphOptions, build_package_graph},
 };
-use stdlib::get_go_stdlib_typedef;
-use syntax::{ast::Expression, types::Type};
+use std::collections;
+use std::mem;
+use std::path::PathBuf;
+use stdlib::{Target, get_go_stdlib_typedef};
+use syntax::program::File;
+use syntax::types;
+use syntax::types::CompoundKind;
+use syntax::{
+    ast::Expression,
+    program::Definition,
+    types::{Symbol, Type},
+};
 
-use super::init_prelude;
+use super::new_test_store;
 
 use super::builders::*;
 use super::filesystem::MockFileSystem;
 use super::pipeline::TestPipeline;
-use super::register_test_builtins;
+pub fn checker_errors(raw_source: &str, typedefs: &[(&str, &str)]) -> Vec<LisetteDiagnostic> {
+    let mut pipeline = TestPipeline::new(raw_source);
+    for (name, source) in typedefs {
+        pipeline = pipeline.with_go_typedef(name, source);
+    }
+    pipeline.compile().run_inference().errors
+}
 
 pub fn infer(raw_source: &str) -> InferResult {
     let result = TestPipeline::new(raw_source)
@@ -21,99 +41,150 @@ pub fn infer(raw_source: &str) -> InferResult {
     InferResult {
         ast: result.ast,
         errors: result.errors,
+        definitions: result.definitions,
     }
 }
 
-pub fn infer_module(module_name: &str, fs: MockFileSystem) -> InferResult {
-    let available_folders = fs.get_folders();
+pub fn infer_with_go_typedefs(raw_source: &str, typedefs: &[(&str, &str)]) -> InferResult {
+    let mut pipeline = TestPipeline::new(raw_source).wrapped();
+    for (name, source) in typedefs {
+        pipeline = pipeline.with_go_typedef(name, source);
+    }
+    let result = pipeline.compile().run_inference();
 
-    let mut store = Store::new();
+    InferResult {
+        ast: result.ast,
+        errors: result.errors,
+        definitions: result.definitions,
+    }
+}
 
-    store.module_ids.extend(available_folders);
+pub fn infer_package(package_name: &str, fs: MockFileSystem) -> InferResult {
+    let mut store = new_test_store();
 
-    let sink = DiagnosticSink::new();
+    let sink = LocalSink::new();
 
     let locator = deps::TypedefLocator::default();
-    let mut graph_result =
-        build_module_graph(&mut store, Some(&fs), module_name, &sink, false, &locator);
+    let discovered = fs.discover_packages();
+    let additional = discovered
+        .test_roots()
+        .map(|package_id| package_id.as_str().into())
+        .collect();
+    let roots = Roots {
+        primary: vec![package_name.into()],
+        additional,
+    };
+    let mut graph_result = build_package_graph(
+        &mut store,
+        roots,
+        PackageGraphOptions {
+            loader: Some(&fs),
+            sink: &sink,
+            scope: &semantics::AnalysisScope::Project(PathBuf::new()),
+            locator: &locator,
+            include_tests: true,
+            project_kind: semantics::ProjectKind::Binary,
+        },
+    );
+
+    let mut parsed: HashMap<String, Vec<File>> = graph_result
+        .files
+        .drain()
+        .map(|(package_id, files)| {
+            let files = files
+                .into_iter()
+                .map(|file| {
+                    let (file, errors) = file.parse(&package_id, false);
+                    sink.extend_parse_errors(errors);
+                    file
+                })
+                .collect();
+            (package_id.to_string(), files)
+        })
+        .collect();
 
     if sink.has_errors() {
         return InferResult {
             ast: vec![],
-            errors: sink.take(),
+            errors: sink.into_diagnostics(),
+            definitions: HashMap::default(),
         };
     }
 
-    init_prelude(&mut store);
-
     let ast = {
-        let mut checker = Checker::new(&mut store, &sink);
-        checker
-            .ufcs_methods
-            .extend(semantics::prelude::compute_prelude_ufcs(checker.store));
-        register_test_builtins(&mut checker);
-        checker.put_prelude_in_scope();
+        let mut checker = TaskState::for_package(package_name);
+        checker.put_prelude_in_scope(&store);
 
-        let order = std::mem::take(&mut graph_result.order);
-        for module_id in order {
-            if let Some(go_pkg) = module_id.strip_prefix("go:") {
-                if let Some(typedef) = get_go_stdlib_typedef(go_pkg) {
-                    checker.parse_and_register_go_module(&module_id, typedef, &locator);
+        let order = mem::take(&mut graph_result.order);
+        let mut to_infer = Vec::new();
+        for package_id in order {
+            if let Some(go_pkg) = package_id.strip_prefix("go:") {
+                if let Some(typedef) = get_go_stdlib_typedef(go_pkg, Target::host()) {
+                    checker.parse_and_register_go_package(
+                        &mut store,
+                        &package_id,
+                        typedef,
+                        None,
+                        &locator,
+                    );
                 }
                 continue;
             }
 
-            if checker.store.is_visited(&module_id) {
-                continue;
-            }
+            let files = parsed.remove(package_id.as_str()).unwrap_or_default();
 
-            let files = graph_result.files.remove(&module_id).unwrap_or_default();
+            store.store_package(&package_id, files);
+            let package = checker.register_package(&mut store, &package_id);
 
-            let prev_module_id = checker.cursor.module_id.clone();
-            checker.cursor.module_id = module_id.to_string();
-
-            checker.store.store_module(&module_id, files);
-            checker.register_module(&module_id);
-            checker.infer_module(&module_id);
-            semantics::checker::infer::checks::check_interface_visibility(
-                checker.store,
-                &module_id,
-                &sink,
-            );
-
-            checker.cursor.module_id = prev_module_id;
+            to_infer.push(package);
         }
 
-        let module = checker.store.get_module(module_name).unwrap();
-        let ast: Vec<_> = module
-            .files
-            .values()
+        checker.finalize_registration(&mut store);
+
+        for package in to_infer {
+            checker.infer_package(&mut store, package);
+        }
+
+        checker.check_post_inference_bounds(&store);
+
+        let package = store.get_package(package_name).unwrap();
+        let ast: Vec<_> = package
+            .source_files()
             .flat_map(|f| f.items.clone())
             .collect();
 
         if !checker.failed() {
-            let pattern_ctx = pattern_analysis::Context::new(
-                checker.store,
-                &checker.facts.or_pattern_error_spans,
+            passes::run(
+                &store,
+                &checker.facts,
+                &checker.sink,
+                passes::LintMode::Skip,
+                passes::UnusedItemReporting::Report,
             );
-            for expression in &ast {
-                pattern_analysis::check(expression, &pattern_ctx, checker.sink);
-            }
-            checker.facts.pattern_issues = pattern_ctx.take_issues();
         }
 
+        sink.extend(checker.sink.into_diagnostics());
         ast
     };
 
+    let definitions = store
+        .packages
+        .values()
+        .flat_map(|package| package.definitions.iter())
+        .map(|(name, definition)| (name.clone(), definition.clone()))
+        .collect();
+
     InferResult {
         ast,
-        errors: sink.take(),
+        errors: sink.into_diagnostics(),
+        definitions,
     }
 }
 
 pub struct InferResult {
     pub ast: Vec<Expression>,
     pub errors: Vec<LisetteDiagnostic>,
+    definitions: HashMap<Symbol, Definition>,
 }
 
 impl InferResult {
@@ -124,7 +195,7 @@ impl InferResult {
             .get_expression_type_at(0)
             .unwrap_or_else(|| panic!("No expression found at index 0"));
 
-        if !types_equal(&actual, &expected) {
+        if !types_equal(&actual, &expected, &self.definitions) {
             panic!(
                 "Type mismatch at expression 0\nExpected: {}\nActual:   {}",
                 expected.stringify(),
@@ -143,7 +214,7 @@ impl InferResult {
             .get_expression_type_at(last_index)
             .unwrap_or_else(|| panic!("No expression found at index {}", last_index));
 
-        if !types_equal(&actual, &expected) {
+        if !types_equal(&actual, &expected, &self.definitions) {
             panic!(
                 "Type mismatch at expression {}\nExpected: {}\nActual: {}",
                 last_index,
@@ -271,6 +342,38 @@ impl InferResult {
         self
     }
 
+    pub fn assert_resolve_code_once(self, code: &str) -> Self {
+        self.assert_code_count(&format!("resolve.{}", code), 1)
+    }
+
+    pub fn assert_infer_code_once(self, code: &str) -> Self {
+        self.assert_code_count(&format!("infer.{}", code), 1)
+    }
+
+    pub fn assert_infer_code_count(self, code: &str, count: usize) -> Self {
+        self.assert_code_count(&format!("infer.{}", code), count)
+    }
+
+    fn assert_code_count(self, expected_code: &str, expected: usize) -> Self {
+        let count = self
+            .errors
+            .iter()
+            .filter(|err| err.code_str() == Some(expected_code))
+            .count();
+        if count != expected {
+            let actual_codes: Vec<&str> = self
+                .errors
+                .iter()
+                .filter_map(|err| err.code_str())
+                .collect();
+            panic!(
+                "Expected {} occurrence(s) of '{}', found {}. Codes: {:?}",
+                expected, expected_code, count, actual_codes
+            );
+        }
+        self
+    }
+
     pub fn assert_type_mismatch(self) -> Self {
         self.assert_error_contains("type mismatch")
     }
@@ -291,7 +394,7 @@ impl InferResult {
         self.assert_error_contains("redundant")
     }
 
-    fn assert_error_contains(self, needle: &str) -> Self {
+    pub fn assert_error_contains(self, needle: &str) -> Self {
         if self.errors.is_empty() {
             panic!("Expected errors, but inference succeeded");
         }
@@ -333,27 +436,103 @@ fn ensure_no_errors(errors: &[LisetteDiagnostic]) {
 }
 
 fn is_slice_with_type_var(ty: &Type) -> bool {
-    let normalized = ty.resolve();
-    matches!(
-        normalized,
-        Type::Constructor { id, params, .. } if id.rsplit('.').next().unwrap_or("") == "Slice" && params.len() == 1 && matches!(params[0], Type::Variable(_))
-    )
+    match ty {
+        Type::Nominal { id, params, .. } => {
+            id.rsplit('.').next().unwrap_or("") == "Slice"
+                && params.len() == 1
+                && matches!(params[0], Type::Var { .. })
+        }
+        Type::Compound {
+            kind: CompoundKind::Slice,
+            args,
+            ..
+        } => args.len() == 1 && matches!(args[0], Type::Var { .. }),
+        _ => false,
+    }
 }
 
-fn types_equal(t1: &Type, t2: &Type) -> bool {
-    let resolved_t1 = t1.resolve();
-    let resolved_t2 = t2.resolve();
+/// A consistent one-to-one renaming between the type variables of the two
+/// types being compared, so `fn(a) -> a` and `fn(a) -> b` are not conflated.
+#[derive(Default)]
+struct VarBijection {
+    forward: collections::HashMap<u32, u32>,
+    backward: collections::HashMap<u32, u32>,
+}
 
-    match (&resolved_t1, &resolved_t2) {
-        (Type::Variable(_), Type::Variable(_)) => true,
+impl VarBijection {
+    fn unify(&mut self, a: u32, b: u32) -> bool {
+        *self.forward.entry(a).or_insert(b) == b && *self.backward.entry(b).or_insert(a) == a
+    }
+}
+
+fn types_equal(t1: &Type, t2: &Type, definitions: &HashMap<Symbol, Definition>) -> bool {
+    types_equal_with(t1, t2, definitions, &mut VarBijection::default())
+}
+
+fn types_equal_with(
+    t1: &Type,
+    t2: &Type,
+    definitions: &HashMap<Symbol, Definition>,
+    vars: &mut VarBijection,
+) -> bool {
+    let resolved1 = if matches!(t1, Type::Nominal { .. }) {
+        types::peel_alias(t1, |id| definitions.get(id))
+    } else {
+        t1.clone()
+    };
+    let resolved2 = if matches!(t2, Type::Nominal { .. }) {
+        types::peel_alias(t2, |id| definitions.get(id))
+    } else {
+        t2.clone()
+    };
+    let (t1, t2) = (&resolved1, &resolved2);
+
+    if let (Some(n1), Some(n2)) = (t1.get_name(), t2.get_name())
+        && n1 == n2
+    {
+        let args1 = t1.get_type_params().unwrap_or(&[]);
+        let args2 = t2.get_type_params().unwrap_or(&[]);
+        if args1.len() == args2.len()
+            && args1
+                .iter()
+                .zip(args2.iter())
+                .all(|(a1, a2)| types_equal_with(a1, a2, definitions, vars))
+        {
+            return true;
+        }
+    }
+
+    match (t1, t2) {
+        (Type::Compound { kind, args, .. }, Type::Nominal { id, params, .. })
+        | (Type::Nominal { id, params, .. }, Type::Compound { kind, args, .. }) => {
+            let leaf = id.rsplit('.').next().unwrap_or("");
+            if kind.leaf_name() == leaf && args.len() == params.len() {
+                return args
+                    .iter()
+                    .zip(params.iter())
+                    .all(|(x, y)| types_equal_with(x, y, definitions, vars));
+            }
+        }
+        (Type::Simple(kind), Type::Nominal { id, params, .. })
+        | (Type::Nominal { id, params, .. }, Type::Simple(kind)) => {
+            let leaf = id.rsplit('.').next().unwrap_or("");
+            if kind.leaf_name() == leaf && params.is_empty() {
+                return true;
+            }
+        }
+        _ => {}
+    }
+
+    match (t1, t2) {
+        (Type::Var { id: a, .. }, Type::Var { id: b, .. }) => vars.unify(a.index(), b.index()),
 
         (
-            Type::Constructor {
+            Type::Nominal {
                 id: id1,
                 params: args1,
-                underlying_ty: u1,
+                ..
             },
-            Type::Constructor {
+            Type::Nominal {
                 id: id2,
                 params: args2,
                 ..
@@ -366,36 +545,21 @@ fn types_equal(t1: &Type, t2: &Type) -> bool {
                 && args1
                     .iter()
                     .zip(args2.iter())
-                    .all(|(a1, a2)| types_equal(a1, a2))
-            {
-                return true;
-            }
-            if let Some(u) = u1
-                && types_equal(u, &resolved_t2)
+                    .all(|(a1, a2)| types_equal_with(a1, a2, definitions, vars))
             {
                 return true;
             }
             false
         }
 
-        (
-            Type::Function {
-                params: args1,
-                return_type: ret1,
-                ..
-            },
-            Type::Function {
-                params: args2,
-                return_type: ret2,
-                ..
-            },
-        ) => {
-            args1.len() == args2.len()
-                && args1
+        (Type::Function(f1), Type::Function(f2)) => {
+            f1.params.len() == f2.params.len()
+                && f1
+                    .params
                     .iter()
-                    .zip(args2.iter())
-                    .all(|(a1, a2)| types_equal(a1, a2))
-                && types_equal(ret1, ret2)
+                    .zip(f2.params.iter())
+                    .all(|(a1, a2)| types_equal_with(&a1.ty, &a2.ty, definitions, vars))
+                && types_equal_with(&f1.return_type, &f2.return_type, definitions, vars)
         }
 
         (Type::Tuple(elems1), Type::Tuple(elems2)) => {
@@ -403,7 +567,25 @@ fn types_equal(t1: &Type, t2: &Type) -> bool {
                 && elems1
                     .iter()
                     .zip(elems2.iter())
-                    .all(|(e1, e2)| types_equal(e1, e2))
+                    .all(|(e1, e2)| types_equal_with(e1, e2, definitions, vars))
+        }
+
+        (Type::Simple(k1), Type::Simple(k2)) => k1 == k2,
+
+        (
+            Type::Compound {
+                kind: k1, args: a1, ..
+            },
+            Type::Compound {
+                kind: k2, args: a2, ..
+            },
+        ) => {
+            k1 == k2
+                && a1.len() == a2.len()
+                && a1
+                    .iter()
+                    .zip(a2.iter())
+                    .all(|(x, y)| types_equal_with(x, y, definitions, vars))
         }
 
         _ => false,

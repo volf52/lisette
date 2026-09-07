@@ -1,11 +1,9 @@
-use rustc_hash::FxHashSet as HashSet;
-
-use crate::Emitter;
+use crate::Planner;
 use crate::names::go_name;
-use syntax::ast::{Annotation, Expression, Generic, ParentInterface, Pattern};
-use syntax::types::{Type, unqualified_name};
+use syntax::ast::{Annotation, Expression, Generic, ParentInterface};
+use syntax::types::unqualified_name;
 
-impl Emitter<'_> {
+impl Planner<'_> {
     pub(crate) fn emit_interface(
         &mut self,
         name: &str,
@@ -14,44 +12,26 @@ impl Emitter<'_> {
         generics: &[Generic],
         is_public: bool,
     ) -> String {
-        if self.current_module == go_name::PRELUDE_MODULE {
+        if self.facts.is_current_package(go_name::PRELUDE_PACKAGE) {
             return format!("type {} struct{{}}", name);
         }
 
-        let generic_names: Vec<&str> = generics.iter().map(|g| g.name.as_ref()).collect();
-        let method_types: Vec<Type> = items.iter().map(|item| item.get_type()).collect();
-        let mut map_key_generics =
-            Self::collect_map_key_generics(method_types.iter(), &generic_names);
-
-        let mut visited = HashSet::default();
-        for parent in parents {
-            if let Type::Constructor { id, params, .. } = &parent.ty {
-                for position in self.map_key_positions(id, &mut visited) {
-                    if let Some(Type::Parameter(name)) = params.get(position)
-                        && generic_names.contains(&name.as_ref())
-                    {
-                        map_key_generics.insert(name.to_string());
-                    }
-                }
-            }
-        }
-
         let filtered = strip_self_referential_bounds(generics, name);
-        let generics_str = self.generics_to_string_with_map_keys(&filtered, &map_key_generics);
+        let generics_str = self.generics_to_string(&filtered);
 
         let mut output = Vec::new();
         output.push(format!(
             "type {}{} interface {{",
-            go_name::escape_keyword(name),
+            go_name::escape_type_name(name),
             generics_str
         ));
 
         for parent in parents {
-            output.push(self.go_type_as_string(&parent.ty));
+            output.push(self.use_go_type(&parent.ty));
         }
 
         for item in items {
-            output.push(self.emit_interface_method(item, is_public));
+            output.push(self.emit_interface_method(name, item, is_public));
         }
 
         output.push("}".to_string());
@@ -59,34 +39,40 @@ impl Emitter<'_> {
         output.join("\n")
     }
 
-    /// Emit one interface method signature. Drops a leading `self` receiver
-    /// from the param list since interface methods take their receiver
-    /// implicitly. Unit returns (`struct{}`) are elided from the Go signature.
-    fn emit_interface_method(&mut self, item: &Expression, is_public: bool) -> String {
-        let func = item.to_function_definition();
+    /// Emit one interface method signature.
+    fn emit_interface_method(
+        &mut self,
+        interface_name: &str,
+        item: &Expression,
+        is_public: bool,
+    ) -> String {
+        let func = item.function_definition_view();
         let ty = item.get_type();
         let all_args = ty
             .get_function_params()
             .expect("interface method must have function type");
 
-        let has_self_receiver = func.params.first().is_some_and(|p| {
-            matches!(p.pattern, Pattern::Identifier { ref identifier, .. } if identifier == "self")
-                && p.annotation.is_none()
-        });
         let args: Vec<String> = all_args
             .iter()
-            .skip(if has_self_receiver { 1 } else { 0 })
-            .map(|a| self.go_type_as_string(a))
+            .map(|param| self.use_go_type(&param.ty))
             .collect();
-        let return_type = self.go_type_as_string(
-            ty.get_function_ret()
-                .expect("interface method must have return type"),
-        );
-
-        let method_name = if is_public || self.method_needs_export(&func.name) {
-            go_name::capitalize_first(&func.name)
+        let raw_return_ty = ty
+            .get_function_ret()
+            .expect("interface method must have return type")
+            .clone();
+        let qualified_id = self.facts.qualified_current(interface_name);
+        let hints = self.go_interface_method_hints(&qualified_id, func.name);
+        let return_abi = self.callable_return_abi_with_go_hints(&raw_return_ty, &hints);
+        let return_type = if return_abi.is_lowered() {
+            self.render_lowered_return_ty(&return_abi, &raw_return_ty)
         } else {
-            go_name::escape_keyword(&func.name).into_owned()
+            self.use_go_type(&raw_return_ty)
+        };
+
+        let method_name = if is_public || self.method_needs_export(func.name) {
+            go_name::snake_to_camel(func.name)
+        } else {
+            go_name::unexported_method_go_name(func.name)
         };
 
         if return_type == "struct{}" {
@@ -107,15 +93,10 @@ fn bound_references_interface(annotation: &Annotation, interface_name: &str) -> 
 fn strip_self_referential_bounds(generics: &[Generic], interface_name: &str) -> Vec<Generic> {
     generics
         .iter()
-        .map(|g| Generic {
-            name: g.name.clone(),
-            bounds: g
-                .bounds
-                .iter()
-                .filter(|ann| !bound_references_interface(ann, interface_name))
-                .cloned()
-                .collect(),
-            span: g.span,
+        .cloned()
+        .map(|mut generic| {
+            generic.retain_bounds(|bound| !bound_references_interface(bound, interface_name));
+            generic
         })
         .collect()
 }

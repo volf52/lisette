@@ -1,103 +1,206 @@
 use std::fmt::Write;
 
-use crate::Emitter;
-use crate::utils::Staged;
-use syntax::ast::{FormatStringPart, Literal};
-use syntax::types::Type;
+use crate::Planner;
+use crate::abi::coercion::CoercionPlan;
+use crate::context::expression::ExpressionContext;
+use crate::plan::values::{
+    CaptureBoundary, ConstantKind, EvaluationEffect, GoExpression, ValuePlan,
+};
+use syntax::ast::{Expression, FormatStringPart, Literal};
+use syntax::types::{SimpleKind, Type};
 
-impl Emitter<'_> {
-    pub(super) fn emit_literal(
-        &mut self,
-        output: &mut String,
-        literal: &Literal,
-        ty: &Type,
-    ) -> String {
-        match literal {
-            Literal::Integer { value, text } => match text {
-                Some(original) => original.clone(),
-                None => value.to_string(),
-            },
-            Literal::Float { value, text } => match text {
-                Some(t) => t.clone(),
-                None => {
-                    let s = value.to_string();
-                    if s.contains('.') || s.contains('e') || s.contains('E') {
-                        s
-                    } else {
-                        format!("{}.0", s)
+impl Planner<'_> {
+    pub(super) fn emit_literal(&mut self, literal: &Literal, ty: &Type) -> ValuePlan {
+        let (value, kind) = match literal {
+            Literal::Integer { value, text } => {
+                let rendered = match text {
+                    Some(original) => original.clone(),
+                    None => value.to_string(),
+                };
+                (rendered, ConstantKind::Int)
+            }
+            Literal::Float { value, text } => {
+                let rendered = match text {
+                    Some(t) => t.clone(),
+                    None => {
+                        let s = value.to_string();
+                        if s.contains('.') || s.contains('e') || s.contains('E') {
+                            s
+                        } else {
+                            format!("{}.0", s)
+                        }
                     }
-                }
-            },
+                };
+                (rendered, ConstantKind::Float)
+            }
             Literal::Imaginary(coef) => {
-                if *coef == coef.trunc() && coef.abs() < 1e15 {
+                let rendered = if *coef == coef.trunc() && coef.abs() < 1e15 {
                     format!("{}i", *coef as i64)
                 } else {
                     format!("{}i", coef)
-                }
+                };
+                (rendered, ConstantKind::Complex)
             }
-            Literal::Boolean(b) => b.to_string(),
-            Literal::String(s) => {
-                format!("\"{}\"", convert_escape_sequences(s))
-            }
-            Literal::Char(c) => {
-                format!("'{}'", convert_escape_sequences(c))
-            }
-            Literal::FormatString(parts) => self.emit_format_string(output, parts),
-            Literal::Slice(elems) => {
-                let stages: Vec<Staged> = elems.iter().map(|e| self.stage_composite(e)).collect();
-                let elements = self.sequence(output, stages, "_v");
+            Literal::Boolean(b) => (b.to_string(), ConstantKind::Bool),
+            Literal::String { value, raw: false } => (
+                format!("\"{}\"", convert_escape_sequences(value)),
+                ConstantKind::String,
+            ),
+            Literal::String { value, raw: true } => (emit_raw_string(value), ConstantKind::String),
+            Literal::Char(c) => (
+                format!("'{}'", convert_escape_sequences(c)),
+                ConstantKind::Rune,
+            ),
+            Literal::FormatString(parts) => return self.emit_format_string(parts),
+            Literal::Slice(elements) => return self.emit_slice_literal(elements, ty),
+        };
+        ValuePlan::constant(value, kind)
+    }
 
-                let elem_lisette_ty = ty
-                    .get_type_params()
+    pub(crate) fn constant_needs_go_type(
+        &mut self,
+        constant: Option<ConstantKind>,
+        slot_ty: &Type,
+    ) -> Option<String> {
+        let kind = constant?;
+        if self.facts.is_interface_or_unknown(slot_ty) {
+            return None;
+        }
+        let peeled = self.facts.peel_alias(slot_ty);
+        match &peeled {
+            Type::Simple(_) => {}
+            Type::Nominal { params, .. } if params.is_empty() => {}
+            _ => return None,
+        }
+        if peeled.as_simple() == Some(kind.default_kind()) {
+            return None;
+        }
+        Some(self.use_go_type(slot_ty))
+    }
+
+    fn emit_slice_literal(&mut self, elements: &[Expression], ty: &Type) -> ValuePlan {
+        // A list literal builds a slice or a fixed-size array, per its type.
+        let (element_lisette_ty, type_prefix) = match ty {
+            Type::Array { length, element } => (element.as_ref().clone(), format!("[{}]", length)),
+            _ => (
+                ty.get_type_params()
                     .expect("Slice type must have type args")
                     .first()
                     .expect("Slice type must have element type")
-                    .clone();
-                let elem_ty = self.go_type_as_string(&elem_lisette_ty);
+                    .clone(),
+                "[]".to_string(),
+            ),
+        };
+        let element_ty = self.use_go_type(&element_lisette_ty);
 
-                let elements: Vec<String> = elems
-                    .iter()
-                    .zip(elements)
-                    .map(|(expr, emitted)| {
-                        self.maybe_wrap_as_go_interface(emitted, &expr.get_type(), &elem_lisette_ty)
-                    })
-                    .collect();
-
-                if elements.len() > 1 && elements.iter().any(|e| e.len() > 30) {
-                    let indented = elements
-                        .iter()
-                        .map(|e| format!("\t{}", e))
-                        .collect::<Vec<_>>()
-                        .join(",\n");
-                    format!("[]{}{{\n{},\n}}", elem_ty, indented)
-                } else {
-                    format!("[]{}{{ {} }}", elem_ty, elements.join(", "))
-                }
-            }
+        if elements.is_empty() {
+            return ValuePlan::computed(
+                Vec::new(),
+                GoExpression::composite_literal(
+                    format!("{}{}{{}}", type_prefix, element_ty),
+                    false,
+                ),
+                EvaluationEffect::Pure,
+            );
         }
+
+        let stages: Vec<ValuePlan> = elements
+            .iter()
+            .map(|e| self.lower_composite_value(e, ExpressionContext::value()))
+            .collect();
+        let sequenced = self.sequence_values(stages, CaptureBoundary::SiblingSequence, "v");
+        let effect = sequenced.effect;
+        let contains_deferred_evaluation = sequenced.contains_deferred_evaluation();
+        let mut setup = sequenced.setup;
+        let values = sequenced.values;
+
+        let mut wrapped: Vec<String> = Vec::with_capacity(values.len());
+        let mut widest = 0;
+        for (expr, value) in elements.iter().zip(&values) {
+            let coercion = CoercionPlan::internal(self, &expr.get_type(), &element_lisette_ty);
+            let is_whole_literal = coercion.is_identity() && value.is_composite_literal();
+            let (coercion_setup, coerced) = coercion.lower(self, value.rendered());
+            setup.extend(coercion_setup);
+            widest = widest.max(coerced.len());
+            wrapped.push(if is_whole_literal {
+                elide_element_type(&element_ty, coerced)
+            } else {
+                coerced
+            });
+        }
+        let elements = wrapped;
+
+        let value = if elements.len() > 1 && widest > 30 {
+            let indented = elements
+                .iter()
+                .map(|e| format!("\t{}", e))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("{}{}{{\n{},\n}}", type_prefix, element_ty, indented)
+        } else {
+            format!("{}{}{{ {} }}", type_prefix, element_ty, elements.join(", "))
+        };
+        ValuePlan::computed(
+            setup,
+            GoExpression::composite_literal(value, contains_deferred_evaluation),
+            effect,
+        )
     }
 
-    fn emit_format_string(&mut self, output: &mut String, parts: &[FormatStringPart]) -> String {
+    fn emit_format_string(&mut self, parts: &[FormatStringPart]) -> ValuePlan {
         let has_interpolation = parts
             .iter()
             .any(|p| matches!(p, FormatStringPart::Expression(_)));
 
-        // Stage all expression parts for eval-order sequencing
-        let stages: Vec<Staged> = parts
+        let mut stages: Vec<ValuePlan> = parts
             .iter()
             .filter_map(|p| {
                 if let FormatStringPart::Expression(e) = p {
-                    Some(self.stage_composite(e))
+                    Some(self.lower_composite_value(e, ExpressionContext::value()))
                 } else {
                     None
                 }
             })
             .collect();
-        let emitted = self.sequence(output, stages, "_fmtarg");
+        let concatenates = self.format_string_concatenates(parts);
+        if concatenates && stages.len() == 1 && parts.len() == 1 {
+            return stages.pop().expect("one staged operand");
+        }
+        let sequenced = self.sequence_values(stages, CaptureBoundary::SiblingSequence, "fmtarg");
+        let effect = sequenced.effect;
+        let setup = sequenced.setup;
+        let mut values = sequenced.values.into_iter();
+
+        if concatenates {
+            let mut pieces: Vec<GoExpression> = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part {
+                    FormatStringPart::Text(text) => {
+                        let unescaped = text.replace("{{", "{").replace("}}", "}");
+                        let unescaped = convert_escape_sequences(&unescaped);
+                        if !unescaped.is_empty() {
+                            pieces.push(GoExpression::constant(
+                                format!("\"{}\"", unescaped),
+                                ConstantKind::String,
+                            ));
+                        }
+                    }
+                    FormatStringPart::Expression(_) => pieces.push(
+                        values
+                            .next()
+                            .expect("sequenced count matches expression parts"),
+                    ),
+                }
+            }
+            let mut pieces = pieces.into_iter();
+            let first = pieces.next().expect("an interpolated f-string has a piece");
+            let concatenation =
+                pieces.fold(first, |left, right| GoExpression::binary(left, "+", right));
+            return ValuePlan::computed(setup, concatenation, effect);
+        }
 
         let mut format_string = String::new();
-        let mut args = Vec::new();
-        let mut expression_idx = 0;
+        let mut args = Vec::with_capacity(values.len());
 
         for part in parts {
             match part {
@@ -111,27 +214,108 @@ impl Emitter<'_> {
                     }
                 }
                 FormatStringPart::Expression(expression) => {
-                    let format_verb = if expression.get_type().resolve().is_rune() {
-                        "%c"
-                    } else {
-                        "%v"
-                    };
-                    format_string.push_str(format_verb);
-                    args.push(emitted[expression_idx].clone());
-                    expression_idx += 1;
+                    let peeled = self.facts.peel_alias(&expression.get_type());
+                    format_string.push_str(format_verb_for(&peeled));
+                    args.push(
+                        values
+                            .next()
+                            .expect("sequenced count matches expression parts")
+                            .rendered(),
+                    );
                 }
             }
         }
 
         if args.is_empty() {
-            return format!("\"{}\"", format_string);
+            return ValuePlan::evaluated_literal(setup, format!("\"{}\"", format_string), effect);
         }
 
-        self.flags.needs_fmt = true;
-        if format_string == "%v" && args.len() == 1 {
-            return format!("fmt.Sprint({})", args[0]);
+        self.require_fmt();
+        // Solo-expression f-strings round-trip through fmt.Sprint, which skips
+        // the format-string parse. Excluded: `%c`, because Sprint on a rune
+        // prints the integer codepoint instead of the character.
+        if let ([FormatStringPart::Expression(_)], [arg]) = (parts, args.as_slice())
+            && format_string != "%c"
+        {
+            return ValuePlan::observable_call(
+                setup,
+                GoExpression::call(
+                    GoExpression::opaque("fmt.Sprint".to_string()),
+                    vec![GoExpression::opaque(arg.clone())],
+                ),
+                effect,
+            );
         }
-        format!("fmt.Sprintf(\"{}\", {})", format_string, args.join(", "))
+        let mut arguments = vec![GoExpression::literal(format!("\"{}\"", format_string))];
+        arguments.extend(args.into_iter().map(GoExpression::opaque));
+        ValuePlan::observable_call(
+            setup,
+            GoExpression::call(GoExpression::opaque("fmt.Sprintf".to_string()), arguments),
+            effect,
+        )
+    }
+
+    pub(crate) fn format_string_lowers_to_sprintf(&self, parts: &[FormatStringPart]) -> bool {
+        let has_interpolation = parts
+            .iter()
+            .any(|p| matches!(p, FormatStringPart::Expression(_)));
+        if !has_interpolation || self.format_string_concatenates(parts) {
+            return false;
+        }
+        let [FormatStringPart::Expression(solo)] = parts else {
+            return true;
+        };
+        format_verb_for(&self.facts.peel_alias(&solo.get_type())) == "%c"
+    }
+
+    fn format_string_concatenates(&self, parts: &[FormatStringPart]) -> bool {
+        let mut operands = parts
+            .iter()
+            .filter_map(|part| match part {
+                FormatStringPart::Expression(expression) => Some(expression),
+                FormatStringPart::Text(_) => None,
+            })
+            .peekable();
+        operands.peek().is_some()
+            && operands.all(|expression| {
+                self.facts.peel_alias(&expression.get_type()).as_simple()
+                    == Some(SimpleKind::String)
+            })
+    }
+}
+
+/// The `fmt` printf verb for interpolating a value of alias-peeled `ty` into
+/// an f-string.
+fn format_verb_for(ty: &Type) -> &'static str {
+    match ty.as_simple() {
+        Some(SimpleKind::Rune) => "%c",
+        Some(SimpleKind::String) => "%s",
+        Some(SimpleKind::Bool) => "%t",
+        Some(k) if k.is_signed_int() || k.is_unsigned_int() => "%d",
+        Some(k) if k.is_float() => "%g",
+        _ => "%v",
+    }
+}
+
+pub(crate) fn elide_element_type(element_ty: &str, rendered: String) -> String {
+    match rendered.strip_prefix(element_ty) {
+        Some(literal) if literal.starts_with('{') => literal.to_string(),
+        _ => rendered,
+    }
+}
+
+pub(crate) fn emit_raw_string(value: &str) -> String {
+    // Go backtick raw strings cannot contain backticks, and Go discards `\r`
+    // from them, so fall back to double-quoted form in either case.
+    if !value.contains('`') && !value.contains('\r') {
+        format!("`{}`", value)
+    } else {
+        let escaped = value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n");
+        format!("\"{}\"", escaped)
     }
 }
 
@@ -173,6 +357,10 @@ pub(crate) fn convert_escape_sequences(s: &str) -> String {
             } else {
                 result.push(c);
             }
+        } else if c == '\n' {
+            result.push_str("\\n");
+        } else if c == '\r' {
+            result.push_str("\\r");
         } else {
             result.push(c);
         }

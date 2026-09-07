@@ -1,6 +1,21 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K, V> Pair<K, V> {\n  fn get_key(self: Pair<K, V>) -> K {\n    return self.key;\n  }\n\n  fn get_value(self: Pair<K, V>) -> V {\n    return self.value;\n  }\n}\n"
+description: |
+  
+  struct Pair<K, V> {
+    key: K,
+    value: V,
+  }
+  
+  impl<K, V> Pair<K, V> {
+    fn get_key(self: Pair<K, V>) -> K {
+      return self.key;
+    }
+  
+    fn get_value(self: Pair<K, V>) -> V {
+      return self.value;
+    }
+  }
 ---
 [
     Struct {
@@ -16,6 +31,7 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
             Generic {
                 name: "K",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 13,
@@ -25,6 +41,7 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
             Generic {
                 name: "V",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 16,
@@ -32,55 +49,60 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
                 },
             },
         ],
-        fields: [
-            StructFieldDefinition {
-                doc: None,
-                attributes: [],
-                name: "key",
-                name_span: Span {
-                    file_id: 0,
-                    byte_offset: 23,
-                    byte_length: 3,
-                },
-                annotation: Constructor {
-                    name: "K",
-                    params: [],
-                    span: Span {
+        fields: Record(
+            [
+                StructFieldDefinition {
+                    doc: None,
+                    name: "key",
+                    name_span: Span {
                         file_id: 0,
-                        byte_offset: 28,
-                        byte_length: 1,
+                        byte_offset: 23,
+                        byte_length: 3,
+                    },
+                    annotation: Constructor {
+                        name: "K",
+                        params: [],
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 28,
+                            byte_length: 1,
+                        },
+                    },
+                    visibility: Private,
+                    ty: Var {
+                        id: uninferred,
+                    },
+                    kind: Named {
+                        attributes: [],
                     },
                 },
-                visibility: Private,
-                ty: Variable(
-                    -1,
-                ),
-            },
-            StructFieldDefinition {
-                doc: None,
-                attributes: [],
-                name: "value",
-                name_span: Span {
-                    file_id: 0,
-                    byte_offset: 33,
-                    byte_length: 5,
-                },
-                annotation: Constructor {
-                    name: "V",
-                    params: [],
-                    span: Span {
+                StructFieldDefinition {
+                    doc: None,
+                    name: "value",
+                    name_span: Span {
                         file_id: 0,
-                        byte_offset: 40,
-                        byte_length: 1,
+                        byte_offset: 33,
+                        byte_length: 5,
+                    },
+                    annotation: Constructor {
+                        name: "V",
+                        params: [],
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 40,
+                            byte_length: 1,
+                        },
+                    },
+                    visibility: Private,
+                    ty: Var {
+                        id: uninferred,
+                    },
+                    kind: Named {
+                        attributes: [],
                     },
                 },
-                visibility: Private,
-                ty: Variable(
-                    -1,
-                ),
-            },
-        ],
-        kind: Record,
+            ],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,
@@ -169,10 +191,9 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
                                 },
                             },
                         ),
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
+                        ty: Var {
+                            id: uninferred,
+                        },
                     },
                 ],
                 return_annotation: Constructor {
@@ -184,59 +205,61 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
                         byte_length: 1,
                     },
                 },
-                return_type: Variable(
-                    -1,
-                ),
+                return_type: Var {
+                    id: uninferred,
+                },
                 visibility: Private,
-                body: Block {
-                    items: [
-                        Return {
-                            expression: DotAccess {
-                                expression: Identifier {
-                                    value: "self",
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                body: Definition(
+                    Block {
+                        items: [
+                            Return {
+                                expression: DotAccess {
+                                    expression: Identifier {
+                                        value: "self",
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
+                                        span: Span {
+                                            file_id: 0,
+                                            byte_offset: 119,
+                                            byte_length: 4,
+                                        },
+                                        resolution: Unresolved,
+                                    },
+                                    member: "key",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 119,
-                                        byte_length: 4,
+                                        byte_length: 8,
                                     },
-                                    binding_id: None,
-                                    qualified: None,
+                                    resolution: Unresolved,
                                 },
-                                member: "key",
-                                ty: Variable(
-                                    -1,
-                                ),
+                                ty: Var {
+                                    id: uninferred,
+                                },
                                 span: Span {
                                     file_id: 0,
-                                    byte_offset: 119,
-                                    byte_length: 8,
+                                    byte_offset: 112,
+                                    byte_length: 15,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 112,
-                                byte_length: 15,
-                            },
+                        ],
+                        ty: Var {
+                            id: uninferred,
                         },
-                    ],
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 106,
-                        byte_length: 26,
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 106,
+                            byte_length: 26,
+                        },
                     },
-                },
-                ty: Variable(
-                    -1,
                 ),
+                ty: Var {
+                    id: uninferred,
+                },
                 span: Span {
                     file_id: 0,
                     byte_offset: 72,
@@ -293,10 +316,9 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
                                 },
                             },
                         ),
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
+                        ty: Var {
+                            id: uninferred,
+                        },
                     },
                 ],
                 return_annotation: Constructor {
@@ -308,59 +330,61 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
                         byte_length: 1,
                     },
                 },
-                return_type: Variable(
-                    -1,
-                ),
+                return_type: Var {
+                    id: uninferred,
+                },
                 visibility: Private,
-                body: Block {
-                    items: [
-                        Return {
-                            expression: DotAccess {
-                                expression: Identifier {
-                                    value: "self",
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                body: Definition(
+                    Block {
+                        items: [
+                            Return {
+                                expression: DotAccess {
+                                    expression: Identifier {
+                                        value: "self",
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
+                                        span: Span {
+                                            file_id: 0,
+                                            byte_offset: 185,
+                                            byte_length: 4,
+                                        },
+                                        resolution: Unresolved,
+                                    },
+                                    member: "value",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 185,
-                                        byte_length: 4,
+                                        byte_length: 10,
                                     },
-                                    binding_id: None,
-                                    qualified: None,
+                                    resolution: Unresolved,
                                 },
-                                member: "value",
-                                ty: Variable(
-                                    -1,
-                                ),
+                                ty: Var {
+                                    id: uninferred,
+                                },
                                 span: Span {
                                     file_id: 0,
-                                    byte_offset: 185,
-                                    byte_length: 10,
+                                    byte_offset: 178,
+                                    byte_length: 17,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 178,
-                                byte_length: 17,
-                            },
+                        ],
+                        ty: Var {
+                            id: uninferred,
                         },
-                    ],
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 172,
-                        byte_length: 28,
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 172,
+                            byte_length: 28,
+                        },
                     },
-                },
-                ty: Variable(
-                    -1,
                 ),
+                ty: Var {
+                    id: uninferred,
+                },
                 span: Span {
                     file_id: 0,
                     byte_offset: 136,
@@ -372,6 +396,7 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
             Generic {
                 name: "K",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 51,
@@ -381,6 +406,7 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
             Generic {
                 name: "V",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 54,
@@ -388,9 +414,9 @@ description: "input: \nstruct Pair<K, V> {\n  key: K,\n  value: V,\n}\n\nimpl<K,
                 },
             },
         ],
-        ty: Variable(
-            -1,
-        ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 46,

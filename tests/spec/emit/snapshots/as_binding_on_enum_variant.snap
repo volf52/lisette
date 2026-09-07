@@ -1,10 +1,17 @@
 ---
 source: tests/spec/emit/patterns.rs
-description: "input: \nenum Status { Good(int), Bad(string) }\n\nfn test(s: Status) -> int {\n  match s {\n    Good(n) as g => n,\n    Bad(_) => -1,\n  }\n}\n"
+description: |
+  
+  enum Status { Good(int), Bad(string) }
+  
+  fn test(s: Status) -> int {
+    match s {
+      Good(n) as g => n,
+      Bad(_) => -1,
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeStatusGood(arg0 int) Status {
 	return Status{Tag: StatusGood, Good: arg0}
@@ -14,7 +21,7 @@ func MakeStatusBad(arg0 string) Status {
 	return Status{Tag: StatusBad, Bad: arg0}
 }
 
-type StatusTag int
+type StatusTag uint8
 
 const (
 	StatusGood StatusTag = iota
@@ -25,17 +32,6 @@ type Status struct {
 	Tag  StatusTag
 	Good int
 	Bad  string
-}
-
-func (s Status) String() string {
-	switch s.Tag {
-	case StatusGood:
-		return fmt.Sprintf("Status.Good(%v)", s.Good)
-	case StatusBad:
-		return fmt.Sprintf("Status.Bad(%v)", s.Bad)
-	default:
-		return fmt.Sprintf("Status(%d)", s.Tag)
-	}
 }
 
 func test(s Status) int {

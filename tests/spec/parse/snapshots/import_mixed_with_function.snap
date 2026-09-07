@@ -1,9 +1,18 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nimport \"go:io\"\nimport \"network\"\n\nfn process() {\n  // function body\n}\n\nimport \"logging\"\n"
+description: |
+  
+  import "go:io"
+  import "network"
+  
+  fn process() {
+    // function body
+  }
+  
+  import "logging"
 ---
 [
-    ModuleImport {
+    PackageImport {
         name: "go:io",
         name_span: Span {
             file_id: 0,
@@ -17,7 +26,7 @@ description: "input: \nimport \"go:io\"\nimport \"network\"\n\nfn process() {\n 
             byte_length: 14,
         },
     },
-    ModuleImport {
+    PackageImport {
         name: "network",
         name_span: Span {
             file_id: 0,
@@ -43,31 +52,33 @@ description: "input: \nimport \"go:io\"\nimport \"network\"\n\nfn process() {\n 
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
-        visibility: Private,
-        body: Block {
-            items: [],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 47,
-                byte_length: 22,
-            },
+        return_type: Var {
+            id: uninferred,
         },
-        ty: Variable(
-            -1,
+        visibility: Private,
+        body: Definition(
+            Block {
+                items: [],
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 47,
+                    byte_length: 22,
+                },
+            },
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 34,
             byte_length: 35,
         },
     },
-    ModuleImport {
+    PackageImport {
         name: "logging",
         name_span: Span {
             file_id: 0,

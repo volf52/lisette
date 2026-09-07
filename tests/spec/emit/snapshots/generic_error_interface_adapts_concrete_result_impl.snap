@@ -1,0 +1,59 @@
+---
+source: tests/spec/emit/types.rs
+description: |
+  
+  import "go:errors"
+  
+  interface Foo<E: error> {
+    fn get() -> Result<int, E>
+  }
+  
+  struct Bar {}
+  
+  impl Bar {
+    fn get(self) -> Result<int, error> {
+      Err(errors.New("failure"))
+    }
+  }
+  
+  fn use_foo(_foo: Foo<error>) {}
+  
+  fn main() {
+    use_foo(Bar {})
+  }
+---
+package main
+
+import (
+	"errors"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+type Foo[E error] interface {
+	get() lisette.Result[int, E]
+}
+
+type Bar struct{}
+
+func (b Bar) get() (int, error) {
+	return 0, errors.New("failure")
+}
+
+func useFoo(_ Foo[error]) {}
+
+func main() {
+	useFoo(_lisAdapter_Bar_Foo_0{inner: Bar{}})
+}
+
+type _lisAdapter_Bar_Foo_0 struct {
+	inner Bar
+}
+
+func (a _lisAdapter_Bar_Foo_0) get() lisette.Result[int, error] {
+	ret_1, ret_2 := a.inner.get()
+	if ret_2 != nil {
+		return lisette.MakeResultErr[int, error](ret_2)
+	} else {
+		return lisette.MakeResultOk[int, error](ret_1)
+	}
+}

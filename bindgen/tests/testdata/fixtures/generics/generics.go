@@ -1,5 +1,58 @@
 package generics
 
+import (
+	"cmp"
+	"fmt"
+)
+
+// Local method-only interface for cross-package and self-package bound tests.
+type Greeter interface {
+	Greet() string
+}
+
+// Type alias to a method-only interface — exercises *types.Alias path.
+type Salutation = Greeter
+
+// Bound by an external method-only interface (fmt.Stringer).
+func Shout[T fmt.Stringer](x T) string {
+	return "!" + x.String() + "!"
+}
+
+// Bound by a method-only interface declared in this package.
+func GreetAll[T Greeter](xs []T) string {
+	out := ""
+	for _, x := range xs {
+		out += x.Greet()
+	}
+	return out
+}
+
+// Bound by an alias of a method-only interface.
+func SalutationsAll[T Salutation](xs []T) {}
+
+// Method-set interface that embeds another interface (the hash.Hash shape).
+type LoudGreeter interface {
+	Greeter
+	Volume() int
+}
+
+// Bound by an embedding method-set interface — representable by name.
+func GreetLoud[T LoudGreeter](xs []T) {}
+
+// Bound by the predeclared error interface; the bare-T return must stay T.
+func FirstError[T error](errs []T) T {
+	var zero T
+	return zero
+}
+
+// Interface bound whose type argument is itself a shape-collapsed param.
+type Sink[T any] interface {
+	Drain(T)
+}
+
+// The `S ~[]E` collapse must reach the bound: `K: Sink<Slice<E>>`, not `Sink<S>`.
+func DrainAll[K Sink[S], S ~[]E, E any](k K, s S) {}
+
 // Basic generic types
 
 type Box[T any] struct {
@@ -86,4 +139,57 @@ func Swap[T, U any](a T, b U) (U, T) {
 // Inline union constraint with non-comparable types
 func Either[T []int | []string](v T) T {
 	return v
+}
+
+// cmp.Ordered constraint (named-identity recognizer)
+func MinOrdered[T cmp.Ordered](a, b T) T {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Slice-shape rewrite: S ~[]E with E: cmp.Ordered
+func SortInts[S ~[]E, E cmp.Ordered](x S) S {
+	return x
+}
+
+// Array-shape rewrite: A ~[4]E with E any.
+func Echo4[A ~[4]E, E any](x A) A {
+	return x
+}
+
+// Map-shape rewrite: single map, V any.
+func MapClone[M ~map[K]V, K comparable, V any](m M) M {
+	return m
+}
+
+// Map-shape rewrite: two maps, shared V (V any).
+func MapCopy[M1, M2 ~map[K]V, K comparable, V any](dst M1, src M2) {
+}
+
+// Map-shape rewrite: two maps, shared V (V comparable).
+func MapEqual[M1, M2 ~map[K]V, K, V comparable](m1 M1, m2 M2) bool {
+	return false
+}
+
+// Map-shape rewrite: two maps, distinct V.
+func MapEqualFunc[M1 ~map[K]V1, M2 ~map[K]V2, K comparable, V1, V2 any](m1 M1, m2 M2, eq func(V1, V2) bool) bool {
+	return false
+}
+
+// Generic interface used as a bound; type args must round-trip into the bound.
+type Pusher[T any, C any] interface {
+	Push(T, C)
+}
+
+// Generic interface bound with type params from the surrounding scope.
+func PushOne[T any, C any, P Pusher[T, C]](p P, t T, c C) {}
+
+// Generic interface bound with a concrete type arg.
+func PushInts[P Pusher[int, string]](p P) {}
+
+// Generic struct field that binds a type parameter to a generic interface.
+type Driver[T any, C any, P Pusher[T, C]] struct {
+	Inner P
 }

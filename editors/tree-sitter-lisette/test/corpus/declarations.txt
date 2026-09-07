@@ -57,6 +57,21 @@ let Some(x) = opt else { return }
       (return_expression))))
 
 ================================================================================
+Let-assert
+================================================================================
+
+let assert Ok(x) = result
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_declaration
+    pattern: (tuple_struct_pattern
+      type: (identifier)
+      (identifier))
+    value: (identifier)))
+
+================================================================================
 Const
 ================================================================================
 
@@ -179,26 +194,6 @@ enum Option { Some(int), None }
         name: (identifier)))))
 
 ================================================================================
-Value enum
-================================================================================
-
-enum Color: int { Red = 1, Blue = 2 }
-
---------------------------------------------------------------------------------
-
-(source_file
-  (value_enum_item
-    name: (type_identifier)
-    underlying_type: (type_identifier)
-    body: (value_enum_variant_list
-      (value_enum_variant
-        name: (identifier)
-        value: (integer_literal))
-      (value_enum_variant
-        name: (identifier)
-        value: (integer_literal)))))
-
-================================================================================
 Interface
 ================================================================================
 
@@ -210,6 +205,28 @@ interface Reader { fn read(self) -> int; }
   (interface_item
     name: (type_identifier)
     body: (interface_body
+      (function_signature_item
+        name: (identifier)
+        parameters: (parameters
+          (self_parameter))
+        return_type: (type_identifier)))))
+
+================================================================================
+Interface embedding
+================================================================================
+
+interface ReadWriter { embed Reader; embed Writer; fn flush(self) -> int; }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (interface_item
+    name: (type_identifier)
+    body: (interface_body
+      (interface_embedding
+        interface: (type_identifier))
+      (interface_embedding
+        interface: (type_identifier))
       (function_signature_item
         name: (identifier)
         parameters: (parameters
@@ -295,3 +312,229 @@ import _ "go:net/http/pprof"
   (import_declaration
     path: (string_literal
       (string_content))))
+
+================================================================================
+Struct with embedded fields
+================================================================================
+
+struct ReadWriter {
+  embed Ref<Reader>,
+  embed base,
+  pub size: int,
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (struct_item
+    (type_identifier)
+    (field_declaration_list
+      (struct_embedding
+        (generic_type
+          (type_identifier)
+          (type_arguments
+            (type_identifier))))
+      (struct_embedding
+        (type_identifier))
+      (field_declaration
+        (visibility_modifier)
+        (field_identifier)
+        (type_identifier)))))
+
+================================================================================
+Interface with attribute on method
+================================================================================
+
+interface Sealed {
+  fn Do() -> int
+  #[go(unexported, "pkg.private()")]
+  fn private()
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (interface_item
+    (type_identifier)
+    (interface_body
+      (function_signature_item
+        (identifier)
+        (parameters)
+        (type_identifier))
+      (attribute_item
+        (attribute
+          (identifier)
+          (attribute_arguments
+            (identifier)
+            (string_literal
+              (string_content)))))
+      (function_signature_item
+        (identifier)
+        (parameters)))))
+
+================================================================================
+Field named embed
+================================================================================
+
+struct S {
+  embed: int,
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (struct_item
+    (type_identifier)
+    (field_declaration_list
+      (field_declaration
+        (field_identifier)
+        (type_identifier)))))
+
+================================================================================
+File comment
+================================================================================
+
+//! Copyright 2026 Acme Corp.
+//! SPDX-License-Identifier: Apache-2.0
+
+fn main() {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (file_comment)
+  (file_comment)
+  (function_item
+    name: (identifier)
+    parameters: (parameters)
+    body: (block)))
+
+================================================================================
+Shebang
+================================================================================
+#!/usr/bin/env -S lis run
+
+fn main() {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (shebang)
+  (function_item
+    name: (identifier)
+    parameters: (parameters)
+    body: (block)))
+
+================================================================================
+Shebang above a file comment
+================================================================================
+#!/usr/bin/env -S lis run
+//! A tool.
+
+fn main() {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (shebang)
+  (file_comment)
+  (function_item
+    name: (identifier)
+    parameters: (parameters)
+    body: (block)))
+
+================================================================================
+Inner attribute is not a shebang
+================================================================================
+
+#![foo]
+fn main() {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (attribute_item
+    (ERROR)
+    (attribute
+      name: (identifier)))
+  (function_item
+    name: (identifier)
+    parameters: (parameters)
+    body: (block)))
+
+================================================================================
+Bare shebang names no interpreter, so it is not a shebang
+================================================================================
+#!
+fn main() {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (ERROR)
+  (function_item
+    name: (identifier)
+    parameters: (parameters)
+    body: (block)))
+
+================================================================================
+Shebang below byte zero is not a shebang
+================================================================================
+
+fn main() {}
+#!x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_item
+    name: (identifier)
+    parameters: (parameters)
+    body: (block))
+  (ERROR)
+  (expression_statement
+    (identifier)))
+
+================================================================================
+Parameter marker is not a permission
+================================================================================
+
+fn sort(mut items: Slice<int>) { }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_item
+    name: (identifier)
+    parameters: (parameters
+      (ERROR
+        (identifier))
+      (parameter
+        pattern: (identifier)
+        type: (generic_type
+          type: (type_identifier)
+          type_arguments: (type_arguments
+            (type_identifier)))))
+    body: (block)))
+
+================================================================================
+Receiver marker is not a permission
+================================================================================
+
+impl Counter {
+  fn bump(mut self) { }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (impl_item
+    type: (type_identifier)
+    body: (declaration_list
+      (function_item
+        name: (identifier)
+        parameters: (parameters
+          (ERROR
+            (identifier))
+          (self_parameter))
+        body: (block)))))

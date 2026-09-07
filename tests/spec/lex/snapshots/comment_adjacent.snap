@@ -1,6 +1,8 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: // first line\n// second line"
+description: |-
+  // first line
+  // second line
 ---
 LexResult {
     tokens: [
@@ -24,18 +26,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [
-            (
-                0,
-                13,
-            ),
-            (
-                14,
-                28,
-            ),
-        ],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

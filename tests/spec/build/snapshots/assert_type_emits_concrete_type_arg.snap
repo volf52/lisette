@@ -6,15 +6,14 @@ package main
 
 import (
 	"fmt"
-	lisette "github.com/ivov/lisette/prelude"
 	"github.com/user/myproject/store"
 )
 
 func main() {
-	raw := store.Get_value("count")
-	subject_1 := lisette.AssertType[int](raw)
-	if subject_1.Tag == lisette.OptionSome {
-		n := subject_1.SomeVal
+	raw := store.GetValue("count")
+	ret_1, ok_2 := raw.(int)
+	if ok_2 {
+		n := ret_1
 		fmt.Print(n)
 	} else {
 		fmt.Print("not an int")

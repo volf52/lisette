@@ -1,0 +1,51 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+import "github.com/user/myproject/phases"
+
+func main() {
+	total := 0
+	for range phases.BuildPhase_Variants() {
+		total++
+	}
+	_ = total
+}
+
+
+// === phases/mod.go ===
+package phases
+
+func MakeBuildPhaseValidate() BuildPhase {
+	return BuildPhase{Tag: BuildPhaseValidate}
+}
+
+func MakeBuildPhaseParse() BuildPhase {
+	return BuildPhase{Tag: BuildPhaseParse}
+}
+
+func MakeBuildPhaseCodegen() BuildPhase {
+	return BuildPhase{Tag: BuildPhaseCodegen}
+}
+
+type BuildPhaseTag uint8
+
+const (
+	BuildPhaseValidate BuildPhaseTag = iota
+	BuildPhaseParse
+	BuildPhaseCodegen
+)
+
+type BuildPhase struct {
+	Tag BuildPhaseTag
+}
+
+func BuildPhase_Variants() []BuildPhase {
+	return []BuildPhase{
+		{Tag: BuildPhaseValidate},
+		{Tag: BuildPhaseParse},
+		{Tag: BuildPhaseCodegen},
+	}
+}

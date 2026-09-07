@@ -1,14 +1,22 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test(opt: Option<int>) -> int {\n  let result = if let Some(x) = opt { x } else { 0 };\n  result\n}\n"
+description: |
+  
+  fn test(opt: Option<int>) -> int {
+    let result = if let Some(x) = opt { x } else { 0 };
+    result
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
 func test(opt lisette.Option[int]) int {
+	var result int
 	if opt.Tag == lisette.OptionSome {
-		return opt.SomeVal
+		result = opt.SomeVal
+	} else {
+		result = 0
 	}
-	return 0
+	return result
 }

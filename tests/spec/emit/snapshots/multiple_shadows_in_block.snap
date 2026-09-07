@@ -1,13 +1,25 @@
 ---
 source: tests/spec/emit/patterns.rs
-description: "input: \nfn test() -> int {\n  let x = 5\n  {\n    let x = x * 2\n    let x = x + 100\n    x\n  }\n}\n"
+description: |
+  
+  fn test() -> int {
+    let x = 5
+    {
+      let x = x * 2
+      let x = x + 100
+      x
+    }
+  }
 ---
 package main
 
 func test() int {
 	x := 5
+	var tmp_1 int
 	{
 		x := x * 2
-		return x + 100
+		x_2 := x + 100
+		tmp_1 = x_2
 	}
+	return tmp_1
 }

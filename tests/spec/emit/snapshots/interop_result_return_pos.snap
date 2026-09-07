@@ -1,6 +1,21 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:strconv\"\n\nfn make_parser() -> fn(string) -> Result<int, error> {\n  strconv.Atoi\n}\n\nfn main() {\n  let f = make_parser()\n  let r = f(\"42\")\n  match r {\n    Ok(v) => { let _ = v },\n    Err(_) => { let _ = 0 },\n  }\n}\n"
+description: |
+  
+  import "go:strconv"
+  
+  fn make_parser() -> fn(string) -> Result<int, error> {
+    strconv.Atoi
+  }
+  
+  fn main() {
+    let f = make_parser()
+    let r = f("42")
+    match r {
+      Ok(v) => { let _ = v },
+      Err(_) => { let _ = 0 },
+    }
+  }
 ---
 package main
 
@@ -9,22 +24,20 @@ import (
 	"strconv"
 )
 
-func make_parser() func(string) lisette.Result[int, error] {
-	return func(arg0 string) lisette.Result[int, error] {
-		ret_1, ret_2 := strconv.Atoi(arg0)
-		if ret_2 != nil {
-			return lisette.MakeResultErr[int, error](ret_2)
-		}
-		return lisette.MakeResultOk[int, error](ret_1)
-	}
+func makeParser() func(string) (int, error) {
+	return strconv.Atoi
 }
 
 func main() {
-	f := make_parser()
-	r := f("42")
+	f := makeParser()
+	ret_1, ret_2 := f("42")
+	var r lisette.Result[int, error]
+	if ret_2 != nil {
+		r = lisette.MakeResultErr[int, error](ret_2)
+	} else {
+		r = lisette.MakeResultOk[int, error](ret_1)
+	}
 	if r.Tag == lisette.ResultOk {
 		_ = r.OkVal
-	} else {
-		_ = 0
 	}
 }

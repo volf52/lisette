@@ -2,30 +2,37 @@ mod agents_md;
 mod command;
 mod go_cli;
 mod handlers;
+mod lock;
 mod output;
 mod panic;
+mod reference;
+mod shell_words;
 mod typedef_regen;
+mod typedef_scan;
 mod workspace;
 
 use command::Command;
+use std::env;
+use std::path::Path;
+use std::process;
 
 fn main() {
     panic::add_handler();
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = env::args().collect();
 
-    let command = match Command::parse(args) {
+    let command = match Command::parse(args, |path| Path::new(path).is_file()) {
         Ok(command) => command,
         Err(command::ParseError::MissingArgument { command, argument }) => {
             cli_error!(
                 "Missing argument",
-                format!("`lis {}` requires `<{}>` argument", command, argument),
+                format!("`lis {}` requires `{}`", command, argument),
                 format!("Run `lis help {}` for usage", command)
             );
-            std::process::exit(1);
+            process::exit(1);
         }
         Err(command::ParseError::UnknownCommand(cmd)) => {
-            let hint = match command::Command::suggest(&cmd) {
+            let hint = match Command::suggest(&cmd) {
                 Some(suggestion) => format!("Did you mean `{}`?", suggestion),
                 None => "Run `lis help` for available commands".to_string(),
             };
@@ -34,7 +41,7 @@ fn main() {
                 format!("`{}` is not a lis command", cmd),
                 hint
             );
-            std::process::exit(1);
+            process::exit(1);
         }
         Err(command::ParseError::UnknownFlag(flag)) => {
             cli_error!(
@@ -42,7 +49,7 @@ fn main() {
                 format!("`{}` is not a valid flag", flag),
                 "Run `lis help` for available flags"
             );
-            std::process::exit(1);
+            process::exit(1);
         }
         Err(command::ParseError::UnexpectedArgument {
             message,
@@ -50,29 +57,52 @@ fn main() {
             hint,
         }) => {
             cli_error!(message, reason, hint);
-            std::process::exit(1);
+            process::exit(1);
         }
     };
 
     let exit_code = match command {
         Command::New { name } => handlers::new_project(&name),
-        Command::Build { path, debug } => handlers::build(path, debug, false),
+        Command::Build {
+            path,
+            sourcemap,
+            go_flags,
+            output,
+            target,
+        } => handlers::build(path, sourcemap, go_flags, output, target),
+        Command::Emit {
+            path,
+            sourcemap,
+            output,
+            target,
+        } => handlers::emit(path, sourcemap, output, target),
         Command::Run {
             target,
             args,
-            debug,
-        } => handlers::run(target, args, debug),
+            sourcemap,
+            go_flags,
+        } => handlers::run(target, args, sourcemap, go_flags),
         Command::Format { path, check } => handlers::format(path, check),
         Command::Check {
             path,
-            errors_only,
-            warnings_only,
-        } => handlers::check(path, errors_only, warnings_only),
-        Command::Clean { path } => handlers::clean(path),
+            filter,
+            action,
+            format,
+            target,
+        } => handlers::check(path, filter, action, format, target),
+        Command::Test {
+            path,
+            go_flags,
+            selection,
+        } => handlers::test(path, go_flags, selection),
+        Command::Overview => {
+            handlers::help::print_main_help();
+            0
+        }
         Command::Help { command } => {
             match command {
                 Some(cmd) => handlers::help::print_command_help(&cmd),
-                None => handlers::help::print_main_help(),
+                None => handlers::help::print_help_prompt(),
             }
             0
         }
@@ -80,19 +110,26 @@ fn main() {
             handlers::help::print_version();
             0
         }
-        Command::Add { dependency } => handlers::add(&dependency),
+        Command::Add {
+            dependency,
+            replace,
+            path,
+            script,
+        } => handlers::add(
+            dependency.as_deref(),
+            replace.as_deref(),
+            path.as_deref(),
+            script.as_deref(),
+        ),
+        Command::Sync { script } => handlers::sync(script.as_deref()),
         Command::Lsp => handlers::lsp(),
-        Command::Bindgen {
-            package,
-            output,
-            version,
-            verbose,
-        } => handlers::bindgen(&package, output, version, verbose),
+        Command::Bindgen { target, verbose } => handlers::bindgen(target, verbose),
         Command::Doc { query } => handlers::doc(query),
         Command::DocSearch { query } => handlers::doc_search(&query),
         Command::Learn => handlers::learn(),
         Command::Completions { shell } => handlers::completions(shell),
+        Command::Upgrade => handlers::upgrade(),
     };
 
-    std::process::exit(exit_code);
+    process::exit(exit_code);
 }

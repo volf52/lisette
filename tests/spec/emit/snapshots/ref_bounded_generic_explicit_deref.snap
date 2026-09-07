@@ -1,10 +1,27 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \ninterface Greetable {\n  fn greet(self) -> string\n}\n\nstruct Person { name: string }\n\nimpl Person {\n  fn greet(self) -> string { f\"Hello, {self.name}\" }\n}\n\nfn greet_ref<T: Greetable>(item: Ref<T>) -> string {\n  item.*.greet()\n}\n\nfn test() {\n  let p = Person { name: \"Alice\" }\n  greet_ref(&p)\n}\n"
+description: |
+  
+  interface Greetable {
+    fn greet() -> string
+  }
+  
+  struct Person { name: string }
+  
+  impl Person {
+    fn greet(self) -> string { f"Hello, {self.name}" }
+  }
+  
+  fn greet_ref<T: Greetable>(item: Ref<T>) -> string {
+    item.*.greet()
+  }
+  
+  fn test() {
+    let p = Person { name: "Alice" }
+    greet_ref(&p)
+  }
 ---
 package main
-
-import "fmt"
 
 type Greetable interface {
 	greet() string
@@ -14,19 +31,15 @@ type Person struct {
 	name string
 }
 
-func (p Person) String() string {
-	return fmt.Sprintf("Person { name: %v }", p.name)
-}
-
 func (p Person) greet() string {
-	return fmt.Sprintf("Hello, %v", p.name)
+	return "Hello, " + p.name
 }
 
-func greet_ref[T Greetable](item T) string {
+func greetRef[T Greetable](item T) string {
 	return item.greet()
 }
 
 func test() {
 	p := Person{name: "Alice"}
-	greet_ref(&p)
+	_ = greetRef(&p)
 }

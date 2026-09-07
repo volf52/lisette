@@ -1,6 +1,15 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nimport \"go:fmt\"\n\nfn get() -> Slice<int> { [1] }\nfn arg() -> int { let _ = fmt.Println(1); 2 }\n\nfn main() {\n  get().append(arg())\n}\n"
+description: |
+  
+  import "go:fmt"
+  
+  fn get() -> Slice<int> { [1] }
+  fn arg() -> int { let _ = fmt.Println(1); 2 }
+  
+  fn main() {
+    get().append(arg())
+  }
 ---
 package main
 
@@ -16,5 +25,6 @@ func arg() int {
 }
 
 func main() {
-	_ = append(get(), arg())
+	recv_1 := get()
+	_ = append(recv_1[:len(recv_1):len(recv_1)], arg())
 }

@@ -11,6 +11,7 @@ enum TokenType {
     ERROR_SENTINEL,
     OPEN_ANGLE,
     BANG,
+    INTERPOLATION_OPEN,
 };
 
 void *tree_sitter_lisette_external_scanner_create() { return NULL; }
@@ -185,6 +186,13 @@ static inline bool scan_open_angle(TSLexer *lexer) {
             depth++;
             has_content = true;
             skip(lexer);
+        } else if (lexer->lookahead == '-') {
+            // A function type's `->` arrow: its '>' is not a closing angle.
+            skip(lexer);
+            if (lexer->lookahead == '>') {
+                skip(lexer);
+            }
+            has_content = true;
         } else if (lexer->lookahead == '>') {
             depth--;
             if (depth == 0) {
@@ -197,12 +205,12 @@ static inline bool scan_open_angle(TSLexer *lexer) {
                 return lexer->lookahead == '(' && has_content;
             }
             skip(lexer);
-        } else if (lexer->lookahead == '(' || lexer->lookahead == ')' ||
-                   lexer->lookahead == '{' || lexer->lookahead == '}' ||
+        } else if (lexer->lookahead == '{' || lexer->lookahead == '}' ||
                    lexer->lookahead == ';' || lexer->lookahead == '=' ||
                    lexer->lookahead == '!' || lexer->lookahead == '/' ||
                    lexer->lookahead == '"' || lexer->lookahead == '\'') {
-            // Characters that can't appear in type arguments
+            // Characters that can't appear in type arguments. Parens are
+            // allowed: function types like fn(int) -> int contain them.
             return false;
         } else if (lexer->lookahead == 0) {
             return false;
@@ -283,7 +291,23 @@ static inline bool scan_automatic_semicolon(TSLexer *lexer) {
 
         case '|': // |> and || continue, but bare | is closure
             advance(lexer);
-            return lexer->lookahead != '>' && lexer->lookahead != '|';
+            if (lexer->lookahead == '>') {
+                return false;
+            }
+            if (lexer->lookahead == '|') {
+                // `|| ->` is an empty closure with a return type, never
+                // binary or (mirrors PipeDouble+Arrow in the Pratt parser).
+                advance(lexer);
+                while (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
+                    advance(lexer);
+                }
+                if (lexer->lookahead == '-') {
+                    advance(lexer);
+                    return lexer->lookahead == '>';
+                }
+                return false;
+            }
+            return true;
 
         case '&': // && continues, but bare & is reference (prefix)
             advance(lexer);
@@ -296,6 +320,119 @@ static inline bool scan_automatic_semicolon(TSLexer *lexer) {
         default:
             return true;
     }
+}
+
+// Mutually recursive: interpolation can contain f-strings can contain interpolation.
+static bool peek_through_interpolation(TSLexer *lexer, int depth);
+
+// Skips a quoted span. allow_escapes is false for backticks (Go raw-string semantics).
+static bool skip_past_quoted(TSLexer *lexer, int32_t delim, bool allow_escapes) {
+    skip(lexer); // opening delim
+    while (!lexer->eof(lexer)) {
+        int32_t c = lexer->lookahead;
+        if (c == '\n') return false;
+        if (allow_escapes && c == '\\') {
+            skip(lexer);
+            if (lexer->eof(lexer)) return false;
+            skip(lexer);
+            continue;
+        }
+        if (c == delim) {
+            skip(lexer);
+            return true;
+        }
+        skip(lexer);
+    }
+    return false;
+}
+
+// Lexer is just past the opening `"` of an f-string.
+static bool skip_past_fstring_body(TSLexer *lexer, int depth) {
+    while (!lexer->eof(lexer)) {
+        int32_t c = lexer->lookahead;
+        if (c == '\n') return false;
+        if (c == '\\') {
+            skip(lexer);
+            if (lexer->eof(lexer)) return false;
+            skip(lexer);
+            continue;
+        }
+        if (c == '{') {
+            skip(lexer);
+            if (lexer->lookahead == '{') {
+                skip(lexer);
+                continue;
+            }
+            if (!peek_through_interpolation(lexer, depth + 1)) return false;
+            continue;
+        }
+        if (c == '}') {
+            skip(lexer);
+            if (lexer->lookahead == '}') skip(lexer);
+            continue;
+        }
+        if (c == '"') {
+            skip(lexer);
+            return true;
+        }
+        skip(lexer);
+    }
+    return false;
+}
+
+// Lexer is just past `{`. Mirrors `scan_interpolation` in crates/syntax/src/lex/mod.rs.
+static bool peek_through_interpolation(TSLexer *lexer, int depth) {
+    if (depth > 16) return false;
+    int brace_depth = 1;
+    while (brace_depth > 0) {
+        if (lexer->eof(lexer)) return false;
+        int32_t c = lexer->lookahead;
+
+        if (c == '\n') return false;
+        if (c == '{') { brace_depth++; skip(lexer); continue; }
+        if (c == '}') { brace_depth--; skip(lexer); continue; }
+        if (c == '"' || c == '\'') {
+            if (!skip_past_quoted(lexer, c, true)) return false;
+            continue;
+        }
+        if (c == '`') {
+            if (!skip_past_quoted(lexer, c, false)) return false;
+            continue;
+        }
+        if (c == 'f') {
+            skip(lexer);
+            if (lexer->lookahead == '"') {
+                skip(lexer); // opening "
+                if (!skip_past_fstring_body(lexer, depth)) return false;
+            }
+            continue;
+        }
+        if (c == '\\') {
+            skip(lexer);
+            if (lexer->eof(lexer)) return false;
+            skip(lexer);
+            continue;
+        }
+        if (c == '/') {
+            skip(lexer);
+            if (lexer->lookahead == '/') return false;
+            continue;
+        }
+        skip(lexer);
+    }
+    return true;
+}
+
+// Refuses `{` when the body would span newlines, mirroring the Lisette compiler's
+// `lex.format_string_multiline_interpolation` rejection.
+static inline bool scan_interpolation_open(TSLexer *lexer) {
+    if (lexer->lookahead != '{') return false;
+    advance(lexer);
+    if (lexer->lookahead == '{') return false; // {{ is an escaped brace, not interpolation
+    lexer->mark_end(lexer);
+    if (!peek_through_interpolation(lexer, 1)) return false;
+    lexer->result_symbol = INTERPOLATION_OPEN;
+    return true;
 }
 
 // Scan `!` as an external token to avoid internal lexer conflict with `!=`
@@ -321,7 +458,13 @@ bool tree_sitter_lisette_external_scanner_scan(
         return scan_string_content(lexer);
     }
 
-    // Format string content
+    // Try INTERPOLATION_OPEN before FORMAT_STRING_CONTENT — at a bare `{` the
+    // latter would return false and starve the dispatch of a chance to emit `{`.
+    if (valid_symbols[INTERPOLATION_OPEN] && lexer->lookahead == '{') {
+        if (scan_interpolation_open(lexer)) return true;
+        // Fall through for the `{{` case so format_string_content can consume the escape.
+    }
+
     if (valid_symbols[FORMAT_STRING_CONTENT] && !valid_symbols[FLOAT_LITERAL]) {
         return scan_format_string_content(lexer);
     }

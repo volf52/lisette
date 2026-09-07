@@ -1,6 +1,12 @@
 ---
 source: tests/spec/emit/concurrency.rs
-description: "input: \nfn test() {\n  let ch = Channel.new<int>();\n  let (tx, rx) = ch.split();\n  tx.send(42);\n}\n"
+description: |
+  
+  fn test() {
+    let ch = Channel.new<int>();
+    let (tx, rx) = ch.split();
+    tx.send(42);
+  }
 ---
 package main
 
@@ -10,5 +16,5 @@ func test() {
 	ch := make(chan int)
 	tmp_1 := lisette.ChannelSplit(ch)
 	tx := tmp_1.First
-	lisette.SenderSend(tx, 42)
+	_ = lisette.SenderSend(tx, 42)
 }

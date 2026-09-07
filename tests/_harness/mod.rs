@@ -10,72 +10,77 @@ pub mod pipeline;
 pub mod wrap;
 
 pub use builders::*;
-pub use emit::emit_with_debug_info;
+pub use emit::{emit_with_go_typedefs, emit_with_sourcemap};
 pub use filesystem::MockFileSystem;
-pub use infer::{InferResult, infer, infer_module};
+pub use formatting::snapshot_description;
+pub use infer::{InferResult, infer, infer_package, infer_with_go_typedefs};
+use syntax::program::ValueKind;
 
-pub const TEST_MODULE_ID: &str = "test";
+pub const TEST_PACKAGE_ID: &str = "test";
 
-use diagnostics::DiagnosticSink;
-use semantics::checker::Checker;
-use semantics::prelude::parse_and_register_prelude;
+use std::sync::OnceLock;
+
+use diagnostics::LocalSink;
+use semantics::prelude::{parse_and_register_prelude, parse_and_register_test_prelude};
 use semantics::store::Store;
-use syntax::program::{Definition, Visibility};
-use syntax::types::Type;
+use syntax::program::{Definition, DefinitionBody, Visibility};
+use syntax::types::{CompoundKind, FunctionParameter, Type};
 
-pub fn init_prelude(store: &mut Store) {
-    let sink = DiagnosticSink::new();
-    parse_and_register_prelude(store, &sink);
+pub fn new_test_store() -> Store {
+    static TEMPLATE: OnceLock<Store> = OnceLock::new();
+
+    TEMPLATE
+        .get_or_init(|| {
+            let mut store = Store::new();
+            let sink = LocalSink::new();
+            parse_and_register_prelude(&mut store, &sink);
+            parse_and_register_test_prelude(&mut store, &sink);
+            register_test_builtins(&mut store);
+            store
+        })
+        .clone()
 }
 
-pub fn register_test_builtins(checker: &mut Checker) {
-    let module_id = "prelude";
-    let module = checker
-        .store
-        .modules
-        .get_mut(module_id)
-        .expect("prelude module must exist");
+fn register_test_builtins(store: &mut Store) {
+    let package = store
+        .get_package_mut("prelude")
+        .expect("prelude package must exist");
 
-    let unknown_type = Type::Constructor {
+    let mut define = |name: &str, params: Vec<Type>, return_type: Type| {
+        package.definitions.insert(
+            format!("prelude.{name}").into(),
+            Definition {
+                visibility: Visibility::Public,
+                ty: Type::function(
+                    params.into_iter().map(FunctionParameter::new).collect(),
+                    vec![],
+                    Box::new(return_type),
+                ),
+                name_span: None,
+                doc: None,
+                body: DefinitionBody::Value {
+                    kind: ValueKind::Runtime,
+                    allowed_lints: vec![],
+                    go_hints: vec![],
+                    go_name: None,
+                    go_type_param_recipe: None,
+                    superseded_by: None,
+                },
+            },
+        );
+    };
+
+    let unknown = Type::Nominal {
         id: "prelude.Unknown".into(),
         params: vec![],
-        underlying_ty: None,
+        writable: false,
     };
-    let get_unknown_ty = Type::Function {
-        params: vec![],
-        param_mutability: vec![],
-        bounds: vec![],
-        return_type: Box::new(unknown_type.clone()),
-    };
-    module.definitions.insert(
-        "prelude.get_unknown".into(),
-        Definition::Value {
-            visibility: Visibility::Public,
-            ty: get_unknown_ty,
-            name_span: None,
-            allowed_lints: vec![],
-            go_hints: vec![],
-            go_name: None,
-            doc: None,
-        },
-    );
+    let unknown_map = Type::compound(CompoundKind::Map, vec![string_type(), unknown.clone()]);
+    let unknown_slice = slice_type(unknown.clone());
 
-    let takes_unknown_ty = Type::Function {
-        params: vec![unknown_type],
-        param_mutability: vec![false],
-        bounds: vec![],
-        return_type: Box::new(Type::unit()),
-    };
-    module.definitions.insert(
-        "prelude.takes_unknown".into(),
-        Definition::Value {
-            visibility: Visibility::Public,
-            ty: takes_unknown_ty,
-            name_span: None,
-            allowed_lints: vec![],
-            go_hints: vec![],
-            go_name: None,
-            doc: None,
-        },
-    );
+    define("get_unknown", vec![], unknown.clone());
+    define("takes_unknown", vec![unknown], Type::unit());
+    define("get_unknown_map", vec![], unknown_map.clone());
+    define("takes_unknown_map", vec![unknown_map], Type::unit());
+    define("takes_unknown_slice", vec![unknown_slice], Type::unit());
 }

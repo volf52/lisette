@@ -1,14 +1,30 @@
 use crate::ast::{self, Span};
+use crate::attributes::has_test_attribute;
 use crate::lex;
 use crate::lex::TokenKind::*;
 use crate::lex::{Token, TokenKind};
 use crate::types::Type;
+use std::borrow::Cow;
+use std::ops::{Deref, DerefMut};
+use std::string;
 
-pub const MAX_TUPLE_ARITY: usize = 5;
+pub(crate) const MAX_TUPLE_ARITY: usize = 5;
 pub const TUPLE_FIELDS: &[&str] = &["First", "Second", "Third", "Fourth", "Fifth"];
+pub const IMPORT_AFTER_ITEM_CODE: &str = "parse.import_after_item";
 const MAX_DEPTH: u32 = 64;
 const MAX_ERRORS: usize = 50;
 const MAX_LOOKAHEAD: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamMode {
+    Strict,
+    TestFunction,
+}
+
+struct TypeArgsScan {
+    end: usize,
+    crossed_newline: bool,
+}
 
 mod annotations;
 mod control_flow;
@@ -19,28 +35,66 @@ mod expressions;
 mod identifiers;
 mod patterns;
 mod pratt;
+mod strings;
 
 pub use error::ParseError;
 
 pub struct ParseResult {
     pub ast: Vec<ast::Expression>,
     pub errors: Vec<ParseError>,
+    pub file_comment: Option<string::String>,
+    pub truncated: bool,
+    pub status: FileParseStatus,
+}
+
+/// How much of a file survived parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileParseStatus {
+    #[default]
+    Clean,
+    Recovered,
+    Failed,
 }
 
 impl ParseResult {
-    pub fn failed(&self) -> bool {
+    pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
 }
 
 pub struct Parser<'source> {
     stream: TokenStream<'source>,
-    previous_token: Token<'source>,
-    pub errors: Vec<ParseError>,
+    errors: Vec<ParseError>,
     file_id: u32,
-    in_control_flow_header: bool,
     source: &'source str,
     depth: u32,
+}
+
+/// A recursion frame owns the parser depth it opened and restores the previous
+/// depth even when parsing exits early or panics.
+struct RecursionScope<'parser, 'source> {
+    parser: &'parser mut Parser<'source>,
+    previous_depth: u32,
+}
+
+impl<'parser, 'source> Deref for RecursionScope<'parser, 'source> {
+    type Target = Parser<'source>;
+
+    fn deref(&self) -> &Self::Target {
+        self.parser
+    }
+}
+
+impl<'parser, 'source> DerefMut for RecursionScope<'parser, 'source> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.parser
+    }
+}
+
+impl Drop for RecursionScope<'_, '_> {
+    fn drop(&mut self) {
+        self.parser.depth = self.previous_depth;
+    }
 }
 
 impl<'source> Parser<'source> {
@@ -55,6 +109,9 @@ impl<'source> Parser<'source> {
             return ParseResult {
                 ast: vec![],
                 errors: lex_result.errors,
+                file_comment: None,
+                truncated: true,
+                status: FileParseStatus::Failed,
             };
         }
 
@@ -67,32 +124,38 @@ impl<'source> Parser<'source> {
         file_id: u32,
     ) -> Parser<'source> {
         let stream = TokenStream::new(tokens);
-        let first_token = stream.peek();
 
-        let mut parser = Parser {
+        Parser {
             stream,
-            previous_token: first_token,
             errors: Default::default(),
             file_id,
-            in_control_flow_header: false,
             source,
             depth: 0,
-        };
-
-        parser.skip_comments();
-
-        parser
+        }
     }
 
     pub fn parse(mut self) -> ParseResult {
         let mut top_items = vec![];
+        let mut seen_non_import = false;
 
+        let shebang_end = self.consume_shebang();
+        let file_comment = self.collect_file_comments(shebang_end);
         self.skip_comments();
 
         while !self.at_eof() && !self.too_many_errors() {
             let position = self.position();
             let item = self.parse_top_item();
             if !matches!(item, ast::Expression::Unit { .. }) {
+                if let ast::Expression::PackageImport {
+                    span, name_span, ..
+                } = &item
+                {
+                    if seen_non_import {
+                        self.error_import_after_item(*span, *name_span);
+                    }
+                } else {
+                    seen_non_import = true;
+                }
                 top_items.push(item);
             }
             self.advance_if(Semicolon);
@@ -101,13 +164,23 @@ impl<'source> Parser<'source> {
             }
         }
 
+        let truncated = !self.at_eof();
+        let status = if self.errors.is_empty() {
+            FileParseStatus::Clean
+        } else {
+            FileParseStatus::Recovered
+        };
+
         ParseResult {
             ast: top_items,
             errors: self.errors,
+            file_comment,
+            truncated,
+            status,
         }
     }
 
-    pub fn parse_top_item(&mut self) -> ast::Expression {
+    fn parse_top_item(&mut self) -> ast::Expression {
         let doc_with_span = self.collect_doc_comments();
 
         let attributes = self.parse_attributes();
@@ -122,13 +195,21 @@ impl<'source> Parser<'source> {
             self.next();
         }
 
-        if is_public && self.is(Impl) {
-            let token = pub_token.unwrap();
-            let span = ast::Span::new(self.file_id, token.byte_offset, token.byte_length);
-            let error = ParseError::new("Misplaced `pub`", span, "not allowed here")
-                .with_parse_code("syntax_error")
-                .with_help("Place `pub` on individual methods inside the `impl` block instead");
-            self.errors.push(error);
+        if let Some(token) = pub_token {
+            let span = Span::new(self.file_id, token.byte_offset, token.byte_length);
+            match self.current_token().kind {
+                Impl => self.error_misplaced_pub(
+                    span,
+                    "syntax_error",
+                    "Place `pub` on individual methods inside the `impl` block instead",
+                ),
+                Import => self.error_misplaced_pub(
+                    span,
+                    "pub_import",
+                    "An import is always private to the file that declares it. Remove `pub`",
+                ),
+                _ => {}
+            }
         }
 
         let is_documentable = matches!(
@@ -144,22 +225,36 @@ impl<'source> Parser<'source> {
 
         let doc = doc_with_span.map(|(text, _)| text);
 
+        if !matches!(self.current_token().kind, Enum | Struct | Function | Type)
+            && let Some(attribute) = attributes.first()
+        {
+            self.error_misplaced_attribute(attribute.span);
+        }
+
         let expression = match self.current_token().kind {
             Enum => self.parse_enum_definition(doc, attributes),
             Struct => self.parse_struct_definition(doc, attributes),
             Interface => self.parse_interface_definition(doc),
-            Function => self.parse_function(doc, attributes),
+            Function => {
+                // Only a top-level `#[test]` declaration may write a bare handle parameter.
+                let mode = if has_test_attribute(&attributes) {
+                    ParamMode::TestFunction
+                } else {
+                    ParamMode::Strict
+                };
+                self.parse_function(doc, attributes, mode)
+            }
             Impl => self.parse_impl_block(),
             Const => self.parse_const_definition(doc),
             Var => self.parse_var_declaration(doc),
             Import => self.parse_import(),
-            Type => self.parse_type_alias_with_doc(doc),
+            Type => self.parse_type_alias_with_doc(doc, attributes),
             Comment => {
                 let start = self.current_token();
                 self.skip_comments();
                 ast::Expression::Unit {
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
             _ => self.unexpected_token("top_item"),
@@ -172,7 +267,7 @@ impl<'source> Parser<'source> {
         expression
     }
 
-    pub fn parse_block_item(&mut self) -> ast::Expression {
+    fn parse_block_item(&mut self) -> ast::Expression {
         match self.current_token().kind {
             Enum => {
                 self.track_error(
@@ -193,7 +288,7 @@ impl<'source> Parser<'source> {
                     "misplaced",
                     "Move this type alias to the top level of the file.",
                 );
-                self.parse_type_alias_with_doc(None)
+                self.parse_type_alias_with_doc(None, vec![])
             }
             Import => {
                 self.track_error(
@@ -216,17 +311,33 @@ impl<'source> Parser<'source> {
                 );
                 self.parse_interface_definition(None)
             }
-            Function => self.parse_function(None, vec![]),
+            Function => self.parse_function(None, vec![], ParamMode::Strict),
             Const => self.parse_const_definition(None),
 
+            Hash => {
+                let attributes = self.parse_attributes();
+                if let Some(attribute) = attributes.first() {
+                    self.error_misplaced_attribute(attribute.span);
+                }
+                if self.is(RightCurlyBrace) || self.at_eof() {
+                    ast::Expression::Unit {
+                        ty: Type::uninferred(),
+                        span: self.span_from_token(self.current_token()),
+                    }
+                } else {
+                    self.parse_block_item()
+                }
+            }
+
             Let => self.parse_let(),
-            Return => self.parse_return(),
+            Return => self.parse_return(true),
             For => self.parse_for(),
             While => self.parse_while(),
             Loop => self.parse_loop(),
             Break => self.parse_break(),
             Continue => self.parse_continue(),
             Defer => self.parse_defer(),
+            Assert => self.parse_assert(),
             Directive => self.parse_directive(),
             _ => self.parse_assignment(),
         }
@@ -237,7 +348,8 @@ impl<'source> Parser<'source> {
     }
 
     fn newline_before_current(&self) -> bool {
-        let prev_end = (self.previous_token.byte_offset + self.previous_token.byte_length) as usize;
+        let previous = self.stream.previous();
+        let prev_end = (previous.byte_offset + previous.byte_length) as usize;
         let curr_start = self.current_token().byte_offset as usize;
         if prev_end <= curr_start && curr_start <= self.source.len() {
             return self.source[prev_end..curr_start].contains('\n');
@@ -246,21 +358,81 @@ impl<'source> Parser<'source> {
     }
 
     fn next(&mut self) {
-        self.previous_token = self.current_token();
         self.stream.consume();
         self.skip_comments();
     }
 
     fn skip_comments(&mut self) {
         while self.is(Comment) {
-            self.previous_token = self.current_token();
             self.stream.consume();
+        }
+        if self.is(FileComment) {
+            self.error_misplaced_file_comment();
         }
     }
 
-    fn collect_doc_comments(&mut self) -> Option<(std::string::String, ast::Span)> {
+    fn consume_shebang(&mut self) -> Option<u32> {
+        if !self.is(Shebang) {
+            return None;
+        }
+
+        let token = self.current_token();
+        self.stream.consume();
+        Some(token.end_offset())
+    }
+
+    fn opens_file_header(&self, offset: u32, shebang_end: Option<u32>) -> bool {
+        match shebang_end {
+            None => offset == 0,
+            Some(end) => self
+                .source
+                .get(end as usize..offset as usize)
+                .is_some_and(|between| {
+                    between.chars().all(char::is_whitespace)
+                        && between.bytes().filter(|&byte| byte == b'\n').count() <= 2
+                }),
+        }
+    }
+
+    fn collect_file_comments(&mut self, shebang_end: Option<u32>) -> Option<string::String> {
         let mut docs = Vec::new();
-        let mut first_span: Option<ast::Span> = None;
+        let mut previous_end: Option<u32> = None;
+
+        while self.is(FileComment) {
+            let token = self.current_token();
+            match previous_end {
+                None if !self.opens_file_header(token.byte_offset, shebang_end) => {
+                    self.error_misplaced_file_comment_at(self.span_from_token(token));
+                }
+                Some(end)
+                    if self.source[end as usize..token.byte_offset as usize]
+                        .bytes()
+                        .filter(|&byte| byte == b'\n')
+                        .count()
+                        > 1 =>
+                {
+                    self.error_split_file_comment(self.span_from_token(token));
+                }
+                _ => {}
+            }
+            if is_go_build_constraint(token.text) {
+                self.error_file_comment_build_constraint(self.span_from_token(token));
+            }
+            docs.push(token.text.to_string());
+            previous_end = Some(token.byte_offset + token.byte_length);
+            self.stream.consume();
+        }
+
+        if docs.is_empty() {
+            None
+        } else {
+            Some(docs.join("\n"))
+        }
+    }
+
+    fn collect_doc_comments(&mut self) -> Option<(string::String, Span)> {
+        let mut docs = Vec::new();
+        let mut first_span: Option<Span> = None;
 
         while self.is(DocComment) {
             let token = self.current_token();
@@ -268,7 +440,6 @@ impl<'source> Parser<'source> {
                 first_span = Some(self.span_from_token(token));
             }
             docs.push(token.text.to_string());
-            self.previous_token = token;
             self.stream.consume();
             self.skip_comments();
         }
@@ -291,17 +462,19 @@ impl<'source> Parser<'source> {
             "Add a comma between elements.",
         );
 
-        loop {
-            if self.at_eof() || self.is(Comma) || self.is(closing) || self.at_item_boundary() {
-                break;
-            }
+        self.recover_to_comma_or(closing);
+    }
+
+    fn recover_to_comma_or(&mut self, closing: TokenKind) {
+        while !self.at_eof() && !self.is(Comma) && !self.is(closing) && !self.at_recovery_boundary()
+        {
             self.next();
         }
 
         self.advance_if(Comma);
     }
 
-    pub fn at_eof(&self) -> bool {
+    fn at_eof(&self) -> bool {
         self.is(EOF)
     }
 
@@ -342,59 +515,85 @@ impl<'source> Parser<'source> {
         self.next();
     }
 
+    fn ensure_in_place(&mut self, token_kind: TokenKind) -> bool {
+        if self.is(token_kind) {
+            self.next();
+            return true;
+        }
+
+        self.track_ensure_error(token_kind);
+        false
+    }
+
     fn ensure_progress(&mut self, start_position: usize, closing: TokenKind) {
         if self.stream.position == start_position && self.is_not(closing) && !self.at_eof() {
             self.next();
         }
     }
 
-    fn span_from_token(&self, token: Token<'source>) -> ast::Span {
-        ast::Span::new(self.file_id, token.byte_offset, token.byte_length)
+    fn is_right_angle_like(&self) -> bool {
+        matches!(self.current_token().kind, RightAngleBracket | ShiftRight)
     }
 
-    fn span_from_tokens(&self, start_token: Token<'source>) -> ast::Span {
-        let end_byte_offset = self.previous_token.byte_offset + self.previous_token.byte_length;
-        let byte_length = end_byte_offset.saturating_sub(start_token.byte_offset);
-
-        ast::Span::new(self.file_id, start_token.byte_offset, byte_length)
+    fn advance_if_right_angle(&mut self) -> bool {
+        if self.stream.consume_right_angle().is_some() {
+            self.skip_comments();
+            true
+        } else {
+            false
+        }
     }
 
-    fn span_from_offset(&self, start_byte_offset: u32) -> ast::Span {
-        let end_byte_offset = self.previous_token.byte_offset + self.previous_token.byte_length;
+    fn span_from_token(&self, token: Token<'source>) -> Span {
+        Span::new(self.file_id, token.byte_offset, token.byte_length)
+    }
+
+    fn span_from_offset(&self, start_byte_offset: u32) -> Span {
+        let previous = self.stream.previous_code();
+        let end_byte_offset = previous.byte_offset + previous.byte_length;
         let byte_length = end_byte_offset.saturating_sub(start_byte_offset);
 
-        ast::Span::new(self.file_id, start_byte_offset, byte_length)
+        Span::new(self.file_id, start_byte_offset, byte_length)
     }
 
-    fn is_type_args_call(&self) -> bool {
+    fn scan_type_args(&self) -> Option<TypeArgsScan> {
         let mut position = 1; // 0 is <
         let mut depth = 1;
+        let mut crossed_newline = false;
 
         loop {
             if position > MAX_LOOKAHEAD {
-                return false;
+                return None;
             }
+            crossed_newline |= self.newline_before_peek(position);
             match self.stream.peek_ahead(position).kind {
                 LeftAngleBracket => depth += 1,
                 RightAngleBracket if depth == 1 => {
-                    let next = self.stream.peek_ahead(position + 1).kind;
-                    return next == LeftParen
-                        || (next == Dot
-                            && self.stream.peek_ahead(position + 2).kind == Identifier
-                            && self.stream.peek_ahead(position + 3).kind == LeftParen);
+                    return Some(TypeArgsScan {
+                        end: position + 1,
+                        crossed_newline,
+                    });
                 }
                 RightAngleBracket => depth -= 1,
+                ShiftRight if depth <= 2 => {
+                    return Some(TypeArgsScan {
+                        end: position + 1,
+                        crossed_newline,
+                    });
+                }
+                ShiftRight => depth -= 2,
                 LeftParen => {
                     let mut paren_depth = 1;
                     position += 1;
                     while paren_depth > 0 {
                         if position > MAX_LOOKAHEAD {
-                            return false;
+                            return None;
                         }
+                        crossed_newline |= self.newline_before_peek(position);
                         match self.stream.peek_ahead(position).kind {
                             LeftParen => paren_depth += 1,
                             RightParen => paren_depth -= 1,
-                            EOF => return false,
+                            EOF => return None,
                             _ => {}
                         }
                         position += 1;
@@ -403,11 +602,50 @@ impl<'source> Parser<'source> {
                 }
                 EOF | Plus | Minus | Star | Slash | Percent | EqualDouble | NotEqual
                 | AmpersandDouble | PipeDouble | Semicolon | LeftCurlyBrace | RightCurlyBrace
-                | LeftSquareBracket | RightSquareBracket => return false,
+                | LeftSquareBracket | RightSquareBracket => return None,
                 _ => {}
             }
             position += 1;
         }
+    }
+
+    fn opens_type_args(&self) -> bool {
+        let Some(scan) = self.scan_type_args() else {
+            return false;
+        };
+
+        let next = self.stream.peek_ahead(scan.end).kind;
+
+        let call = next == LeftParen
+            || (next == Dot
+                && self.stream.peek_ahead(scan.end + 1).kind == Identifier
+                && self.stream.peek_ahead(scan.end + 2).kind == LeftParen);
+
+        call || (!scan.crossed_newline && self.ends_expression_at(scan.end))
+    }
+
+    fn ends_expression_at(&self, position: usize) -> bool {
+        let mut position = position;
+        while matches!(
+            self.stream.peek_ahead(position).kind,
+            Comment | DocComment | FileComment
+        ) {
+            position += 1;
+        }
+
+        self.newline_before_peek(position)
+            || matches!(
+                self.stream.peek_ahead(position).kind,
+                EOF | Semicolon | RightCurlyBrace | RightParen | RightSquareBracket | Comma
+            )
+    }
+
+    fn newline_before_peek(&self, position: usize) -> bool {
+        let previous = self.stream.peek_ahead(position.saturating_sub(1));
+        let from = (previous.byte_offset + previous.byte_length) as usize;
+        let to = self.stream.peek_ahead(position).byte_offset as usize;
+
+        from <= to && to <= self.source.len() && self.source[from..to].contains('\n')
     }
 
     fn has_block_after_struct(&self) -> bool {
@@ -447,15 +685,13 @@ impl<'source> Parser<'source> {
         )
     }
 
-    fn is_struct_instantiation(&self) -> bool {
-        if self.previous_token.kind != Identifier {
+    fn is_struct_instantiation(&self, context: pratt::ExpressionContext) -> bool {
+        let previous = self.stream.previous();
+        if previous.kind != Identifier {
             return false;
         }
 
-        let is_uppercase = self
-            .previous_token
-            .text
-            .starts_with(|c: char| c.is_uppercase());
+        let is_uppercase = previous.text.starts_with(|c: char| c.is_uppercase());
         let first_ahead = self.stream.peek_ahead(1);
 
         if first_ahead.kind == DotDot {
@@ -463,7 +699,7 @@ impl<'source> Parser<'source> {
         }
 
         if first_ahead.kind == RightCurlyBrace {
-            if self.in_control_flow_header {
+            if context.is_control_flow_header() {
                 return is_uppercase && self.has_block_after_struct();
             }
             return is_uppercase;
@@ -474,7 +710,7 @@ impl<'source> Parser<'source> {
             return match second_ahead.kind {
                 Colon => self.stream.peek_ahead(3).kind != Colon,
                 Comma | RightCurlyBrace => {
-                    if self.in_control_flow_header {
+                    if context.is_control_flow_header() {
                         is_uppercase && self.has_block_after_struct()
                     } else {
                         is_uppercase
@@ -487,7 +723,26 @@ impl<'source> Parser<'source> {
         false
     }
 
-    fn enter_recursion(&mut self) -> bool {
+    fn with_recursion<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> Option<T> {
+        let mut scope = self.enter_recursion()?;
+        Some(parse(&mut scope))
+    }
+
+    fn enter_recursion(&mut self) -> Option<RecursionScope<'_, 'source>> {
+        let previous_depth = self.depth;
+        if self.depth >= MAX_DEPTH {
+            let span = self.span_from_token(self.current_token());
+            self.track_error_at(span, "too deeply nested", "Reduce nesting depth");
+            return None;
+        }
+        self.depth += 1;
+        Some(RecursionScope {
+            parser: self,
+            previous_depth,
+        })
+    }
+
+    fn deepen(&mut self) -> bool {
         if self.depth >= MAX_DEPTH {
             let span = self.span_from_token(self.current_token());
             self.track_error_at(span, "too deeply nested", "Reduce nesting depth");
@@ -495,10 +750,6 @@ impl<'source> Parser<'source> {
         }
         self.depth += 1;
         true
-    }
-
-    fn leave_recursion(&mut self) {
-        self.depth -= 1;
     }
 
     fn too_many_errors(&self) -> bool {
@@ -529,7 +780,34 @@ impl<'source> Parser<'source> {
     }
 
     fn can_start_annotation(&self) -> bool {
-        matches!(self.current_token().kind, Identifier | Function | LeftParen)
+        matches!(
+            self.current_token().kind,
+            Identifier | Function | LeftParen | Integer | Mut
+        )
+    }
+
+    fn can_recover_annotation(&self) -> bool {
+        !self.at_recovery_boundary() && self.can_start_annotation()
+    }
+
+    fn at_recovery_boundary(&self) -> bool {
+        if self.is(Function) {
+            return self.at_function_declaration();
+        }
+        matches!(self.current_token().kind, DocComment | Hash | Pub) || self.at_item_boundary()
+    }
+
+    fn at_parameter_recovery_boundary(&self) -> bool {
+        self.at_recovery_boundary() && self.stream.peek_ahead(1).kind != Colon
+    }
+
+    fn at_function_declaration(&self) -> bool {
+        self.is(Function)
+            && self.stream.peek_ahead(1).kind == Identifier
+            && matches!(
+                self.stream.peek_ahead(2).kind,
+                LeftParen | LeftAngleBracket | Dot
+            )
     }
 
     fn at_item_boundary(&self) -> bool {
@@ -537,6 +815,10 @@ impl<'source> Parser<'source> {
             self.current_token().kind,
             Let | Function | Struct | Enum | Impl | Interface | Type | Const | Import
         )
+    }
+
+    fn at_match_arm_terminator(&self) -> bool {
+        self.at_eof() || self.is(Comma) || self.is(RightCurlyBrace) || self.at_item_boundary()
     }
 
     fn resync_on_error(&mut self) {
@@ -549,21 +831,17 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn track_error(
-        &mut self,
-        label: impl Into<std::string::String>,
-        help: impl Into<std::string::String>,
-    ) {
+    fn track_error(&mut self, label: impl Into<string::String>, help: impl Into<string::String>) {
         let current = self.current_token();
-        let span = ast::Span::new(self.file_id, current.byte_offset, current.byte_length);
+        let span = Span::new(self.file_id, current.byte_offset, current.byte_length);
         self.track_error_at(span, label, help);
     }
 
     fn track_error_at(
         &mut self,
-        span: ast::Span,
-        label: impl Into<std::string::String>,
-        help: impl Into<std::string::String>,
+        span: Span,
+        label: impl Into<string::String>,
+        help: impl Into<string::String>,
     ) {
         if self.too_many_errors() {
             return;
@@ -571,6 +849,97 @@ impl<'source> Parser<'source> {
         let error = ParseError::new("Syntax error", span, label.into())
             .with_parse_code("syntax_error")
             .with_help(help.into());
+
+        self.errors.push(error);
+    }
+
+    fn error_angle_brackets_for_generics(&mut self, span: Span, help: impl Into<string::String>) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new("Syntax error", span, "use `<...>` for type args")
+            .with_parse_code("angle_brackets_for_generics")
+            .with_help(help.into());
+
+        self.errors.push(error);
+    }
+
+    fn error_var_initializer(&mut self, span: Span) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new("Syntax error", span, "not allowed")
+            .with_parse_code("var_not_allowed")
+            .with_help(
+                "Use `const` for a primitive, or a function that returns the value e.g. `fn origin() -> Point { ... }` for a composite",
+            );
+
+        self.errors.push(error);
+    }
+
+    fn error_import_alias_after_path(&mut self, span: Span, alias: &str, path: &str) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new("Syntax error", span, "import alias goes before the path")
+            .with_parse_code("import_alias_position")
+            .with_help(format!(
+                "Use Go-style alias syntax: `import {alias} \"{path}\"`"
+            ));
+
+        self.errors.push(error);
+    }
+
+    fn error_bare_multi_return(&mut self, span: Span, suggestion: &str) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new(
+            "Multiple return values must be a tuple",
+            span,
+            "wrap these values in parentheses",
+        )
+        .with_parse_code("bare_multi_value_return")
+        .with_help(format!(
+            "To return multiple values, use a tuple: `{suggestion}`"
+        ));
+
+        self.errors.push(error);
+    }
+
+    fn error_match_arm_missing_comma(&mut self, span: Span) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new("Syntax error", span, "missing comma after match arm")
+            .with_parse_code("match_arm_missing_comma")
+            .with_help("Match arms must be separated by commas, even when the body is a block.");
+
+        self.errors.push(error);
+    }
+
+    fn error_map_literal_not_supported(&mut self, span: Span) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new("Invalid `Map` initialization", span, "invalid syntax")
+            .with_parse_code("invalid_map_initialization")
+            .with_help("To initialize a `Map`, use `Map.new<K, V>()` then `m[key] = value`");
+
+        self.errors.push(error);
+    }
+
+    fn error_missing_initializer(&mut self, span: Span) {
+        if self.too_many_errors() {
+            return;
+        }
+        let error = ParseError::new(
+            "Missing initializer",
+            span,
+            "annotated binding needs a value",
+        )
+        .with_parse_code("missing_initializer")
+        .with_help("Bindings must be initialized");
 
         self.errors.push(error);
     }
@@ -587,7 +956,7 @@ impl<'source> Parser<'source> {
             _ => "unexpected_token",
         };
 
-        let span = ast::Span::new(self.file_id, current.byte_offset, current.byte_length);
+        let span = Span::new(self.file_id, current.byte_offset, current.byte_length);
         let error = ParseError::new("Syntax error", span, format!("expected {}", expected_token))
             .with_parse_code(error_code);
 
@@ -606,12 +975,12 @@ impl<'source> Parser<'source> {
             )
         } else {
             self.error_unclosed_block(&error_anchor);
-            self.span_from_tokens(start)
+            self.span_from_offset(start.byte_offset)
         }
     }
 
     fn error_unclosed_block(&mut self, open_brace: &Token) {
-        let span = ast::Span::new(self.file_id, open_brace.byte_offset, open_brace.byte_length);
+        let span = Span::new(self.file_id, open_brace.byte_offset, open_brace.byte_length);
         let error = ParseError::new("Unclosed block", span, "opening brace here")
             .with_parse_code("unclosed_block")
             .with_help("Add a closing `}`");
@@ -657,11 +1026,23 @@ impl<'source> Parser<'source> {
         self.errors.push(error);
     }
 
-    fn error_duplicate_impl_parent(&mut self, first_span: Span, second_span: Span) {
-        let error = ParseError::new("Duplicate impl", first_span, "first use")
+    fn error_duplicate_embed_parent(&mut self, first_span: Span, second_span: Span) {
+        let error = ParseError::new("Duplicate embed", first_span, "first use")
             .with_span_label(second_span, "used again")
-            .with_parse_code("duplicate_impl_parent")
+            .with_parse_code("duplicate_embed_parent")
             .with_help("Remove the duplicate parent");
+
+        self.errors.push(error);
+    }
+
+    fn error_impl_interface_embed(&mut self, keyword_span: Span) {
+        let error = ParseError::new(
+            "Interface embedding uses `embed`",
+            keyword_span,
+            "write `embed` here",
+        )
+        .with_parse_code("impl_interface_embed")
+        .with_help("Interfaces embed other interfaces with `embed`. Replace `impl` with `embed`");
 
         self.errors.push(error);
     }
@@ -720,7 +1101,94 @@ impl<'source> Parser<'source> {
     fn error_detached_doc_comment(&mut self, span: Span) {
         let error = ParseError::new("Unattached doc comment", span, "is detached")
             .with_parse_code("detached_doc_comment")
-            .with_help("Place the doc comment on the line immediately above a symbol definition");
+            .with_help(
+                "Place doc comments `///` on the line above a symbol definition and file comments `//!` at the very top of the file",
+            );
+
+        self.errors.push(error);
+    }
+
+    fn error_split_file_comment(&mut self, span: Span) {
+        let error = ParseError::new("Split file comment", span, "separated from the block above")
+            .with_parse_code("split_file_comment")
+            .with_help(
+                "Remove the blank line, or write a bare `//!` line to keep a visible gap in the emitted header",
+            );
+
+        self.errors.push(error);
+    }
+
+    fn error_file_comment_build_constraint(&mut self, span: Span) {
+        let error = ParseError::new(
+            "Invalid file comment",
+            span,
+            "would become a Go build constraint",
+        )
+        .with_parse_code("file_comment_build_constraint")
+        .with_help(
+            "Reword the line so it does not start with `+build`. Emitted as a Go comment it would act as a legacy build constraint and exclude the generated file from builds",
+        );
+
+        self.errors.push(error);
+    }
+
+    fn error_misplaced_file_comment(&mut self) {
+        let first = self.current_token();
+        let mut last = first;
+
+        while self.is(FileComment) {
+            last = self.current_token();
+            self.stream.consume();
+            while self.is(Comment) {
+                self.stream.consume();
+            }
+        }
+
+        let length = last.byte_offset + last.byte_length - first.byte_offset;
+        self.error_misplaced_file_comment_at(Span::new(self.file_id, first.byte_offset, length));
+    }
+
+    fn error_misplaced_file_comment_at(&mut self, span: Span) {
+        let error = ParseError::new("Misplaced file comment", span, "not allowed here")
+            .with_parse_code("misplaced_file_comment")
+            .with_help(
+                "Move this file comment to the very top of the file to document it, or use `///` to document the symbol below",
+            );
+
+        self.errors.push(error);
+    }
+
+    fn error_import_after_item(&mut self, statement: Span, path: Span) {
+        let span = Span::new(
+            statement.file_id,
+            statement.byte_offset,
+            path.end() - statement.byte_offset,
+        );
+        let error = ParseError::new("Misplaced import", span, "not allowed here")
+            .with_parse_code("import_after_item")
+            .with_help(
+                "Imports must come before every other top-level item. Move this import to the top of the file, or run `lis format` to hoist it",
+            );
+
+        self.errors.push(error);
+    }
+
+    fn error_misplaced_pub(&mut self, span: Span, code: &str, help: &str) {
+        let error = ParseError::new("Misplaced `pub`", span, "not allowed here")
+            .with_parse_code(code)
+            .with_help(help);
+
+        self.errors.push(error);
+    }
+
+    fn error_misplaced_attribute(&mut self, span: Span) {
+        let error = ParseError::new(
+            "Attribute not supported on target",
+            span,
+            "nothing here can carry an attribute",
+        )
+        .with_parse_code("misplaced_attribute")
+        .with_help("Remove the attribute, or move it onto an enum, struct, or function");
 
         self.errors.push(error);
     }
@@ -740,19 +1208,27 @@ impl<'source> Parser<'source> {
         self.errors.push(error);
     }
 
-    pub(crate) fn parse_integer_text(&mut self, text: &str) -> ast::Literal {
+    fn error_leading_zero(&mut self) {
+        let span = self.span_from_token(self.current_token());
+        let error = ParseError::new(
+            "Invalid number literal",
+            span,
+            "leading zero in integer literal",
+        )
+        .with_parse_code("number_leading_zero")
+        .with_help("Prefix with `0o` for octal (e.g. `0o644`) or remove the leading zero");
+        self.errors.push(error);
+    }
+
+    fn parse_integer_text(&mut self, text: &str) -> ast::Literal {
         self.parse_integer_text_with(text, false)
     }
 
-    pub(crate) fn parse_integer_text_with(
-        &mut self,
-        text: &str,
-        preserve_decimal_text: bool,
-    ) -> ast::Literal {
+    fn parse_integer_text_with(&mut self, text: &str, preserve_decimal_text: bool) -> ast::Literal {
         let clean = if text.contains('_') {
-            std::borrow::Cow::Owned(text.replace('_', ""))
+            Cow::Owned(text.replace('_', ""))
         } else {
-            std::borrow::Cow::Borrowed(text)
+            Cow::Borrowed(text)
         };
 
         let (n, is_decimal) = if clean.starts_with("0x") || clean.starts_with("0X") {
@@ -782,18 +1258,9 @@ impl<'source> Parser<'source> {
                 0
             });
             (value, false)
-        } else if clean.len() > 1
-            && clean.starts_with('0')
-            && clean.chars().skip(1).all(|c| c.is_ascii_digit())
-        {
-            let value = u64::from_str_radix(&clean[1..], 8).unwrap_or_else(|_| {
-                self.track_error(
-                    format!("octal literal '{text}' is too large"),
-                    "Maximum value is `01777777777777777777777`.",
-                );
-                0
-            });
-            (value, false)
+        } else if clean.len() > 1 && clean.starts_with('0') {
+            self.error_leading_zero();
+            (clean.parse().unwrap_or(0), false)
         } else {
             let value = clean.parse().unwrap_or_else(|_| {
                 self.track_error(
@@ -825,7 +1292,7 @@ impl<'source> Parser<'source> {
             format!("`{}`", token.text)
         };
 
-        let span = ast::Span::new(self.file_id, token.byte_offset, token.byte_length);
+        let span = Span::new(self.file_id, token.byte_offset, token.byte_length);
 
         let (label, error_code, help) = match ctx {
             "expr" => (
@@ -851,12 +1318,17 @@ impl<'source> Parser<'source> {
             "top_item" if token.text == "use" => (
                 "unexpected syntax for import".to_string(),
                 "use_unsupported",
-                "Use `import` instead of `use` for imports: `import \"module/path\"`",
+                "Use `import` instead of `use` for imports: `import \"package/path\"`",
+            ),
+            "top_item" if token.kind == Let => (
+                "`let` is not allowed at the top level".to_string(),
+                "top_level_let",
+                "Use `const` for a primitive, or a function that returns the value e.g. `fn origin() -> Point { ... }` for a composite",
             ),
             "top_item" => (
                 "expected declaration".to_string(),
                 "expected_declaration",
-                "At the top level of a file, Lisette expects `fn`, `struct`, `enum`, `interface`, `import`, or `type`.",
+                "At the top level of a file, Lisette expects `fn`, `struct`, `enum`, `interface`, `impl`, `const`, `import`, or `type`.",
             ),
             _ => (
                 format!("unexpected {}", token_descriptor),
@@ -882,6 +1354,10 @@ impl<'source> Parser<'source> {
     }
 }
 
+fn is_go_build_constraint(text: &str) -> bool {
+    text.split_whitespace().next() == Some("+build")
+}
+
 struct TokenStream<'source> {
     tokens: Vec<Token<'source>>,
     position: usize,
@@ -889,6 +1365,10 @@ struct TokenStream<'source> {
 
 impl<'source> TokenStream<'source> {
     fn new(tokens: Vec<Token<'source>>) -> Self {
+        debug_assert!(
+            !tokens.is_empty(),
+            "lexer must always produce at least an EOF token",
+        );
         Self {
             tokens,
             position: 0,
@@ -896,42 +1376,338 @@ impl<'source> TokenStream<'source> {
     }
 
     fn peek(&self) -> Token<'source> {
-        self.tokens
-            .get(self.position)
-            .copied()
-            .unwrap_or_else(|| Token {
-                kind: TokenKind::EOF,
-                text: "",
-                byte_offset: self
-                    .tokens
-                    .last()
-                    .map(|t| t.byte_offset + t.byte_length)
-                    .unwrap_or(0),
-                byte_length: 0,
-            })
+        self.tokens[self.position]
     }
 
     fn peek_ahead(&self, n: usize) -> Token<'source> {
-        self.tokens
-            .get(self.position + n)
-            .copied()
-            .unwrap_or_else(|| Token {
-                kind: TokenKind::EOF,
-                text: "",
-                byte_offset: self
-                    .tokens
-                    .last()
-                    .map(|t| t.byte_offset + t.byte_length)
-                    .unwrap_or(0),
-                byte_length: 0,
-            })
+        let last_index = self.tokens.len() - 1;
+        let idx = self.position.saturating_add(n).min(last_index);
+        self.tokens[idx]
+    }
+
+    fn previous(&self) -> Token<'source> {
+        self.tokens[self.position.saturating_sub(1)]
+    }
+
+    fn previous_code(&self) -> Token<'source> {
+        let mut index = self.position.saturating_sub(1);
+
+        while index > 0 && matches!(self.tokens[index].kind, Comment | DocComment | FileComment) {
+            index -= 1;
+        }
+
+        self.tokens[index]
     }
 
     fn consume(&mut self) -> Token<'source> {
-        let token = self.peek();
-        if self.position < self.tokens.len() {
+        let token = self.tokens[self.position];
+        if self.position + 1 < self.tokens.len() {
             self.position += 1;
         }
         token
+    }
+
+    fn consume_right_angle(&mut self) -> Option<Token<'source>> {
+        let token = self.peek();
+        match token.kind {
+            RightAngleBracket => Some(self.consume()),
+            ShiftRight => {
+                let first = Token {
+                    kind: RightAngleBracket,
+                    text: ">",
+                    byte_offset: token.byte_offset,
+                    byte_length: 1,
+                };
+                let second = Token {
+                    byte_offset: token.byte_offset + 1,
+                    ..first
+                };
+                self.tokens[self.position] = first;
+                self.tokens.insert(self.position + 1, second);
+                Some(self.consume())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod import_order_tests {
+    use super::IMPORT_AFTER_ITEM_CODE;
+    use crate::ast::Expression;
+    use crate::build_ast;
+
+    fn codes(source: &str) -> Vec<String> {
+        build_ast(source, 0)
+            .errors
+            .iter()
+            .map(|error| error.code.clone())
+            .collect()
+    }
+
+    #[test]
+    fn imports_before_every_other_item_are_allowed() {
+        for source in [
+            "import \"go:fmt\"\nimport _ \"go:os\"\nimport alias \"go:io\"\nfn f() {}",
+            "//! header\n\nimport \"go:fmt\"\n\nfn f() {}",
+            "// note\nimport \"go:fmt\"\n\n/// docs\nfn f() {}",
+            "import \"go:fmt\"\n\n#[test]\nfn f(t: T) {}",
+            "import \"go:fmt\"",
+        ] {
+            assert!(codes(source).is_empty(), "for source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_public_import_is_rejected() {
+        for source in [
+            "pub import \"go:fmt\"",
+            "pub import _ \"go:fmt\"",
+            "pub import alias \"go:fmt\"",
+            "pub // note\nimport \"go:fmt\"",
+            "import \"go:os\"\npub import \"go:fmt\"\nfn f() {}",
+        ] {
+            assert_eq!(
+                codes(source),
+                ["parse.pub_import"],
+                "for source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visibility_on_definitions_is_untouched() {
+        for source in [
+            "pub fn f() {}",
+            "pub struct S {}",
+            "pub enum E { A }",
+            "pub const N: int = 1",
+            "pub type T = int",
+            "pub interface I {}",
+        ] {
+            assert!(codes(source).is_empty(), "for source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn import_after_a_definition_is_rejected() {
+        for source in [
+            "fn f() {}\nimport \"go:fmt\"",
+            "struct S {}\nimport _ \"go:fmt\"",
+            "const N: int = 1\nimport alias \"go:fmt\"",
+            "type T = int\nimport \"go:fmt\"",
+            "import \"go:os\"\nfn f() {}\nimport \"go:fmt\"",
+        ] {
+            assert_eq!(
+                codes(source),
+                [IMPORT_AFTER_ITEM_CODE],
+                "for source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_misplaced_import_is_reported() {
+        let source = "fn f() {}\nimport \"go:fmt\"\nimport \"go:os\"";
+        assert_eq!(
+            codes(source),
+            [IMPORT_AFTER_ITEM_CODE, IMPORT_AFTER_ITEM_CODE]
+        );
+    }
+
+    #[test]
+    fn a_misplaced_import_still_reaches_the_ast() {
+        let result = super::Parser::lex_and_parse_file("fn f() {}\nimport \"go:fmt\"", 0);
+        assert!(matches!(
+            result.ast.last(),
+            Some(Expression::PackageImport { .. })
+        ));
+    }
+
+    #[test]
+    fn a_parse_stopped_by_the_error_cap_is_truncated() {
+        let mut source = String::from("fn f() {}\n");
+        for index in 0..60 {
+            source.push_str(&format!("import \"go:pkg{index}\"\n"));
+        }
+        source.push_str("fn last() {}\n");
+
+        let result = super::Parser::lex_and_parse_file(&source, 0);
+        assert!(result.truncated);
+        assert!(!result.ast.iter().any(|item| matches!(
+            item,
+            Expression::Function { name, .. } if name == "last"
+        )));
+    }
+
+    #[test]
+    fn a_parse_that_reaches_the_end_is_not_truncated() {
+        let result = super::Parser::lex_and_parse_file("fn f() {}\nimport \"go:fmt\"", 0);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn an_import_inside_a_block_keeps_its_own_error() {
+        let source = "fn f() {\n  import \"go:fmt\"\n}";
+        assert_eq!(codes(source), ["parse.syntax_error"]);
+    }
+
+    #[test]
+    fn comments_between_imports_do_not_count_as_items() {
+        let source = "import \"go:fmt\"\n// note\n\n// another note\nimport \"go:os\"\nfn f() {}";
+        assert!(codes(source).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod file_comment_tests {
+    use crate::build_ast;
+
+    fn file_comment(source: &str) -> Option<String> {
+        let result = build_ast(source, 0);
+        assert!(
+            result.errors.is_empty(),
+            "unexpected errors: {:?}",
+            result.errors
+        );
+        result.file_comment
+    }
+
+    #[test]
+    fn consecutive_lines_join_with_newlines() {
+        assert_eq!(
+            file_comment("//! a\n//! b\nfn f() {}").as_deref(),
+            Some("a\nb")
+        );
+    }
+
+    #[test]
+    fn bare_line_contributes_empty_line() {
+        assert_eq!(
+            file_comment("//! a\n//!\n//! b\nfn f() {}").as_deref(),
+            Some("a\n\nb")
+        );
+    }
+
+    #[test]
+    fn blank_line_between_runs_is_an_error() {
+        for source in [
+            "//! a\n\n//! b\n\nfn f() {}",
+            "//! a\r\n\r\n//! b\r\n\r\nfn f() {}",
+            "//! a\n//!\n\n//! b\nfn f() {}",
+        ] {
+            let result = build_ast(source, 0);
+            let codes: Vec<_> = result.errors.iter().map(|e| e.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["parse.split_file_comment"],
+                "for source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_before_the_block_is_rejected() {
+        for source in ["\n//! a\nfn f() {}", " //! a\nfn f() {}"] {
+            let result = build_ast(source, 0);
+            let codes: Vec<_> = result.errors.iter().map(|e| e.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["parse.misplaced_file_comment"],
+                "for source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_lines_after_the_block_are_allowed() {
+        assert_eq!(
+            file_comment("//! a\n//! b\n\n\nfn f() {}").as_deref(),
+            Some("a\nb")
+        );
+    }
+
+    #[test]
+    fn leading_comment_makes_the_header_misplaced() {
+        let result = build_ast("// leading\n//! too late\nfn f() {}", 0);
+        let codes: Vec<_> = result.errors.iter().map(|e| e.code.as_str()).collect();
+        assert_eq!(codes, ["parse.misplaced_file_comment"]);
+    }
+
+    #[test]
+    fn interleaved_comment_ends_the_block() {
+        let result = build_ast("//! a\n// note\n//! b\nfn f() {}", 0);
+        let codes: Vec<_> = result.errors.iter().map(|e| e.code.as_str()).collect();
+        assert_eq!(codes, ["parse.misplaced_file_comment"]);
+    }
+
+    #[test]
+    fn comment_after_the_block_is_allowed() {
+        assert_eq!(
+            file_comment("//! a\n\n// section note\nfn f() {}").as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn file_without_header_has_no_file_comment() {
+        assert_eq!(file_comment("fn f() {}"), None);
+    }
+
+    #[test]
+    fn header_without_items_is_valid() {
+        assert_eq!(
+            file_comment("//! header only").as_deref(),
+            Some("header only")
+        );
+    }
+
+    #[test]
+    fn header_before_doc_commented_item() {
+        let result = build_ast("//! header\n/// item doc\nfn f() {}", 0);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.file_comment.as_deref(), Some("header"));
+    }
+
+    #[test]
+    fn misplaced_file_comment_reports_one_error_per_run() {
+        let result = build_ast("fn f() {}\n//! a\n//! b\nfn g() {}", 0);
+        let codes: Vec<_> = result.errors.iter().map(|e| e.code.as_str()).collect();
+        assert_eq!(codes, ["parse.misplaced_file_comment"]);
+    }
+
+    #[test]
+    fn build_constraint_lines_are_rejected() {
+        for source in [
+            "//!+build ignore\nfn f() {}",
+            "//! +build ignore\nfn f() {}",
+            "//!  \t+build linux\nfn f() {}",
+            "//! +build\nfn f() {}",
+            "//! +build ignore\r\nfn f() {}",
+            "//! +build\r\nfn f() {}",
+            "//!\u{00A0}+build ignore\nfn f() {}",
+            "//! +build\u{00A0}ignore\nfn f() {}",
+            "//! +build\u{3000}ignore\nfn f() {}",
+        ] {
+            let result = build_ast(source, 0);
+            let codes: Vec<_> = result.errors.iter().map(|e| e.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                ["parse.file_comment_build_constraint"],
+                "for source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_constraint_lookalikes_are_allowed() {
+        for source in [
+            "//! +buildx tag\nfn f() {}",
+            "//! use +build wisely\nfn f() {}",
+            "//! +builder pattern\nfn f() {}",
+        ] {
+            let result = build_ast(source, 0);
+            assert!(result.errors.is_empty(), "for source: {source:?}");
+        }
     }
 }

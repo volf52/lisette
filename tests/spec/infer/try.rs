@@ -1,3 +1,4 @@
+use crate::assert_infer_error_snapshot;
 use crate::spec::infer::*;
 
 #[test]
@@ -337,6 +338,36 @@ fn try_block_with_loop_inside() {
     }"#,
     )
     .assert_type_struct_generic("Option", vec![int_type()]);
+}
+
+#[test]
+fn try_block_cannot_break_an_enclosing_loop() {
+    infer(
+        r#"{
+    for i in 0..3 {
+      try {
+        break
+        Option.Some(i)?
+      }
+    }
+    }"#,
+    )
+    .assert_infer_code("try_block_break");
+}
+
+#[test]
+fn try_block_cannot_continue_an_enclosing_loop() {
+    infer(
+        r#"{
+    for i in 0..3 {
+      try {
+        continue
+        Option.Some(i)?
+      }
+    }
+    }"#,
+    )
+    .assert_infer_code("try_block_continue");
 }
 
 #[test]
@@ -739,6 +770,254 @@ fn task_defer_as_statement_valid() {
 }
 
 #[test]
+fn defer_in_lambda_inside_try_block_valid() {
+    infer(
+        r#"
+    fn work() {}
+    fn run(f: fn() -> int) -> int { f() }
+    fn risky() -> Option<int> { Some(1) }
+    fn f() {
+      let result = try {
+        let base = risky()?
+        run(|| {
+          defer work()
+          base
+        })
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn defer_outside_try_block_valid() {
+    infer(
+        r#"
+    fn work() {}
+    fn risky() -> Option<int> { Some(1) }
+    fn f() {
+      defer work()
+      let result = try {
+        risky()?
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn defer_in_plain_block_valid() {
+    infer(
+        r#"
+    fn work() {}
+    fn f() {
+      {
+        defer work()
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn defer_in_if_expression_valid() {
+    infer(
+        r#"
+    fn work() {}
+    fn f() {
+      let n = if true {
+        defer work()
+        1
+      } else {
+        0
+      }
+      let _ = n
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn defer_in_task_inside_try_block_valid() {
+    infer(
+        r#"
+    fn work() {}
+    fn risky() -> Option<int> { Some(1) }
+    fn f() {
+      let result = try {
+        let base = risky()?
+        task {
+          defer work()
+        }
+        base
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn unbounded_map_key_in_task_rejected() {
+    infer(
+        r#"
+    fn f<T>() {
+      task {
+        let m = Map.new<T, int>()
+        let _ = m
+      }
+    }
+        "#,
+    )
+    .assert_infer_code("missing_map_key_bound");
+}
+
+#[test]
+fn bounded_map_key_in_task_valid() {
+    infer(
+        r#"
+    fn f<T: Comparable>() {
+      task {
+        let m = Map.new<T, int>()
+        let _ = m
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn bare_return_in_task_valid() {
+    infer(
+        r#"
+    fn f() -> int {
+      task {
+        return
+      }
+      1
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn value_return_in_task_rejected() {
+    infer(
+        r#"
+    fn f() -> int {
+      task {
+        return 5
+      }
+      1
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn propagate_in_task_rejected() {
+    infer(
+        r#"
+    fn risky() -> Option<int> { Some(1) }
+    fn f() -> Option<int> {
+      task {
+        let n = risky()?
+        let _ = n
+      }
+      Some(1)
+    }
+        "#,
+    )
+    .assert_infer_code("try_return_type_mismatch");
+}
+
+#[test]
+fn propagate_in_task_inside_try_block_rejected() {
+    infer(
+        r#"
+    fn risky() -> Option<int> { Some(1) }
+    fn f() {
+      let result = try {
+        let base = risky()?
+        task {
+          let n = risky()?
+          let _ = n
+        }
+        base
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_infer_code("try_return_type_mismatch");
+}
+
+#[test]
+fn defer_in_try_block_inside_task_rejected() {
+    infer(
+        r#"
+    fn work() {}
+    fn risky() -> Option<int> { Some(1) }
+    fn f() {
+      task {
+        let inner = try {
+          defer work()
+          risky()?
+        }
+        let _ = inner
+      }
+    }
+        "#,
+    )
+    .assert_infer_code("try_block_defer");
+}
+
+#[test]
+fn defer_in_try_block_rejected() {
+    infer(
+        r#"
+    fn work() {}
+    fn risky() -> Option<int> { Some(1) }
+    fn f() {
+      let result = try {
+        defer work()
+        risky()?
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_infer_code("try_block_defer");
+}
+
+#[test]
+fn defer_in_recover_block_rejected() {
+    infer(
+        r#"
+    fn work() {}
+    fn f() {
+      let result = recover {
+        defer work()
+        1
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_infer_code("recover_block_defer");
+}
+
+#[test]
 fn return_break_rejected() {
     infer(
         r#"
@@ -883,4 +1162,493 @@ fn paren_break_in_match_arm_rejected() {
         "#,
     )
     .assert_infer_code("control_flow_in_expression");
+}
+
+#[test]
+fn wrap_err_on_error_result_propagates() {
+    infer(
+        r#"
+    struct MyErr { msg: string }
+
+    impl MyErr {
+      fn Error(self) -> string { self.msg }
+    }
+
+    fn run() -> Result<int, error> {
+      let r: Result<int, error> = Err(MyErr { msg: "boom" })
+      let n = r.wrap_err("context")?
+      Ok(n)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn wrap_err_returns_result_of_error() {
+    infer(
+        r#"
+    struct MyErr { msg: string }
+
+    impl MyErr {
+      fn Error(self) -> string { self.msg }
+    }
+
+    fn run() -> Result<int, error> {
+      let r: Result<int, error> = Err(MyErr { msg: "boom" })
+      r.wrap_err("context")
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn wrap_err_unavailable_on_non_error_result() {
+    infer(
+        r#"
+    fn run() {
+      let r: Result<int, string> = Err("boom")
+      let _ = r.wrap_err("context")
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn bare_error_where_result_expected_suggests_err() {
+    infer(
+        r#"
+    struct MyErr { msg: string }
+
+    impl MyErr {
+      fn Error(self) -> string { self.msg }
+    }
+
+    fn run() -> Result<int, error> {
+      let e: error = MyErr { msg: "boom" }
+      e
+    }
+        "#,
+    )
+    .assert_error_contains("Wrap the value: `Err(...)`");
+}
+
+#[test]
+fn bare_error_value_where_result_expected_suggests_err() {
+    infer(
+        r#"
+    fn run() -> Result<int, string> {
+      "boom"
+    }
+        "#,
+    )
+    .assert_error_contains("Wrap the value: `Err(...)`");
+}
+
+#[test]
+fn bare_ok_value_where_result_expected_still_suggests_ok() {
+    infer(
+        r#"
+    fn run() -> Result<int, string> {
+      42
+    }
+        "#,
+    )
+    .assert_error_contains("Wrap the value: `Ok(...)`");
+}
+
+#[test]
+fn propagate_widens_concrete_error_to_error_result() {
+    infer(
+        r#"
+    struct ValidationError { field: string }
+
+    impl ValidationError {
+      fn Error(self) -> string { self.field }
+    }
+
+    fn validate(name: string) -> Result<string, ValidationError> {
+      if name == "" { return Err(ValidationError { field: "name" }) }
+      Ok(name)
+    }
+
+    fn load(name: string) -> Result<string, error> {
+      let n = validate(name)?
+      Ok(n)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_widens_to_custom_interface_with_different_ok_types() {
+    infer(
+        r#"
+    pub interface AppError {
+      fn Error() -> string
+      fn status() -> int
+    }
+
+    struct DbError { }
+
+    impl DbError {
+      fn Error(self) -> string { "db down" }
+      pub fn status(self) -> int { 500 }
+    }
+
+    fn query() -> Result<string, DbError> { Err(DbError {}) }
+
+    fn handler() -> Result<int, AppError> {
+      let row = query()?
+      Ok(row.length())
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_widens_ref_with_pointer_receiver_error_method() {
+    infer(
+        r#"
+    struct FileError { path: string }
+
+    impl FileError {
+      fn Error(self: Ref<FileError>) -> string { self.path }
+    }
+
+    fn read_value() -> Result<int, Ref<FileError>> { Err(&FileError { path: "a" }) }
+
+    fn load() -> Result<int, error> {
+      let n = read_value()?
+      Ok(n)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn annotated_try_block_widens_two_concrete_errors() {
+    infer(
+        r#"
+    struct AError { }
+
+    impl AError {
+      fn Error(self) -> string { "a" }
+    }
+
+    struct BError { }
+
+    impl BError {
+      fn Error(self) -> string { "b" }
+    }
+
+    fn do_a() -> Result<int, AError> { Err(AError {}) }
+    fn do_b() -> Result<int, BError> { Err(BError {}) }
+
+    fn run() -> int {
+      let r: Result<int, error> = try {
+        let a = do_a()?
+        let b = do_b()?
+        a + b
+      }
+      match r {
+        Ok(v) => v,
+        Err(_) => 0,
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_widens_into_aliased_result_return_type() {
+    infer(
+        r#"
+    type Outcome = Result<string, error>
+
+    struct ValidationError { field: string }
+
+    impl ValidationError {
+      fn Error(self) -> string { self.field }
+    }
+
+    fn validate(name: string) -> Result<string, ValidationError> {
+      if name == "" { return Err(ValidationError { field: "name" }) }
+      Ok(name)
+    }
+
+    fn load(name: string) -> Outcome {
+      let n = validate(name)?
+      Ok(n)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_accepts_aliased_result_operand() {
+    infer(
+        r#"
+    type Outcome = Result<int, error>
+
+    fn source() -> Outcome {
+      Ok(5)
+    }
+
+    fn load() -> Result<int, error> {
+      let n = source()?
+      Ok(n + 1)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_accepts_aliased_option_operand() {
+    infer(
+        r#"
+    type Maybe = Option<int>
+
+    fn source() -> Maybe {
+      Some(5)
+    }
+
+    fn load() -> Option<int> {
+      let n = source()?
+      Some(n + 1)
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_on_aliased_partial_operand_is_rejected() {
+    infer(
+        r#"
+    type Outcome = Partial<int, error>
+
+    fn source() -> Outcome {
+      Partial.Ok(3)
+    }
+
+    fn load() -> Result<int, error> {
+      let n = source()?
+      Ok(n)
+    }
+        "#,
+    )
+    .assert_infer_code("propagate_on_partial");
+}
+
+#[test]
+fn aliased_try_block_annotation_seeds_the_error_slot() {
+    infer(
+        r#"
+    type Outcome = Result<string, error>
+
+    struct AError { }
+
+    impl AError {
+      fn Error(self) -> string { "a" }
+    }
+
+    struct BError { }
+
+    impl BError {
+      fn Error(self) -> string { "b" }
+    }
+
+    fn do_a() -> Result<string, AError> { Err(AError {}) }
+    fn do_b() -> Result<string, BError> { Err(BError {}) }
+
+    fn run() -> string {
+      let r: Outcome = try {
+        let a = do_a()?
+        let b = do_b()?
+        a + b
+      }
+      match r {
+        Ok(v) => v,
+        Err(e) => e.Error(),
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn propagate_without_error_method_names_the_missing_method() {
+    assert_infer_error_snapshot!(
+        r#"
+    struct PlainError { code: int }
+
+    fn fetch() -> Result<int, PlainError> { Err(PlainError { code: 7 }) }
+
+    fn load() -> Result<int, error> {
+      let n = fetch()?
+      Ok(n)
+    }
+        "#
+    );
+}
+
+#[test]
+fn propagate_value_with_pointer_receiver_error_method_is_rejected() {
+    assert_infer_error_snapshot!(
+        r#"
+    struct FileError { path: string }
+
+    impl FileError {
+      fn Error(self: Ref<FileError>) -> string { self.path }
+    }
+
+    fn read_value() -> Result<int, FileError> { Err(FileError { path: "a" }) }
+
+    fn load() -> Result<int, error> {
+      let n = read_value()?
+      Ok(n)
+    }
+        "#
+    );
+}
+
+#[test]
+fn propagate_missing_custom_interface_method_lists_the_gap() {
+    assert_infer_error_snapshot!(
+        r#"
+    pub interface AppError {
+      fn Error() -> string
+      fn status() -> int
+    }
+
+    struct DbError { }
+
+    impl DbError {
+      fn Error(self) -> string { "db down" }
+    }
+
+    fn query() -> Result<string, DbError> { Err(DbError {}) }
+
+    fn handler() -> Result<int, AppError> {
+      let row = query()?
+      Ok(row.length())
+    }
+        "#
+    );
+}
+
+#[test]
+fn propagate_unrelated_concrete_errors_is_rejected() {
+    assert_infer_error_snapshot!(
+        r#"
+    struct AError { }
+
+    impl AError {
+      fn Error(self) -> string { "a" }
+    }
+
+    struct BError { }
+
+    impl BError {
+      fn Error(self) -> string { "b" }
+    }
+
+    fn do_a() -> Result<int, AError> { Err(AError {}) }
+
+    fn load() -> Result<int, BError> {
+      let n = do_a()?
+      Ok(n)
+    }
+        "#
+    );
+}
+
+#[test]
+fn unannotated_try_block_still_binds_first_operand_error() {
+    assert_infer_error_snapshot!(
+        r#"
+    struct AError { }
+
+    impl AError {
+      fn Error(self) -> string { "a" }
+    }
+
+    struct BError { }
+
+    impl BError {
+      fn Error(self) -> string { "b" }
+    }
+
+    fn do_a() -> Result<int, AError> { Err(AError {}) }
+    fn do_b() -> Result<int, BError> { Err(BError {}) }
+
+    fn run() -> int {
+      let r = try {
+        let a = do_a()?
+        let b = do_b()?
+        a + b
+      }
+      match r {
+        Ok(v) => v,
+        Err(_) => 0,
+      }
+    }
+        "#
+    );
+}
+
+#[test]
+fn slice_of_concrete_errors_still_rejected_for_slice_of_error() {
+    assert_infer_error_snapshot!(
+        r#"
+    struct CError { }
+
+    impl CError {
+      fn Error(self) -> string { "c" }
+    }
+
+    fn take_errors(s: Slice<error>) -> int { s.length() }
+
+    fn run() -> int {
+      let errors: Slice<CError> = [CError {}]
+      take_errors(errors)
+    }
+        "#
+    );
+}
+
+#[test]
+fn generic_container_still_invariant_over_interface_argument() {
+    assert_infer_error_snapshot!(
+        r#"
+    pub interface Animal {
+      fn speak() -> string
+    }
+
+    struct Cat { }
+
+    impl Cat {
+      pub fn speak(self) -> string { "meow" }
+    }
+
+    struct Box<T> { value: T }
+
+    fn take_box(b: Box<Animal>) -> string { b.value.speak() }
+
+    fn run() -> string {
+      let boxed = Box { value: Cat {} }
+      take_box(boxed)
+    }
+        "#
+    );
 }

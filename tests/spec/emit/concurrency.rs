@@ -74,6 +74,39 @@ fn test() {
 }
 
 #[test]
+fn mutex_field_locked_through_ref_receiver() {
+    let input = r#"
+import "go:sync"
+
+struct Counter { mu: sync.Mutex, n: int }
+
+impl Counter {
+  fn bump(self: mut Ref<Counter>) {
+    self.mu.Lock()
+    defer self.mu.Unlock()
+    self.n += 1
+  }
+
+  fn read(self: mut Ref<Counter>) -> int {
+    self.mu.Lock()
+    defer self.mu.Unlock()
+    self.n
+  }
+}
+
+fn main() {
+  let mut c = Counter { mu: sync.Mutex{}, n: 0 }
+  c.bump()
+  let n = c.read()
+  if n != 1 {
+    panic(f"expected 1, got {n}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn select_simple() {
     let input = r#"
 fn test() -> int {
@@ -349,7 +382,7 @@ fn test() -> int {
 #[test]
 fn defer_in_nested_block() {
     let input = r#"
-fn record(acc: Ref<int>, digit: int) {
+fn record(acc: mut Ref<int>, digit: int) {
   acc.* = acc.* * 10 + digit
 }
 
@@ -635,6 +668,124 @@ fn main() {
 }
 
 #[test]
+fn select_continue_in_loop_needs_label() {
+    let input = r#"
+fn main() {
+  let ch = Channel.buffered<int>(4)
+  ch.send(-1)
+  ch.send(10)
+  ch.send(20)
+  ch.close()
+  let mut processed = ""
+  for _ in 0..2 {
+    select {
+      let Some(x) = ch.receive() => {
+        if x < 0 {
+          continue
+        }
+        processed += f"{x},"
+      },
+      _ => {
+        processed += "none,"
+      },
+    }
+  }
+  if processed != "10," {
+    panic(f"expected 10, got {processed}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_continue_in_default_arm_needs_label() {
+    let input = r#"
+fn main() {
+  let ch = Channel.buffered<int>(1)
+  let mut skipped = 0
+  for i in 0..2 {
+    if i == 1 {
+      ch.send(7)
+    }
+    select {
+      let Some(_x) = ch.receive() => {},
+      _ => {
+        skipped += 1
+        continue
+      },
+    }
+  }
+  if skipped != 1 {
+    panic(f"expected 1 skip, got {skipped}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_continue_without_retry_loop_unlabeled() {
+    let input = r#"
+fn main() {
+  let ch = Channel.buffered<int>(2)
+  ch.send(1)
+  ch.send(2)
+  let mut total = 0
+  for _ in 0..2 {
+    select {
+      match ch.receive() {
+        Some(x) => {
+          if x == 1 {
+            continue
+          }
+          total += x
+        },
+        None => {},
+      },
+      _ => {
+        total += 100
+      },
+    }
+  }
+  if total != 2 {
+    panic(f"expected 2, got {total}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_retry_region_preserves_nested_loop_target() {
+    let input = r#"
+fn main() {
+  let ch = Channel.buffered<int>(1)
+  ch.send(1)
+  let mut total = 0
+  loop {
+    select {
+      let Some(_) = ch.receive() => {
+        for i in 0..2 {
+          if i == 0 {
+            continue
+          }
+          total += 1
+        }
+        break
+      },
+      _ => break,
+    }
+  }
+  if total != 1 {
+    panic(f"expected 1, got {total}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn select_arm_binding_does_not_leak() {
     let input = r#"
 import "go:fmt"
@@ -653,6 +804,26 @@ fn main() {
   }
 
   fmt.Println(x)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_receive_bindings_are_scoped_per_arm_and_after_select() {
+    let input = r#"
+fn test() -> int {
+  let value = 40
+  let first = Channel.new<int>()
+  let outbound = Channel.new<int>()
+
+  let selected = select {
+    let Some(value) = first.receive() => value,
+    outbound.send(1) => value + 1,
+    _ => value + 2,
+  }
+
+  selected + value
 }
 "#;
     assert_emit_snapshot!(input);
@@ -840,6 +1011,20 @@ fn main() {
   select {
     Channel.send(ch, 1) => { let _ = 0 },
     _ => { let _ = 1 },
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_ufcs_receive() {
+    let input = r#"
+fn main() {
+  let ch = Channel.new<int>()
+  select {
+    let Some(value) = Channel.receive(ch) => { let _ = value },
+    _ => {},
   }
 }
 "#;
@@ -1067,6 +1252,186 @@ fn main() {
     let Some(v) = choose(2, ch2).receive() => v,
     _ => -2,
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn task_native_method_inlined_to_builtin_wraps_in_iife() {
+    let input = r#"
+fn test() {
+  let xs = [1]
+  task xs.length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn task_captures_reassigned_local_before_the_goroutine_runs() {
+    let input = r#"
+fn test() {
+  let mut xs = [1]
+  task xs.length()
+  xs = [1, 2]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_native_method_inlined_to_builtin_wraps_in_iife() {
+    let input = r#"
+fn test() {
+  let xs = [1]
+  defer xs.length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_native_method_iife_evaluates_argument_eagerly() {
+    let input = r#"
+fn mark() -> int {
+  2
+}
+
+fn test() {
+  let mut xs = [1]
+  defer xs.append(mark())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_native_method_iife_evaluates_receiver_eagerly() {
+    let input = r#"
+fn get_items() -> Slice<int> {
+  [1]
+}
+
+fn test() {
+  defer get_items().length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_native_method_iife_snapshots_mutable_identifier_argument() {
+    let input = r#"
+fn run() {
+  let mut dst = [0, 0, 0]
+  let mut src = [1, 2, 3]
+  defer dst.copy_from(src)
+  src = [9, 9, 9]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_native_method_iife_snapshots_deref_receiver() {
+    let input = r#"
+fn run(out: mut Ref<mut Slice<int>>) {
+  defer out.copy_from([1, 2, 3])
+  out.* = [7, 7, 7, 7, 7]
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn task_native_method_inlined_to_non_call_wraps_in_iife() {
+    let input = r#"
+fn test() {
+  let xs = [1]
+  task xs.is_empty()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn task_native_method_inlining_to_regular_call_skips_wrap() {
+    let input = r#"
+fn test() {
+  let xs = [1, 2, 3]
+  task xs.contains(2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_hoist_channel_temp_declared_before_user_binding() {
+    let input = r#"
+fn get_ch() -> Channel<int> {
+  Channel.buffered<int>(1)
+}
+
+fn test() -> int {
+  let result = select {
+    let Some(v) = get_ch().receive() => v,
+    _ => 0,
+  }
+  let ch_1 = result + 1
+  ch_1
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn select_hoist_send_value_temp_declared_before_user_binding() {
+    let input = r#"
+import "go:fmt"
+
+fn mark(log: Channel<int>, tag: int) -> int {
+  log.send(tag)
+  tag
+}
+
+fn test() {
+  let log = Channel.buffered<int>(8)
+  let closed = Channel.new<int>()
+  closed.close()
+  let out_ch = Channel.new<int>()
+
+  let result = select {
+    let Some(v) = closed.receive() => v,
+    out_ch.send(mark(log, 1)) => 0,
+    _ => -1,
+  }
+  let send_val_2 = result + 1
+  fmt.Println(send_val_2)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_static_native_method_iife_captures_value_receiver() {
+    let input = r#"
+fn test() {
+  let items = [1, 2, 3]
+  defer Slice.length(items)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn defer_static_native_method_iife_on_alias_captures_value_receiver() {
+    let input = r#"
+type MyString = string
+
+fn test() {
+  let s = "hi"
+  defer MyString.length(s)
 }
 "#;
     assert_emit_snapshot!(input);

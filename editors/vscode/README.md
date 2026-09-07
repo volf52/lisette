@@ -6,6 +6,7 @@ VSCode language support for [Lisette](https://github.com/ivov/lisette).
 
 - Syntax highlighting
 - Diagnostics
+- Quick fixes (lint autofixes)
 - Hover
 - Completions
 - Go-to-definition
@@ -21,7 +22,7 @@ VSCode language support for [Lisette](https://github.com/ivov/lisette).
 
     ```bash
     cargo install lisette
-    lis version # -> lisette 0.1.0 (go 1.25.5)
+    lis version # -> lisette 0.2.1 (go 1.25.10)
     ```
 
 2. Install the [Lisette extension](https://marketplace.visualstudio.com/items?itemName=ivov.lisette) from the Visual Studio marketplace.
@@ -57,13 +58,8 @@ pnpm run package
 code --install-extension lisette-0.1.0.vsix
 ```
 
-First time:
+To publish:
 
-1. Create a publisher at https://marketplace.visualstudio.com/manage
-2. Generate a Personal Access Token (PAT) from Azure DevOps
-3. `pnpm dlx @vscode/vsce login {publisher_name}`
-
-Updating:
-
-1. Bump `version` in `package.json` and commit
+1. Bump `version` in `package.json`
 2. `pnpm run publish`
+3. `npx ovsx publish lisette-<version>.vsix --pat $OVSX_PAT`

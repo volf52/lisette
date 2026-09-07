@@ -1,9 +1,27 @@
-use crate::assert_parse_snapshot;
+use crate::{assert_parse_error_snapshot, assert_parse_snapshot};
+use std::fmt;
+use std::fmt::Error;
 
 #[test]
 fn array_literal_operand() {
     let input = r#"
 fn test() { let result = [1, 2, 3][index]; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn array_type_annotation() {
+    let input = r#"
+fn test(xs: Array<int, 3>) -> int { xs[0] }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn array_new_turbofish_args() {
+    let input = r#"
+fn test() { let _xs = Array.new<int, 3>(); }
 "#;
     assert_parse_snapshot!(input);
 }
@@ -362,6 +380,16 @@ fn let_else_basic() {
 fn test() -> Option<int> {
   let Some(x) = opt else { return None; };
   Some(x)
+}
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn let_assert_basic() {
+    let input = r#"
+fn test() {
+  let assert Ok(x) = result;
 }
 "#;
     assert_parse_snapshot!(input);
@@ -787,6 +815,14 @@ fn function_with_generic() {
       1 => 1;
     }
   }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn integer_in_type_argument_position() {
+    let input = r#"
+fn test(value: Array<int, 3>) {}
 "#;
     assert_parse_snapshot!(input);
 }
@@ -1347,7 +1383,7 @@ impl Counter {
 #[test]
 fn import_basic() {
     let input = r#"
-import "my_module"
+import "my_package"
 "#;
     assert_parse_snapshot!(input);
 }
@@ -2280,6 +2316,40 @@ struct Marker()
 }
 
 #[test]
+fn tuple_struct_function_type_field() {
+    let input = r#"
+struct WriterFunc(fn(byte) -> Option<string>)
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn tuple_struct_function_type_field_after_other_field() {
+    let input = r#"
+struct Handler(int, fn(int) -> int)
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn tuple_struct_multiple_function_type_fields() {
+    let input = r#"
+struct Callbacks(fn() -> int, fn(int))
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn enum_tuple_variant_function_type_field() {
+    let input = r#"
+enum E {
+  V(fn(int) -> int)
+}
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
 fn brace_after_call_is_block() {
     let input = r#"
 fn get_value() -> int { 1 }
@@ -2597,6 +2667,26 @@ fn test(count: int) {
 }
 
 #[test]
+fn subtraction_of_unary_minus_variable() {
+    let input = r#"
+fn test(a: int, b: int) {
+  let result = a--b;
+}
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn subtraction_of_unary_minus_literal() {
+    let input = r#"
+fn test(a: int) {
+  let result = a--1;
+}
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
 fn unary_minus_parenthesized() {
     let input = r#"
 fn test(a: int, b: int) {
@@ -2802,6 +2892,30 @@ fn test(base: Point) { let p = Point { ..base, }; }
 }
 
 #[test]
+fn struct_autofill_with_fields() {
+    let input = r#"
+fn test() { let p = Point { x: 1, .. }; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn struct_autofill_only() {
+    let input = r#"
+fn test() { let p = Point { .. }; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn struct_autofill_trailing_comma() {
+    let input = r#"
+fn test() { let p = Point { x: 1, .., }; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
 fn call_with_type_arg_simple() {
     let input = r#"
 fn test() { func<int>(x); }
@@ -2837,6 +2951,25 @@ fn test() { obj.method<int>(arg); }
 fn call_with_function_type_in_type_args() {
     let input = r#"
 fn test() { Map.new<string, fn(int, int) -> int>(); }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn comparison_args_are_not_type_args() {
+    let input = r#"
+fn test() { take(a < b, c > d); }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn comparison_ending_statement_is_not_type_args() {
+    let input = r#"
+fn test() {
+  let ok = a < b
+  side()
+}
 "#;
     assert_parse_snapshot!(input);
 }
@@ -2918,6 +3051,42 @@ fn test() {
 }
 "#;
     assert_parse_snapshot!(input);
+}
+
+#[test]
+fn compound_assignment_on_block_no_exponential_blowup() {
+    use std::fmt::Write;
+    use syntax::lex::Lexer;
+    use syntax::parse::Parser;
+
+    let levels = 20;
+    let mut input = String::from("fn test() {\n");
+    for _ in 0..levels {
+        input.push('{');
+    }
+    input.push('a');
+    for _ in 0..levels {
+        input.push_str(" } -= 0");
+    }
+    input.push_str("\n}\n");
+
+    let lex = Lexer::new(&input, 0).lex();
+    let parse_result = Parser::new(lex.tokens, &input).parse();
+
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            self.0 += s.len();
+            if self.0 >= 100_000 {
+                Err(Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut counter = Counter(0);
+    let result = write!(counter, "{:?}", parse_result.ast);
+    assert!(result.is_ok(), "AST debug output exceeded 100 KiB");
 }
 
 #[test]
@@ -3172,52 +3341,6 @@ fn test() {
 }
 
 #[test]
-fn value_enum_basic() {
-    let input = r#"
-enum Weekday {
-  Sunday = 0,
-  Monday = 1,
-  Tuesday = 2,
-}
-"#;
-    assert_parse_snapshot!(input);
-}
-
-#[test]
-fn value_enum_hex() {
-    let input = r#"
-enum FileMode {
-  ModeDir = 0x80000000,
-  ModeRegular = 0,
-}
-"#;
-    assert_parse_snapshot!(input);
-}
-
-#[test]
-fn value_enum_string() {
-    let input = r#"
-enum HttpMethod {
-  Get = "GET",
-  Post = "POST",
-  Put = "PUT",
-}
-"#;
-    assert_parse_snapshot!(input);
-}
-
-#[test]
-fn value_enum_negative() {
-    let input = r#"
-enum Offset {
-  Start = 0,
-  End = -1,
-}
-"#;
-    assert_parse_snapshot!(input);
-}
-
-#[test]
 fn negative_pattern_i64_min() {
     let input = r#"
 fn classify(x: int) -> string {
@@ -3225,16 +3348,6 @@ fn classify(x: int) -> string {
     -9223372036854775808 => "min",
     _ => "other",
   }
-}
-"#;
-    assert_parse_snapshot!(input);
-}
-
-#[test]
-fn value_enum_negative_i64_min() {
-    let input = r#"
-enum Time: int64 {
-  Earliest = -9223372036854775808,
 }
 "#;
     assert_parse_snapshot!(input);
@@ -3488,7 +3601,7 @@ fn test() -> Slice<string> {
 #[test]
 fn call_with_spread_arg() {
     let input = r#"
-fn test() { func(..xs); }
+fn test() { func(xs...); }
 "#;
     assert_parse_snapshot!(input);
 }
@@ -3496,7 +3609,7 @@ fn test() { func(..xs); }
 #[test]
 fn call_with_leading_args_and_spread_arg() {
     let input = r#"
-fn test() { func(a, b, ..xs); }
+fn test() { func(a, b, xs...); }
 "#;
     assert_parse_snapshot!(input);
 }
@@ -3504,7 +3617,7 @@ fn test() { func(a, b, ..xs); }
 #[test]
 fn call_with_spread_arg_trailing_comma() {
     let input = r#"
-fn test() { func(..xs,); }
+fn test() { func(xs...,); }
 "#;
     assert_parse_snapshot!(input);
 }
@@ -3512,7 +3625,149 @@ fn test() { func(..xs,); }
 #[test]
 fn call_with_leading_args_and_spread_arg_trailing_comma() {
     let input = r#"
-fn test() { func(a, b, ..xs,); }
+fn test() { func(a, b, xs...,); }
 "#;
     assert_parse_snapshot!(input);
+}
+
+#[test]
+fn call_with_range_to_arg() {
+    let input = r#"
+fn test() { func(..5); }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn call_with_range_to_inclusive_arg() {
+    let input = r#"
+fn test() { func(..=4); }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn call_with_range_full_arg() {
+    let input = r#"
+fn test() { func(..); }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn standalone_range_to_binding() {
+    let input = r#"
+fn test() { let r: RangeTo<int> = ..5; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn raw_string_literal_assignment() {
+    let input = r#"
+fn test() { let x = r"\d+\.\d+"; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_function_arg() {
+    let input = r#"
+fn test() { f(r"C:\Users\me"); }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_slice() {
+    let input = r#"
+fn test() { let xs = [r"\d", r"\s", "plain"]; }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_match_pattern() {
+    let input = r#"
+fn test() {
+  match s {
+    r"\d+" => 1,
+    "plain" => 2,
+    _ => 0,
+  }
+}
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_rawgo_directive() {
+    let input = r#"
+fn test() { @rawgo(r"if x > 0 {\n}") }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn parse_string_multiline_preserves_indent() {
+    let input = "fn test() { let s = \"a\n    b\" }";
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn parse_string_crlf_normalised() {
+    let input = "fn test() { let s = \"a\r\nb\" }";
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn parse_raw_string_crlf_normalised() {
+    let input = "fn test() { let s = r\"a\r\nb\" }";
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn parse_pattern_string_multiline() {
+    let input = "fn test() { match s { \"a\nb\" => 1, _ => 0 } }";
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn writable_qualifier_positions() {
+    let input = r#"
+struct Batch { items: mut Slice<int>, tags: Slice<string> }
+fn fill(data: mut Slice<int>) -> mut Slice<int> { data }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn writable_qualifier_nested_type_argument() {
+    let input = r#"
+fn rows(data: mut Slice<mut Slice<int>>) -> int { 0 }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn writable_qualifier_enum_payload() {
+    let input = r#"
+enum Holder { Tags(mut Slice<string>), None }
+"#;
+    assert_parse_snapshot!(input);
+}
+
+#[test]
+fn writable_qualifier_duplicate_mut_error() {
+    assert_parse_error_snapshot!("fn f(x: mut mut Slice<int>) -> int { 0 }");
+}
+
+#[test]
+fn writable_qualifier_on_tuple_error() {
+    assert_parse_error_snapshot!("fn f(x: mut (int, string)) -> int { 0 }");
+}
+
+#[test]
+fn struct_field_name_position_mut_error() {
+    assert_parse_error_snapshot!("struct S { mut items: Slice<int> }");
 }

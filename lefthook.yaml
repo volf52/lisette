@@ -3,7 +3,7 @@ commit-msg:
     conventional-commit:
       run: |
         MSG=$(head -1 {1})
-        echo "$MSG" | grep -qE "^(feat|fix|refactor|test|docs|chore|ci|perf|build)(\(.+\))?!?: [a-z].*" || { echo "Commit message must follow Conventional Commits: <type>: <description> (lowercase after colon)"; exit 1; }
+        echo "$MSG" | grep -qE '^(feat|fix|refactor|test|docs|chore|ci|perf)(\(.+\))?!?: [a-z`].*' || { echo "Commit message must follow Conventional Commits: <type>: <description> (lowercase after colon)"; exit 1; }
         LEN=$(echo -n "$MSG" | wc -c | tr -d ' ')
         [ "$LEN" -le 72 ] || { echo "Commit subject is $LEN chars (max 72)"; exit 1; }
 
@@ -12,23 +12,21 @@ pre-commit:
   commands:
     check:
       glob: "**/*.{rs,lis,toml}"
-      run: just check && just check-stdlib-typedefs
+      run: just check && cargo run -p lisette -- check crates/stdlib/typedefs/
     bindgen:
       glob: "bindgen/**/*.go"
       root: "bindgen"
       run: just check
-    generate-stdlib-typedefs:
+    check-stdlib-drift:
       glob: "bindgen/**/*.go"
-      run: just generate-stdlib-typedefs "$(grep '// Lisette:' crates/stdlib/typedefs/fmt.d.lis | awk '{print $3}')" && git diff --exit-code crates/stdlib/
-    go-version-sync:
-      glob: "{go-version,prelude/go.mod,bindgen/go.mod,bindgen/internal/cli/metadata/go-version,crates/cli/go-version}"
+      run: just check-stdlib-drift
+    go-versions-sync:
+      glob: "{go-toolchain,go-language,prelude/go.mod,bindgen/go.mod,bindgen/internal/cli/metadata/go-toolchain,crates/cli/go-toolchain,crates/cli/go-language,README.md,site/src/content/docs/intro/quickstart.mdx}"
+      run: ./scripts/check-go-versions.sh
+    tree-sitter-sync:
+      glob: "editors/tree-sitter-lisette/{grammar.js,queries/**/*,src/**/*}"
+      root: "editors/tree-sitter-lisette"
       run: |
-        EXPECTED=$(cat go-version | cut -d. -f1,2)
-        PRELUDE=$(grep '^go ' prelude/go.mod | awk '{print $2}')
-        BINDGEN=$(grep '^go ' bindgen/go.mod | awk '{print $2}')
-        EMBEDDED=$(cat bindgen/internal/cli/metadata/go-version | tr -d '[:space:]')
-        CLI=$(cat crates/cli/go-version | tr -d '[:space:]')
-        [ "$EXPECTED" = "$PRELUDE" ] || { echo "Go version mismatch: go-version has $EXPECTED but prelude/go.mod has $PRELUDE"; exit 1; }
-        [ "$EXPECTED" = "$BINDGEN" ] || { echo "Go version mismatch: go-version has $EXPECTED but bindgen/go.mod has $BINDGEN"; exit 1; }
-        [ "$(cat go-version | tr -d '[:space:]')" = "$EMBEDDED" ] || { echo "Go version mismatch: go-version has $(cat go-version) but bindgen metadata has $EMBEDDED"; exit 1; }
-        [ "$(cat go-version | tr -d '[:space:]')" = "$CLI" ] || { echo "Go version mismatch: go-version has $(cat go-version) but crates/cli/go-version has $CLI"; exit 1; }
+        npm ci
+        npx tree-sitter generate
+        git diff --exit-code src || { echo "tree-sitter src/ is out of sync with the pinned CLI; run 'just grammar' and stage src/"; exit 1; }

@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn bump(i: Ref<int>) -> int {\n  i.* = 1\n  10\n}\n\nfn main() {\n  let mut i = 0\n  let s = f\"{i},{bump(&i)}\"\n  let _ = s\n}\n"
+description: |
+  
+  fn bump(i: mut Ref<int>) -> int {
+    i.* = 1
+    10
+  }
+  
+  fn main() {
+    let mut i = 0
+    let s = f"{i},{bump(&i)}"
+    let _ = s
+  }
 ---
 package main
 
@@ -13,5 +24,7 @@ func bump(i *int) int {
 
 func main() {
 	i := 0
-	_ = fmt.Sprintf("%v,%v", i, bump(&i))
+	fmtarg_1 := i
+	s := fmt.Sprintf("%d,%d", fmtarg_1, bump(&i))
+	_ = s
 }

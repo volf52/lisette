@@ -1,6 +1,6 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: f\"result: {if x { 1 } else { 0 }}\""
+description: "f\"result: {if x { 1 } else { 0 }}\""
 ---
 LexResult {
     tokens: [
@@ -96,9 +96,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

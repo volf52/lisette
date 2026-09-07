@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nimport \"go:fmt\"\n\nstruct default {\n  value: int,\n}\n\nfn main() {\n  let x = default { value: 42 }\n  fmt.Println(x)\n}\n"
+description: |
+  
+  import "go:fmt"
+  
+  struct default {
+    value: int,
+  }
+  
+  fn main() {
+    let x = default { value: 42 }
+    fmt.Println(x)
+  }
 ---
 package main
 
@@ -8,10 +19,6 @@ import "fmt"
 
 type default_ struct {
 	value int
-}
-
-func (d default_) String() string {
-	return fmt.Sprintf("default { value: %v }", d.value)
 }
 
 func main() {

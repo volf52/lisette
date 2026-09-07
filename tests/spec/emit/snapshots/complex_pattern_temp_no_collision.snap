@@ -1,13 +1,22 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn main() {\n  let (a, (b, c)) = (1, (2, 3));\n  let tmp_1 = 7;\n  let _ = a;\n  let _ = b;\n  let _ = c;\n  let _ = tmp_1;\n}\n"
+description: |
+  
+  fn main() {
+    let (a, (b, c)) = (1, (2, 3));
+    let tmp_1 = 7;
+    let _ = a;
+    let _ = b;
+    let _ = c;
+    let _ = tmp_1;
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
 func main() {
-	tmp_1 := lisette.MakeTuple2(1, lisette.MakeTuple2(2, 3))
+	tmp_1 := lisette.MakeTuple2[int, lisette.Tuple2[int, int]](1, lisette.MakeTuple2[int, int](2, 3))
 	a := tmp_1.First
 	b := tmp_1.Second.First
 	c := tmp_1.Second.Second

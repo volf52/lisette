@@ -1,6 +1,18 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nimport \"go:fmt\"\n\nfn main() {\n  let mut m = Map.new<string, (int, int)>()\n  m[\"k\"] = (0, 0)\n  let mut entry = m[\"k\"]\n  entry.0 = 1\n  m[\"k\"] = entry\n  let v = m[\"k\"].0\n  fmt.Println(v)\n}\n"
+description: |
+  
+  import "go:fmt"
+  
+  fn main() {
+    let mut m = Map.new<string, (int, int)>()
+    m["k"] = (0, 0)
+    let mut entry = m["k"]
+    entry.0 = 1
+    m["k"] = entry
+    let v = m["k"].0
+    fmt.Println(v)
+  }
 ---
 package main
 
@@ -11,7 +23,7 @@ import (
 
 func main() {
 	m := make(map[string]lisette.Tuple2[int, int])
-	m["k"] = lisette.MakeTuple2(0, 0)
+	m["k"] = lisette.MakeTuple2[int, int](0, 0)
 	entry := m["k"]
 	entry.First = 1
 	m["k"] = entry

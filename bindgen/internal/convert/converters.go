@@ -35,8 +35,60 @@ func sanitizeParamName(name string) string {
 	return name
 }
 
-func isReferenceType(typeStr string) bool {
-	return strings.HasPrefix(typeStr, "Slice<") || strings.HasPrefix(typeStr, "Map<")
+// liftReflectionDecodeParams returns (specs, nil) when not whitelisted or no
+// `interface{}` params are liftable; the index map encodes per-param
+// `mut Ref<T>` rewrites for the caller to apply during the param loop.
+func (c *Converter) liftReflectionDecodeParams(
+	sig *types.Signature,
+	qualifiedName string,
+	specs TypeParamSpecs,
+) (TypeParamSpecs, map[int]string) {
+	if !c.cfg.IsReflectionDecode(c.currentPkgPath, qualifiedName) {
+		return specs, nil
+	}
+	used := make(map[string]bool, len(specs))
+	for _, s := range specs {
+		used[s.Name] = true
+	}
+	var overrides map[int]string
+	params := sig.Params()
+	for i := 0; i < params.Len(); i++ {
+		if sig.Variadic() && i == params.Len()-1 {
+			continue
+		}
+		t := params.At(i).Type()
+		for {
+			alias, ok := t.(*types.Alias)
+			if !ok {
+				break
+			}
+			t = alias.Rhs()
+		}
+		iface, ok := t.(*types.Interface)
+		if !ok || !iface.Empty() || isErrorInterface(iface) {
+			continue
+		}
+		name := freshTypeParamName(used)
+		used[name] = true
+		specs = append(specs, TypeParamSpec{Name: name})
+		if overrides == nil {
+			overrides = make(map[int]string)
+		}
+		overrides[i] = "mut " + refOf(name)
+	}
+	return specs, overrides
+}
+
+func freshTypeParamName(used map[string]bool) string {
+	if !used["T"] {
+		return "T"
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("T%d", n)
+		if !used[candidate] {
+			return candidate
+		}
+	}
 }
 
 func (c *Converter) convertFunction(result *ConvertResult, symbolExport extract.SymbolExport) {
@@ -46,81 +98,203 @@ func (c *Converter) convertFunction(result *ConvertResult, symbolExport extract.
 		return
 	}
 
-	mutParams := c.cfg.MutatingParams(c.currentPkgPath, result.Name)
-
-	params := signature.Params()
-	for i := 0; i < params.Len(); i++ {
-		param := params.At(i)
-		paramType := ToLisette(param.Type(), c)
-		if paramType.SkipReason != nil {
-			result.SkipReason = paramType.SkipReason
-			return
-		}
-
-		typeStr := paramType.LisetteType
-		if signature.Variadic() && i == params.Len()-1 {
-			typeStr = sliceToVarArgs(typeStr)
-		}
-
-		name := param.Name()
-		if name == "" {
-			name = fmt.Sprintf("arg%d", i)
-		}
-		name = sanitizeParamName(name)
-
-		result.Params = append(result.Params, FunctionParameter{
-			Name:    name,
-			Type:    typeStr,
-			Mutable: isMutableParam(mutParams, name, typeStr, result.Name),
-		})
-	}
-
-	returnType := ReturnsToLisette(signature, c, result.Name)
-	if returnType.LisetteType != "" {
-		result.ReturnType = returnType.LisetteType
-	} else if returnType.SkipReason != nil {
-		result.ReturnType = "Unknown"
-	}
-	result.CommaOk = returnType.CommaOk
-	result.ArrayReturn = returnType.ArrayReturn
-
-	isSinglePointerReturn := isSinglePointerResult(signature)
-	if isSinglePointerReturn && returnType.IsDirectError {
-		isSinglePointerReturn = false
-	}
-	forceNonNilable := false
-	forceNilable := c.cfg != nil && c.cfg.ShouldWrapNilableReturn(c.currentPkgPath, result.Name)
-	if isSinglePointerReturn && looksLikeConstructor(result.Name) {
-		forceNonNilable = true
-	}
-	if !forceNonNilable && isSinglePointerReturn && isPointerBoxingFunction(signature) {
-		forceNonNilable = true
-	}
-	if !forceNonNilable && isSinglePointerReturn && isIteratorReturnType(signature) {
-		forceNonNilable = true
-	}
-	if !forceNonNilable && isSinglePointerReturn && c.isManyToOneFactory(signature) {
-		forceNonNilable = true
-	}
-	if !forceNonNilable && isSinglePointerReturn && c.hasMatchingSelfReturningMethod(result.Name, signature) {
-		forceNonNilable = true
-	}
-	if !forceNonNilable && isSinglePointerReturn {
-		forceNonNilable = c.isProvenNonNilReturn(symbolExport.Obj)
-	}
-	if !forceNonNilable {
-		forceNonNilable = c.cfg != nil && c.cfg.IsNonNilableReturn(c.currentPkgPath, result.Name)
-	}
-	if (isSinglePointerReturn && !forceNonNilable) || (forceNilable && !returnType.NilableReturnApplied) {
-		result.ReturnType = fmt.Sprintf("Option<%s>", result.ReturnType)
-	}
-
-	typeParams, skip := collectTypeParams(signature.TypeParams(), false)
+	// Scan first: param/return processing must observe `S ~[]E` substitutions.
+	typeParams, substitutions, recipe, skip := collectTypeParams(signature.TypeParams(), false, c)
 	if skip != nil {
 		result.SkipReason = skip
 		return
 	}
 	result.TypeParams = typeParams
+	if len(substitutions) > 0 {
+		result.CollapsedTypeParamRecipe = strings.Join(recipe, ", ")
+	}
+	c.applySupersededBy(result, result.Name)
+
+	liftedSpecs, paramOverrides := c.liftReflectionDecodeParams(signature, result.Name, result.TypeParams)
+	result.TypeParams = liftedSpecs
+
+	params, skip := c.convertParams(signature, symbolExport.Obj, result.Name, result.Name, paramOverrides, true, substitutions)
+	if skip != nil {
+		result.SkipReason = skip
+		return
+	}
+	result.Params = params
+
+	returnType := c.applyReturnType(result, signature, symbolExport.Obj, result.Name, substitutions)
+
+	c.resolveNilability(result, signature, returnType, nilabilityDecision{
+		obj:               symbolExport.Obj,
+		lookups:           []configKey{{c.currentPkgPath, result.Name}},
+		nameIsConstructor: looksLikeConstructor(result.Name),
+		heuristicNonNil: func(isSinglePointerReturn bool) bool {
+			if looksLikeConstructor(result.Name) {
+				return true
+			}
+			if isSinglePointerReturn && isPointerBoxingFunction(signature) {
+				return true
+			}
+			if isSinglePointerReturn && isIteratorReturnType(signature) {
+				return true
+			}
+			if isSinglePointerReturn && c.isManyToOneFactory(signature) {
+				return true
+			}
+			if isSinglePointerReturn && c.hasMatchingSelfReturningMethod(result.Name, signature) {
+				return true
+			}
+			return false
+		},
+	})
+}
+
+// applySentinelInt rewrites a bare `int` return into `Option<int>` when
+// the config declares a sentinel; emit then writes the matching flag.
+func (c *Converter) applySentinelInt(result *ConvertResult, qualifiedName string) {
+	if result.ReturnType != "int" {
+		return
+	}
+	value, ok := c.cfg.SentinelInt(c.currentPkgPath, qualifiedName)
+	if !ok {
+		return
+	}
+	result.ReturnType = "Option<int>"
+	result.SentinelInt = &value
+}
+
+func (c *Converter) applySupersededBy(result *ConvertResult, qualifiedName string) {
+	if successor, ok := c.cfg.SupersededBy(c.currentPkgPath, qualifiedName); ok {
+		result.SupersededBy = successor
+	}
+}
+
+func (c *Converter) convertParams(sig *types.Signature, obj types.Object, lookupName, methodName string, paramOverrides map[int]string, directEligible bool, substitutions map[string]string) ([]FunctionParameter, *SkipReason) {
+	mutParams := c.cfg.MutatingParams(c.currentPkgPath, lookupName)
+	nonMutParams := c.cfg.NonMutatingParams(c.currentPkgPath, lookupName)
+	mutation, _ := c.mutation.Function(obj)
+	declaring, _ := obj.(*types.Func)
+
+	params := sig.Params()
+	names := paramNames(sig)
+	var out []FunctionParameter
+	for i := 0; i < params.Len(); i++ {
+		param := params.At(i)
+		isVariadicTail := sig.Variadic() && i == params.Len()-1
+		name := names[i]
+
+		var paramType TypeResult
+		directHandled := false
+		optional := false
+		if named, ok := c.directHandleIfEligible(param.Type(), directEligible); ok {
+			paramType = TypeResult{LisetteType: named.Obj().Name()}
+			directHandled = true
+		} else {
+			optional = declaring != nil && c.nilness.Params().Optional(declaring, i)
+			paramType = convertParamType(param.Type(), optional, c, substitutions)
+		}
+		if paramType.SkipReason != nil {
+			return nil, paramType.SkipReason
+		}
+
+		typeStr := paramType.LisetteType
+		naming := paramNaming{emitted: name, goName: param.Name()}
+		if !directHandled && !isVariadicTail &&
+			isMutableParam(mutation.Mutates(i), mutParams, nonMutParams, naming, param.Type(), methodName) {
+			writable := writableParamType(param.Type(), optional, c, substitutions)
+			if writable.SkipReason != nil {
+				return nil, writable.SkipReason
+			}
+			typeStr = writable.LisetteType
+		}
+		if isVariadicTail {
+			typeStr = sliceToVarArgs(typeStr)
+		}
+		if override, ok := paramOverrides[i]; ok {
+			typeStr = override
+		}
+
+		out = append(out, FunctionParameter{Name: name, Type: typeStr})
+	}
+	return out, nil
+}
+
+func (c *Converter) applyReturnType(result *ConvertResult, sig *types.Signature, obj types.Object, lookupName string, substitutions map[string]string) TypeResult {
+	returnType := returnsToLisetteWithSubstitutions(sig, c, obj, lookupName, substitutions)
+	if returnType.LisetteType != "" {
+		result.ReturnType = returnType.LisetteType
+	} else if returnType.SkipReason != nil {
+		result.ReturnType = "Unknown"
+	}
+	if returnType.SkipReason != nil {
+		result.SkipNote = returnType.SkipReason
+	}
+	result.CommaOk = returnType.CommaOk
+	c.applySentinelInt(result, lookupName)
+	return returnType
+}
+
+type configKey struct {
+	pkgPath string
+	name    string
+}
+
+type nilabilityDecision struct {
+	obj types.Object
+	// lookups: config keys consulted in order, first match wins.
+	lookups []configKey
+	// heuristicNonNil: kind-specific rules, used only when there is no body to analyze.
+	heuristicNonNil func(isSinglePointerReturn bool) bool
+	// nameIsConstructor: the only heuristic trusted over an inconclusive body, since
+	// weaker shape heuristics misfire on real nil-returning delegators like big.Int.Exp.
+	nameIsConstructor bool
+}
+
+// resolveNilability wraps the return in Option<> unless body proof, a name
+// heuristic, or config pins it non-nilable (in that precedence).
+func (c *Converter) resolveNilability(result *ConvertResult, sig *types.Signature, returnType TypeResult, d nilabilityDecision) {
+	isSingleNilableReturn := isSingleNilableResult(sig)
+	if isSingleNilableReturn && returnType.IsDirectError {
+		isSingleNilableReturn = false
+	}
+	isSinglePointerReturn := isSingleNilableReturn && isSinglePointerResult(sig)
+
+	witnessNilable := false
+	if !isSingleNilableReturn && isSingleDemotableResult(sig) {
+		facts, ok := c.nilness.Function(d.obj)
+		witnessNilable = ok && facts.HasBody && facts.Single == ReturnHasNilPath
+	}
+
+	forceNonNilable := false
+	if isSingleNilableReturn {
+		if facts, ok := c.nilness.Function(d.obj); ok && facts.HasBody {
+			switch facts.Single {
+			case ReturnProvenNonNil:
+				forceNonNilable = true
+			case ReturnUnknown:
+				forceNonNilable = d.nameIsConstructor
+			}
+		} else {
+			forceNonNilable = d.heuristicNonNil(isSinglePointerReturn)
+		}
+	}
+	for _, k := range d.lookups {
+		if forceNonNilable {
+			break
+		}
+		forceNonNilable = c.cfg.IsNonNilableReturn(k.pkgPath, k.name)
+	}
+
+	forceNilable := false
+	for _, k := range d.lookups {
+		if forceNilable {
+			break
+		}
+		forceNilable = c.cfg.ShouldWrapNilableReturn(k.pkgPath, k.name)
+	}
+
+	if ((isSingleNilableReturn || witnessNilable) && !forceNonNilable) ||
+		(forceNilable && !returnType.NilableReturnApplied) {
+		result.ReturnType = optionOf(result.ReturnType)
+	}
 }
 
 func (c *Converter) convertMethod(result *ConvertResult, symbolExport extract.SymbolExport) {
@@ -133,12 +307,12 @@ func (c *Converter) convertMethod(result *ConvertResult, symbolExport extract.Sy
 	if symbolExport.ReceiverVariable != nil {
 		if symbolExport.IsPromoted {
 			typeName := symbolExport.BaseType.Obj().Name()
-			typeParams := extractReceiverTypeParams(symbolExport.BaseType)
-			isPointerReceiver := symbolExport.NeedsPointerReceiver
+			typeParams := extractReceiverTypeParams(symbolExport.BaseType, c)
+			_, isPointerReceiver := symbolExport.ReceiverVariable.Type().(*types.Pointer)
 
 			recvLisetteType := typeName
 			if isPointerReceiver {
-				recvLisetteType = fmt.Sprintf("Ref<%s>", typeName)
+				recvLisetteType = refOf(typeName)
 			}
 
 			result.Receiver = &Receiver{
@@ -149,137 +323,349 @@ func (c *Converter) convertMethod(result *ConvertResult, symbolExport extract.Sy
 				TypeParams:   typeParams,
 			}
 		} else {
-			recvType := ToLisette(symbolExport.ReceiverVariable.Type(), c)
-			if recvType.SkipReason != nil {
-				result.SkipReason = recvType.SkipReason
-				return
-			}
-
 			isPointerReceiver := false
 			typeName := ""
-			var typeParams []string
+			var typeParams TypeParamSpecs
 			if pointer, ok := symbolExport.ReceiverVariable.Type().(*types.Pointer); ok {
 				isPointerReceiver = true
 				if named, ok := pointer.Elem().(*types.Named); ok {
 					typeName = named.Obj().Name()
-					typeParams = extractReceiverTypeParams(named)
+					typeParams = extractReceiverTypeParams(named, c)
 				}
 			} else if named, ok := symbolExport.ReceiverVariable.Type().(*types.Named); ok {
 				typeName = named.Obj().Name()
-				typeParams = extractReceiverTypeParams(named)
+				typeParams = extractReceiverTypeParams(named, c)
+			}
+
+			// An unexported same-package struct receiver renders by its bare name;
+			// ToLisette has no name for it, so bypass it.
+			var recvLisetteType string
+			if _, ok := unexportedSamePkgStruct(symbolExport.ReceiverVariable.Type(), c); ok {
+				recvLisetteType = typeName
+				if isPointerReceiver {
+					recvLisetteType = refOf(typeName)
+				}
+			} else {
+				recvType := ToLisette(symbolExport.ReceiverVariable.Type(), c)
+				if recvType.SkipReason != nil {
+					result.SkipReason = recvType.SkipReason
+					return
+				}
+				recvLisetteType = recvType.LisetteType
 			}
 
 			result.Receiver = &Receiver{
 				Name:         symbolExport.ReceiverVariable.Name(),
-				Type:         recvType.LisetteType,
+				Type:         recvLisetteType,
 				IsPointer:    isPointerReceiver,
 				BaseTypeName: typeName,
 				TypeParams:   typeParams,
 			}
 		}
+
+		if result.Receiver != nil {
+			if mutation, ok := c.mutation.Function(symbolExport.Obj); ok {
+				if mutation.ReceiverMutates && !result.Receiver.IsPointer {
+					result.Receiver.Mutable = true
+				}
+				if !mutation.ReceiverMutates {
+					result.Receiver.ProvenReadOnly = true
+				}
+			}
+		}
+	}
+
+	// A seal is recorded by identity and receiver only; its params and return are
+	// unused and may be unrepresentable.
+	if symbolExport.Unexported {
+		pkgPath := ""
+		if symbolExport.Obj != nil && symbolExport.Obj.Pkg() != nil {
+			pkgPath = symbolExport.Obj.Pkg().Path()
+		}
+		result.SealId = sealIdentity(pkgPath, result.Name, signature)
+		return
 	}
 
 	qualifiedName := result.Name
 	if result.Receiver != nil && result.Receiver.BaseTypeName != "" {
 		qualifiedName = result.Receiver.BaseTypeName + "." + result.Name
 	}
+	if result.Receiver != nil && c.cfg.MutatesReceiver(c.currentPkgPath, qualifiedName) {
+		result.Receiver.Mutable = true
+		result.Receiver.ProvenReadOnly = false
+	}
+	c.applySupersededBy(result, qualifiedName)
 
-	mutParams := c.cfg.MutatingParams(c.currentPkgPath, qualifiedName)
+	methodSpecs, _, _, skip := collectTypeParams(signature.TypeParams(), false, c)
+	if skip != nil {
+		result.SkipReason = skip
+		return
+	}
+	liftedSpecs, paramOverrides := c.liftReflectionDecodeParams(signature, qualifiedName, methodSpecs)
 
-	params := signature.Params()
-	for i := 0; i < params.Len(); i++ {
-		param := params.At(i)
-		paramType := ToLisette(param.Type(), c)
-		if paramType.SkipReason != nil {
-			result.SkipReason = paramType.SkipReason
-			return
-		}
+	params, skip := c.convertParams(signature, symbolExport.Obj, qualifiedName, result.Name, paramOverrides, true, nil)
+	if skip != nil {
+		result.SkipReason = skip
+		return
+	}
+	result.Params = params
 
-		typeStr := paramType.LisetteType
-		if signature.Variadic() && i == params.Len()-1 {
-			typeStr = sliceToVarArgs(typeStr)
-		}
+	returnType := c.applyReturnType(result, signature, symbolExport.Obj, qualifiedName, nil)
 
-		name := param.Name()
-		if name == "" {
-			name = fmt.Sprintf("arg%d", i)
-		}
-		name = sanitizeParamName(name)
-
-		result.Params = append(result.Params, FunctionParameter{
-			Name:    name,
-			Type:    typeStr,
-			Mutable: isMutableParam(mutParams, name, typeStr, result.Name),
-		})
+	lookups := []configKey{{c.currentPkgPath, qualifiedName}}
+	if symbolExport.IsPromoted && symbolExport.OriginalTypeName != "" {
+		lookups = append(lookups, configKey{symbolExport.OriginalPkgPath, symbolExport.OriginalTypeName + "." + result.Name})
 	}
-
-	returnType := ReturnsToLisette(signature, c, qualifiedName)
-	if returnType.LisetteType != "" {
-		result.ReturnType = returnType.LisetteType
-	} else if returnType.SkipReason != nil {
-		result.ReturnType = "Unknown"
-	}
-	result.CommaOk = returnType.CommaOk
-	result.ArrayReturn = returnType.ArrayReturn
-
-	isSinglePointerReturn := isSinglePointerResult(signature)
-	if isSinglePointerReturn && returnType.IsDirectError {
-		isSinglePointerReturn = false
-	}
-	forceNonNilable := isSinglePointerReturn && looksLikeConstructor(result.Name)
-	if !forceNonNilable && isSinglePointerReturn && result.Receiver != nil && !looksLikeNavigationMethod(result.Name) {
-		if isSelfReturning(signature, result.Receiver.BaseTypeName) ||
-			c.isUniformPointerReturnType(result.Receiver.BaseTypeName) ||
-			c.isMajorityPointerReturnType(result.Receiver.BaseTypeName) {
-			forceNonNilable = true
-		}
-	}
-	if !forceNonNilable && isSinglePointerReturn && symbolExport.IsPromoted && symbolExport.OriginalTypeName != "" {
-		if isSelfReturning(signature, symbolExport.OriginalTypeName) {
-			forceNonNilable = true
-		}
-	}
-	if !forceNonNilable && isSinglePointerReturn && isIteratorReturnType(signature) {
-		forceNonNilable = true
-	}
-	if !forceNonNilable && isSinglePointerReturn {
-		forceNonNilable = c.isProvenNonNilReturn(symbolExport.Obj)
-	}
-	if !forceNonNilable {
-		forceNonNilable = c.cfg != nil && c.cfg.IsNonNilableReturn(c.currentPkgPath, qualifiedName)
-	}
-	if !forceNonNilable && symbolExport.IsPromoted && symbolExport.OriginalTypeName != "" {
-		originalQualified := symbolExport.OriginalTypeName + "." + result.Name
-		forceNonNilable = c.cfg != nil && c.cfg.IsNonNilableReturn(symbolExport.OriginalPkgPath, originalQualified)
-	}
-	methodForceNilable := c.cfg != nil && c.cfg.ShouldWrapNilableReturn(c.currentPkgPath, qualifiedName)
-	if !methodForceNilable && symbolExport.IsPromoted && symbolExport.OriginalTypeName != "" {
-		originalQualified := symbolExport.OriginalTypeName + "." + result.Name
-		methodForceNilable = c.cfg != nil && c.cfg.ShouldWrapNilableReturn(symbolExport.OriginalPkgPath, originalQualified)
-	}
-	if (isSinglePointerReturn && !forceNonNilable) || (methodForceNilable && !returnType.NilableReturnApplied) {
-		result.ReturnType = fmt.Sprintf("Option<%s>", result.ReturnType)
-	}
+	c.resolveNilability(result, signature, returnType, nilabilityDecision{
+		obj:               symbolExport.Obj,
+		lookups:           lookups,
+		nameIsConstructor: looksLikeConstructor(result.Name),
+		heuristicNonNil: func(isSinglePointerReturn bool) bool {
+			if looksLikeConstructor(result.Name) {
+				return true
+			}
+			if isSinglePointerReturn && result.Receiver != nil && !looksLikeNavigationMethod(result.Name) {
+				if isSelfReturning(signature, result.Receiver.BaseTypeName) ||
+					c.isUniformPointerReturnType(result.Receiver.BaseTypeName) ||
+					c.isMajorityPointerReturnType(result.Receiver.BaseTypeName) {
+					return true
+				}
+			}
+			if isSinglePointerReturn && symbolExport.IsPromoted && symbolExport.OriginalTypeName != "" {
+				if isSelfReturning(signature, symbolExport.OriginalTypeName) {
+					return true
+				}
+			}
+			if isSinglePointerReturn && isIteratorReturnType(signature) {
+				return true
+			}
+			return false
+		},
+	})
 
 	if symbolExport.BaseType != nil {
-		_, skip := collectTypeParams(symbolExport.BaseType.TypeParams(), false)
+		_, substitutions, _, skip := collectTypeParams(symbolExport.BaseType.TypeParams(), false, c)
 		if skip != nil {
 			result.SkipReason = skip
 			return
 		}
+		if len(substitutions) > 0 {
+			result.SkipReason = &SkipReason{
+				Code:    "collapsed-type-param",
+				Message: "receiver type has a shape-collapsed type parameter",
+			}
+			return
+		}
 	}
+
+	result.TypeParams = liftedSpecs
+
+	if isFluentBuilderCandidate(result, symbolExport, signature) {
+		if fn := c.findFuncDecl(symbolExport.Obj); fn != nil && isFluentMethod(fn, ncGetReceiverName(fn)) {
+			if !c.cfg.ShouldDenyUnusedValue(c.currentPkgPath, qualifiedName) {
+				result.BuilderMethod = true
+			}
+		}
+	}
+}
+
+// isFluentBuilderCandidate gates AST inspection. Clone/Copy return new values despite the fluent shape.
+func isFluentBuilderCandidate(result *ConvertResult, exp extract.SymbolExport, sig *types.Signature) bool {
+	if result.Receiver == nil || !result.Receiver.IsPointer {
+		return false
+	}
+	if result.Name == "Clone" || result.Name == "Copy" {
+		return false
+	}
+	return returnIsReceiverShaped(sig)
+}
+
+// leftmostIdent walks `recv.A(...).B(...)` chains so the receiver can be detected at the head.
+func leftmostIdent(expr ast.Expr) *ast.Ident {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e
+	case *ast.SelectorExpr:
+		return leftmostIdent(e.X)
+	case *ast.CallExpr:
+		return leftmostIdent(e.Fun)
+	}
+	return nil
+}
+
+// returnIsReceiverShaped filters out delegation that returns unrelated types (e.g. `*Alpha.At -> color.Color`) and Result/Option-wrapped returns where unused_value cannot fire.
+func returnIsReceiverShaped(sig *types.Signature) bool {
+	recv := sig.Recv()
+	if recv == nil {
+		return false
+	}
+	results := sig.Results()
+	if results.Len() != 1 {
+		return false
+	}
+	recvPtr, ok := recv.Type().(*types.Pointer)
+	if !ok {
+		return false
+	}
+	recvNamed, ok := recvPtr.Elem().(*types.Named)
+	if !ok {
+		return false
+	}
+
+	if retNamed := singlePointerReturnNamed(sig); retNamed != nil && retNamed == recvNamed {
+		return true
+	}
+	retNamed, ok := results.At(0).Type().(*types.Named)
+	if !ok {
+		return false
+	}
+	if retNamed == recvNamed {
+		return true
+	}
+	if iface, ok := retNamed.Underlying().(*types.Interface); ok && !iface.Empty() {
+		return types.Implements(recvPtr, iface)
+	}
+	return false
+}
+
+func (c *Converter) finalizeInterfaceBuilders(symbols []convertedSymbol) {
+	if c.pkg == nil || c.pkg.Types == nil {
+		return
+	}
+
+	concreteBuilders := make(map[string]map[string]bool)
+	for _, symbol := range symbols {
+		r := symbol.result
+		if r.Kind != extract.ExportMethod || r.Receiver == nil || !r.BuilderMethod {
+			continue
+		}
+		methods, ok := concreteBuilders[r.Receiver.BaseTypeName]
+		if !ok {
+			methods = make(map[string]bool)
+			concreteBuilders[r.Receiver.BaseTypeName] = methods
+		}
+		methods[r.Name] = true
+	}
+	if len(concreteBuilders) == 0 {
+		return
+	}
+
+	scope := c.pkg.Types.Scope()
+	for i := range symbols {
+		result := &symbols[i].result
+		if result.Kind != extract.ExportType || !result.IsInterface || len(result.InterfaceMethods) == 0 {
+			continue
+		}
+		ifaceObj := scope.Lookup(result.Name)
+		if ifaceObj == nil {
+			continue
+		}
+		ifaceNamed, ok := ifaceObj.Type().(*types.Named)
+		if !ok {
+			continue
+		}
+		iface, ok := ifaceNamed.Underlying().(*types.Interface)
+		if !ok {
+			continue
+		}
+		for mi := range result.InterfaceMethods {
+			methodName := result.InterfaceMethods[mi].Name
+			for concreteName, builderMethods := range concreteBuilders {
+				if !builderMethods[methodName] {
+					continue
+				}
+				concreteObj := scope.Lookup(concreteName)
+				if concreteObj == nil {
+					continue
+				}
+				concreteNamed, ok := concreteObj.Type().(*types.Named)
+				if !ok {
+					continue
+				}
+				if types.Implements(types.NewPointer(concreteNamed), iface) {
+					result.InterfaceMethods[mi].BuilderMethod = true
+					break
+				}
+			}
+		}
+	}
+}
+
+// isFluentMethod excludes trivial `return self` getters — real fluent setters either do work before returning or delegate via a method call on the receiver.
+func isFluentMethod(fn *ast.FuncDecl, recvName string) bool {
+	if fn == nil || fn.Body == nil || recvName == "" {
+		return false
+	}
+
+	hasReturn := false
+	allMatchRecv := true
+	anyCallOnRecv := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		if len(ret.Results) != 1 {
+			allMatchRecv = false
+			return true
+		}
+		hasReturn = true
+		switch r := ret.Results[0].(type) {
+		case *ast.Ident:
+			if r.Name != recvName {
+				allMatchRecv = false
+			}
+		case *ast.CallExpr:
+			if id := leftmostIdent(r); id != nil && id.Name == recvName {
+				anyCallOnRecv = true
+				return true
+			}
+			allMatchRecv = false
+		default:
+			allMatchRecv = false
+		}
+		return true
+	})
+
+	if !hasReturn || !allMatchRecv {
+		return false
+	}
+	return len(fn.Body.List) > 1 || anyCallOnRecv
 }
 
 func (c *Converter) convertType(result *ConvertResult, exp extract.SymbolExport) {
 	if alias, ok := exp.GoType.(*types.Alias); ok {
+		if isGenericAlias(alias) {
+			result.SkipReason = &SkipReason{
+				Code:    "generic-alias",
+				Message: "generic type aliases are not yet representable",
+			}
+			return
+		}
 		rhs := alias.Rhs()
 		t := ToLisette(rhs, c)
 		if t.SkipReason != nil {
+			if newtype, ok := c.salvageInternalAlias(rhs, t.SkipReason); ok {
+				result.LisetteType = newtype
+				return
+			}
 			result.SkipReason = withOpaqueType(t.SkipReason)
 			return
 		}
 		result.LisetteType = t.LisetteType
 		result.IsTypeAlias = true
+		return
+	}
+
+	if basic, ok := exp.GoType.(*types.Basic); ok && basic.Kind() == types.UnsafePointer {
+		result.SkipReason = &SkipReason{
+			Code:           "unrepresentable-builtin",
+			Message:        "Lisette has no untyped pointer type",
+			EmitOpaqueType: true,
+		}
 		return
 	}
 
@@ -289,38 +675,42 @@ func (c *Converter) convertType(result *ConvertResult, exp extract.SymbolExport)
 		return
 	}
 
-	typeParams, skip := collectTypeParams(named.TypeParams(), true)
+	typeParams, substitutions, _, skip := collectTypeParams(named.TypeParams(), true, c)
 	if skip != nil {
+		result.TypeParams = bareTypeParamSpecs(named.TypeParams())
 		result.SkipReason = skip
 		return
 	}
+	// Shape collapse (`S ~[]E`) is only supported for functions, not types.
+	if len(substitutions) > 0 {
+		result.TypeParams = bareTypeParamSpecs(named.TypeParams())
+		result.SkipReason = &SkipReason{
+			Code:           "collapsed-type-param",
+			Message:        "generic type with a shape-collapsed type parameter is not representable",
+			EmitOpaqueType: true,
+		}
+		return
+	}
 	result.TypeParams = typeParams
+	result.UnexportedType = exp.Unexported
 
 	underlying := named.Underlying()
 
 	switch u := underlying.(type) {
 	case *types.Struct:
-		for field := range u.Fields() {
-			if !field.Exported() {
-				continue
-			}
-
-			fieldType := ToLisetteNilable(field.Type(), c)
-			if fieldType.SkipReason != nil {
-				continue
-			}
-
-			result.Fields = append(result.Fields, StructField{
-				Name: field.Name(),
-				Type: fieldType.LisetteType,
-			})
-		}
+		fields, hasHidden := convertStructFields(u, c)
+		result.Fields = fields
+		result.HasHiddenEmbed = structHasHiddenEmbed(u, result.Fields)
+		result.HasHiddenFields = hasHidden
+		result.ZeroSafe = c.cfg.IsCuratedZeroSafe(c.currentPkgPath, result.Name)
+		result.ZeroUnsafe = c.cfg.IsCuratedZeroUnsafe(c.currentPkgPath, result.Name)
 
 	case *types.Interface:
 		if isErrorInterface(u) {
 			result.LisetteType = "error"
 		} else if u.Empty() {
-			result.IsInterface = true
+			result.LisetteType = "Unknown"
+			result.IsTypeAlias = true
 		} else if methods, ok := c.extractInterfaceMethods(u, result.Name); ok {
 			result.IsInterface = true
 			result.InterfaceMethods = methods
@@ -331,12 +721,40 @@ func (c *Converter) convertType(result *ConvertResult, exp extract.SymbolExport)
 
 	default:
 		t := ToLisette(underlying, c)
+		if goWritableCapability(underlying) {
+			t = writableRecursive(underlying, make(map[types.Type]bool), c, nil, false)
+		}
 		if t.SkipReason != nil {
 			result.SkipReason = withOpaqueType(t.SkipReason)
 			return
 		}
 		result.LisetteType = t.LisetteType
 	}
+}
+
+// goWritableCapability reports whether Go grants writes through this storage.
+func goWritableCapability(t types.Type) bool {
+	return writableCapability(t, make(map[types.Type]bool))
+}
+
+func writableCapability(t types.Type, seen map[types.Type]bool) bool {
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	switch u := t.Underlying().(type) {
+	case *types.Slice, *types.Map, *types.Pointer:
+		return true
+	case *types.Struct:
+		for field := range u.Fields() {
+			if writableCapability(field.Type(), seen) {
+				return true
+			}
+		}
+	case *types.Array:
+		return writableCapability(u.Elem(), seen)
+	}
+	return false
 }
 
 // withOpaqueType clones reason with EmitOpaqueType set, so a skipped top-level
@@ -372,6 +790,16 @@ func (c *Converter) convertConstant(result *ConvertResult, exp extract.SymbolExp
 
 	t := ToLisette(actualType, c)
 	if t.SkipReason != nil {
+		// Const typed by an internal package stays referenceable as an opaque
+		// value; the rendered Lisette code emits the qualified name verbatim,
+		// and Go preserves the original const's type at the call site. Mirrors
+		// the function-return fallback in convertFunction.
+		if t.SkipReason.Code == "internal-package-ref" {
+			result.LisetteType = "Unknown"
+			result.ConstValue = ""
+			result.SkipNote = t.SkipReason
+			return
+		}
 		result.SkipReason = t.SkipReason
 		return
 	}
@@ -379,76 +807,247 @@ func (c *Converter) convertConstant(result *ConvertResult, exp extract.SymbolExp
 }
 
 func (c *Converter) convertVariable(result *ConvertResult, exp extract.SymbolExport) {
+	if named, ok := c.directHandle(exp.GoType); ok {
+		result.LisetteType = named.Obj().Name()
+		return
+	}
+
 	t := ToLisette(exp.GoType, c)
-	if t.SkipReason != nil {
+	if t.SkipReason != nil && t.SkipReason.Code != "internal-package-ref" {
 		result.SkipReason = t.SkipReason
 		return
 	}
-	result.LisetteType = t.LisetteType
+	if t.SkipReason != nil {
+		result.LisetteType = "Unknown"
+		result.SkipNote = t.SkipReason
+	} else {
+		result.LisetteType = t.LisetteType
+		if goWritableCapability(exp.GoType) {
+			writable := writableRecursive(exp.GoType, make(map[types.Type]bool), c, nil, false)
+			if writable.SkipReason == nil {
+				result.LisetteType = writable.LisetteType
+			}
+		}
+	}
 
 	isNilable := isNilableGoType(exp.GoType)
-	forceNonNilable := c.cfg != nil && (c.cfg.IsNonNilableVar(c.currentPkgPath, result.Name) || c.cfg.IsNonNilableReturn(c.currentPkgPath, result.Name))
+	forceNonNilable := c.cfg.IsNonNilableVar(c.currentPkgPath, result.Name) || c.cfg.IsNonNilableReturn(c.currentPkgPath, result.Name)
 	if !forceNonNilable && isNilable {
 		forceNonNilable = c.isProvenNonNilVar(exp.Obj)
 	}
 	if isNilable && !forceNonNilable {
-		result.LisetteType = fmt.Sprintf("Option<%s>", result.LisetteType)
+		result.LisetteType = optionOf(result.LisetteType)
 	}
 }
 
-func (c *Converter) getOriginalLiteral(constObj *types.Const) string {
-	if c.pkg == nil {
-		return ""
-	}
-
-	pos := constObj.Pos()
-	if !pos.IsValid() {
-		return ""
-	}
-
-	for _, file := range c.pkg.Syntax {
-		if file == nil {
+// convertStructFields reports whether any real Go field went unrepresented.
+func convertStructFields(s *types.Struct, c *Converter) ([]StructField, bool) {
+	var fields []StructField
+	hasHidden := false
+	for field := range s.Fields() {
+		if !field.Exported() {
+			if field.Embedded() && c.EmbedIsFaithful(field) {
+				fields = append(fields, embeddedStructField(field, c))
+			} else {
+				hasHidden = true
+			}
 			continue
 		}
-
-		tokenFile := c.pkg.Fset.File(file.Pos())
-		if tokenFile == nil || int(pos) < tokenFile.Base() || int(pos) >= tokenFile.Base()+tokenFile.Size() {
+		if field.Embedded() {
+			fields = append(fields, embeddedStructField(field, c))
 			continue
 		}
-
-		var literal string
-		ast.Inspect(file, func(n ast.Node) bool {
-			vs, ok := n.(*ast.ValueSpec)
-			if !ok {
-				return true
-			}
-
-			for i, name := range vs.Names {
-				if name.Pos() == pos && i < len(vs.Values) {
-					switch v := vs.Values[i].(type) {
-					case *ast.BasicLit:
-						if v.Kind == token.INT {
-							literal = v.Value
-						}
-					case *ast.UnaryExpr:
-						// Handle negative numbers: -0x8000
-						if v.Op == token.SUB {
-							if lit, ok := v.X.(*ast.BasicLit); ok && lit.Kind == token.INT {
-								literal = "-" + lit.Value
-							}
-						}
-					}
-				}
-			}
-			return literal == ""
+		fieldType := WritableFieldType(field.Type(), c)
+		if fieldType.SkipReason != nil {
+			fields = append(fields, StructField{
+				Name:       field.Name(),
+				SkipReason: fieldType.SkipReason,
+			})
+			hasHidden = true
+			continue
+		}
+		fields = append(fields, StructField{
+			Name: field.Name(),
+			Type: fieldType.LisetteType,
 		})
+	}
+	return fields, hasHidden
+}
 
-		if literal != "" {
-			return literal
+// EmbedIsFaithful reports whether bindgen emits field as an `embed`.
+func (c *Converter) EmbedIsFaithful(field *types.Var) bool {
+	if !field.Exported() {
+		named, ok := unexportedSamePkgStruct(field.Type(), c)
+		if !ok {
+			return false
+		}
+		st := named.Underlying().(*types.Struct)
+		for embed := range st.Fields() {
+			if embed.Embedded() && !c.EmbedIsFaithful(embed) {
+				return false
+			}
+		}
+		return true
+	}
+	probe := c.forkProbe()
+	return embeddedStructField(field, probe).IsEmbedded
+}
+
+// unexportedSamePkgStruct returns the named type behind t (peeling one pointer)
+// when it is an unexported struct declared in the package being generated, which
+// is emitted as an opaque `#[go(unexported)]` type the outer struct can embed.
+func unexportedSamePkgStruct(t types.Type, c *Converter) (*types.Named, bool) {
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil, false
+	}
+	obj := named.Obj()
+	if obj.Exported() || obj.Pkg() == nil || obj.Pkg().Path() != c.currentPkgPath {
+		return nil, false
+	}
+	if _, ok := named.Underlying().(*types.Struct); !ok {
+		return nil, false
+	}
+	if named.TypeParams().Len() > 0 || named.TypeArgs().Len() > 0 {
+		return nil, false
+	}
+	return named, true
+}
+
+func embeddedStructField(field *types.Var, c *Converter) StructField {
+	target := field.Type()
+	isPointer := false
+	if ptr, ok := target.(*types.Pointer); ok {
+		target = ptr.Elem()
+		isPointer = true
+	}
+	if named, ok := unexportedSamePkgStruct(target, c); ok {
+		ref := named.Obj().Name()
+		if isPointer {
+			ref = "mut " + refOf(ref)
+		} else if goWritableCapability(named) {
+			ref = "mut " + ref
+		}
+		return StructField{Name: field.Name(), Type: ref, IsEmbedded: true}
+	}
+	// Generic type aliases are not yet representable, so do not embed one.
+	if isGenericAlias(target) {
+		return StructField{Name: field.Name(), SkipReason: &SkipReason{
+			Code:    "generic-alias-embed",
+			Message: "generic type alias embedding is not yet representable",
+		}}
+	}
+	elem := ToLisetteNilable(target, c)
+	if elem.SkipReason != nil {
+		return StructField{Name: field.Name(), SkipReason: elem.SkipReason}
+	}
+	_, isStruct := target.Underlying().(*types.Struct)
+	bare := elem.LisetteType
+	// Keep the alias spelling as the embed target (h.Alias, not its RHS h.Base).
+	if isStruct {
+		if alias, ok := target.(*types.Alias); ok {
+			bare = aliasEmbedTarget(alias, c)
 		}
 	}
+	ref := bare
+	if isPointer {
+		ref = "mut " + refOf(ref)
+	} else if goWritableCapability(target) {
+		if isStruct {
+			ref = "mut " + ref
+		} else {
+			writable := WritableFieldType(target, c)
+			if writable.SkipReason == nil {
+				ref = writable.LisetteType
+			}
+		}
+	}
+	if !isStruct {
+		return StructField{Name: field.Name(), Type: ref}
+	}
+	return StructField{Name: field.Name(), Type: ref, IsEmbedded: true}
+}
 
-	return ""
+// aliasEmbedTarget returns the alias's own name (qualified when external), not its RHS.
+func aliasEmbedTarget(alias *types.Alias, c *Converter) string {
+	obj := alias.Obj()
+	if pkg := obj.Pkg(); pkg != nil && pkg.Path() != c.currentPkgPath {
+		c.trackExternalPkg(pkg.Path(), pkg.Name())
+		return fmt.Sprintf("%s.%s", PkgRef(pkg.Path()), obj.Name())
+	}
+	return obj.Name()
+}
+
+// isGenericAlias reports whether t is a generic type alias (or an instantiation of one).
+func isGenericAlias(t types.Type) bool {
+	alias, ok := t.(*types.Alias)
+	if !ok {
+		return false
+	}
+	return alias.TypeParams().Len() > 0 || alias.TypeArgs().Len() > 0
+}
+
+// structHasHiddenEmbed reports whether s has an embed bindgen did not emit, so it looks flat but is not.
+func structHasHiddenEmbed(s *types.Struct, emitted []StructField) bool {
+	goEmbeds := 0
+	for field := range s.Fields() {
+		if field.Embedded() {
+			goEmbeds++
+		}
+	}
+	faithful := 0
+	for _, f := range emitted {
+		if f.IsEmbedded {
+			faithful++
+		}
+	}
+	return goEmbeds > faithful
+}
+
+func (c *Converter) getOriginalLiteral(constObj *types.Const) string {
+	entry, ok := c.valueSpecFor(constObj)
+	if !ok || entry.index >= len(entry.spec.Values) {
+		return ""
+	}
+
+	var literal string
+	switch v := entry.spec.Values[entry.index].(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.INT {
+			literal = v.Value
+		}
+	case *ast.UnaryExpr:
+		// Handle negative numbers: -0x8000
+		if v.Op == token.SUB {
+			if lit, ok := v.X.(*ast.BasicLit); ok && lit.Kind == token.INT {
+				literal = "-" + lit.Value
+			}
+		}
+	}
+	if literal == "" {
+		return ""
+	}
+	return normalizeLegacyOctal(literal)
+}
+
+func normalizeLegacyOctal(literal string) string {
+	sign := ""
+	digits := literal
+	if strings.HasPrefix(digits, "-") {
+		sign = "-"
+		digits = digits[1:]
+	}
+	if len(digits) < 2 || digits[0] != '0' {
+		return literal
+	}
+	switch digits[1] {
+	case 'x', 'X', 'o', 'O', 'b', 'B':
+		return literal
+	}
+	return sign + "0o" + digits[1:]
 }
 
 func isBasicType(t types.Type) bool {
@@ -463,45 +1062,13 @@ func (c *Converter) inferRhsType(constObj *types.Const) types.Type {
 	if c.pkg == nil || c.pkg.TypesInfo == nil {
 		return nil
 	}
-
-	pos := constObj.Pos()
-	if !pos.IsValid() {
+	entry, ok := c.valueSpecFor(constObj)
+	if !ok || entry.index >= len(entry.spec.Values) {
 		return nil
 	}
-
-	var foundType types.Type
-	for _, file := range c.pkg.Syntax {
-		if file == nil {
-			continue
-		}
-
-		tokenFile := c.pkg.Fset.File(file.Pos())
-		if tokenFile == nil || int(pos) < tokenFile.Base() || int(pos) >= tokenFile.Base()+tokenFile.Size() {
-			continue
-		}
-
-		ast.Inspect(file, func(n ast.Node) bool {
-			vs, ok := n.(*ast.ValueSpec)
-			if !ok {
-				return true
-			}
-
-			for i, name := range vs.Names {
-				if name.Pos() == pos && i < len(vs.Values) {
-					rhsExpr := vs.Values[i]
-					if tv, ok := c.pkg.TypesInfo.Types[rhsExpr]; ok {
-						foundType = tv.Type
-					}
-				}
-			}
-			return foundType == nil
-		})
-
-		if foundType != nil {
-			return foundType
-		}
+	if tv, ok := c.pkg.TypesInfo.Types[entry.spec.Values[entry.index]]; ok {
+		return tv.Type
 	}
-
 	return nil
 }
 
@@ -514,12 +1081,28 @@ func isSinglePointerResult(sig *types.Signature) bool {
 	return ok
 }
 
+// isSingleNilableResult reports whether sig has exactly one Go-nilable result.
+func isSingleNilableResult(sig *types.Signature) bool {
+	results := sig.Results()
+	return results.Len() == 1 && isNilableGoType(results.At(0).Type())
+}
+
+// isSingleDemotableResult reports whether sig has exactly one demotable result.
+func isSingleDemotableResult(sig *types.Signature) bool {
+	results := sig.Results()
+	return results.Len() == 1 && isDemotableGoType(results.At(0).Type())
+}
+
 func sliceToVarArgs(typeStr string) string {
-	if strings.HasPrefix(typeStr, "Slice<") && strings.HasSuffix(typeStr, ">") {
-		elemType := typeStr[6 : len(typeStr)-1]
-		return fmt.Sprintf("VarArgs<%s>", elemType)
+	base, writable := strings.CutPrefix(typeStr, "mut ")
+	elem, ok := unwrapSlice(base)
+	if !ok {
+		return typeStr
 	}
-	return typeStr
+	if writable {
+		return "mut " + varArgsOf(elem)
+	}
+	return varArgsOf(elem)
 }
 
 func formatConstantValue(val constant.Value) string {
@@ -551,47 +1134,85 @@ func formatConstantValue(val constant.Value) string {
 	}
 }
 
-func collectTypeParams(typeParams *types.TypeParamList, emitOpaque bool) ([]string, *SkipReason) {
+// `S ~[]E`, `M ~map[K]V`, and `A ~[N]E` shapes go into substitutions (caller
+// rewrites `S` to `Slice<E>`, `M` to `Map<K, V>`, or `A` to `Array<E, N>`)
+// rather than into specs. Recognized bounds register their imports on conv.
+// `recipe` is Go's full type-parameter list in declaration order, each entry as
+// a Lisette type (collapsed entries as their shape, kept entries as the bare
+// name), so emit can rebuild Go's type arguments when inference cannot.
+func collectTypeParams(
+	typeParams *types.TypeParamList,
+	emitOpaque bool,
+	conv *Converter,
+) (specs TypeParamSpecs, substitutions map[string]string, recipe []string, skip *SkipReason) {
 	if typeParams == nil {
-		return nil, nil
+		return nil, nil, nil, nil
 	}
 
-	var names []string
 	for tp := range typeParams.TypeParams() {
-		constraint := tp.Constraint()
-		if iface, ok := constraint.Underlying().(*types.Interface); ok {
-			if !isAnyConstraint(iface) {
-				return nil, &SkipReason{
-					Code:           "constraint:" + describeConstraint(iface),
-					Message:        fmt.Sprintf("type constraint %s cannot be represented", tp.Obj().Name()),
-					EmitOpaqueType: emitOpaque,
-				}
+		if shape, ok := collapsedShape(tp.Constraint()); ok {
+			if substitutions == nil {
+				substitutions = make(map[string]string)
 			}
+			substitutions[tp.Obj().Name()] = shape
 		}
-		names = append(names, tp.Obj().Name())
 	}
-	return names, nil
+
+	for tp := range typeParams.TypeParams() {
+		name := tp.Obj().Name()
+		constraint := tp.Constraint()
+
+		if shape, ok := substitutions[name]; ok {
+			recipe = append(recipe, shape)
+			continue
+		}
+
+		if isAnyConstraint(constraint) {
+			specs = append(specs, TypeParamSpec{Name: name})
+			recipe = append(recipe, name)
+			continue
+		}
+
+		if boundExpr, ok := recognizeBound(constraint, conv, substitutions); ok {
+			specs = append(specs, TypeParamSpec{Name: name, Bound: boundExpr})
+			recipe = append(recipe, name)
+			continue
+		}
+
+		iface, _ := constraint.Underlying().(*types.Interface)
+		return nil, nil, nil, &SkipReason{
+			Code:           "constraint:" + describeConstraint(iface),
+			Message:        fmt.Sprintf("type constraint %s cannot be represented", name),
+			EmitOpaqueType: emitOpaque,
+		}
+	}
+	return specs, substitutions, recipe, nil
 }
 
-func extractReceiverTypeParams(named *types.Named) []string {
+func extractReceiverTypeParams(named *types.Named, conv *Converter) TypeParamSpecs {
 	origin := named.Origin()
 	typeParams := origin.TypeParams()
 	if typeParams == nil || typeParams.Len() == 0 {
 		return nil
 	}
 
-	var names []string
-	for tp := range typeParams.TypeParams() {
-		names = append(names, tp.Obj().Name())
+	specs, substitutions, _, skip := collectTypeParams(typeParams, false, conv)
+	if skip != nil || len(substitutions) > 0 {
+		// Base type emits the skip; impl block falls back to bare names.
+		return bareTypeParamSpecs(typeParams)
 	}
-	return names
+	return specs
 }
 
-func isAnyConstraint(constraint *types.Interface) bool {
+func isAnyConstraint(constraint types.Type) bool {
 	if constraint == nil {
 		return true
 	}
-	return constraint.Empty()
+	iface, ok := constraint.Underlying().(*types.Interface)
+	if !ok {
+		return false
+	}
+	return iface.Empty()
 }
 
 func describeConstraint(constraint *types.Interface) string {
@@ -599,12 +1220,12 @@ func describeConstraint(constraint *types.Interface) string {
 		return "any"
 	}
 
-	if constraint.IsComparable() {
-		return "comparable"
-	}
-
 	if constraint.NumMethods() > 0 {
 		return "interface-method"
+	}
+
+	if constraint.IsComparable() {
+		return "comparable"
 	}
 
 	if constraint.NumEmbeddeds() > 0 {
@@ -614,22 +1235,28 @@ func describeConstraint(constraint *types.Interface) string {
 	return "complex"
 }
 
-func isMutableParam(mutParams []string, name, typeStr, funcName string) bool {
-	if !isReferenceType(typeStr) {
+type paramNaming struct {
+	emitted string
+	goName  string
+}
+
+// isMutableParam lets an explicit read-only contract override all write signals.
+// The writable renderer neutralizes a signal on a type Go cannot write through.
+func isMutableParam(derivedMutates bool, mutParams, nonMutParams []string, names paramNaming, t types.Type, funcName string) bool {
+	if slices.Contains(nonMutParams, names.emitted) {
 		return false
 	}
-	if mutParams != nil {
-		return slices.Contains(mutParams, name)
-	}
-	return looksLikeMutableParam(name, typeStr, funcName)
+	return slices.Contains(mutParams, names.emitted) ||
+		derivedMutates ||
+		looksLikeMutableParam(names.goName, t, funcName)
 }
 
 // looksLikeMutableParam returns true if the parameter is likely written into.
-func looksLikeMutableParam(name, typeStr, funcName string) bool {
+func looksLikeMutableParam(name string, t types.Type, funcName string) bool {
 	if name == "dst" {
 		return true
 	}
-	if typeStr == "Slice<uint8>" {
+	if isByteSlice(t) {
 		switch funcName {
 		case "Read", "ReadAt", "ReadFull", "ReadFrom", "ReadMsgUDP", "Recv", "ReadPixels":
 			return true
@@ -638,16 +1265,34 @@ func looksLikeMutableParam(name, typeStr, funcName string) bool {
 	return false
 }
 
+func isByteSlice(t types.Type) bool {
+	slice, ok := types.Unalias(t).(*types.Slice)
+	if !ok {
+		return false
+	}
+	basic, ok := slice.Elem().(*types.Basic)
+	return ok && basic.Kind() == types.Uint8
+}
+
 var constructorPrefixes = [...]string{
 	"New", "Must", "Default", "Open", "Create",
 	"Init", "Make", "Connect", "Dial", "Build",
 	"Acquire", "Start", "With", "QueryRow",
 }
 
-// looksLikeConstructor returns true if the function name matches a constructor prefix.
+// looksLikeConstructor reports whether the name matches a constructor
+// prefix at a word boundary.
 func looksLikeConstructor(name string) bool {
 	for _, prefix := range constructorPrefixes {
-		if strings.HasPrefix(name, prefix) {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rest := name[len(prefix):]
+		if rest == "" {
+			return true
+		}
+		first := rune(rest[0])
+		if first >= 'A' && first <= 'Z' || first >= '0' && first <= '9' {
 			return true
 		}
 	}
@@ -729,6 +1374,13 @@ func isIteratorReturnType(sig *types.Signature) bool {
 
 // isManyToOneFactory returns true if 10+ free functions in the same package
 // return the same pointer type.
+const (
+	manyToOneFactoryThreshold      = 10
+	uniformPointerMethodThreshold  = 10
+	majorityPointerMethodThreshold = 20
+	majorityPointerRatio           = 0.9
+)
+
 func (c *Converter) isManyToOneFactory(sig *types.Signature) bool {
 	if c.manyToOneTypes == nil {
 		c.analyzeManyToOneFactories()
@@ -766,7 +1418,7 @@ func (c *Converter) analyzeManyToOneFactories() {
 	}
 
 	for typeName, count := range counts {
-		if count >= 10 {
+		if count >= manyToOneFactoryThreshold {
 			c.manyToOneTypes[typeName] = true
 		}
 	}
@@ -863,13 +1515,13 @@ func (c *Converter) analyzeUniformPointerTypes() {
 				distinctTypes = true
 			}
 			// Early exit once both thresholds are met
-			if count >= 10 && distinctTypes {
+			if count >= uniformPointerMethodThreshold && distinctTypes {
 				break
 			}
 		}
 
 		// Require 10+ methods AND 2+ distinct return types.
-		if count >= 10 && distinctTypes {
+		if count >= uniformPointerMethodThreshold && distinctTypes {
 			c.uniformPointerTypes[named.Obj().Name()] = true
 		}
 	}
@@ -934,7 +1586,7 @@ func (c *Converter) analyzeMajorityPointerTypes() {
 		}
 
 		for _, count := range counts {
-			if count >= 20 && total > 0 && float64(count)/float64(total) > 0.9 {
+			if count >= majorityPointerMethodThreshold && total > 0 && float64(count)/float64(total) > majorityPointerRatio {
 				c.majorityPointerTypes[named.Obj().Name()] = true
 				break
 			}
@@ -942,13 +1594,327 @@ func (c *Converter) analyzeMajorityPointerTypes() {
 	}
 }
 
-// extractInterfaceMethods walks a Go interface's exported methods and converts
-// each to a Lisette InterfaceMethod. The second return value reports whether
-// the interface is representable at all: false when an embedded union or an
-// unrepresentable param/return type is encountered, true otherwise. A true
-// return with an empty slice means the interface has no exported methods
-// (e.g. empty interface or all methods unexported) and should be emitted as
-// `pub interface Name {}`.
+// bestImplementedInterface returns the most specific interface (largest method
+// set; ties prefer same-package, then smaller qualified name) that the unexported
+// value type `t` satisfies, or nil for none.
+func (c *Converter) bestImplementedInterface(t *types.Named) *types.Named {
+	if t.TypeParams().Len() > 0 {
+		return nil
+	}
+	var best *types.Named
+	for _, candidate := range c.collectInterfaceCandidates() {
+		if !types.Implements(t, candidate.Underlying().(*types.Interface)) {
+			continue
+		}
+		if !c.interfaceRepresentable(candidate) {
+			continue
+		}
+		if best == nil || c.moreSpecificInterface(candidate, best) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+// interfaceRepresentable reports whether bindgen can emit `named` as a Lisette
+// interface, so a marker var is never typed by one that would dangle or be
+// skipped.
+func (c *Converter) interfaceRepresentable(named *types.Named) bool {
+	if c.ifaceRepresentable == nil {
+		c.ifaceRepresentable = make(map[*types.Named]bool)
+		c.ifaceProbing = make(map[*types.Named]bool)
+	}
+	if verdict, ok := c.ifaceRepresentable[named]; ok {
+		return verdict
+	}
+	if c.ifaceProbing[named] {
+		return true
+	}
+	c.ifaceProbing[named] = true
+	defer delete(c.ifaceProbing, named)
+
+	iface := named.Underlying().(*types.Interface)
+	probe := c.forkProbe()
+	_, representable := probe.extractInterfaceMethods(iface, named.Obj().Name())
+	c.ifaceRepresentable[named] = representable
+	return representable
+}
+
+func (c *Converter) moreSpecificInterface(a, b *types.Named) bool {
+	am := a.Underlying().(*types.Interface).NumMethods()
+	bm := b.Underlying().(*types.Interface).NumMethods()
+	if am != bm {
+		return am > bm
+	}
+	aSame := a.Obj().Pkg().Path() == c.currentPkgPath
+	bSame := b.Obj().Pkg().Path() == c.currentPkgPath
+	if aSame != bSame {
+		return aSame
+	}
+	return qualifiedName(a) < qualifiedName(b)
+}
+
+func qualifiedName(named *types.Named) string {
+	return named.Obj().Pkg().Path() + "." + named.Obj().Name()
+}
+
+func (c *Converter) collectInterfaceCandidates() []*types.Named {
+	if c.ifaceCandidates != nil {
+		return c.ifaceCandidates
+	}
+	candidates := []*types.Named{}
+
+	collect := func(scope *types.Scope) {
+		for _, name := range scope.Names() {
+			typeName, ok := scope.Lookup(name).(*types.TypeName)
+			if !ok || !typeName.Exported() || typeName.Pkg() == nil {
+				continue
+			}
+			if extract.IsInternalPackagePath(typeName.Pkg().Path()) {
+				continue
+			}
+			named, ok := typeName.Type().(*types.Named)
+			if !ok || named.TypeParams().Len() > 0 {
+				continue
+			}
+			// IsMethodSet excludes constraint interfaces (unions, `~T` terms).
+			iface, ok := named.Underlying().(*types.Interface)
+			if !ok || iface.NumMethods() == 0 || !iface.IsMethodSet() {
+				continue
+			}
+			candidates = append(candidates, named)
+		}
+	}
+
+	if c.pkg != nil && c.pkg.Types != nil {
+		collect(c.pkg.Types.Scope())
+		for _, imported := range c.pkg.Imports {
+			if imported != nil && imported.Types != nil {
+				collect(imported.Types.Scope())
+			}
+		}
+	}
+
+	c.ifaceCandidates = candidates
+	return c.ifaceCandidates
+}
+
+// hasReachableUnexportedType reports whether any exported declaration in the
+// current package surfaces a value of the given unexported named type.
+func (c *Converter) hasReachableUnexportedType(named *types.Named) bool {
+	if c.reachableUnexportedTypes == nil {
+		c.computeReachableUnexportedTypes()
+	}
+	return c.reachableUnexportedTypes[named.Obj().Name()]
+}
+
+func (c *Converter) computeReachableUnexportedTypes() {
+	c.reachableUnexportedTypes = make(map[string]bool)
+	if c.pkg == nil || c.pkg.Types == nil {
+		return
+	}
+	seen := make(map[types.Type]bool)
+	scope := c.pkg.Types.Scope()
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		if !obj.Exported() {
+			continue
+		}
+		switch o := obj.(type) {
+		case *types.Const, *types.Var, *types.Func:
+			c.markUnexportedNamesIn(o.Type(), seen)
+		case *types.TypeName:
+			named, ok := o.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			for method := range types.NewMethodSet(types.NewPointer(named)).Methods() {
+				if method.Obj().Exported() {
+					c.markUnexportedNamesIn(method.Type(), seen)
+				}
+			}
+			if s, ok := named.Underlying().(*types.Struct); ok {
+				for i := 0; i < s.NumFields(); i++ {
+					if f := s.Field(i); f.Exported() {
+						c.markUnexportedNamesIn(f.Type(), seen)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (c *Converter) isOpaqueHandleStruct(named *types.Named) bool {
+	obj := named.Obj()
+	if obj == nil || obj.Exported() {
+		return false
+	}
+	if obj.Pkg() == nil || obj.Pkg().Path() != c.currentPkgPath {
+		return false
+	}
+	if named.TypeParams().Len() > 0 || named.TypeArgs().Len() > 0 {
+		return false
+	}
+	s, ok := named.Underlying().(*types.Struct)
+	if !ok || s.NumFields() == 0 {
+		return false
+	}
+	if namedImplementsError(named) {
+		return false
+	}
+	return c.bestImplementedInterface(named) == nil
+}
+
+func (c *Converter) computeDirectProducers() {
+	c.directProducers = make(map[string]bool)
+	if c.pkg == nil || c.pkg.Types == nil {
+		return
+	}
+	scope := c.pkg.Types.Scope()
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		if obj == nil || !obj.Exported() {
+			continue
+		}
+		v, ok := obj.(*types.Var)
+		if !ok {
+			continue
+		}
+		named, ok := types.Unalias(v.Type()).(*types.Named)
+		if !ok {
+			continue
+		}
+		if c.isOpaqueHandleStruct(named) {
+			c.directProducers[named.Obj().Name()] = true
+		}
+	}
+}
+
+// directHandle resolves t to an eligible opaque handle only when t is a bare
+// *types.Named, so nested occurrences (`[]chest`, `func(chest)`, `...chest`)
+// keep skipping through the normal conversion path.
+func (c *Converter) directHandle(t types.Type) (*types.Named, bool) {
+	if c.directProducers == nil {
+		c.computeDirectProducers()
+	}
+	named, ok := types.Unalias(t).(*types.Named)
+	if !ok {
+		return nil, false
+	}
+	obj := named.Obj()
+	if obj.Pkg() == nil || obj.Pkg().Path() != c.currentPkgPath {
+		return nil, false
+	}
+	if !c.directProducers[obj.Name()] {
+		return nil, false
+	}
+	return named, true
+}
+
+func (c *Converter) directHandleIfEligible(t types.Type, directEligible bool) (*types.Named, bool) {
+	if !directEligible {
+		return nil, false
+	}
+	return c.directHandle(t)
+}
+
+func (c *Converter) opaqueHandles() []ConvertResult {
+	if c.directProducers == nil {
+		c.computeDirectProducers()
+	}
+	out := make([]ConvertResult, 0, len(c.directProducers))
+	for name := range c.directProducers {
+		out = append(out, ConvertResult{
+			Name:           name,
+			Kind:           extract.ExportType,
+			UnexportedType: true,
+		})
+	}
+	slices.SortFunc(out, func(a, b ConvertResult) int { return strings.Compare(a.Name, b.Name) })
+	return out
+}
+
+// markUnexportedNamesIn walks `t` and marks any unexported named types from
+// the current package as reachable. Recurses through wrapper types
+// (Pointer/Slice/Array/Map/Chan) and through Signature results — the latter
+// so that `func() level` counts as evidence that `level` is reachable.
+func (c *Converter) markUnexportedNamesIn(t types.Type, seen map[types.Type]bool) {
+	if t == nil || seen[t] {
+		return
+	}
+	seen[t] = true
+
+	switch t := t.(type) {
+	case *types.Named:
+		obj := t.Obj()
+		if obj.Pkg() != nil && obj.Pkg().Path() == c.currentPkgPath && !obj.Exported() {
+			c.reachableUnexportedTypes[obj.Name()] = true
+		}
+	case *types.Pointer:
+		c.markUnexportedNamesIn(t.Elem(), seen)
+	case *types.Slice:
+		c.markUnexportedNamesIn(t.Elem(), seen)
+	case *types.Array:
+		c.markUnexportedNamesIn(t.Elem(), seen)
+	case *types.Map:
+		c.markUnexportedNamesIn(t.Key(), seen)
+		c.markUnexportedNamesIn(t.Elem(), seen)
+	case *types.Chan:
+		c.markUnexportedNamesIn(t.Elem(), seen)
+	case *types.Signature:
+		results := t.Results()
+		for i := 0; i < results.Len(); i++ {
+			c.markUnexportedNamesIn(results.At(i).Type(), seen)
+		}
+	}
+}
+
+func sealQualifier(p *types.Package) string {
+	if p == nil {
+		return ""
+	}
+	return p.Path()
+}
+
+// sealIdentity is an unexported method's package-qualified identity: declaring
+// package, name, and signature (receiver excluded). A seal and a method that
+// implements it share it; a different signature or package does not.
+func sealIdentity(pkgPath, name string, sig *types.Signature) string {
+	var b strings.Builder
+	b.WriteString(pkgPath)
+	b.WriteString(".")
+	b.WriteString(name)
+	b.WriteString("(")
+	if sig != nil {
+		params := sig.Params()
+		for i := 0; i < params.Len(); i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			if sig.Variadic() && i == params.Len()-1 {
+				b.WriteString("...")
+			}
+			b.WriteString(types.TypeString(params.At(i).Type(), sealQualifier))
+		}
+	}
+	b.WriteString(")")
+	if sig != nil && sig.Results().Len() > 0 {
+		b.WriteString(" ")
+		results := sig.Results()
+		for i := 0; i < results.Len(); i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(types.TypeString(results.At(i).Type(), sealQualifier))
+		}
+	}
+	return b.String()
+}
+
+// extractInterfaceMethods walks a Go interface's method set and converts each to
+// a Lisette InterfaceMethod. The second return value is false when an embedded
+// union or an unrepresentable exported param/return type is encountered.
+// Unexported methods are recorded by their seal identity only.
 func (c *Converter) extractInterfaceMethods(_interface *types.Interface, typeName string) ([]InterfaceMethod, bool) {
 	if _interface.NumEmbeddeds() > 0 {
 		for embedded := range _interface.EmbeddedTypes() {
@@ -962,6 +1928,11 @@ func (c *Converter) extractInterfaceMethods(_interface *types.Interface, typeNam
 
 	for method := range _interface.Methods() {
 		if !method.Exported() {
+			sig, _ := method.Type().(*types.Signature)
+			methods = append(methods, InterfaceMethod{
+				Name:   method.Name(),
+				SealId: sealIdentity(method.Pkg().Path(), method.Name(), sig),
+			})
 			continue
 		}
 
@@ -970,40 +1941,28 @@ func (c *Converter) extractInterfaceMethods(_interface *types.Interface, typeNam
 			return nil, false
 		}
 
-		mutParams := c.cfg.MutatingParams(c.currentPkgPath, typeName+"."+method.Name())
-
-		var params []FunctionParameter
-		for j := 0; j < signature.Params().Len(); j++ {
-			param := signature.Params().At(j)
-			paramType := ToLisette(param.Type(), c)
-			if paramType.SkipReason != nil {
-				return nil, false
-			}
-
-			name := param.Name()
-			if name == "" {
-				name = fmt.Sprintf("arg%d", j)
-			}
-			name = sanitizeParamName(name)
-
-			params = append(params, FunctionParameter{
-				Name:    name,
-				Type:    paramType.LisetteType,
-				Mutable: isMutableParam(mutParams, name, paramType.LisetteType, method.Name()),
-			})
+		qualifiedName := typeName + "." + method.Name()
+		params, skip := c.convertParams(signature, method, qualifiedName, method.Name(), nil, false, nil)
+		if skip != nil {
+			return nil, false
 		}
 
-		returnType := ReturnsToLisette(signature, c, typeName+"."+method.Name())
+		returnType := ReturnsToLisette(signature, c, method, qualifiedName)
 		if returnType.SkipReason != nil {
 			return nil, false
 		}
 
+		// Interface methods are contracts; any nilable return permits nil.
+		if isSingleNilableResult(signature) && !returnType.IsDirectError &&
+			!c.cfg.IsNonNilableReturn(c.currentPkgPath, qualifiedName) {
+			returnType.LisetteType = optionOf(returnType.LisetteType)
+		}
+
 		methods = append(methods, InterfaceMethod{
-			Name:        method.Name(),
-			Params:      params,
-			ReturnType:  returnType.LisetteType,
-			CommaOk:     returnType.CommaOk,
-			ArrayReturn: returnType.ArrayReturn,
+			Name:       method.Name(),
+			Params:     params,
+			ReturnType: returnType.LisetteType,
+			CommaOk:    returnType.CommaOk,
 		})
 	}
 

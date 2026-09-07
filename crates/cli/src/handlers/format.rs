@@ -5,8 +5,17 @@ use std::time::Instant;
 
 use format::format_source;
 use lisette::fs::collect_lis_filepaths_recursive;
+use rayon::prelude::*;
 
 use crate::cli_error;
+use crate::output;
+use std::path::PathBuf;
+
+enum Outcome {
+    Unchanged,
+    Changed,
+    Failed { reason: String, hint: &'static str },
+}
 
 pub fn format(path: Option<String>, check: bool) -> i32 {
     let target = path.unwrap_or_else(|| ".".to_string());
@@ -21,7 +30,7 @@ pub fn format(path: Option<String>, check: bool) -> i32 {
         return 1;
     }
 
-    let filepaths: Vec<std::path::PathBuf> = if target_path.is_dir() {
+    let filepaths: Vec<PathBuf> = if target_path.is_dir() {
         collect_lis_filepaths_recursive(target_path)
     } else {
         vec![target_path.to_path_buf()]
@@ -34,68 +43,67 @@ pub fn format(path: Option<String>, check: bool) -> i32 {
     }
 
     let start = Instant::now();
-    let mut changed_count = 0;
+
+    let outcomes: Vec<Outcome> = filepaths
+        .par_iter()
+        .map(|file| {
+            let source = match fs::read_to_string(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Outcome::Failed {
+                        reason: format!("Failed to read `{}`: {}", file.display(), e),
+                        hint: "Check file permissions",
+                    };
+                }
+            };
+
+            let formatted = match format_source(&source) {
+                Ok(f) => f,
+                Err(errors) => {
+                    return Outcome::Failed {
+                        reason: format!(
+                            "Parse error in `{}`: {} error(s)",
+                            file.display(),
+                            errors.len()
+                        ),
+                        hint: "Fix syntax errors first",
+                    };
+                }
+            };
+
+            if source == formatted {
+                return Outcome::Unchanged;
+            }
+
+            if check {
+                return Outcome::Changed;
+            }
+
+            match fs::File::create(file) {
+                Ok(mut f) => match f.write_all(formatted.as_bytes()) {
+                    Ok(()) => Outcome::Changed,
+                    Err(e) => Outcome::Failed {
+                        reason: format!("Failed to write `{}`: {}", file.display(), e),
+                        hint: "Check file permissions",
+                    },
+                },
+                Err(e) => Outcome::Failed {
+                    reason: format!("Failed to open `{}` for writing: {}", file.display(), e),
+                    hint: "Check file permissions",
+                },
+            }
+        })
+        .collect();
+
+    let mut changed_files: Vec<PathBuf> = Vec::new();
     let mut error_count = 0;
 
-    for file in &filepaths {
-        let source = match fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                cli_error!(
-                    "Failed to format",
-                    format!("Failed to read `{}`: {}", file.display(), e),
-                    "Check file permissions"
-                );
-                error_count += 1;
-                continue;
-            }
-        };
-
-        let formatted = match format_source(&source) {
-            Ok(f) => f,
-            Err(errors) => {
-                cli_error!(
-                    "Failed to format",
-                    format!(
-                        "Parse error in `{}`: {} error(s)",
-                        file.display(),
-                        errors.len()
-                    ),
-                    "Fix syntax errors first"
-                );
-                error_count += 1;
-                continue;
-            }
-        };
-
-        if source == formatted {
-            continue;
-        }
-
-        changed_count += 1;
-
-        if check {
-            eprintln!("Formatting would reformat: {}", file.display());
-            continue;
-        }
-
-        match fs::File::create(file) {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(formatted.as_bytes()) {
-                    cli_error!(
-                        "Failed to format",
-                        format!("Failed to write `{}`: {}", file.display(), e),
-                        "Check file permissions"
-                    );
-                    error_count += 1;
-                }
-            }
-            Err(e) => {
-                cli_error!(
-                    "Failed to format",
-                    format!("Failed to open `{}` for writing: {}", file.display(), e),
-                    "Check file permissions"
-                );
+    for (file, outcome) in filepaths.iter().zip(outcomes) {
+        match outcome {
+            Outcome::Unchanged => {}
+            Outcome::Changed => changed_files.push(file.clone()),
+            Outcome::Failed { reason, hint } => {
+                cli_error!("Failed to format", reason, hint);
                 error_count += 1;
             }
         }
@@ -107,23 +115,45 @@ pub fn format(path: Option<String>, check: bool) -> i32 {
 
     eprintln!();
 
-    let time_display = crate::output::format_elapsed(start.elapsed());
+    let time_display = output::format_elapsed(start.elapsed());
 
     if check {
-        if changed_count > 0 {
-            eprintln!("  ✖ {} file(s) would be reformatted", changed_count);
-            return 1;
+        let colored = output::use_color();
+        let render_path = |file: &Path| -> String {
+            let s = file.display().to_string();
+            if colored {
+                use owo_colors::OwoColorize;
+                format!("{}", s.bright_magenta())
+            } else {
+                format!("`{}`", s)
+            }
+        };
+        match changed_files.len() {
+            0 => {
+                eprintln!("  ✓ No changes needed {}", time_display);
+                return 0;
+            }
+            1 => {
+                eprintln!(
+                    "  ✖ 1 file needs formatting: {} {}",
+                    render_path(&changed_files[0]),
+                    time_display
+                );
+            }
+            n => {
+                eprintln!("  ✖ {} files need formatting: {}", n, time_display);
+                for file in &changed_files {
+                    eprintln!("    {}", render_path(file));
+                }
+            }
         }
-        eprintln!("  ✓ All files formatted {}", time_display);
-        return 0;
+        return 1;
     }
 
-    if changed_count == 1 {
-        eprintln!("  ✓ Formatted 1 file {}", time_display);
-    } else if changed_count > 1 {
-        eprintln!("  ✓ Formatted {} files {}", changed_count, time_display);
-    } else {
-        eprintln!("  ✓ All files formatted {}", time_display);
+    match changed_files.len() {
+        0 => eprintln!("  ✓ All files formatted {}", time_display),
+        1 => eprintln!("  ✓ Formatted 1 file {}", time_display),
+        n => eprintln!("  ✓ Formatted {} files {}", n, time_display),
     }
 
     0

@@ -1,6 +1,6 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: x += 1; y -= 2; z *= 3; a /= 4; b %= 5;"
+description: x += 1; y -= 2; z *= 3; a /= 4; b %= 5;
 ---
 LexResult {
     tokens: [
@@ -132,9 +132,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn display<T: Display>(value: T) -> string {\n  return \"displayed\";\n}\n"
+description: |
+  
+  fn display<T: Display>(value: T) -> string {
+    return "displayed";
+  }
 ---
 [
     Function {
@@ -26,6 +30,7 @@ description: "input: \nfn display<T: Display>(value: T) -> string {\n  return \"
                         },
                     },
                 ],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 12,
@@ -54,10 +59,9 @@ description: "input: \nfn display<T: Display>(value: T) -> string {\n  return \"
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
         ],
         return_annotation: Constructor {
@@ -69,48 +73,51 @@ description: "input: \nfn display<T: Display>(value: T) -> string {\n  return \"
                 byte_length: 6,
             },
         },
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Return {
-                    expression: Literal {
-                        literal: String(
-                            "displayed",
-                        ),
-                        ty: Variable(
-                            -1,
-                        ),
+        body: Definition(
+            Block {
+                items: [
+                    Return {
+                        expression: Literal {
+                            literal: String {
+                                value: "displayed",
+                                raw: false,
+                            },
+                            ty: Var {
+                                id: uninferred,
+                            },
+                            span: Span {
+                                file_id: 0,
+                                byte_offset: 55,
+                                byte_length: 11,
+                            },
+                        },
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 55,
-                            byte_length: 11,
+                            byte_offset: 48,
+                            byte_length: 18,
                         },
                     },
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 48,
-                        byte_length: 18,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 44,
-                byte_length: 25,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 44,
+                    byte_length: 25,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

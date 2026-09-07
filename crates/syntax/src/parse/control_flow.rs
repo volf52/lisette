@@ -1,5 +1,5 @@
-use super::Parser;
-use crate::ast::{Expression, MatchArm, MatchOrigin, Span};
+use super::{MAX_TUPLE_ARITY, Parser};
+use crate::ast::{Expression, IfLetAlternative, MatchArm, Span};
 use crate::lex::TokenKind::*;
 use crate::types::Type;
 
@@ -9,7 +9,7 @@ impl<'source> Parser<'source> {
 
         self.ensure(Match);
 
-        let subject = self.with_control_flow_header(|p| p.parse_expression());
+        let subject = self.parse_control_flow_header();
 
         self.ensure(LeftCurlyBrace);
 
@@ -17,10 +17,20 @@ impl<'source> Parser<'source> {
 
         while self.is_not(RightCurlyBrace) {
             let start_position = self.stream.position;
-            if let Some(arm) = self.parse_match_arm() {
+            let arm = self.parse_match_arm();
+            let block_bodied = arm.as_ref().is_some_and(|a| a.expression.is_block());
+            if let Some(arm) = arm {
                 arms.push(arm);
             }
-            self.expect_comma_or(RightCurlyBrace);
+
+            if block_bodied && !self.at_match_arm_terminator() {
+                let span = self.span_from_token(self.stream.previous());
+                self.error_match_arm_missing_comma(span);
+                self.recover_to_comma_or(RightCurlyBrace);
+            } else {
+                self.expect_comma_or(RightCurlyBrace);
+            }
+
             self.ensure_progress(start_position, RightCurlyBrace);
         }
 
@@ -30,8 +40,7 @@ impl<'source> Parser<'source> {
             ty: Type::uninferred(),
             subject: subject.into(),
             arms,
-            origin: MatchOrigin::Explicit,
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -63,55 +72,47 @@ impl<'source> Parser<'source> {
         Some(MatchArm {
             pattern,
             guard,
-            typed_pattern: None,
             expression: Box::new(self.parse_assignment()),
         })
     }
 
     pub(super) fn parse_if(&mut self) -> Expression {
         let start = self.current_token();
+        if let Some(result) = self.with_recursion(|parser| {
+            parser.ensure(If);
 
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            self.resync_on_error();
-            return Expression::Unit {
-                ty: Type::uninferred(),
-                span,
+            if parser.is(Let) {
+                return parser.parse_if_let_expression(start);
+            }
+
+            let condition = parser.parse_control_flow_header();
+            let consequence = parser.parse_block_expression();
+
+            let alternative = if parser.advance_if(Else) {
+                if parser.is(If) {
+                    Some(parser.parse_if().into())
+                } else {
+                    Some(parser.parse_block_expression().into())
+                }
+            } else {
+                None
             };
-        }
 
-        self.ensure(If);
-
-        if self.is(Let) {
-            let result = self.parse_if_let_expression(start);
-            self.leave_recursion();
+            Expression::If {
+                ty: Type::uninferred(),
+                condition: condition.into(),
+                consequence: consequence.into(),
+                alternative,
+                span: parser.span_from_offset(start.byte_offset),
+            }
+        }) {
             return result;
         }
-
-        let condition = self.with_control_flow_header(|p| p.parse_expression());
-        let consequence = self.parse_block_expression();
-
-        let alternative = if self.advance_if(Else) {
-            if self.is(If) {
-                self.parse_if()
-            } else {
-                self.parse_block_expression()
-            }
-        } else {
-            Expression::Unit {
-                ty: Type::uninferred(),
-                span: self.span_from_tokens(start),
-            }
-        };
-
-        self.leave_recursion();
-
-        Expression::If {
+        let span = self.span_from_token(self.current_token());
+        self.resync_on_error();
+        Expression::Unit {
             ty: Type::uninferred(),
-            condition: condition.into(),
-            consequence: consequence.into(),
-            alternative: alternative.into(),
-            span: self.span_from_tokens(start),
+            span,
         }
     }
 
@@ -120,10 +121,10 @@ impl<'source> Parser<'source> {
 
         let pattern = self.parse_pattern_allowing_or();
         self.ensure(Equal);
-        let scrutinee = self.with_control_flow_header(|p| p.parse_expression());
+        let scrutinee = self.parse_control_flow_header();
         let consequence = self.parse_block_expression();
 
-        let (alternative, else_span) = if self.is(Else) {
+        let alternative = if self.is(Else) {
             let else_token = self.current_token();
             let else_span = Span::new(self.file_id, else_token.byte_offset, else_token.byte_length);
             self.next(); // consume `else`
@@ -132,30 +133,25 @@ impl<'source> Parser<'source> {
             } else {
                 self.parse_block_expression()
             };
-            (alt, Some(else_span))
+            IfLetAlternative::Present {
+                expression: alt.into(),
+                else_span,
+            }
         } else {
-            (
-                Expression::Unit {
-                    ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
-                },
-                None,
-            )
+            IfLetAlternative::Absent
         };
 
         Expression::IfLet {
             pattern,
             scrutinee: scrutinee.into(),
             consequence: consequence.into(),
-            alternative: alternative.into(),
-            typed_pattern: None,
-            else_span,
+            alternative,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub(super) fn parse_return(&mut self) -> Expression {
+    pub(super) fn parse_return(&mut self, recover_bare_multi_value: bool) -> Expression {
         let start = self.current_token();
 
         self.ensure(Return);
@@ -163,15 +159,85 @@ impl<'source> Parser<'source> {
         let expression = match self.current_token().kind {
             Semicolon | RightCurlyBrace => Expression::Unit {
                 ty: Type::uninferred(),
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             },
             _ => self.parse_expression(),
+        };
+
+        let expression = if recover_bare_multi_value && self.is(Comma) {
+            self.recover_bare_multi_return(expression)
+        } else {
+            expression
         };
 
         Expression::Return {
             expression: expression.into(),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
+        }
+    }
+
+    fn recover_bare_multi_return(&mut self, first: Expression) -> Expression {
+        let comma = self.current_token();
+        let mut elements = vec![first];
+
+        while self.is(Comma) {
+            self.next();
+            if self.at_eof()
+                || self.is(Semicolon)
+                || self.is(RightCurlyBrace)
+                || self.at_item_boundary()
+                || self.newline_before_current()
+            {
+                break;
+            }
+            elements.push(self.parse_expression());
+        }
+
+        if elements.len() == 1 {
+            self.track_error_at(
+                self.span_from_token(comma),
+                "unexpected trailing comma",
+                "Remove the trailing comma after the return value.",
+            );
+            return elements.into_iter().next().expect("len is 1");
+        }
+
+        let span = elements[0].get_span().merge(
+            elements
+                .last()
+                .expect("seeded with the first value")
+                .get_span(),
+        );
+
+        if elements.len() > MAX_TUPLE_ARITY {
+            self.error_tuple_arity(elements.len(), span);
+        } else {
+            let suggestion = format!(
+                "return ({})",
+                &self.source[span.byte_offset as usize..span.end() as usize]
+            );
+            self.error_bare_multi_return(span, &suggestion);
+        }
+
+        Expression::Tuple {
+            elements,
+            ty: Type::uninferred(),
+            span,
+        }
+    }
+
+    pub(super) fn parse_assert(&mut self) -> Expression {
+        let start = self.current_token();
+
+        self.ensure(Assert);
+
+        let expression = self.parse_expression();
+
+        Expression::Assert {
+            expression: expression.into(),
+            ty: Type::uninferred(),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -180,19 +246,33 @@ impl<'source> Parser<'source> {
 
         self.ensure(For);
 
-        let binding = self.parse_binding();
+        let mut_token = if self.is(Mut) {
+            let token = self.current_token();
+            self.next();
+            Some(token)
+        } else {
+            None
+        };
+
+        let mut binding = self.parse_binding();
+        if let Some(token) = mut_token {
+            binding.mut_span = Some(Span::new(
+                self.file_id,
+                token.byte_offset,
+                token.byte_length,
+            ));
+        }
 
         self.ensure(In_);
 
-        let iterable = self.with_control_flow_header(|p| p.parse_expression());
+        let iterable = self.parse_control_flow_header();
         let body = self.parse_block_expression();
 
         Expression::For {
             binding: Box::new(binding),
             iterable: iterable.into(),
             body: body.into(),
-            span: self.span_from_tokens(start),
-            needs_label: false,
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -205,14 +285,13 @@ impl<'source> Parser<'source> {
             return self.parse_while_let(start);
         }
 
-        let condition = self.with_control_flow_header(|p| p.parse_expression());
+        let condition = self.parse_control_flow_header();
         let body = self.parse_block_expression();
 
         Expression::While {
             condition: condition.into(),
             body: body.into(),
-            span: self.span_from_tokens(start),
-            needs_label: false,
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -221,16 +300,14 @@ impl<'source> Parser<'source> {
 
         let pattern = self.parse_pattern_allowing_or();
         self.ensure(Equal);
-        let scrutinee = self.with_control_flow_header(|p| p.parse_expression());
+        let scrutinee = self.parse_control_flow_header();
         let body = self.parse_block_expression();
 
         Expression::WhileLet {
             pattern,
             scrutinee: scrutinee.into(),
             body: body.into(),
-            typed_pattern: None,
-            span: self.span_from_tokens(start),
-            needs_label: false,
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -243,8 +320,7 @@ impl<'source> Parser<'source> {
         Expression::Loop {
             body: body.into(),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
-            needs_label: false,
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -260,7 +336,7 @@ impl<'source> Parser<'source> {
 
         Expression::Break {
             value,
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -270,7 +346,7 @@ impl<'source> Parser<'source> {
         self.next();
 
         Expression::Continue {
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 }

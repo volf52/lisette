@@ -1,0 +1,23 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+func main() {}
+
+
+// === models/models.go ===
+package models
+
+type Showable interface {
+	Show() string
+}
+
+type Item struct {
+	Name string
+}
+
+func (i Item) Show() string {
+	return i.Name
+}

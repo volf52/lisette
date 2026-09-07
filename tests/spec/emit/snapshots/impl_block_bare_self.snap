@@ -1,18 +1,25 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Point { x: int, y: int }\n\nimpl Point {\n  fn sum(self) -> int {\n    self.x + self.y\n  }\n}\n\nfn main() {\n  let p = Point { x: 10, y: 20 };\n  let s = p.sum();\n}\n"
+description: |
+  
+  struct Point { x: int, y: int }
+  
+  impl Point {
+    fn sum(self) -> int {
+      self.x + self.y
+    }
+  }
+  
+  fn main() {
+    let p = Point { x: 10, y: 20 };
+    let s = p.sum();
+  }
 ---
 package main
-
-import "fmt"
 
 type Point struct {
 	x int
 	y int
-}
-
-func (p Point) String() string {
-	return fmt.Sprintf("Point { x: %v, y: %v }", p.x, p.y)
 }
 
 func (p Point) sum() int {

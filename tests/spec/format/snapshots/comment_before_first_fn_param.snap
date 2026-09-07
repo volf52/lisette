@@ -1,0 +1,16 @@
+---
+source: tests/spec/format/mod.rs
+description: |-
+  fn f(
+    // before first param
+    a: int,
+    b: int,
+  ) -> int { a + b }
+---
+fn f(
+  // before first param
+  a: int,
+  b: int,
+) -> int {
+  a + b
+}

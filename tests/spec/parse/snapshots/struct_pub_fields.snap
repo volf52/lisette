@@ -1,6 +1,11 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Point {\n  pub x: int,\n  pub y: int,\n}\n"
+description: |
+  
+  struct Point {
+    pub x: int,
+    pub y: int,
+  }
 ---
 [
     Struct {
@@ -13,55 +18,60 @@ description: "input: \nstruct Point {\n  pub x: int,\n  pub y: int,\n}\n"
             byte_length: 5,
         },
         generics: [],
-        fields: [
-            StructFieldDefinition {
-                doc: None,
-                attributes: [],
-                name: "x",
-                name_span: Span {
-                    file_id: 0,
-                    byte_offset: 22,
-                    byte_length: 1,
-                },
-                annotation: Constructor {
-                    name: "int",
-                    params: [],
-                    span: Span {
+        fields: Record(
+            [
+                StructFieldDefinition {
+                    doc: None,
+                    name: "x",
+                    name_span: Span {
                         file_id: 0,
-                        byte_offset: 25,
-                        byte_length: 3,
+                        byte_offset: 22,
+                        byte_length: 1,
+                    },
+                    annotation: Constructor {
+                        name: "int",
+                        params: [],
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 25,
+                            byte_length: 3,
+                        },
+                    },
+                    visibility: Public,
+                    ty: Var {
+                        id: uninferred,
+                    },
+                    kind: Named {
+                        attributes: [],
                     },
                 },
-                visibility: Public,
-                ty: Variable(
-                    -1,
-                ),
-            },
-            StructFieldDefinition {
-                doc: None,
-                attributes: [],
-                name: "y",
-                name_span: Span {
-                    file_id: 0,
-                    byte_offset: 36,
-                    byte_length: 1,
-                },
-                annotation: Constructor {
-                    name: "int",
-                    params: [],
-                    span: Span {
+                StructFieldDefinition {
+                    doc: None,
+                    name: "y",
+                    name_span: Span {
                         file_id: 0,
-                        byte_offset: 39,
-                        byte_length: 3,
+                        byte_offset: 36,
+                        byte_length: 1,
+                    },
+                    annotation: Constructor {
+                        name: "int",
+                        params: [],
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 39,
+                            byte_length: 3,
+                        },
+                    },
+                    visibility: Public,
+                    ty: Var {
+                        id: uninferred,
+                    },
+                    kind: Named {
+                        attributes: [],
                     },
                 },
-                visibility: Public,
-                ty: Variable(
-                    -1,
-                ),
-            },
-        ],
-        kind: Record,
+            ],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,

@@ -1,13 +1,25 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test() -> int {\n  let items = [(1,2), (3,4)]\n  let mut sum = 0\n  for (i, (a, b)) in items.enumerate() {\n    sum = sum + a + b\n  }\n  sum\n}\n"
+description: |
+  
+  fn test() -> int {
+    let items = [(1,2), (3,4)]
+    let mut sum = 0
+    for (i, (a, b)) in items.enumerate() {
+      sum = sum + a + b
+    }
+    sum
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
 func test() int {
-	items := []lisette.Tuple2[int, int]{lisette.MakeTuple2(1, 2), lisette.MakeTuple2(3, 4)}
+	items := []lisette.Tuple2[int, int]{
+		lisette.MakeTuple2[int, int](1, 2),
+		lisette.MakeTuple2[int, int](3, 4),
+	}
 	sum := 0
 	for key_1, value_2 := range items {
 		_ = key_1

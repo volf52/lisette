@@ -1,6 +1,16 @@
 ---
 source: tests/spec/emit/recover.rs
-description: "input: \nfn fail(msg: string) -> Never { panic(msg) }\n\nfn test() -> string {\n  let result = recover { fail(\"intentional\") };\n  match result {\n    Ok(_) => \"ok\",\n    Err(_) => \"caught\",\n  }\n}\n"
+description: |
+  
+  fn fail(msg: string) -> Never { panic(msg) }
+  
+  fn test() -> string {
+    let result = recover { fail("intentional") };
+    match result {
+      Ok(_) => "ok",
+      Err(_) => "caught",
+    }
+  }
 ---
 package main
 
@@ -11,11 +21,10 @@ func fail(msg string) struct{} {
 }
 
 func test() string {
-	recoverResult_1 := lisette.RecoverBlock(func() struct{} {
+	result := lisette.RecoverBlock(func() struct{} {
 		fail("intentional")
 		panic("unreachable")
 	})
-	result := recoverResult_1
 	if result.Tag == lisette.ResultOk {
 		return "ok"
 	}

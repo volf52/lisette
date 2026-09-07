@@ -1,31 +1,81 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use diagnostics::{DiagnosticSink, LisetteDiagnostic};
-use ecow::EcoString;
-use semantics::{checker::Checker, pattern_analysis, store::Store};
-use stdlib::get_go_stdlib_typedef;
+use diagnostics::LisetteDiagnostic;
+use semantics::checker::TaskState;
+use semantics::store::Store;
+use std::mem;
+use stdlib::{Target, get_go_stdlib_typedef};
+use syntax::types;
 use syntax::{
-    ast::Expression,
-    desugar,
+    ast::{Expression, FunctionBody},
     lex::Lexer,
     parse::Parser,
-    program::{
-        CoercionInfo, Definition, File, FileImport, MutationInfo, ResolutionInfo, UnusedInfo,
-        Visibility,
-    },
+    program::{Definition, EqualityIndex, File, MutationInfo, UnusedInfo},
+    types::Symbol,
 };
 
-use super::init_prelude;
+use super::new_test_store;
 
-use crate::_harness::register_test_builtins;
-
-use super::TEST_MODULE_ID;
+use super::TEST_PACKAGE_ID;
 use super::wrap::{TEST_WRAPPER_NAME, wrap};
+
+pub(super) const TEST_FILE_ID: u32 = 0;
+
+pub(super) struct InferredTestFile {
+    pub(super) store: Store,
+    pub(super) checker: TaskState,
+}
+
+/// Runs a synthetic single-file package through the production registration and inference path.
+pub(super) fn infer_test_file(
+    source: &str,
+    ast: Vec<Expression>,
+    extra_go_typedefs: &[(String, String)],
+) -> InferredTestFile {
+    let mut store = new_test_store();
+    store.add_package(TEST_PACKAGE_ID);
+
+    let mut checker = TaskState::for_package(TEST_PACKAGE_ID);
+    let locator = deps::TypedefLocator::default();
+
+    for (name, typedef) in extra_go_typedefs {
+        checker.parse_and_register_go_package(&mut store, name, typedef, None, &locator);
+    }
+
+    for item in &ast {
+        if let Expression::PackageImport { name, .. } = item
+            && let Some(go_pkg) = name.strip_prefix("go:")
+            && let Some(typedef) = get_go_stdlib_typedef(go_pkg, Target::host())
+        {
+            checker.parse_and_register_go_package(&mut store, name, typedef, None, &locator);
+        }
+    }
+
+    store.store_file(File {
+        id: TEST_FILE_ID,
+        package_id: TEST_PACKAGE_ID.to_string(),
+        parse_status: syntax::FileParseStatus::Clean,
+        name: "test.lis".to_string(),
+        display_path: "test.lis".to_string(),
+        source_path: None,
+        source: source.to_string(),
+        items: ast,
+        file_comment: None,
+    });
+
+    let package = checker.register_package(&mut store, TEST_PACKAGE_ID);
+    checker.finalize_registration(&mut store);
+    checker.infer_package(&mut store, package);
+    checker.check_post_inference_bounds(&store);
+
+    InferredTestFile { store, checker }
+}
 
 pub struct TestPipeline {
     source: String,
     raw_source: String,
     wrapped: bool,
+    e2e_suite_mode: bool,
     extra_go_typedefs: Vec<(String, String)>,
 }
 
@@ -35,6 +85,7 @@ impl TestPipeline {
             source: source.to_string(),
             raw_source: source.to_string(),
             wrapped: false,
+            e2e_suite_mode: false,
             extra_go_typedefs: Vec::new(),
         }
     }
@@ -45,31 +96,35 @@ impl TestPipeline {
         self
     }
 
-    pub fn with_go_typedef(mut self, module_name: &str, typedef_source: &str) -> Self {
+    /// Keep the `__test__` wrapper in the typed AST so it is emitted as a callable Go fn.
+    #[allow(dead_code)]
+    pub fn e2e_suite_mode(mut self) -> Self {
+        self.e2e_suite_mode = true;
+        self
+    }
+
+    pub fn with_go_typedef(mut self, package_name: &str, typedef_source: &str) -> Self {
         self.extra_go_typedefs
-            .push((module_name.to_string(), typedef_source.to_string()));
+            .push((package_name.to_string(), typedef_source.to_string()));
         self
     }
 
     pub fn compile(self) -> CompiledTest {
-        let lex_result = Lexer::new(&self.source, 0).lex();
+        let lex_result = Lexer::new(&self.source, TEST_FILE_ID).lex();
         if lex_result.failed() {
             panic!("Lexing failed in test: {:?}", lex_result.errors);
         }
 
         let parse_result = Parser::new(lex_result.tokens, &self.source).parse();
-        if parse_result.failed() {
+        if parse_result.has_errors() {
             panic!("Parsing failed in test: {:?}", parse_result.errors);
         }
 
-        let desugar_result = desugar::desugar(parse_result.ast);
-        if !desugar_result.errors.is_empty() {
-            panic!("Desugaring failed in test: {:?}", desugar_result.errors);
-        }
-
         CompiledTest {
-            ast: desugar_result.ast,
+            ast: parse_result.ast,
+            source: self.source,
             wrapped: self.wrapped,
+            e2e_suite_mode: self.e2e_suite_mode,
             extra_go_typedefs: self.extra_go_typedefs,
         }
     }
@@ -77,128 +132,50 @@ impl TestPipeline {
 
 pub struct CompiledTest {
     ast: Vec<Expression>,
+    source: String,
     wrapped: bool,
+    e2e_suite_mode: bool,
     extra_go_typedefs: Vec<(String, String)>,
 }
 
 impl CompiledTest {
     pub fn run_inference(self) -> InferenceResult {
-        let mut store = Store::new();
-        store.add_module(TEST_MODULE_ID);
-
-        let sink = DiagnosticSink::new();
-
-        init_prelude(&mut store);
+        let Self {
+            ast,
+            source,
+            wrapped,
+            e2e_suite_mode,
+            extra_go_typedefs,
+        } = self;
+        let InferredTestFile { mut store, checker } =
+            infer_test_file(&source, ast, &extra_go_typedefs);
 
         let (
             typed_ast,
+            errors,
             definitions,
             unused,
             mutations,
-            coercions,
-            resolutions,
-            ufcs_methods,
+            equality_index,
             go_package_names,
+            go_package_ids,
         ) = {
-            let mut checker = Checker::new(&mut store, &sink);
-            checker
-                .ufcs_methods
-                .extend(semantics::prelude::compute_prelude_ufcs(checker.store));
-            checker.cursor.module_id = TEST_MODULE_ID.to_string();
-            register_test_builtins(&mut checker);
-            checker.put_prelude_in_scope();
-
-            let locator = deps::TypedefLocator::default();
-
-            for (name, typedef) in &self.extra_go_typedefs {
-                checker.parse_and_register_go_module(name, typedef, &locator);
-            }
-
-            let imports: Vec<FileImport> = self
-                .ast
-                .iter()
-                .filter_map(|item| {
-                    if let Expression::ModuleImport {
-                        name,
-                        name_span,
-                        alias,
-                        span,
-                    } = item
-                    {
-                        if let Some(go_pkg) = name.strip_prefix("go:")
-                            && let Some(typedef) = get_go_stdlib_typedef(go_pkg)
-                        {
-                            checker.parse_and_register_go_module(name, typedef, &locator);
-                        }
-                        Some(FileImport {
-                            name: name.clone(),
-                            name_span: *name_span,
-                            alias: alias.clone(),
-                            span: *span,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            checker.put_imported_modules_in_scope(&imports);
-
-            checker.register_types_and_values(&self.ast, &Visibility::Local);
-
-            // Store AST in module so compute_module_ufcs can scan impl blocks (condition 3)
-            let test_file_id = checker.store.new_file_id();
-            checker.store.store_file(
-                TEST_MODULE_ID,
-                File::new(
-                    TEST_MODULE_ID,
-                    "test.lis",
-                    "",
-                    self.ast.clone(),
-                    test_file_id,
-                ),
-            );
-            {
-                let module = checker
-                    .store
-                    .get_module(TEST_MODULE_ID)
-                    .expect("test module must exist");
-                let ufcs_entries =
-                    semantics::call_classification::compute_module_ufcs(module, TEST_MODULE_ID);
-                checker.ufcs_methods.extend(ufcs_entries);
-            }
-
-            let mut typed_ast = vec![];
-
-            for expression in self.ast {
-                let type_var = checker.new_type_var();
-                let typed_expression = checker.infer_expression(expression, &type_var);
-                typed_ast.push(typed_expression);
-
-                if checker.failed() {
-                    break;
-                }
-            }
-
-            checker.run_post_inference_checks();
-            semantics::checker::infer::checks::check_interface_visibility(
-                checker.store,
-                TEST_MODULE_ID,
-                &sink,
-            );
-
+            let mut typed_ast = store
+                .get_file(TEST_FILE_ID)
+                .expect("inferred test file must remain in the store")
+                .items
+                .clone();
             if !checker.failed() {
-                let pattern_ctx = pattern_analysis::Context::new(
-                    checker.store,
-                    &checker.facts.or_pattern_error_spans,
+                passes::run(
+                    &store,
+                    &checker.facts,
+                    &checker.sink,
+                    passes::LintMode::Skip,
+                    passes::UnusedItemReporting::Report,
                 );
-                for expression in &typed_ast {
-                    pattern_analysis::check(expression, &pattern_ctx, checker.sink);
-                }
-                checker.facts.pattern_issues = pattern_ctx.take_issues();
             }
 
-            if self.wrapped {
+            if wrapped && !e2e_suite_mode {
                 let has_hoisted = typed_ast.len() > 1
                     && typed_ast.iter().any(|expr| {
                         matches!(expr, Expression::Function { name, .. } if name == TEST_WRAPPER_NAME)
@@ -207,23 +184,18 @@ impl CompiledTest {
                 if has_hoisted {
                     typed_ast = typed_ast
                         .into_iter()
-                        .filter_map(|expr| {
-                            if let Expression::Function { ref name, .. } = expr
-                                && name == TEST_WRAPPER_NAME
-                            {
-                                return Some(unwrap_test_wrapper(expr));
-                            }
-                            None
-                        })
+                        .filter_map(unwrap_hoisted_test_wrapper)
                         .collect();
                 } else {
-                    typed_ast = typed_ast.into_iter().map(unwrap_test_wrapper).collect();
+                    typed_ast = typed_ast
+                        .into_iter()
+                        .filter_map(unwrap_test_wrapper)
+                        .collect();
                 }
             }
 
-            let definitions: HashMap<EcoString, Definition> = checker
-                .store
-                .modules
+            let definitions: HashMap<Symbol, Definition> = store
+                .packages
                 .values()
                 .flat_map(|m| m.definitions.iter())
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -235,39 +207,44 @@ impl CompiledTest {
                 if !b.used {
                     unused.mark_binding_unused(b.span);
                 }
-                if b.mutated {
-                    mutations.mark_binding_mutated(binding_id);
+                if let Some(mutation) = b.mutation {
+                    mutations.record(binding_id, mutation);
                 }
             }
 
-            let coercions = std::mem::take(&mut checker.coercions);
-            let resolutions = std::mem::take(&mut checker.resolutions);
-            let ufcs_methods = std::mem::take(&mut checker.ufcs_methods);
-            let go_package_names = checker.store.go_package_names.clone();
+            let equality_index = mem::take(&mut store.equality_index);
+            let go_package_names = store.go_package_names.clone();
+            let go_package_ids: HashSet<String> = store
+                .packages
+                .keys()
+                .filter(|id| id.starts_with(types::GO_IMPORT_PREFIX))
+                .cloned()
+                .collect();
+
+            let errors = checker.sink.into_diagnostics();
 
             (
                 typed_ast,
+                errors,
                 definitions,
                 unused,
                 mutations,
-                coercions,
-                resolutions,
-                ufcs_methods,
+                equality_index,
                 go_package_names,
+                go_package_ids,
             )
         };
 
         InferenceResult {
             ast: typed_ast,
-            errors: sink.take(),
+            errors,
             definitions,
-            module_id: TEST_MODULE_ID.to_string(),
+            package_id: TEST_PACKAGE_ID.to_string(),
             unused,
             mutations,
-            coercions,
-            resolutions,
-            ufcs_methods,
+            equality_index,
             go_package_names,
+            go_package_ids,
         }
     }
 }
@@ -275,29 +252,40 @@ impl CompiledTest {
 pub struct InferenceResult {
     pub ast: Vec<Expression>,
     pub errors: Vec<LisetteDiagnostic>,
-    pub definitions: HashMap<EcoString, Definition>,
-    pub module_id: String,
+    pub definitions: HashMap<Symbol, Definition>,
+    pub package_id: String,
     pub unused: UnusedInfo,
     pub mutations: MutationInfo,
-    pub coercions: CoercionInfo,
-    pub resolutions: ResolutionInfo,
-    pub ufcs_methods: HashSet<(String, String)>,
+    pub equality_index: EqualityIndex,
     pub go_package_names: HashMap<String, String>,
+    pub go_package_ids: HashSet<String>,
 }
 
-fn unwrap_test_wrapper(expression: Expression) -> Expression {
+fn unwrap_hoisted_test_wrapper(expression: Expression) -> Option<Expression> {
+    if let Expression::Function { ref name, .. } = expression
+        && name == TEST_WRAPPER_NAME
+    {
+        return unwrap_test_wrapper(expression);
+    }
+    None
+}
+
+fn unwrap_test_wrapper(expression: Expression) -> Option<Expression> {
     let Expression::Function { name, .. } = &expression else {
-        return expression;
+        return Some(expression);
     };
 
     if name != TEST_WRAPPER_NAME {
-        return expression;
+        return Some(expression);
     }
 
     let Expression::Function { body, .. } = expression else {
         unreachable!()
     };
 
+    let FunctionBody::Definition(body) = body else {
+        panic!("Expected definition for {TEST_WRAPPER_NAME} wrapper function");
+    };
     let Expression::Block { items, .. } = *body else {
         panic!(
             "Expected Block as body of {} wrapper function",
@@ -305,8 +293,61 @@ fn unwrap_test_wrapper(expression: Expression) -> Expression {
         );
     };
 
-    items
-        .into_iter()
-        .next_back()
-        .expect("Expected at least one expression in wrapped test function body")
+    items.into_iter().next_back()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TestPipeline;
+
+    #[test]
+    fn production_file_checks_reject_definitions_that_shadow_imports() {
+        let result = TestPipeline::new(
+            r#"
+import "go:fmt"
+
+fn fmt() {}
+"#,
+        )
+        .compile()
+        .run_inference();
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.code_str() == Some("resolve.name_shadows_import")),
+            "expected name_shadows_import, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn production_file_checks_reject_reference_aliasing_between_siblings() {
+        let result = TestPipeline::new(
+            r#"
+fn bump(value: mut Ref<int>) -> int {
+  value.* = value.* + 1
+  value.*
+}
+
+fn main() {
+  let mut value = 1
+  let pair = (bump(&value), value)
+  let _ = pair
+}
+"#,
+        )
+        .compile()
+        .run_inference();
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.code_str() == Some("infer.reference_aliases_sibling")),
+            "expected reference_aliases_sibling, got: {:?}",
+            result.errors
+        );
+    }
 }

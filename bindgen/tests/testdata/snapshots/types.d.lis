@@ -3,16 +3,15 @@
 // Go: 0.0.0
 // Lisette: 0.0.0
 
-#[go(array_return)]
-pub fn GetArray() -> Slice<int>
+pub fn GetArray() -> Array<int, 10>
 
 pub fn GetBiDir() -> Channel<int>
 
 pub fn GetBool() -> bool
 
-pub fn GetByte() -> uint8
+pub fn GetByte() -> byte
 
-pub fn GetDoublePtr() -> Option<Ref<Ref<int>>>
+pub fn GetDoublePtr() -> Option<mut Ref<mut Ref<int>>>
 
 pub fn GetFloat32() -> float32
 
@@ -28,29 +27,29 @@ pub fn GetInt64() -> int64
 
 pub fn GetInt8() -> int8
 
-pub fn GetIntPtr() -> Option<Ref<int>>
+pub fn GetIntPtr() -> Option<mut Ref<int>>
 
-pub fn GetIntSlice() -> Slice<int>
+pub fn GetIntSlice() -> mut Slice<int>
 
-pub fn GetIntToInterface() -> Map<int, Unknown>
+pub fn GetIntToInterface() -> mut Map<int, Unknown>
 
-pub fn GetNested() -> Map<string, Map<int, bool>>
+pub fn GetNested() -> mut Map<string, mut Map<int, bool>>
 
-pub fn GetNestedSlice() -> Slice<Slice<uint8>>
+pub fn GetNestedSlice() -> mut Slice<mut Slice<byte>>
 
 pub fn GetRecvOnly() -> Receiver<string>
 
-pub fn GetRune() -> int32
+pub fn GetRune() -> rune
 
 pub fn GetSendOnly() -> Sender<bool>
 
 pub fn GetString() -> string
 
-pub fn GetStringSlice() -> Slice<string>
+pub fn GetStringSlice() -> mut Slice<string>
 
-pub fn GetStringToInt() -> Map<string, int>
+pub fn GetStringToInt() -> mut Map<string, int>
 
-pub fn GetStructPtr() -> Option<Ref<T>>
+pub fn GetStructPtr() -> Option<mut Ref<T>>
 
 pub fn GetUint() -> uint
 
@@ -62,7 +61,7 @@ pub fn GetUint64() -> uint64
 
 pub fn GetUint8() -> uint8
 
-pub fn GetUintptr() -> uint
+pub fn GetUintptr() -> uintptr
 
 pub struct T {
   pub X: int,

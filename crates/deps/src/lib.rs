@@ -1,13 +1,60 @@
+mod dependency_table;
+mod local_source;
+mod module_path;
 mod project_manifest;
 mod typedef_locator;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
-pub use project_manifest::{
-    GoDependency, Manifest, check_toolchain_version, parse_manifest, remove_go_dep, upsert_go_dep,
-    validate_project_name,
+use std::env;
+use std::fs;
+use std::fs::DirEntry;
+use std::process;
+use std::sync::PoisonError;
+pub use stdlib::Target;
+use stdlib::{
+    GO_STD_CONTENT_HASH, LIS_PRELUDE_SOURCE, PRELUDE_CONTENT_HASH, get_go_stdlib_packages,
+    get_go_stdlib_typedef,
 };
-pub use typedef_locator::{TypedefLocator, TypedefLocatorResult, TypedefOrigin};
+
+/// Disambiguates temp paths so concurrent typedef extractions do not collide.
+static TYPEDEF_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+static STDLIB_EXTRACT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Test-only override for the home dir typedefs extract under.
+static TYPEDEF_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_typedef_home(home: PathBuf) {
+    let _ = TYPEDEF_HOME.set(home);
+}
+
+fn typedef_home() -> Option<PathBuf> {
+    match TYPEDEF_HOME.get() {
+        Some(home) => Some(home.clone()),
+        None => Some(PathBuf::from(env::var_os("HOME")?)),
+    }
+}
+
+pub use dependency_table::{
+    DependencyTable, TableError, parse_dependency_table, validate_script_entry,
+};
+pub use project_manifest::{
+    GoDependency, Manifest, ManifestDocument, ReplacementSource, TrimmedVia, ViaChanges,
+    check_no_subpackage_deps, check_toolchain_version, finalize_via, find_project_root,
+    go_deps_of_document, parse_manifest, remove_from_document, upsert_go_dependency,
+    upsert_into_document, validate_project_name,
+};
+pub use toml_edit::DocumentMut;
+pub use typedef_locator::{
+    Bindgen, BindgenFailure, BindgenGuard, BindgenSession, BindgenSetup, DeclarationStatus,
+    ImportablePackage, ResolvedReplacement, ScriptSession, TypedefLocator, TypedefLocatorResult,
+    TypedefOrigin,
+};
 
 pub fn is_third_party(pkg: &str) -> bool {
     pkg.split('/')
@@ -15,21 +62,360 @@ pub fn is_third_party(pkg: &str) -> bool {
         .is_some_and(|first| first.contains('.'))
 }
 
+pub fn placeholder_require_version(module_path: &str) -> String {
+    match path_major(module_path) {
+        Some(major) => format!("v{}.0.0", major),
+        None => "v0.0.0".to_string(),
+    }
+}
+
+pub fn check_version_matches_path(module_path: &str, version: &str) -> Result<(), String> {
+    let Some((_, path_major)) = module_path::split_path_version(module_path) else {
+        return Ok(());
+    };
+    let path_major = path_major.strip_suffix("-unstable").unwrap_or(path_major);
+
+    if version.starts_with("v0.0.0-") && path_major == ".v1" {
+        return Ok(());
+    }
+
+    let Some(actual) = version_major(version) else {
+        return Ok(());
+    };
+
+    let expected = match path_major.strip_prefix(['/', '.']) {
+        Some(required) => required,
+        None => {
+            // `+incompatible` is how a pre-modules v2 or later declares itself.
+            if actual <= 1 || build_metadata(version) == Some("incompatible") {
+                return Ok(());
+            }
+            return Err(format!(
+                "version `{}` is not valid for module path `{}` (expected v0.x or v1.x)",
+                version, module_path
+            ));
+        }
+    };
+
+    if expected.strip_prefix('v').and_then(parse_major_digits) == Some(actual) {
+        return Ok(());
+    }
+    Err(format!(
+        "version `{}` is not valid for module path `{}` (expected {}.x)",
+        version, module_path, expected
+    ))
+}
+
+fn build_metadata(version: &str) -> Option<&str> {
+    version.split_once('+').map(|(_, build)| build)
+}
+
+fn version_major(version: &str) -> Option<u64> {
+    version
+        .strip_prefix('v')?
+        .split(['.', '-', '+'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The major a path's suffix demands: `/vN` (N >= 2), or gopkg.in `.vN` (any N).
+fn path_major(module_path: &str) -> Option<u64> {
+    let (_, path_major) = module_path::split_path_version(module_path)?;
+    let digits = path_major
+        .strip_suffix("-unstable")
+        .unwrap_or(path_major)
+        .strip_prefix(['/', '.'])?
+        .strip_prefix('v')?;
+    parse_major_digits(digits)
+}
+
+fn parse_major_digits(digits: &str) -> Option<u64> {
+    let is_canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits.len() == 1 || !digits.starts_with('0'));
+    is_canonical.then(|| digits.parse().ok()).flatten()
+}
+
+pub fn is_exact_version(version: &str) -> bool {
+    let Some(rest) = version.strip_prefix('v') else {
+        return false;
+    };
+
+    let (rest, build) = match rest.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (rest, None),
+    };
+    let (core, pre_release) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+
+    let mut numbers = core.split('.');
+    let (Some(major), Some(minor), Some(patch), None) = (
+        numbers.next(),
+        numbers.next(),
+        numbers.next(),
+        numbers.next(),
+    ) else {
+        return false;
+    };
+    if ![major, minor, patch].iter().all(|part| is_numeric_id(part)) {
+        return false;
+    }
+
+    pre_release.is_none_or(|section| section.split('.').all(is_pre_release_id))
+        && build.is_none_or(|section| section.split('.').all(is_semver_id))
+}
+
+fn is_numeric_id(part: &str) -> bool {
+    !part.is_empty()
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && (part == "0" || !part.starts_with('0'))
+}
+
+fn is_pre_release_id(part: &str) -> bool {
+    if part.bytes().all(|b| b.is_ascii_digit()) {
+        return is_numeric_id(part);
+    }
+    is_semver_id(part)
+}
+
+fn is_semver_id(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+pub fn is_valid_package_path(pkg: &str) -> bool {
+    !pkg.is_empty()
+        && !pkg.contains('@')
+        && pkg
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
+}
+
 pub fn is_stdlib(pkg: &str) -> bool {
     !is_third_party(pkg)
 }
 
-pub fn typedef_cache_dir(home: &str) -> PathBuf {
+pub fn typedef_cache_dir(project_root: &Path) -> PathBuf {
     let lis_version = env!("CARGO_PKG_VERSION");
-    PathBuf::from(home).join(format!(".lisette/cache/typedefs/lis@v{}", lis_version))
+    project_root
+        .join("target/.lisette/typedefs")
+        .join(format!("lis@v{}", lis_version))
+}
+
+/// Version dir for the extracted stdlib typedefs, under `~/.lisette/cache`.
+/// The name encodes the compiler version and stdlib content hash, so its
+/// existence proves the contents are current, and distinct versions or embedded
+/// stdlibs get distinct dirs.
+fn stdlib_typedef_version_dir() -> Option<PathBuf> {
+    Some(
+        typedef_home()?
+            .join(".lisette/cache/stdlib-typedefs")
+            .join(format!(
+                "lis@v{}-{:016x}",
+                env!("CARGO_PKG_VERSION"),
+                GO_STD_CONTENT_HASH
+            )),
+    )
+}
+
+/// Deterministic on-disk path for a stdlib package's typedef. Pure path
+/// construction; the files are written by [`ensure_stdlib_extracted`].
+pub fn stdlib_typedef_path(target: Target, go_pkg: &str) -> Option<PathBuf> {
+    Some(
+        stdlib_typedef_version_dir()?
+            .join(target.cache_segment())
+            .join(format!("{go_pkg}.d.lis")),
+    )
+}
+
+/// Extract the whole embedded Go stdlib for `target` so the editor can open
+/// typedefs as regular files. Runs once, at LSP startup.
+///
+/// All-or-nothing: written to a temp dir then atomically renamed, so the target
+/// dir exists only when complete and one existence check gates the work. Sibling
+/// `lis@v*` dirs from other versions are pruned.
+pub fn ensure_stdlib_extracted(target: Target) {
+    let Some(version_dir) = stdlib_typedef_version_dir() else {
+        return;
+    };
+    let target_dir = version_dir.join(target.cache_segment());
+    if target_dir.exists() {
+        return;
+    }
+
+    let _guard = STDLIB_EXTRACT_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if target_dir.exists() {
+        return;
+    }
+
+    if fs::create_dir_all(&version_dir).is_err() {
+        return;
+    }
+    clear_stale_temp_dirs(&version_dir, target, STALE_TEMP_AGE);
+
+    // Build in a temp dir, then atomically rename into place. The temp name
+    // carries the pid and a counter so concurrent extractions don't collide.
+    let counter = TYPEDEF_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = version_dir.join(format!(
+        "{}.tmp.{}.{}",
+        target.cache_segment(),
+        process::id(),
+        counter
+    ));
+    if extract_all(&tmp, target).is_none() {
+        let _ = fs::remove_dir_all(&tmp);
+        return;
+    }
+    if fs::rename(&tmp, &target_dir).is_err() {
+        // Another extraction won the race, or the rename failed; drop our temp.
+        let _ = fs::remove_dir_all(&tmp);
+    }
+    prune_stale_version_dirs(&version_dir);
+}
+
+/// Write every embedded stdlib typedef for `target` into `target_tmp`. Returns
+/// `None` on the first I/O error so a partial set is never renamed into place.
+fn extract_all(target_tmp: &Path, target: Target) -> Option<()> {
+    for pkg in get_go_stdlib_packages(target) {
+        let Some(source) = get_go_stdlib_typedef(pkg, target) else {
+            continue;
+        };
+        let path = target_tmp.join(format!("{pkg}.d.lis"));
+        fs::create_dir_all(path.parent()?).ok()?;
+        fs::write(&path, source).ok()?;
+    }
+    Some(())
+}
+
+const STALE_TEMP_AGE: Duration = Duration::from_secs(300);
+
+fn clear_stale_temp_dirs(version_dir: &Path, target: Target, min_age: Duration) {
+    let prefix = format!("{}.tmp.", target.cache_segment());
+    let Ok(entries) = fs::read_dir(version_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name_matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix));
+        if name_matches && temp_dir_is_stale(&entry, min_age) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn temp_dir_is_stale(entry: &DirEntry, min_age: Duration) -> bool {
+    entry
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= min_age)
+}
+
+/// Remove sibling `lis@v*` dirs from other compiler versions or embedded stdlibs.
+///
+/// Caveat: if another `lis` version's LSP is running, this removes its dir; its
+/// go-to-definition then declines until it restarts. Acceptable, normal lisette
+/// users don't run multiple versions simultaneously.
+fn prune_stale_version_dirs(current: &Path) {
+    let Some(parent) = current.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current {
+            continue;
+        }
+        let is_version_dir = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("lis@v"));
+        if is_version_dir {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn prelude_typedef_version_dir() -> Option<PathBuf> {
+    Some(
+        typedef_home()?
+            .join(".lisette/cache/prelude-typedefs")
+            .join(format!(
+                "lis@v{}-{:016x}",
+                env!("CARGO_PKG_VERSION"),
+                PRELUDE_CONTENT_HASH
+            )),
+    )
+}
+
+pub fn prelude_typedef_path() -> Option<PathBuf> {
+    Some(prelude_typedef_version_dir()?.join("prelude.d.lis"))
+}
+
+pub fn is_generated_typedef_path(path: &Path) -> bool {
+    let Some(home) = typedef_home() else {
+        return false;
+    };
+    let cache = home.join(".lisette/cache");
+    path.starts_with(cache.join("prelude-typedefs"))
+        || path.starts_with(cache.join("stdlib-typedefs"))
+}
+
+pub fn ensure_prelude_extracted() {
+    let Some(version_dir) = prelude_typedef_version_dir() else {
+        return;
+    };
+    let path = version_dir.join("prelude.d.lis");
+    if path.exists() {
+        return;
+    }
+    if fs::create_dir_all(&version_dir).is_err() {
+        return;
+    }
+
+    let counter = TYPEDEF_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = version_dir.join(format!("prelude.tmp.{}.{}", process::id(), counter));
+    if fs::write(&tmp, LIS_PRELUDE_SOURCE).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    prune_stale_version_dirs(&version_dir);
+}
+
+/// The target of a module-path replace directive: code from `path` at `version`.
+#[derive(Clone, Copy)]
+pub struct Replacement<'a> {
+    pub path: &'a str,
+    pub version: &'a str,
+}
+
+/// Where a replaced module's code comes from.
+#[derive(Clone, Copy)]
+pub enum ReplacementTarget<'a> {
+    Module(Replacement<'a>),
+    /// Carries no identity: local typedefs are stamp-gated, not version-keyed.
+    LocalDirectory,
 }
 
 #[derive(Clone, Copy)]
 pub struct GoModule<'a> {
-    /// Module path, e.g. `github.com/gorilla/mux`.
+    /// Module path, e.g. `github.com/gorilla/mux`. For a replaced module, the original path.
     pub path: &'a str,
-    /// Module version, e.g. `v1.8.0`.
+    /// Version handed to Go commands. For a replaced module, a placeholder.
     pub version: &'a str,
+    pub replacement: Option<ReplacementTarget<'a>>,
 }
 
 /// A Go package within a module.
@@ -45,11 +431,23 @@ impl GoPackage<'_> {
     /// Build the path to a `.d.lis` file under a base directory.
     ///
     /// ```text
-    /// ~/.lisette/cache/typedefs/lis@v0.1.6/github.com/gorilla/mux@v1.8.0/mux.d.lis
-    /// ~/.lisette/cache/typedefs/lis@v0.1.6/github.com/gorilla/mux@v1.8.0/middleware/middleware.d.lis
+    /// <project>/target/.lisette/typedefs/lis@v0.1.6/darwin_arm64/github.com/gorilla/mux@v1.8.0/mux.d.lis
+    /// <project>/target/.lisette/typedefs/lis@v0.1.6/darwin_arm64/github.com/gorilla/mux@v1.8.0/middleware/middleware.d.lis
     /// ```
-    pub fn typedef_path(&self, base_dir: &Path) -> PathBuf {
-        let module_dir = base_dir.join(format!("{}@{}", self.module.path, self.module.version));
+    pub fn typedef_path(&self, base_dir: &Path, target: Target) -> PathBuf {
+        let target_dir = base_dir.join(target.cache_segment());
+        let module_dir = match self.module.replacement {
+            Some(ReplacementTarget::Module(replacement)) => target_dir
+                .join("replaced")
+                .join(self.module.path)
+                .join("module")
+                .join(format!("{}@{}", replacement.path, replacement.version)),
+            Some(ReplacementTarget::LocalDirectory) => target_dir
+                .join("replaced")
+                .join(self.module.path)
+                .join("local"),
+            None => target_dir.join(format!("{}@{}", self.module.path, self.module.version)),
+        };
 
         let relative = if self.package == self.module.path {
             ""
@@ -68,6 +466,191 @@ impl GoPackage<'_> {
             module_dir.join(filename)
         } else {
             module_dir.join(relative).join(&filename)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn clear_stale_temp_dirs_removes_old_temps_but_keeps_fresh_and_other_targets() {
+        let version_dir = tempfile::tempdir().unwrap();
+        let root = version_dir.path();
+        let target = Target::new("darwin", "arm64");
+
+        let this_target = root.join("darwin_arm64.tmp.999.0");
+        fs::create_dir_all(&this_target).unwrap();
+        fs::write(this_target.join("fmt.d.lis"), "x").unwrap();
+        let completed = root.join("darwin_arm64");
+        fs::create_dir_all(&completed).unwrap();
+        let other_target_tmp = root.join("linux_amd64.tmp.1.0");
+        fs::create_dir_all(&other_target_tmp).unwrap();
+
+        clear_stale_temp_dirs(root, target, STALE_TEMP_AGE);
+        assert!(this_target.exists(), "a fresh in-flight temp is kept");
+
+        clear_stale_temp_dirs(root, target, Duration::ZERO);
+        assert!(
+            !this_target.exists(),
+            "a stale temp of this target is removed"
+        );
+        assert!(completed.exists(), "the completed target dir is kept");
+        assert!(other_target_tmp.exists(), "another target's temp is kept");
+    }
+
+    #[test]
+    fn typedef_path_uses_replaced_layout_keyed_by_replacement_identity() {
+        let target = Target::new("linux", "amd64");
+        let pkg = GoPackage {
+            module: GoModule {
+                path: "example.com/dragon",
+                version: "v0.0.0",
+                replacement: Some(ReplacementTarget::Module(Replacement {
+                    path: "fork.example/dragon",
+                    version: "v1.2.0",
+                })),
+            },
+            package: "example.com/dragon/server",
+        };
+        let path = pkg.typedef_path(Path::new("/base"), target);
+        assert_eq!(
+            path,
+            Path::new(
+                "/base/linux_amd64/replaced/example.com/dragon/module/fork.example/dragon@v1.2.0/server/server.d.lis"
+            )
+        );
+    }
+
+    #[test]
+    fn typedef_path_uses_versionless_local_layout_for_local_directory() {
+        let target = Target::new("linux", "amd64");
+        let pkg = GoPackage {
+            module: GoModule {
+                path: "example.com/me/foo",
+                version: "v0.0.0",
+                replacement: Some(ReplacementTarget::LocalDirectory),
+            },
+            package: "example.com/me/foo/server",
+        };
+        let path = pkg.typedef_path(Path::new("/base"), target);
+        assert_eq!(
+            path,
+            Path::new("/base/linux_amd64/replaced/example.com/me/foo/local/server/server.d.lis")
+        );
+    }
+
+    #[test]
+    fn check_version_matches_path_enforces_major_suffix() {
+        // /vN path requires vN
+        assert!(
+            check_version_matches_path("github.com/hashicorp/consul", "v2.1.0+incompatible")
+                .is_ok()
+        );
+        assert!(
+            check_version_matches_path("github.com/docker/docker", "v20.10.24+incompatible")
+                .is_ok()
+        );
+        assert!(
+            check_version_matches_path("gopkg.in/check.v1", "v0.0.0-20161208181325-20d25e280405")
+                .is_ok()
+        );
+        assert!(check_version_matches_path("gopkg.in/pkg.v3-unstable", "v3.1.0").is_ok());
+        assert!(check_version_matches_path("github.com/you/mux", "v2.1.0+build.1").is_err());
+        assert!(check_version_matches_path("example.com/lib/v2", "v2.3.0").is_ok());
+        assert!(check_version_matches_path("example.com/lib/v2", "v1.0.0").is_err());
+        // gopkg.in .vN path requires vN
+        assert!(check_version_matches_path("gopkg.in/yaml.v3", "v3.1.0").is_ok());
+        assert!(check_version_matches_path("gopkg.in/yaml.v3", "v2.0.0").is_err());
+        // plain path requires v0/v1 (incl. pseudo-versions)
+        assert!(check_version_matches_path("github.com/you/mux", "v1.5.0").is_ok());
+        assert!(
+            check_version_matches_path("github.com/you/mux", "v0.0.0-20260101000000-abc").is_ok()
+        );
+        assert!(check_version_matches_path("github.com/you/mux", "v3.1.0").is_err());
+    }
+
+    #[test]
+    fn synthetic_require_version_is_major_matched() {
+        assert_eq!(
+            placeholder_require_version("github.com/df-mc/dragonfly"),
+            "v0.0.0"
+        );
+        assert_eq!(placeholder_require_version("example.com/lib/v2"), "v2.0.0");
+        assert_eq!(
+            placeholder_require_version("example.com/lib/v10"),
+            "v10.0.0"
+        );
+        assert_eq!(placeholder_require_version("example.com/lib/v1"), "v0.0.0");
+        assert_eq!(placeholder_require_version("example.com/vault"), "v0.0.0");
+        assert_eq!(placeholder_require_version("gopkg.in/yaml.v2"), "v2.0.0");
+        assert_eq!(
+            placeholder_require_version("gopkg.in/user/pkg.v3"),
+            "v3.0.0"
+        );
+    }
+
+    #[test]
+    fn is_generated_typedef_path_matches_only_cache_files() {
+        let Some(home) = typedef_home() else {
+            return;
+        };
+        let cache = home.join(".lisette/cache");
+
+        assert!(is_generated_typedef_path(
+            &cache.join("prelude-typedefs/lis@v1-abc/prelude.d.lis")
+        ));
+        assert!(is_generated_typedef_path(
+            &cache.join("stdlib-typedefs/lis@v1-abc/darwin_arm64/fmt.d.lis")
+        ));
+        assert!(!is_generated_typedef_path(
+            &home.join("project/src/main.lis")
+        ));
+        assert!(!is_generated_typedef_path(Path::new("/etc/passwd")));
+    }
+}
+
+#[cfg(test)]
+mod exact_version_tests {
+    use super::is_exact_version;
+
+    #[test]
+    fn accepts_go_module_versions() {
+        for version in [
+            "v1.6.0",
+            "v0.0.0-20191109021931-daa7c04131f5",
+            "v2.1.0+incompatible",
+            "v1.2.3-rc.1",
+            "v1.2.3+001",
+            "v0.21.0",
+        ] {
+            assert!(is_exact_version(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn rejects_inexact_or_malformed_versions() {
+        for version in [
+            "latest",
+            "master",
+            "",
+            "v1",
+            "v1.6",
+            "1.6.0",
+            "vx.y.z",
+            "v01.2.3",
+            "v1.2.3-",
+            "v1.2.3+",
+            "v1.2.3-rc..1",
+            "v1.2.3-rc_1",
+            "v1.2.3-01",
+            "v1.2.3-rc.007",
+            "v1.2.3.4",
+            "v-1.2.3",
+        ] {
+            assert!(!is_exact_version(version), "{version}");
         }
     }
 }

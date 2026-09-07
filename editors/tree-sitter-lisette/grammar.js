@@ -69,6 +69,7 @@ module.exports = grammar({
   extras: $ => [
     /\s/,
     $.line_comment,
+    $.file_comment,
   ],
 
   externals: $ => [
@@ -79,6 +80,7 @@ module.exports = grammar({
     $._error_sentinel,
     $._open_angle,
     $._bang,
+    $._interpolation_open,
   ],
 
   supertypes: $ => [
@@ -97,16 +99,15 @@ module.exports = grammar({
   ],
 
   conflicts: $ => [
-    [$.unit_type, $.tuple_pattern],
     [$._type, $.scoped_type_identifier],
+    [$.writable_type, $.scoped_type_identifier],
     [$._expression_except_range, $._type_identifier],
-    [$._pattern, $._type_identifier],
   ],
 
   word: $ => $.identifier,
 
   rules: {
-    source_file: $ => repeat($._statement),
+    source_file: $ => seq(optional($.shebang), repeat($._statement)),
 
     _statement: $ => choice(
       $.expression_statement,
@@ -128,7 +129,6 @@ module.exports = grammar({
       $.attribute_item,
       $.struct_item,
       $.enum_item,
-      $.value_enum_item,
       $.type_item,
       $.function_item,
       $.function_signature_item,
@@ -139,6 +139,7 @@ module.exports = grammar({
       $.import_declaration,
       $.defer_statement,
       $.task_statement,
+      $.assert_statement,
     ),
 
     // Attributes
@@ -197,30 +198,6 @@ module.exports = grammar({
       field('body', $.enum_variant_list),
     ),
 
-    value_enum_item: $ => seq(
-      optional($.visibility_modifier),
-      'enum',
-      field('name', $._type_identifier),
-      ':',
-      field('underlying_type', $._type),
-      field('body', $.value_enum_variant_list),
-    ),
-
-    value_enum_variant_list: $ => bracedList(seq(
-      optional($.doc_comment),
-      $.value_enum_variant,
-    )),
-
-    value_enum_variant: $ => seq(
-      field('name', $.identifier),
-      '=',
-      field('value', choice(
-        $.integer_literal,
-        $.negative_literal,
-        $.string_literal,
-      )),
-    ),
-
     enum_variant_list: $ => bracedList(seq(
       repeat($.attribute_item), optional($.doc_comment), $.enum_variant,
     )),
@@ -236,12 +213,20 @@ module.exports = grammar({
     field_declaration_list: $ => bracedList(seq(
       repeat($.attribute_item),
       optional($.doc_comment),
-      $.field_declaration,
+      choice($.field_declaration, $.struct_embedding),
     )),
+
+    struct_embedding: $ => seq(
+      'embed',
+      field('type', $._type),
+    ),
 
     field_declaration: $ => seq(
       optional($.visibility_modifier),
-      field('name', $._field_identifier),
+      field('name', choice(
+        $._field_identifier,
+        alias('embed', $.field_identifier),
+      )),
       ':',
       field('type', $._type),
     ),
@@ -306,6 +291,7 @@ module.exports = grammar({
         $._type_identifier,
         $.scoped_type_identifier,
         $.generic_type,
+        $.writable_type,
       )),
       field('body', $.declaration_list),
     ),
@@ -320,15 +306,18 @@ module.exports = grammar({
 
     interface_body: $ => seq(
       '{',
-      repeat(choice(
-        $.function_signature_item,
-        $.interface_embedding,
+      repeat(seq(
+        repeat($.attribute_item),
+        choice(
+          $.function_signature_item,
+          $.interface_embedding,
+        ),
       )),
       '}',
     ),
 
     interface_embedding: $ => seq(
-      'impl',
+      'embed',
       field('interface', $._type),
       $._semicolon,
     ),
@@ -347,14 +336,14 @@ module.exports = grammar({
         $.parameter,
         $.self_parameter,
         '_',
-        $._type,
       ),
     )),
+
+    parameter_types: $ => parenList(choice($._type, '_')),
 
     self_parameter: $ => 'self',
 
     parameter: $ => seq(
-      optional($.mutable_specifier),
       field('pattern', choice(
         $._pattern,
         'self',
@@ -392,6 +381,7 @@ module.exports = grammar({
     // Types
 
     _type: $ => choice(
+      $.writable_type,
       $.generic_type,
       $.scoped_type_identifier,
       $.tuple_type,
@@ -399,6 +389,15 @@ module.exports = grammar({
       $.function_type,
       $._type_identifier,
       $.never_type,
+    ),
+
+    writable_type: $ => seq(
+      $.mutable_specifier,
+      choice(
+        $.generic_type,
+        $.scoped_type_identifier,
+        $._type_identifier,
+      ),
     ),
 
     generic_type: $ => prec(1, seq(
@@ -431,7 +430,7 @@ module.exports = grammar({
 
     function_type: $ => seq(
       'fn',
-      field('parameters', $.parameters),
+      field('parameters', $.parameter_types),
       optional(seq('->', field('return_type', $._type))),
     ),
 
@@ -507,7 +506,7 @@ module.exports = grammar({
     )),
 
     unary_expression: $ => prec(PREC.unary, seq(
-      choice('-', alias($._bang, '!')),
+      choice('-', '^', alias($._bang, '!')),
       $._expression,
     )),
 
@@ -533,8 +532,8 @@ module.exports = grammar({
         [PREC.and, '&&'],
         [PREC.or, '||'],
         [PREC.comparative, choice('==', '!=', '<=', '>=')],
-        [PREC.additive, choice('+', '-')],
-        [PREC.multiplicative, choice('*', '/', '%')],
+        [PREC.additive, choice('+', '-', '|', '^')],
+        [PREC.multiplicative, choice('*', '/', '%', '<<', '>>', '&', '&^')],
       ];
 
       return choice(
@@ -566,7 +565,7 @@ module.exports = grammar({
 
     compound_assignment_expression: $ => prec.left(PREC.assign, seq(
       field('left', $._expression),
-      field('operator', choice('+=', '-=', '*=', '/=', '%=')),
+      field('operator', choice('+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '&^=', '<<=', '>>=')),
       field('right', $._expression),
     )),
 
@@ -602,7 +601,9 @@ module.exports = grammar({
       '>',
     ),
 
-    arguments: $ => parenList($._expression),
+    arguments: $ => parenList(choice($._expression, $.spread_argument)),
+
+    spread_argument: $ => prec(PREC.try, seq($._expression, '...')),
 
     slice_expression: $ => seq('[', commaSep($._expression), ']'),
 
@@ -634,6 +635,7 @@ module.exports = grammar({
       $.shorthand_field_initializer,
       $.field_initializer,
       $.base_field_initializer,
+      $.zero_fill_initializer,
     )),
 
     shorthand_field_initializer: $ => $.identifier,
@@ -648,6 +650,8 @@ module.exports = grammar({
       '..',
       $._expression,
     ),
+
+    zero_fill_initializer: _ => prec(1, '..'),
 
     // Control flow
 
@@ -735,6 +739,7 @@ module.exports = grammar({
 
     for_expression: $ => seq(
       'for',
+      optional($.mutable_specifier),
       field('pattern', $._pattern),
       'in',
       field('value', $._expression),
@@ -756,6 +761,8 @@ module.exports = grammar({
       prec(1, seq('defer', $.block)),
       seq('defer', $._expression, $._semicolon),
     ),
+
+    assert_statement: $ => seq('assert', field('condition', $._expression), $._semicolon),
 
     select_expression: $ => seq(
       'select',
@@ -861,6 +868,7 @@ module.exports = grammar({
 
     let_declaration: $ => seq(
       'let',
+      optional('assert'),
       optional($.mutable_specifier),
       field('pattern', $._pattern),
       optional(seq(':', field('type', $._type))),
@@ -886,6 +894,7 @@ module.exports = grammar({
     _pattern: $ => choice(
       $._literal_pattern,
       $.identifier,
+      $.scoped_type_identifier,
       $.tuple_pattern,
       $.tuple_struct_pattern,
       $.struct_pattern,
@@ -946,6 +955,7 @@ module.exports = grammar({
 
     _literal: $ => choice(
       $.string_literal,
+      $.raw_string_literal,
       $.char_literal,
       $.boolean_literal,
       $.integer_literal,
@@ -956,6 +966,7 @@ module.exports = grammar({
 
     _literal_pattern: $ => choice(
       $.string_literal,
+      $.raw_string_literal,
       $.char_literal,
       $.boolean_literal,
       $.integer_literal,
@@ -988,6 +999,8 @@ module.exports = grammar({
       token.immediate('"'),
     ),
 
+    raw_string_literal: _ => token(seq('r"', /[^"]*/, '"')),
+
     format_string: $ => seq(
       'f"',
       repeat(choice(
@@ -999,7 +1012,7 @@ module.exports = grammar({
     ),
 
     interpolation: $ => seq(
-      '{',
+      alias($._interpolation_open, '{'),
       $._expression,
       '}',
     ),
@@ -1024,6 +1037,11 @@ module.exports = grammar({
     line_comment: _ => token(seq('//', /.*/)),
 
     doc_comment: _ => token(seq('///', /.*/)),
+
+    file_comment: _ => token(prec(1, seq('//!', /.*/))),
+
+    // `immediate` pins byte 0, and the class is the interpreter the compiler needs.
+    shebang: _ => token.immediate(/#![^\[\r\n][^\r\n]*/),
 
     // Identifiers
 

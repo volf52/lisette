@@ -1,16 +1,22 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum Marker {\n  Value,\n}\n\nfn test() -> Marker {\n  Marker.Value\n}\n"
+description: |
+  
+  enum Marker {
+    Value,
+  }
+  
+  fn test() -> Marker {
+    Marker.Value
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeMarkerValue() Marker {
 	return Marker{Tag: MarkerValue}
 }
 
-type MarkerTag int
+type MarkerTag uint8
 
 const (
 	MarkerValue MarkerTag = iota
@@ -18,15 +24,6 @@ const (
 
 type Marker struct {
 	Tag MarkerTag
-}
-
-func (m Marker) String() string {
-	switch m.Tag {
-	case MarkerValue:
-		return "Marker.Value"
-	default:
-		return fmt.Sprintf("Marker(%d)", m.Tag)
-	}
 }
 
 func test() Marker {

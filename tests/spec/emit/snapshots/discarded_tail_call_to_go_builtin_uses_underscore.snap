@@ -1,0 +1,13 @@
+---
+source: tests/spec/emit/functions.rs
+description: |
+  
+  fn test() {
+    "test".length()
+  }
+---
+package main
+
+func test() {
+	_ = len("test")
+}

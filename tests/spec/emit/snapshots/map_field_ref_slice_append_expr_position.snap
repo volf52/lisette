@@ -1,25 +1,35 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Outer { items: Ref<Slice<int>> }\n\nfn main() {\n  let mut items = [1]\n  let mut m = Map.new<string, Outer>()\n  m[\"a\"] = Outer { items: &items }\n  let _ = { m[\"a\"].items.*.append(2) }\n  let _ = items\n}\n"
+description: |
+  
+  struct Outer { items: Ref<Slice<int>> }
+  
+  fn main() {
+    let mut items = [1]
+    let mut m = Map.new<string, Outer>()
+    m["a"] = Outer { items: &items }
+    let Some(o) = m.get("a") else { return; };
+    let _ = { o.items.*.append(2) }
+    let _ = items
+  }
 ---
 package main
 
-import "fmt"
-
 type Outer struct {
 	items *[]int
-}
-
-func (o Outer) String() string {
-	return fmt.Sprintf("Outer { items: %v }", o.items)
 }
 
 func main() {
 	items := []int{1}
 	m := make(map[string]Outer)
 	m["a"] = Outer{items: &items}
-	var tmp_1 []int
-	tmp_1 = append(*m["a"].items, 2)
-	_ = tmp_1
+	o, ok_1 := m["a"]
+	if !ok_1 {
+		return
+	}
+	var tmp_2 []int
+	recv_3 := *o.items
+	tmp_2 = append(recv_3[:len(recv_3):len(recv_3)], 2)
+	_ = tmp_2
 	_ = items
 }

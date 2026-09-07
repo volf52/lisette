@@ -1,10 +1,21 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum Transform<T> {\n  Identity,\n  Apply(fn(T) -> T),\n}\n\nfn test() -> int {\n  let t = Transform.Apply(|x: int| x + 1);\n  match t {\n    Transform.Identity => 0,\n    Transform.Apply(f) => f(41),\n  }\n}\n"
+description: |
+  
+  enum Transform<T> {
+    Identity,
+    Apply(fn(T) -> T),
+  }
+  
+  fn test() -> int {
+    let t = Transform.Apply(|x: int| x + 1);
+    match t {
+      Transform.Identity => 0,
+      Transform.Apply(f) => f(41),
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeTransformIdentity[T any]() Transform[T] {
 	return Transform[T]{Tag: TransformIdentity}
@@ -14,7 +25,7 @@ func MakeTransformApply[T any](arg0 func(T) T) Transform[T] {
 	return Transform[T]{Tag: TransformApply, Apply: arg0}
 }
 
-type TransformTag int
+type TransformTag uint8
 
 const (
 	TransformIdentity TransformTag = iota
@@ -26,17 +37,6 @@ type Transform[T any] struct {
 	Apply func(T) T
 }
 
-func (t Transform[T]) String() string {
-	switch t.Tag {
-	case TransformIdentity:
-		return "Transform.Identity"
-	case TransformApply:
-		return fmt.Sprintf("Transform.Apply(%v)", t.Apply)
-	default:
-		return fmt.Sprintf("Transform(%d)", t.Tag)
-	}
-}
-
 func test() int {
 	t := MakeTransformApply(func(x int) int {
 		return x + 1
@@ -44,6 +44,5 @@ func test() int {
 	if t.Tag == TransformIdentity {
 		return 0
 	}
-	f := t.Apply
-	return f(41)
+	return t.Apply(41)
 }

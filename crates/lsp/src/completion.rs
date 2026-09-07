@@ -1,18 +1,35 @@
-use tower_lsp::lsp_types::*;
-
-use syntax::ast::Expression;
+use crate::protocol::*;
+use semantics::checker::promotion::{self, MemberKind};
+use syntax::ast::{Expression, IdentifierResolution};
+use syntax::attributes::{AttributeInfo, AttributeTarget, attributes_for};
+use syntax::lex::{Lexer, Token, TokenKind as Tk};
+use syntax::program::DefinitionBody;
+use syntax::types::Type;
 
 use crate::definition::get_root_expression;
+use crate::hover;
 use crate::snapshot::AnalysisSnapshot;
 use crate::traversal::{find_enclosing_impl_type, find_expression_at};
 use crate::type_name;
+use syntax::ast::Pattern;
+use syntax::ast::StructFieldAssignment;
+use syntax::attributes;
+use syntax::program;
+use syntax::program::AliasKind;
+use syntax::program::Definition;
+use syntax::program::File;
+use syntax::types;
 
-pub(crate) fn get_module_prefix(source: &str, offset: usize) -> Option<&str> {
+/// The identifier before the dot, with that dot's offset, whether the cursor
+/// sits right after it or partway through the member.
+pub(crate) fn get_package_prefix(source: &str, offset: usize) -> Option<(&str, usize)> {
     let before = &source[..offset];
+    let before = before.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
     if !before.ends_with('.') {
         return None;
     }
-    let before_dot = &before[..before.len() - 1];
+    let dot_offset = before.len() - 1;
+    let before_dot = &before[..dot_offset];
 
     let base = if before_dot.ends_with(']') {
         let bracket_start = before_dot.rfind('[')?;
@@ -21,31 +38,27 @@ pub(crate) fn get_module_prefix(source: &str, offset: usize) -> Option<&str> {
         before_dot
     };
 
+    // A multi-byte boundary character would otherwise leave `start` inside it.
     let start = base
         .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
+        .map(|index| index + base[index..].chars().next().map_or(1, char::len_utf8))
         .unwrap_or(0);
     let identifier = base[start..].trim();
     if identifier.is_empty() || !identifier.starts_with(|c: char| c.is_alphabetic() || c == '_') {
         return None;
     }
-    Some(identifier)
+    Some((identifier, dot_offset))
 }
 
-pub(crate) fn definition_to_completion_kind(
-    definition: &syntax::program::Definition,
-) -> CompletionItemKind {
-    use syntax::program::Definition;
-    match definition {
-        Definition::Struct { .. } => CompletionItemKind::STRUCT,
-        Definition::Enum { .. } | Definition::ValueEnum { .. } => CompletionItemKind::ENUM,
-        Definition::Interface { .. } => CompletionItemKind::INTERFACE,
-        Definition::TypeAlias { .. } => CompletionItemKind::TYPE_PARAMETER,
-        Definition::Value { ty, .. } => {
-            if matches!(
-                ty,
-                syntax::types::Type::Function { .. } | syntax::types::Type::Forall { .. }
-            ) {
+pub(crate) fn definition_to_completion_kind(definition: &Definition) -> CompletionItemKind {
+    use syntax::program::DefinitionBody;
+    match &definition.body {
+        DefinitionBody::Struct { .. } => CompletionItemKind::STRUCT,
+        DefinitionBody::Enum { .. } => CompletionItemKind::ENUM,
+        DefinitionBody::Interface { .. } => CompletionItemKind::INTERFACE,
+        DefinitionBody::TypeAlias { .. } => CompletionItemKind::TYPE_PARAMETER,
+        DefinitionBody::Value { .. } => {
+            if matches!(&definition.ty, Type::Function(_) | Type::Forall { .. }) {
                 CompletionItemKind::FUNCTION
             } else {
                 CompletionItemKind::CONSTANT
@@ -54,17 +67,19 @@ pub(crate) fn definition_to_completion_kind(
     }
 }
 
-/// Extract the element type from a collection type (Slice<T>, Array<T>, Map<K, V>).
-fn element_type_name(ty: &syntax::types::Type) -> Option<&str> {
-    match ty {
-        syntax::types::Type::Constructor { id, params, .. }
-            if id == "prelude.Slice" || id == "prelude.Array" =>
-        {
-            params.first().and_then(type_name)
+/// Extract the element type from an array, slice, or map.
+fn element_type_name(ty: &Type, snapshot: &AnalysisSnapshot) -> Option<String> {
+    use syntax::types::CompoundKind;
+
+    if let Type::Array { element, .. } = ty {
+        return type_name(element, snapshot);
+    }
+
+    match ty.as_compound()? {
+        (CompoundKind::Slice | CompoundKind::EnumeratedSlice, args) => {
+            args.first().and_then(|ty| type_name(ty, snapshot))
         }
-        syntax::types::Type::Constructor { id, params, .. } if id == "prelude.Map" => {
-            params.get(1).and_then(type_name)
-        }
+        (CompoundKind::Map, args) => args.get(1).and_then(|ty| type_name(ty, snapshot)),
         _ => None,
     }
 }
@@ -73,15 +88,12 @@ fn element_type_name(ty: &syntax::types::Type) -> Option<&str> {
 /// When `indexed` is true, extracts the element type for collection types.
 pub(crate) fn resolve_variable_type(
     var_name: &str,
-    file: &syntax::program::File,
+    file: &File,
     offset: u32,
     snapshot: &AnalysisSnapshot,
     indexed: bool,
 ) -> Option<String> {
-    let binding =
-        snapshot.facts().bindings.values().find(|b| {
-            b.name == var_name && b.span.file_id == file.id && b.span.byte_offset < offset
-        })?;
+    let binding = snapshot.binding_named_before(file.id, var_name, offset)?;
 
     let expression = find_expression_at(&file.items, binding.span.byte_offset)?;
     let borrowed_ty = match expression {
@@ -90,8 +102,8 @@ pub(crate) fn resolve_variable_type(
             ..
         } => {
             let matches_name = match &let_binding.pattern {
-                syntax::ast::Pattern::Identifier { identifier, .. } => identifier == var_name,
-                syntax::ast::Pattern::AsBinding { name, .. } => name == var_name,
+                Pattern::Identifier { identifier, .. } => identifier == var_name,
+                Pattern::AsBinding { name, .. } => name == var_name,
                 _ => false,
             };
             if matches_name {
@@ -107,8 +119,8 @@ pub(crate) fn resolve_variable_type(
         } => Some(&for_binding.ty),
         Expression::Function { params, .. } | Expression::Lambda { params, .. } => {
             let param = params.iter().find(|p| match &p.pattern {
-                syntax::ast::Pattern::Identifier { identifier, .. } => identifier == var_name,
-                syntax::ast::Pattern::AsBinding { name, .. } => name == var_name,
+                Pattern::Identifier { identifier, .. } => identifier == var_name,
+                Pattern::AsBinding { name, .. } => name == var_name,
                 _ => false,
             })?;
             Some(&param.ty)
@@ -120,18 +132,18 @@ pub(crate) fn resolve_variable_type(
     let ty = if let Some(t) = borrowed_ty {
         t
     } else {
-        let (t, _) = crate::hover::get_hover_type_and_span(expression, binding.span.byte_offset);
+        let (t, _) = hover::get_hover_type_and_span(snapshot, expression, binding.span.byte_offset);
         owned_ty = t;
         &owned_ty
     };
 
-    let (resolved, _) = syntax::types::Type::remove_vars(&[ty]);
+    let (resolved, _) = Type::remove_vars(&[ty]);
     let ty = &resolved[0];
 
     if indexed {
-        element_type_name(ty).map(|s| s.to_string())
+        element_type_name(ty, snapshot)
     } else {
-        type_name(ty).map(|s| s.to_string())
+        type_name(ty, snapshot)
     }
 }
 
@@ -141,7 +153,7 @@ pub(crate) enum DotContext {
 }
 
 pub(crate) fn detect_dot_context(
-    file: &syntax::program::File,
+    file: &File,
     offset: u32,
     snapshot: &AnalysisSnapshot,
 ) -> Option<DotContext> {
@@ -151,22 +163,28 @@ pub(crate) fn detect_dot_context(
     else {
         return None;
     };
+
+    // `Array.x` is always type-level. Runs before the member check, which would
+    // otherwise slurp a trailing `}` as a non-empty member.
+    if matches!(expression.as_ref(), Expression::Identifier { value, .. } if value == "Array") {
+        return Some(DotContext::TypeLevel("prelude.Array".to_string()));
+    }
     if !member.is_empty() {
         if !matches!(
             get_root_expression(expression),
             Expression::Identifier {
-                binding_id: None,
+                resolution,
                 ..
-            }
+            } if !matches!(resolution, IdentifierResolution::Binding(_))
         ) {
-            let ty = expression.get_type().resolve();
-            return type_name(&ty).map(|type_id| DotContext::Instance(type_id.to_string()));
+            let ty = expression.get_type();
+            return type_name(&ty, snapshot).map(DotContext::Instance);
         }
         return None;
     }
 
     if let Expression::Identifier { value, .. } = expression.as_ref() {
-        for prefix in [file.module_id.as_str(), "prelude"] {
+        for prefix in [file.package_id.as_str(), "prelude"] {
             let qualified = format!("{prefix}.{value}");
             if let Some(definition) = snapshot.definitions().get(qualified.as_str())
                 && definition.is_type_definition()
@@ -176,16 +194,16 @@ pub(crate) fn detect_dot_context(
         }
     }
 
-    let ty = expression.get_type().resolve();
-    if let Some(type_id) = type_name(&ty) {
-        return Some(DotContext::Instance(type_id.to_string()));
+    let ty = expression.get_type();
+    if let Some(type_id) = type_name(&ty, snapshot) {
+        return Some(DotContext::Instance(type_id));
     }
 
     if let Expression::Identifier { value, .. } = expression.as_ref()
         && value == "self"
         && let Some(impl_type) = find_enclosing_impl_type(&file.items, offset)
     {
-        let qualified = format!("{}.{}", file.module_id, impl_type);
+        let qualified = format!("{}.{}", file.package_id, impl_type);
         return Some(DotContext::Instance(qualified));
     }
 
@@ -195,15 +213,94 @@ pub(crate) fn detect_dot_context(
 pub(crate) fn get_instance_completions(
     type_id: &str,
     snapshot: &AnalysisSnapshot,
-    same_module: bool,
+    current_package: &str,
 ) -> Vec<CompletionItem> {
+    let same_package = id_is_in_package(type_id, current_package);
     let mut items = Vec::new();
+    struct_field_completions(type_id, snapshot, same_package, &mut items);
 
-    if let Some(syntax::program::Definition::Struct { fields, .. }) =
-        snapshot.definitions().get(type_id)
+    let ty = Type::Nominal {
+        id: type_id.into(),
+        params: vec![],
+        writable: false,
+    };
+    for method in program::methods_for_type(&ty, &Default::default(), |id| {
+        snapshot.definitions().get(id)
+    })
+    .into_values()
+    {
+        if same_package || method.visibility.is_public() {
+            items.push(CompletionItem {
+                label: method.source_name.to_string(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some(method.ty.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    promoted_member_completions(&ty, snapshot, current_package, &mut items);
+
+    items
+}
+
+/// The fields and methods an embed promotes onto `ty`. Visibility is judged
+/// per declaring type, so an embed cannot leak a foreign type's private
+/// members.
+fn promoted_member_completions(
+    ty: &Type,
+    snapshot: &AnalysisSnapshot,
+    current_package: &str,
+    items: &mut Vec<CompletionItem>,
+) {
+    for (name, member) in promotion::promoted_members(ty, |id| snapshot.definitions().get(id)) {
+        let is_public = match &member.kind {
+            MemberKind::Field { visibility, .. } => visibility.is_public(),
+            MemberKind::Method(method) => method.visibility.is_public(),
+        };
+        if !is_public && !id_is_in_package(member.declaring_type.as_str(), current_package) {
+            continue;
+        }
+        let item = match &member.kind {
+            MemberKind::Field { ty, .. } => CompletionItem {
+                label: name.to_string(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(ty.to_string()),
+                ..Default::default()
+            },
+            MemberKind::Method(method) => CompletionItem {
+                label: method.source_name.to_string(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some(method.ty.to_string()),
+                ..Default::default()
+            },
+        };
+        // Own members never reach here, so a label already taken belongs to a
+        // UFCS method, which promotion skips and the checker resolves past.
+        match items
+            .iter_mut()
+            .find(|existing| existing.label == item.label)
+        {
+            Some(existing) => *existing = item,
+            None => items.push(item),
+        }
+    }
+}
+
+/// A struct's own field completions, honoring visibility. No methods.
+fn struct_field_completions(
+    type_id: &str,
+    snapshot: &AnalysisSnapshot,
+    same_package: bool,
+    items: &mut Vec<CompletionItem>,
+) {
+    if let Some(Definition {
+        body: DefinitionBody::Struct { fields, .. },
+        ..
+    }) = snapshot.definitions().get(type_id)
     {
         for field in fields {
-            if same_module || field.visibility.is_public() {
+            if same_package || field.visibility.is_public() {
                 items.push(CompletionItem {
                     label: field.name.to_string(),
                     kind: Some(CompletionItemKind::FIELD),
@@ -213,71 +310,142 @@ pub(crate) fn get_instance_completions(
             }
         }
     }
+}
 
-    let method_prefix = format!("{type_id}.");
-    for (qname, definition) in snapshot.definitions().iter() {
-        if let Some(method_name) = qname.strip_prefix(method_prefix.as_str())
-            && !method_name.contains('.')
-            && matches!(definition, syntax::program::Definition::Value { .. })
-            && is_instance_method(definition.ty(), type_id)
-            && (same_module || definition.visibility().is_public())
-        {
-            items.push(CompletionItem {
-                label: method_name.to_string(),
-                kind: Some(CompletionItemKind::METHOD),
-                detail: Some(definition.ty().to_string()),
-                ..Default::default()
-            });
-        }
+/// The struct literal's name, type, and assignments when `offset` is at a field name.
+pub(crate) fn detect_struct_literal_field_context(
+    file: &File,
+    offset: u32,
+) -> Option<(&str, &Type, &[StructFieldAssignment])> {
+    let tokens = Lexer::new(&file.source, 0).lex().tokens;
+    let split = tokens.partition_point(|t| (t.byte_offset as usize) < offset as usize);
+    if !in_field_name_position(&tokens[..split]) {
+        return None;
     }
 
+    let Expression::StructCall {
+        name,
+        ty,
+        field_assignments,
+        spread,
+        ..
+    } = find_expression_at(&file.items, offset)?
+    else {
+        return None;
+    };
+
+    if let Some(spread_span) = spread.span()
+        && offset >= spread_span.byte_offset
+    {
+        return None;
+    }
+
+    Some((name.as_str(), ty, field_assignments))
+}
+
+/// Whether the token before any partial name is `{` or `,` (field name), not `:` (value).
+fn in_field_name_position(before: &[Token]) -> bool {
+    let end = match before.last() {
+        Some(t) if t.kind == Tk::Identifier => before.len() - 1,
+        _ => before.len(),
+    };
+    end >= 1 && matches!(before[end - 1].kind, Tk::LeftCurlyBrace | Tk::Comma)
+}
+
+/// A struct or enum-variant literal's unset fields, plus the one being typed. No methods.
+pub(crate) fn get_struct_literal_completions(
+    type_id: &str,
+    call_name: &str,
+    snapshot: &AnalysisSnapshot,
+    same_package: bool,
+    assigned: &[StructFieldAssignment],
+    offset: u32,
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    struct_field_completions(type_id, snapshot, same_package, &mut items);
+    enum_variant_field_completions(type_id, call_name, snapshot, &mut items);
+    items.retain(|item| {
+        !assigned
+            .iter()
+            .any(|fa| fa.name.as_str() == item.label && !cursor_on_name(fa, offset))
+    });
     items
+}
+
+/// An enum struct-variant's fields, resolved from the literal's `Enum.Variant` name.
+fn enum_variant_field_completions(
+    type_id: &str,
+    call_name: &str,
+    snapshot: &AnalysisSnapshot,
+    items: &mut Vec<CompletionItem>,
+) {
+    let Some(Definition {
+        body: DefinitionBody::Enum { variants, .. },
+        ..
+    }) = snapshot.definitions().get(type_id)
+    else {
+        return;
+    };
+    let variant_name = call_name.rsplit_once('.').map_or(call_name, |(_, v)| v);
+    let Some(variant) = variants.iter().find(|v| v.name == variant_name) else {
+        return;
+    };
+    for field in variant.fields.iter() {
+        items.push(CompletionItem {
+            label: field.name.to_string(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(field.ty.to_string()),
+            ..Default::default()
+        });
+    }
+}
+
+fn cursor_on_name(fa: &StructFieldAssignment, offset: u32) -> bool {
+    let start = fa.name_span.byte_offset;
+    offset >= start && offset <= start + fa.name_span.byte_length
 }
 
 pub(crate) fn get_type_completions(
     type_id: &str,
     snapshot: &AnalysisSnapshot,
-    same_module: bool,
+    current_package: &str,
 ) -> Vec<CompletionItem> {
-    use syntax::program::Definition;
-
-    let mut items = Vec::new();
-
-    match snapshot.definitions().get(type_id) {
-        Some(Definition::Enum { variants, .. }) => {
-            for variant in variants {
-                items.push(CompletionItem {
-                    label: variant.name.to_string(),
-                    kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    ..Default::default()
-                });
-            }
-        }
-        Some(Definition::ValueEnum { variants, .. }) => {
-            for variant in variants {
-                items.push(CompletionItem {
-                    label: variant.name.to_string(),
-                    kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    ..Default::default()
-                });
-            }
-        }
-        _ => {}
+    // Inline builtin constructors, not prelude definitions.
+    if type_id == "prelude.Array" {
+        return vec![
+            CompletionItem {
+                label: "new".to_string(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some("fn() -> Array<T, N>".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "from".to_string(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some("fn(Slice<T>) -> Option<Array<T, N>>".to_string()),
+                ..Default::default()
+            },
+        ];
     }
 
-    let method_prefix = format!("{type_id}.");
+    let target = alias_target(type_id, snapshot);
+    let method_id = target.as_deref().unwrap_or(type_id);
+
+    let mut items = enum_variant_items(method_id, snapshot).unwrap_or_default();
+
+    let same_package = id_is_in_package(method_id, current_package);
+    let method_prefix = format!("{method_id}.");
     for (qname, definition) in snapshot.definitions().iter() {
         if let Some(method_name) = qname.strip_prefix(method_prefix.as_str())
             && !method_name.contains('.')
-            && matches!(definition, Definition::Value { .. })
-            && !is_instance_method(definition.ty(), type_id)
-            && (same_module || definition.visibility().is_public())
-            && !items.iter().any(|i| i.label == method_name)
+            && matches!(definition.body, DefinitionBody::Value { .. })
+            && (same_package || definition.visibility.is_public())
+            && !items.iter().any(|item| item.label == method_name)
         {
             items.push(CompletionItem {
                 label: method_name.to_string(),
                 kind: Some(CompletionItemKind::METHOD),
-                detail: Some(definition.ty().to_string()),
+                detail: Some(definition.ty.to_string()),
                 ..Default::default()
             });
         }
@@ -286,15 +454,538 @@ pub(crate) fn get_type_completions(
     items
 }
 
-fn is_instance_method(ty: &syntax::types::Type, type_id: &str) -> bool {
-    let func_ty = match ty {
-        syntax::types::Type::Forall { body, .. } => body,
-        other => other,
+pub(crate) fn id_is_in_package(qualified_id: &str, package: &str) -> bool {
+    qualified_id.starts_with(package) && qualified_id.as_bytes().get(package.len()) == Some(&b'.')
+}
+
+fn enum_variant_items(type_id: &str, snapshot: &AnalysisSnapshot) -> Option<Vec<CompletionItem>> {
+    let to_item = |name: &str| CompletionItem {
+        label: name.to_string(),
+        kind: Some(CompletionItemKind::ENUM_MEMBER),
+        ..Default::default()
     };
-    match func_ty {
-        syntax::types::Type::Function { params, .. } if !params.is_empty() => {
-            type_name(&params[0]).is_some_and(|name| name == type_id)
+    match &snapshot.definitions().get(type_id)?.body {
+        DefinitionBody::Enum { variants, .. } => {
+            Some(variants.iter().map(|v| to_item(&v.name)).collect())
         }
-        _ => false,
+        _ => None,
+    }
+}
+
+/// Returns the target id of a non-generic alias.
+fn alias_target(type_id: &str, snapshot: &AnalysisSnapshot) -> Option<String> {
+    let def = snapshot.definitions().get(type_id)?;
+    let DefinitionBody::TypeAlias {
+        generics,
+        alias: AliasKind::Transparent { .. },
+        ..
+    } = &def.body
+    else {
+        return None;
+    };
+    if !generics.is_empty() {
+        return None;
+    }
+    let target = types::peel_alias(&def.ty, |id| snapshot.definitions().get(id));
+    let target = match target {
+        Type::Nominal { id, .. } => id.to_string(),
+        Type::Simple(kind) => format!("prelude.{}", kind.leaf_name()),
+        Type::Compound { kind, .. } => format!("prelude.{}", kind.leaf_name()),
+        _ => return None,
+    };
+    (target != type_id).then_some(target)
+}
+
+pub(crate) fn attribute_completions(
+    source: &str,
+    offset: usize,
+    is_test_file: bool,
+) -> Option<Vec<CompletionItem>> {
+    let tokens = Lexer::new(source, 0).lex().tokens;
+    let split = tokens.partition_point(|t| (t.byte_offset as usize) < offset);
+    let (before, after) = tokens.split_at(split);
+
+    if !in_attribute_name_position(before) {
+        return None;
+    }
+
+    let mut items = match enclosing_context(before) {
+        EnclosingContext::Struct => collect(attributes_for(AttributeTarget::StructField)),
+        EnclosingContext::Enum => collect(attributes_for(AttributeTarget::EnumVariant)),
+        EnclosingContext::Parenthesized | EnclosingContext::Function => Vec::new(),
+        EnclosingContext::Impl => match following_item(after).item {
+            FollowingItem::Target(AttributeTarget::Function) | FollowingItem::Unknown => {
+                collect(attributes_for(AttributeTarget::Method))
+            }
+            _ => Vec::new(),
+        },
+        // An interface accepts an attribute only on a bare `fn`, not `pub fn`.
+        EnclosingContext::Interface => match following_item(after) {
+            Following {
+                item: FollowingItem::Target(AttributeTarget::Function),
+                is_pub: false,
+            }
+            | Following {
+                item: FollowingItem::Unknown,
+                is_pub: false,
+            } => collect(attributes_for(AttributeTarget::Method)),
+            _ => Vec::new(),
+        },
+        EnclosingContext::TopLevel => match following_item(after).item {
+            FollowingItem::Target(target) => collect(attributes_for(target)),
+            FollowingItem::Invalid => Vec::new(),
+            FollowingItem::Unknown => collect(top_level_attributes()),
+        },
+    };
+
+    if !is_test_file {
+        items.retain(|item| item.label != "test");
+    }
+
+    Some(items)
+}
+
+fn collect<'a>(infos: impl Iterator<Item = &'a AttributeInfo>) -> Vec<CompletionItem> {
+    infos.map(attribute_item).collect()
+}
+
+fn attribute_item(info: &AttributeInfo) -> CompletionItem {
+    CompletionItem {
+        label: info.name.to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: Some(info.detail.to_string()),
+        ..Default::default()
+    }
+}
+
+fn top_level_attributes() -> impl Iterator<Item = &'static AttributeInfo> {
+    attributes::ATTRIBUTES.iter().filter(|a| {
+        a.applies_to(AttributeTarget::Struct)
+            || a.applies_to(AttributeTarget::Enum)
+            || a.applies_to(AttributeTarget::Function)
+    })
+}
+
+fn in_attribute_name_position(before: &[Token]) -> bool {
+    let end = match before.last() {
+        Some(t) if t.kind == Tk::Identifier => before.len() - 1,
+        _ => before.len(),
+    };
+    end >= 2 && before[end - 1].kind == Tk::LeftSquareBracket && before[end - 2].kind == Tk::Hash
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnclosingContext {
+    Parenthesized,
+    Struct,
+    Enum,
+    Impl,
+    Interface,
+    Function,
+    TopLevel,
+}
+
+fn enclosing_context(before: &[Token]) -> EnclosingContext {
+    enum Frame {
+        Paren,
+        Brace(EnclosingContext),
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut pending = EnclosingContext::TopLevel;
+    for token in before {
+        match token.kind {
+            Tk::LeftCurlyBrace => {
+                stack.push(Frame::Brace(pending));
+                pending = EnclosingContext::TopLevel;
+            }
+            Tk::LeftParen => stack.push(Frame::Paren),
+            Tk::RightCurlyBrace | Tk::RightParen => {
+                stack.pop();
+            }
+            Tk::Semicolon => pending = EnclosingContext::TopLevel,
+            Tk::Struct => pending = EnclosingContext::Struct,
+            Tk::Enum => pending = EnclosingContext::Enum,
+            Tk::Impl => pending = EnclosingContext::Impl,
+            Tk::Interface => pending = EnclosingContext::Interface,
+            Tk::Function => pending = EnclosingContext::Function,
+            _ => {}
+        }
+    }
+    for frame in stack.iter().rev() {
+        match frame {
+            Frame::Paren => return EnclosingContext::Parenthesized,
+            Frame::Brace(EnclosingContext::TopLevel) => continue,
+            Frame::Brace(context) => return *context,
+        }
+    }
+    EnclosingContext::TopLevel
+}
+
+enum FollowingItem {
+    Target(AttributeTarget),
+    /// A declaration that rejects attributes (`interface`, `impl`, `embed`, `const`, ...).
+    Invalid,
+    Unknown,
+}
+
+/// The following item, plus whether it carries `pub` (rejected on an interface
+/// method).
+struct Following {
+    item: FollowingItem,
+    is_pub: bool,
+}
+
+/// Classifies the definition following the in-progress attribute.
+fn following_item(after: &[Token]) -> Following {
+    let kind = |i: usize| after.get(i).map(|t| t.kind);
+    let mut i = 0;
+
+    // Skip the rest of the current attribute: optional name, `( ... )`, and `]`.
+    // `embed` is never an attribute name; it starts a following embedding item.
+    if kind(i) == Some(Tk::Identifier) && after.get(i).is_none_or(|t| t.text != "embed") {
+        i += 1;
+    }
+    if kind(i) == Some(Tk::LeftParen) {
+        i = skip_balanced(after, i, Tk::LeftParen, Tk::RightParen);
+    }
+    if kind(i) == Some(Tk::RightSquareBracket) {
+        i += 1;
+    }
+
+    let mut is_pub = false;
+    loop {
+        let item = match kind(i) {
+            Some(Tk::Comment | Tk::Semicolon) => {
+                i += 1;
+                continue;
+            }
+            Some(Tk::DocComment | Tk::FileComment) => FollowingItem::Invalid,
+            Some(Tk::Hash) if kind(i + 1) == Some(Tk::LeftSquareBracket) => {
+                i = skip_stacked_attribute(after, i);
+                continue;
+            }
+            Some(Tk::Pub) => {
+                is_pub = true;
+                i += 1;
+                continue;
+            }
+            Some(Tk::Struct) => FollowingItem::Target(AttributeTarget::Struct),
+            Some(Tk::Enum) => FollowingItem::Target(AttributeTarget::Enum),
+            Some(Tk::Function) => FollowingItem::Target(AttributeTarget::Function),
+            Some(Tk::Type) => FollowingItem::Target(AttributeTarget::TypeAlias),
+            Some(Tk::Interface | Tk::Impl | Tk::Const | Tk::Var | Tk::Import) => {
+                FollowingItem::Invalid
+            }
+            // `embed` is a contextual keyword lexed as an identifier; an interface
+            // embedding or embedded field takes no attribute.
+            Some(Tk::Identifier) if after.get(i).is_some_and(|t| t.text == "embed") => {
+                FollowingItem::Invalid
+            }
+            _ => FollowingItem::Unknown,
+        };
+        return Following { item, is_pub };
+    }
+}
+
+fn skip_balanced(after: &[Token], mut i: usize, open: Tk, close: Tk) -> usize {
+    let mut depth = 0;
+    while i < after.len() {
+        if after[i].kind == open {
+            depth += 1;
+        } else if after[i].kind == close {
+            depth -= 1;
+        }
+        i += 1;
+        if depth == 0 {
+            break;
+        }
+    }
+    i
+}
+
+/// Index past a stacked `#[ ... ]` (a `]` inside a string arg is its own token).
+fn skip_stacked_attribute(after: &[Token], mut i: usize) -> usize {
+    while i < after.len() && after[i].kind != Tk::RightSquareBracket {
+        i += 1;
+    }
+    if i < after.len() {
+        i += 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod package_prefix_tests {
+    use super::get_package_prefix;
+
+    fn prefix_at(source_with_cursor: &str) -> Option<String> {
+        let offset = source_with_cursor
+            .find('|')
+            .expect("test input needs a `|` cursor");
+        let source = source_with_cursor.replacen('|', "", 1);
+        get_package_prefix(&source, offset).map(|(prefix, dot)| {
+            assert_eq!(&source[dot..dot + 1], ".", "the offset should be the dot");
+            prefix.to_string()
+        })
+    }
+
+    #[test]
+    fn a_dot_and_a_half_typed_member_both_resolve_to_the_qualifier() {
+        assert_eq!(prefix_at("strings.|"), Some("strings".to_string()));
+        assert_eq!(prefix_at("strings.To|"), Some("strings".to_string()));
+        assert_eq!(
+            prefix_at("let s = strings.ToLo|wer"),
+            Some("strings".to_string())
+        );
+    }
+
+    #[test]
+    fn an_indexed_element_resolves_to_the_collection() {
+        assert_eq!(prefix_at("items[0].|"), Some("items".to_string()));
+        assert_eq!(prefix_at("items[0].fi|"), Some("items".to_string()));
+    }
+
+    #[test]
+    fn a_dotless_cursor_or_a_number_resolves_to_nothing() {
+        assert!(prefix_at("let x = 1|").is_none());
+        assert!(prefix_at("let x = 1.5|").is_none());
+    }
+
+    #[test]
+    fn a_multi_byte_boundary_character_does_not_split() {
+        assert_eq!(prefix_at("→名.|"), Some("名".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod attribute_completion_tests {
+    use super::*;
+
+    /// Runs `attribute_completions` with the cursor at the `|` marker (which is
+    /// stripped before scanning) and returns the offered labels, or `None` when
+    /// the cursor is not in attribute position.
+    fn labels_at(src_with_cursor: &str, is_test_file: bool) -> Option<Vec<String>> {
+        let offset = src_with_cursor
+            .find('|')
+            .expect("test input needs a `|` cursor");
+        let source = src_with_cursor.replacen('|', "", 1);
+        attribute_completions(&source, offset, is_test_file)
+            .map(|items| items.into_iter().map(|i| i.label).collect())
+    }
+
+    #[test]
+    fn top_level_struct_offers_serialization_tag_and_display() {
+        let labels = labels_at("#[|\nstruct Point { x: int }", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(labels.contains(&"display".to_string()));
+        assert!(labels.contains(&"equality".to_string()));
+        assert!(labels.contains(&"tag".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+        assert!(labels.contains(&"allow".to_string()));
+    }
+
+    #[test]
+    fn top_level_enum_offers_iterate_display_and_json() {
+        let labels = labels_at("#[|\nenum Direction { North, South }", false).unwrap();
+        assert!(labels.contains(&"iterate".to_string()));
+        assert!(labels.contains(&"display".to_string()));
+        assert!(labels.contains(&"equality".to_string()));
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"xml".to_string()));
+        assert!(!labels.contains(&"tag".to_string()));
+        assert!(labels.contains(&"allow".to_string()));
+    }
+
+    #[test]
+    fn struct_field_offers_serialization_and_tag_not_display() {
+        let labels = labels_at("struct S {\n  #[|\n  x: int\n}", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(labels.contains(&"tag".to_string()));
+        assert!(!labels.contains(&"display".to_string()));
+        assert!(!labels.contains(&"equality".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+        assert!(!labels.contains(&"allow".to_string()));
+    }
+
+    #[test]
+    fn method_in_impl_offers_allow_only() {
+        let labels = labels_at("impl S {\n  #[|\n  fn run(self) {}\n}", false).unwrap();
+        assert_eq!(labels, vec!["allow".to_string()]);
+    }
+
+    #[test]
+    fn method_in_interface_offers_allow_only() {
+        let labels = labels_at("interface I {\n  #[|\n  fn run()\n}", false).unwrap();
+        assert_eq!(labels, vec!["allow".to_string()]);
+    }
+
+    #[test]
+    fn top_level_fn_offers_allow_and_test() {
+        let labels = labels_at("#[|\nfn run() {}", true).unwrap();
+        assert!(labels.contains(&"allow".to_string()), "got: {labels:?}");
+        assert!(labels.contains(&"test".to_string()), "got: {labels:?}");
+    }
+
+    #[test]
+    fn top_level_fn_in_production_file_omits_test() {
+        let labels = labels_at("#[|\nfn run() {}", false).unwrap();
+        assert!(labels.contains(&"allow".to_string()), "got: {labels:?}");
+        assert!(!labels.contains(&"test".to_string()), "got: {labels:?}");
+    }
+
+    #[test]
+    fn interface_parent_embed_offers_nothing() {
+        let labels = labels_at("interface Child {\n  #[|\n  embed Parent\n}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn comment_between_attribute_and_enum_resolves_target() {
+        let labels = labels_at("#[|\n// note\nenum E { A }", false).unwrap();
+        assert!(labels.contains(&"iterate".to_string()));
+        assert!(labels.contains(&"allow".to_string()));
+    }
+
+    #[test]
+    fn doc_comment_after_attribute_offers_nothing() {
+        let labels = labels_at("#[|\n/// doc\nstruct S {}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn interface_pub_fn_offers_nothing() {
+        let labels = labels_at("interface I {\n  #[|\n  pub fn run()\n}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn impl_pub_fn_offers_allow() {
+        let labels = labels_at("impl S {\n  #[|\n  pub fn run(self) {}\n}", false).unwrap();
+        assert_eq!(labels, vec!["allow".to_string()]);
+    }
+
+    #[test]
+    fn interface_partial_pub_offers_nothing() {
+        let labels = labels_at("interface I {\n  #[|\n  pub\n}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn attribute_arg_backtick_paren_resolves_target() {
+        let labels = labels_at("#[|tag(`json:\")\"`)]\nstruct S { x: int }", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+        assert!(labels.contains(&"allow".to_string()));
+    }
+
+    #[test]
+    fn stacked_attribute_string_bracket_resolves_target() {
+        let labels = labels_at("#[|\n#[json(\"x]\")]\nstruct S { x: int }", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+        assert!(labels.contains(&"allow".to_string()));
+    }
+
+    #[test]
+    fn function_params_offer_nothing() {
+        let labels = labels_at("fn f(#[| x: int) {}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn tuple_struct_field_offers_nothing() {
+        let labels = labels_at("struct S(#[| int)", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn method_param_offers_nothing() {
+        let labels = labels_at("impl S {\n  fn m(#[| x: int) {}\n}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn enum_variant_position_offers_default() {
+        let labels = labels_at("enum E {\n  #[|\n  A\n}", false).unwrap();
+        assert_eq!(labels, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn function_body_offers_nothing() {
+        let labels = labels_at("fn main() {\n  #[|\n}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn function_body_inside_nested_block_offers_nothing() {
+        let labels = labels_at("fn main() {\n  if true {\n    #[|\n  }\n}", false).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn unknown_top_level_target_offers_full_union() {
+        let labels = labels_at("#[|", false).unwrap();
+        for expected in ["json", "display", "iterate", "allow", "tag"] {
+            assert!(labels.contains(&expected.to_string()), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn before_attribute_rejecting_declaration_offers_nothing() {
+        for decl in ["interface S {}", "impl S {}", "const X = 1"] {
+            let labels = labels_at(&format!("#[|\n{decl}"), false).unwrap();
+            assert!(
+                labels.is_empty(),
+                "expected nothing before `{decl}`, got {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_type_alias_offers_allow() {
+        let labels = labels_at("#[|\ntype Alias = int", false).unwrap();
+        assert_eq!(labels, vec!["allow".to_string()]);
+    }
+
+    #[test]
+    fn partial_name_still_resolves_target() {
+        let labels = labels_at("#[js|\nstruct Point { x: int }", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+    }
+
+    #[test]
+    fn stacked_attributes_resolve_to_following_item() {
+        let labels = labels_at("#[display]\n#[|\nstruct Point { x: int }", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+    }
+
+    #[test]
+    fn pub_modifier_is_skipped() {
+        let labels = labels_at("#[|\npub struct Point { x: int }", false).unwrap();
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"iterate".to_string()));
+    }
+
+    #[test]
+    fn not_in_attribute_position_yields_none() {
+        assert!(labels_at("let x = |5", false).is_none());
+        assert!(labels_at("fn main() { let y = |x }", false).is_none());
+    }
+
+    #[test]
+    fn hash_inside_string_is_not_an_attribute() {
+        assert!(labels_at("fn main() { let s = \"#[|\" }", false).is_none());
+    }
+
+    #[test]
+    fn closed_attribute_is_not_in_name_position() {
+        assert!(labels_at("#[json]|\nstruct Point { x: int }", false).is_none());
+    }
+
+    #[test]
+    fn cursor_in_argument_list_is_not_name_position() {
+        assert!(labels_at("struct S {\n  #[json(|\n  x: int\n}", false).is_none());
     }
 }

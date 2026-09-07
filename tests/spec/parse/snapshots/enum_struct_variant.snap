@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nenum Message {\n  Move { x: int, y: int },\n}\n"
+description: |
+  
+  enum Message {
+    Move { x: int, y: int },
+  }
 ---
 [
     Enum {
@@ -16,6 +20,7 @@ description: "input: \nenum Message {\n  Move { x: int, y: int },\n}\n"
         variants: [
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Move",
                 name_span: Span {
                     file_id: 0,
@@ -40,9 +45,9 @@ description: "input: \nenum Message {\n  Move { x: int, y: int },\n}\n"
                                     byte_length: 3,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                         EnumFieldDefinition {
                             name: "y",
@@ -60,9 +65,9 @@ description: "input: \nenum Message {\n  Move { x: int, y: int },\n}\n"
                                     byte_length: 3,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                     ],
                 ),

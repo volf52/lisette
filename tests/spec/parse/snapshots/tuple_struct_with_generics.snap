@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nstruct Wrapper<T>(T)\n"
+description: |
+  
+  struct Wrapper<T>(T)
 ---
 [
     Struct {
@@ -16,6 +18,7 @@ description: "input: \nstruct Wrapper<T>(T)\n"
             Generic {
                 name: "T",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 16,
@@ -23,32 +26,35 @@ description: "input: \nstruct Wrapper<T>(T)\n"
                 },
             },
         ],
-        fields: [
-            StructFieldDefinition {
-                doc: None,
-                attributes: [],
-                name: "_0",
-                name_span: Span {
-                    file_id: 0,
-                    byte_offset: 19,
-                    byte_length: 1,
-                },
-                annotation: Constructor {
-                    name: "T",
-                    params: [],
-                    span: Span {
+        fields: Tuple(
+            [
+                StructFieldDefinition {
+                    doc: None,
+                    name: "_0",
+                    name_span: Span {
                         file_id: 0,
                         byte_offset: 19,
                         byte_length: 1,
                     },
+                    annotation: Constructor {
+                        name: "T",
+                        params: [],
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 19,
+                            byte_length: 1,
+                        },
+                    },
+                    visibility: Private,
+                    ty: Var {
+                        id: uninferred,
+                    },
+                    kind: Named {
+                        attributes: [],
+                    },
                 },
-                visibility: Private,
-                ty: Variable(
-                    -1,
-                ),
-            },
-        ],
-        kind: Tuple,
+            ],
+        ),
         visibility: Private,
         span: Span {
             file_id: 0,

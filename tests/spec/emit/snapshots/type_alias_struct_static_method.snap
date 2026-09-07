@@ -1,17 +1,24 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Box { v: int }\n\nimpl Box {\n  fn new(v: int) -> Box { Box { v } }\n}\n\ntype Alias = Box\n\nfn main() {\n  let b = Alias.new(1)\n  let _ = b\n}\n"
+description: |
+  
+  struct Box { v: int }
+  
+  impl Box {
+    fn new(v: int) -> Box { Box { v } }
+  }
+  
+  type Alias = Box
+  
+  fn main() {
+    let b = Alias.new(1)
+    let _ = b
+  }
 ---
 package main
 
-import "fmt"
-
 type Box struct {
 	v int
-}
-
-func (b Box) String() string {
-	return fmt.Sprintf("Box { v: %v }", b.v)
 }
 
 func Box_new(v int) Box {
@@ -21,5 +28,6 @@ func Box_new(v int) Box {
 type Alias = Box
 
 func main() {
-	_ = Box_new(1)
+	b := Box_new(1)
+	_ = b
 }

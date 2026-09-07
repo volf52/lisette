@@ -1,6 +1,22 @@
 use crate::assert_emit_snapshot;
 
 #[test]
+fn let_binding_types_a_character_literal_into_a_byte() {
+    let input = r#"
+fn takes_byte(b: byte) -> byte { b }
+
+fn test() -> byte {
+  let b: byte = 'a'
+  let i: int = 'a'
+  let r: rune = 'a'
+  let _ = (i, r)
+  takes_byte(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn integer_literal() {
     let input = r#"
 fn test() -> int {
@@ -151,6 +167,41 @@ fn test() {
 }
 
 #[test]
+fn empty_slice_literal_is_not_nil_at_go_boundary() {
+    let input = r#"
+import "go:encoding/json"
+
+struct Payload {
+  pub items: Slice<int>,
+}
+
+fn main() {
+  let xs: Slice<int> = []
+  let encoded = json.Marshal(xs).unwrap_or([]) as string
+  if encoded != "[]" {
+    panic(f"expected an explicit empty literal to encode as [], got {encoded}")
+  }
+  let payload = Payload { items: [] }
+  let wrapped = json.Marshal(payload).unwrap_or([]) as string
+  if wrapped != "{\"Items\":[]}" {
+    panic(f"expected an empty slice field to encode as [], got {wrapped}")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn empty_slice_of_function_type() {
+    let input = r#"
+fn test() {
+  let x: Slice<fn(int) -> int> = [];
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn hex_literal() {
     let input = r#"
 fn test() -> int {
@@ -235,16 +286,6 @@ fn octal_uppercase() {
     let input = r#"
 fn test() -> int {
   0O644
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn octal_legacy() {
-    let input = r#"
-fn test() -> int {
-  0755
 }
 "#;
     assert_emit_snapshot!(input);
@@ -403,6 +444,46 @@ fn test() -> rune {
 }
 
 #[test]
+fn hex_escape_in_char() {
+    let input = r#"
+fn test() -> rune {
+  '\x41'
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unicode_escape_in_char() {
+    let input = r#"
+fn test() -> rune {
+  '\u{e9}'
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn capital_unicode_escape_in_char() {
+    let input = r#"
+fn test() -> rune {
+  '\U0001F600'
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn capital_unicode_escape_in_string() {
+    let input = r#"
+fn test() -> string {
+  "\U0001F600"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn octal_escape_esc_in_string() {
     let input = r#"
 fn test() -> string {
@@ -513,5 +594,116 @@ fn main() {
   fmt.Println(f"tuple: {t}")
 }
 "#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_empty() {
+    let input = r#"
+fn test() -> string {
+  r""
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_simple() {
+    let input = r#"
+fn test() -> string {
+  r"abc"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_regex_escapes() {
+    let input = r#"
+fn test() -> string {
+  r"\d+"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_windows_path() {
+    let input = r#"
+fn test() -> string {
+  r"C:\Users"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_backtick_falls_back_to_double_quoted() {
+    let input = r#"
+fn test() -> string {
+  r"has `tick"
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_cr_falls_back_to_double_quoted() {
+    let input = "\nfn test() -> string {\n  r\"x\ry\"\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_multiline() {
+    let input = "fn test() -> string {\n  r\"\nSELECT foo FROM bar\nWHERE id = 100\n\"\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_multiline_with_backtick_falls_back_to_double_quoted() {
+    let input = "fn test() -> string {\n  r\"line1\nhas `tick\nline3\"\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn raw_string_pattern_emit() {
+    let input = r#"
+fn test(s: string) -> int {
+  match s {
+    r"\d+" => 1,
+    _ => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emit_string_multiline_basic() {
+    let input = "\nfn test() -> string {\n  let s = \"a\nb\"\n  s\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emit_raw_string_multiline_via_backtick() {
+    let input = "\nfn test() -> string {\n  let s = r\"a\nb\"\n  s\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emit_raw_string_multiline_with_backtick_fallback() {
+    let input = "\nfn test() -> string {\n  let s = r\"first `tick\nsecond\"\n  s\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emit_fstring_multiline_text() {
+    let input = "\nfn test(name: string) -> string {\n  f\"hello\n{name}\nworld\"\n}\n";
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn emit_string_singleline_unchanged() {
+    let input = "\nfn test() -> string {\n  let s = \"x\"\n  s\n}\n";
     assert_emit_snapshot!(input);
 }

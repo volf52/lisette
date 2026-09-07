@@ -1,0 +1,50 @@
+---
+source: tests/spec/emit/go_interface_adapter.rs
+description: |
+  
+  import "go:example.com/svc"
+  
+  struct Loader {}
+  
+  impl Loader {
+    fn Load(self, key: string) -> Result<int, error> {
+      Ok(1)
+    }
+  }
+  
+  fn run(s: svc.Alias) -> int {
+    match s.Load("k") {
+      Ok(n) => n,
+      Err(_) => 0,
+    }
+  }
+  
+  fn main() {
+    let l = Loader {}
+    let _ = run(l as svc.Alias)
+  }
+---
+package main
+
+import "example.com/svc"
+
+type Loader struct{}
+
+func (l Loader) Load(_ string) (int, error) {
+	return 1, nil
+}
+
+func run(s svc.Alias) int {
+	ret_1, err_2 := s.Load("k")
+	if err_2 == nil {
+		n := ret_1
+		return n
+	} else {
+		return 0
+	}
+}
+
+func main() {
+	l := Loader{}
+	_ = run(l)
+}

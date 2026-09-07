@@ -1,0 +1,25 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:example.com/aws"
+  
+  fn main() {
+    let input = aws.ListInput { .. }
+    let n = input.MaxItems
+    let _ = n
+  }
+---
+package main
+
+import (
+	"example.com/aws"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func main() {
+	input := aws.ListInput{}
+	raw_1 := input.MaxItems
+	n := lisette.OptionFromPointer[int32](raw_1)
+	_ = n
+}

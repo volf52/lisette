@@ -1,20 +1,21 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nfn noop() {}\nstruct P((), int)\n\nfn test() -> P {\n  P(noop(), 1)\n}\n"
+description: |
+  
+  fn noop() {}
+  struct P((), int)
+  
+  fn test() -> P {
+    P(noop(), 1)
+  }
 ---
 package main
-
-import "fmt"
 
 func noop() {}
 
 type P struct {
 	F0 struct{}
 	F1 int
-}
-
-func (p P) String() string {
-	return fmt.Sprintf("P(%v, %v)", p.F0, p.F1)
 }
 
 func test() P {

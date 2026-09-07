@@ -1,15 +1,26 @@
 ---
 source: tests/spec/emit/patterns.rs
-description: "input: \nfn test(opt: Option<int>) -> int {\n  let x = 1;\n  let x = match opt {\n    Some(v) => v,\n    None => 0,\n  };\n  x\n}\n"
+description: |
+  
+  fn test(opt: Option<int>) -> int {
+    let x = 1;
+    let x = match opt {
+      Some(v) => v,
+      None => 0,
+    };
+    x
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
 func test(opt lisette.Option[int]) int {
-	_ = 1
+	var x int
 	if opt.Tag == lisette.OptionSome {
-		return opt.SomeVal
+		x = opt.SomeVal
+	} else {
+		x = 0
 	}
-	return 0
+	return x
 }

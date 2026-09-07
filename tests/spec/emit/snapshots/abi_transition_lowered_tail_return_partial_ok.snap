@@ -1,0 +1,13 @@
+---
+source: tests/spec/emit/functions.rs
+description: |
+  
+  fn run(x: int) -> Partial<int, error> {
+    Partial.Ok(x)
+  }
+---
+package main
+
+func run(x int) (int, error) {
+	return x, nil
+}

@@ -1,6 +1,10 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: apply(\n    10,\n    |x| { x * 3 }\n)"
+description: |-
+  apply(
+      10,
+      |x| { x * 3 }
+  )
 ---
 LexResult {
     tokens: [
@@ -90,9 +94,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

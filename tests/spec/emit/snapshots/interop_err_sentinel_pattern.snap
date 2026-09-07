@@ -1,6 +1,23 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:bufio\"\nimport \"go:fmt\"\nimport \"go:io\"\nimport \"go:os\"\n\nfn main() {\n  let reader = bufio.NewReader(os.Stdin)\n  while true {\n    let r = match reader.ReadRune() {\n      Ok((r, _)) => r,\n      Err(io.EOF) => break,\n      Err(_) => panic(\"error\"),\n    }\n    fmt.Printf(\"%c\", r)\n  }\n}\n"
+description: |
+  
+  import "go:bufio"
+  import "go:fmt"
+  import "go:io"
+  import "go:os"
+  
+  fn main() {
+    let mut reader = bufio.NewReader(os.Stdin)
+    while true {
+      let r = match reader.ReadRune() {
+        Ok((r, _)) => r,
+        Err(io.EOF) => break,
+        Err(_) => panic("error"),
+      }
+      fmt.Printf("%c", r)
+    }
+  }
 ---
 package main
 
@@ -14,25 +31,24 @@ import (
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
-loop_1:
 	for {
-		var r_2 int32
-		ret_4, ret_5, ret_6 := reader.ReadRune()
-		tup_7 := lisette.MakeTuple2(ret_4, ret_5)
-		var subject_3 lisette.Result[lisette.Tuple2[int32, int], error]
-		if ret_6 != nil {
-			subject_3 = lisette.MakeResultErr[lisette.Tuple2[int32, int], error](ret_6)
+		var r_1 rune
+		ret_2, ret_3, ret_4 := reader.ReadRune()
+		tup_5 := lisette.MakeTuple2(ret_2, ret_3)
+		var result_6 lisette.Result[lisette.Tuple2[rune, int], error]
+		if ret_4 != nil {
+			result_6 = lisette.MakeResultErr[lisette.Tuple2[rune, int], error](ret_4)
 		} else {
-			subject_3 = lisette.MakeResultOk[lisette.Tuple2[int32, int], error](tup_7)
+			result_6 = lisette.MakeResultOk[lisette.Tuple2[rune, int], error](tup_5)
 		}
-		if subject_3.Tag == lisette.ResultOk {
-			r_2 = subject_3.OkVal.First
+		if result_6.Tag == lisette.ResultOk {
+			r_1 = result_6.OkVal.First
 		} else {
-			if subject_3.ErrVal == io.EOF {
-				break loop_1
+			if result_6.ErrVal == io.EOF {
+				break
 			}
 			panic("error")
 		}
-		fmt.Printf("%c", r_2)
+		fmt.Printf("%c", r_1)
 	}
 }

@@ -1,0 +1,43 @@
+import "models"
+
+fn sample() -> Slice<models.Task> {
+  [
+    models.Task.new(1, "first", models.Priority.Low, []),
+    models.Task.new(2, "second", models.Priority.High, []),
+  ]
+}
+
+#[test]
+fn next_id_starts_at_one_for_empty() {
+  let empty: Slice<models.Task> = []
+  assert next_id(empty) == 1
+}
+
+#[test]
+fn next_id_is_one_past_the_max() {
+  assert next_id(sample()) == 3
+}
+
+#[test]
+fn set_status_marks_a_task_done() {
+  let assert Ok(updated) = set_status(sample(), 1, models.Status.Done)
+  let assert Some(item) = updated.find(|t| t.id == 1)
+  assert item.status == models.Status.Done
+}
+
+#[test]
+fn set_status_reports_a_missing_task() {
+  let assert Err(err) = set_status(sample(), 99, models.Status.Done)
+  assert err.Error().contains("not found")
+}
+
+#[test]
+fn set_status_records_a_cancel_reason() {
+  let assert Ok(updated) = set_status(
+    sample(),
+    2,
+    models.Status.Cancelled("obsolete"),
+  )
+  let assert Some(item) = updated.find(|t| t.id == 2)
+  assert item.status.label() == "cancelled: obsolete"
+}

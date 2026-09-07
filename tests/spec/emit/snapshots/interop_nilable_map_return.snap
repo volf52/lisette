@@ -1,0 +1,24 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:example.com/reg"
+  
+  fn main() {
+    match reg.Registry(true) {
+      Some(m) => { let _ = m.length() },
+      None => { let _ = 0 },
+    }
+  }
+---
+package main
+
+import "example.com/reg"
+
+func main() {
+	ret_1 := reg.Registry(true)
+	if ret_1 != nil {
+		m := ret_1
+		_ = len(m)
+	}
+}

@@ -1,6 +1,12 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test(opt: Option<int>) {\n  if let Some(x) = opt {\n    let y = x + 1;\n  }\n}\n"
+description: |
+  
+  fn test(opt: Option<int>) {
+    if let Some(x) = opt {
+      let y = x + 1;
+    }
+  }
 ---
 package main
 
@@ -8,7 +14,6 @@ import lisette "github.com/ivov/lisette/prelude"
 
 func test(opt lisette.Option[int]) {
 	if opt.Tag == lisette.OptionSome {
-		x := opt.SomeVal
-		_ = x + 1
+		_ = opt.SomeVal + 1
 	}
 }

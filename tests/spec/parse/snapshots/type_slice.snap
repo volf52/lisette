@@ -1,10 +1,13 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \ntype IntSlice = Slice<int>;\n"
+description: |
+  
+  type IntSlice = Slice<int>;
 ---
 [
     TypeAlias {
         doc: None,
+        attributes: [],
         name: "IntSlice",
         name_span: Span {
             file_id: 0,
@@ -31,9 +34,9 @@ description: "input: \ntype IntSlice = Slice<int>;\n"
                 byte_length: 10,
             },
         },
-        ty: Variable(
-            -1,
-        ),
+        ty: Var {
+            id: uninferred,
+        },
         visibility: Private,
         span: Span {
             file_id: 0,

@@ -1,0 +1,16 @@
+/// The handle passed to a `#[test]` function, backed by Go's `*testing.T`.
+pub type TestContext
+
+impl TestContext {
+    /// Run `body` as a named subtest.
+    pub fn run(self, name: string, body: fn(TestContext) -> ())
+
+    /// Signal that this test may run in parallel with other parallel tests.
+    pub fn parallel(self)
+
+    /// Skip this test at runtime with a reason.
+    pub fn skip(self, reason: string) -> Never
+
+    /// Log a value while debugging.
+    pub fn log(self, value: Unknown)
+}

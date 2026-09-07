@@ -21,6 +21,8 @@ type Overrides struct {
 // LintOverrides holds lint-suppression overrides.
 type LintOverrides struct {
 	AllowUnusedResult map[string][]string `json:"allow_unused_result"`
+	AllowUnusedValue  map[string][]string `json:"allow_unused_value"`
+	DenyUnusedValue   map[string][]string `json:"deny_unused_value"`
 }
 
 // TypeOverrides holds type-conversion overrides.
@@ -34,6 +36,49 @@ type TypeOverrides struct {
 	NeverReturn      map[string][]string            `json:"never_return"`
 	PartialResult    map[string][]string            `json:"partial_result"`
 	MutatesParam     map[string]map[string][]string `json:"mutates_param"`
+	// NonMutatingParam declares read-only contracts, overriding inferred writes,
+	// name heuristics, and mutates_param entries for the named parameters.
+	NonMutatingParam map[string]map[string][]string `json:"non_mutating_param"`
+	// MutatesReceiver curates receiver writes the SSA walk cannot see, as "Type.Method".
+	MutatesReceiver map[string][]string `json:"mutates_receiver"`
+	// ReturnsViewOf curates view aliasing the SSA result walk cannot see:
+	// "<result>:<param>" for whole-value sharing, "<result>:[<param>]" for
+	// element-level, "recv" for the receiver, an empty list for fresh.
+	ReturnsViewOf map[string]map[string][]string `json:"returns_view_of"`
+	// WritableReturn curates results callers write, stating the permission
+	// without an aliasing claim, as "Type.Method".
+	WritableReturn map[string][]string `json:"writable_return"`
+	// NilableParam declares pointer/interface parameters that accept nil in Go
+	// (e.g. `nil` means "use the default"), so they should be `Option<Ref<T>>`
+	// instead of `Ref<T>`.
+	NilableParam map[string]map[string][]string `json:"nilable_param"`
+	// NonNilableParam cancels a wrong inference, keeping a parameter `Ref<T>`
+	// when the analysis proved it accepts nil.
+	NonNilableParam map[string]map[string][]string `json:"non_nilable_param"`
+	// SentinelMinusOne declares int-returning functions that signal
+	// "absent" with `-1`. Bindgen rewrites the return to `Option<int>`
+	// and emits `#[go(sentinel_minus_one)]`.
+	SentinelMinusOne map[string][]string `json:"sentinel_minus_one"`
+	// ReflectionDecode declares functions whose `interface{}` params reach
+	// Go reflection; each such param is lifted to a fresh `T` and rewritten
+	// to `Ref<T>`.
+	ReflectionDecode map[string][]string `json:"reflection_decode"`
+	// BitFlagSet forces named integer types to carry the #[go(bit_flag_set)]
+	// attribute. Used for types that look like sequential const groups to the
+	// heuristic but are semantically bit-flag sets.
+	BitFlagSet map[string][]string `json:"bit_flag_set"`
+	// ClosedDomain marks named primitive types whose valid values are a fixed
+	// finite set, emitting #[go(closed_domain)]. Drives the out_of_domain_value lint.
+	// Curated, never auto-detected; mutually exclusive with bit_flag_set.
+	ClosedDomain map[string][]string `json:"closed_domain"`
+	// SupersededBy maps each superseded symbol to its successor as "pkg.Name". Curated, never derived.
+	SupersededBy map[string]map[string]string `json:"superseded_by"`
+	// Curated per type from Go's docs, never derived from field shape.
+	// ZeroSafe admits zero construction of types with no visible fields,
+	// which are refused by default. ZeroUnsafe denies it for structs with
+	// visible fields, which are admitted by default.
+	ZeroSafe   map[string][]string `json:"zero_safe"`
+	ZeroUnsafe map[string][]string `json:"zero_unsafe"`
 }
 
 // LoadConfig loads bindgen configuration from the given path.
@@ -59,6 +104,40 @@ func LoadConfig(configPath string, defaultData []byte) (Config, error) {
 	return cfg, nil
 }
 
+// matchKind selects how a configured name list is matched against a query name.
+type matchKind int
+
+const (
+	matchExact    matchKind = iota // exact name only
+	matchStar                      // exact name or bare "*"
+	matchWildcard                  // exact, bare "*", or "*.Method"
+)
+
+// matchField reports whether name matches the package's configured names under the given strategy.
+func matchField(m map[string][]string, pkg, name string, kind matchKind) bool {
+	names, ok := lookupWithGlob(m, pkg)
+	if !ok {
+		return false
+	}
+	switch kind {
+	case matchWildcard:
+		return matchesWildcard(names, name)
+	case matchStar:
+		return slices.Contains(names, "*") || slices.Contains(names, name)
+	default:
+		return slices.Contains(names, name)
+	}
+}
+
+// nestedParams returns the configured parameter names for the given function.
+func nestedParams(m map[string]map[string][]string, pkg, name string) []string {
+	funcs, ok := lookupWithGlobNested(m, pkg)
+	if !ok {
+		return nil
+	}
+	return funcs[name]
+}
+
 // ShouldAllowUnusedResult returns true if the given function in the given
 // package should be annotated with #[allow(unused_result)].
 //
@@ -66,22 +145,41 @@ func LoadConfig(configPath string, defaultData []byte) (Config, error) {
 //   - "*" matches all functions and methods in the package
 //   - "*.Method" matches Method on any type (e.g., "*.Write" for all Writer types)
 func (c *Config) ShouldAllowUnusedResult(pkg, funcName string) bool {
-	funcs, ok := lookupWithGlob(c.Overrides.Lints.AllowUnusedResult, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return matchesWildcard(funcs, funcName)
+	return matchField(c.Overrides.Lints.AllowUnusedResult, pkg, funcName, matchWildcard)
+}
+
+// ShouldAllowUnusedValue returns true if the given package-level function in
+// the given package should be annotated with #[allow(unused_value)]. Used for
+// fluent registration APIs (e.g. beego's `web.Get` returns `*HttpServer` for
+// chaining but is idiomatically called for side effect).
+//
+// Supports the same wildcards as ShouldAllowUnusedResult.
+func (c *Config) ShouldAllowUnusedValue(pkg, funcName string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Lints.AllowUnusedValue, pkg, funcName, matchWildcard)
+}
+
+// ShouldDenyUnusedValue forces the AST fluent-method heuristic off for curated methods that match its shape but semantically return new values.
+func (c *Config) ShouldDenyUnusedValue(pkg, name string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Lints.DenyUnusedValue, pkg, name, matchWildcard)
 }
 
 // ShouldWrapNilableReturn returns true if the given function or method in the given
 // package should be wrapped in Option<> because it can return nil.
 // Uses "Type.Method" dot notation for methods.
 func (c *Config) ShouldWrapNilableReturn(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.NilableReturn, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return slices.Contains(names, name)
+	return matchField(c.Overrides.Types.NilableReturn, pkg, name, matchExact)
 }
 
 // IsNonNilableReturnreturns true if the given function or method in the given
@@ -92,32 +190,29 @@ func (c *Config) ShouldWrapNilableReturn(pkg, name string) bool {
 //   - "*" matches all functions and methods in the package
 //   - "*.Method" matches Method on any type (e.g., "*.Header" for all RR types)
 func (c *Config) IsNonNilableReturn(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.NonNilableReturn, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return matchesWildcard(names, name)
+	return matchField(c.Overrides.Types.NonNilableReturn, pkg, name, matchWildcard)
 }
 
 // IsNonNilableVar returns true if the given package-level variable in the given
 // package is known to always be initialized, suppressing automatic Option<> wrapping.
 func (c *Config) IsNonNilableVar(pkg, varName string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.NonNilableVar, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return slices.Contains(names, "*") || slices.Contains(names, varName)
+	return matchField(c.Overrides.Types.NonNilableVar, pkg, varName, matchStar)
 }
 
 // HasBoolAsFlag returns true if the given function or method returns (T, bool)
 // where the bool is a flag (not presence), so it should NOT be converted to Option<T>.
 // Uses "Type.Method" dot notation for methods.
 func (c *Config) HasBoolAsFlag(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.BoolAsFlag, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return slices.Contains(names, name)
+	return matchField(c.Overrides.Types.BoolAsFlag, pkg, name, matchExact)
 }
 
 // MutatingParams returns the list of parameter names that are mutated by the
@@ -126,54 +221,163 @@ func (c *Config) MutatingParams(pkg, name string) []string {
 	if c == nil {
 		return nil
 	}
-	funcs, ok := lookupWithGlobNested(c.Overrides.Types.MutatesParam, pkg)
-	if !ok {
+	return nestedParams(c.Overrides.Types.MutatesParam, pkg, name)
+}
+
+// NonMutatingParams declares parameters whose public contract forbids writes.
+func (c *Config) NonMutatingParams(pkg, name string) []string {
+	if c == nil {
 		return nil
 	}
-	return funcs[name] // nil if not found
+	return nestedParams(c.Overrides.Types.NonMutatingParam, pkg, name)
+}
+
+// MutatesReceiver returns true if the "Type.Method" is curated as writing through its receiver.
+func (c *Config) MutatesReceiver(pkg, name string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.MutatesReceiver, pkg, name, matchExact)
+}
+
+// ViewOverrides returns the curated view-aliasing entries, and whether an
+// entry exists at all, since an empty entry asserts freshness.
+func (c *Config) ViewOverrides(pkg, name string) ([]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+	funcs, ok := lookupWithGlobNested(c.Overrides.Types.ReturnsViewOf, pkg)
+	if !ok {
+		return nil, false
+	}
+	entries, ok := funcs[name]
+	return entries, ok
+}
+
+// HasWritableReturn returns true if the "Type.Method" is curated as returning a value its callers write.
+func (c *Config) HasWritableReturn(pkg, name string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.WritableReturn, pkg, name, matchExact)
+}
+
+// NilableParams returns the list of parameter names that should be wrapped in
+// `Option<>` for the given function or method, or nil if none are configured.
+func (c *Config) NilableParams(pkg, name string) []string {
+	if c == nil {
+		return nil
+	}
+	return nestedParams(c.Overrides.Types.NilableParam, pkg, name)
+}
+
+// NonNilableParams returns the list of parameter names that must stay `Ref<>`
+// for the given function or method, cancelling an inference, or nil if none
+// are configured.
+func (c *Config) NonNilableParams(pkg, name string) []string {
+	if c == nil {
+		return nil
+	}
+	return nestedParams(c.Overrides.Types.NonNilableParam, pkg, name)
 }
 
 // IsPartialResult returns true if the given function or method in the given
 // package returns (T, error) where both values may be simultaneously meaningful,
 // so the return type should be Partial<T, error> instead of Result<T, error>.
 func (c *Config) IsPartialResult(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.PartialResult, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return matchesWildcard(names, name)
+	return matchField(c.Overrides.Types.PartialResult, pkg, name, matchWildcard)
 }
 
 // HasDirectError returns true if the given function returns error as a value
 // (e.g., errors.New), not as a fallible indicator. These should return `error`
 // directly instead of `Result<(), error>`.
 func (c *Config) HasDirectError(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.DirectError, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return slices.Contains(names, name)
+	return matchField(c.Overrides.Types.DirectError, pkg, name, matchExact)
 }
 
 // HasNilableError returns true if the given function returns error as an
 // optional value (e.g., errors.Unwrap), where nil means "absent" rather than
 // "success". These should return `Option<error>` instead of `Result<(), error>`.
 func (c *Config) HasNilableError(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.NilableError, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return slices.Contains(names, name)
+	return matchField(c.Overrides.Types.NilableError, pkg, name, matchExact)
+}
+
+// SentinelInt returns (value, true) when the given function signals
+// "absent" with a magic int (e.g. -1 for strings.Index).
+func (c *Config) SentinelInt(pkg, name string) (int, bool) {
+	if c == nil {
+		return 0, false
+	}
+	if matchField(c.Overrides.Types.SentinelMinusOne, pkg, name, matchWildcard) {
+		return -1, true
+	}
+	return 0, false
+}
+
+// IsReflectionDecode reports whether the given function or method is
+// configured to lift its `interface{}` params to `Ref<T>`. Uses "Type.Method"
+// dot notation for methods.
+func (c *Config) IsReflectionDecode(pkg, name string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.ReflectionDecode, pkg, name, matchWildcard)
 }
 
 // IsNeverReturn returns true if the given function or method in the given
 // package never returns normally (e.g., os.Exit, log.Fatal).
 func (c *Config) IsNeverReturn(pkg, name string) bool {
-	names, ok := lookupWithGlob(c.Overrides.Types.NeverReturn, pkg)
-	if !ok {
+	if c == nil {
 		return false
 	}
-	return matchesWildcard(names, name)
+	return matchField(c.Overrides.Types.NeverReturn, pkg, name, matchWildcard)
+}
+
+func (c *Config) ShouldTreatAsBitFlagSet(pkg, typeName string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.BitFlagSet, pkg, typeName, matchExact)
+}
+
+// IsClosedDomain reports whether the given named type is curated as a closed
+// domain, so it should carry #[go(closed_domain)].
+func (c *Config) IsClosedDomain(pkg, typeName string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.ClosedDomain, pkg, typeName, matchExact)
+}
+
+func (c *Config) SupersededBy(pkg, name string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	successor, ok := c.Overrides.Types.SupersededBy[pkg][name]
+	return successor, ok
+}
+
+func (c *Config) IsCuratedZeroSafe(pkg, typeName string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.ZeroSafe, pkg, typeName, matchExact)
+}
+
+func (c *Config) IsCuratedZeroUnsafe(pkg, typeName string) bool {
+	if c == nil {
+		return false
+	}
+	return matchField(c.Overrides.Types.ZeroUnsafe, pkg, typeName, matchExact)
 }
 
 // lookupWithGlob returns all matching names for a package from a map,

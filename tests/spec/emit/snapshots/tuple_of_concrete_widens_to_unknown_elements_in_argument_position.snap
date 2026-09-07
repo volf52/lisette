@@ -1,0 +1,37 @@
+---
+source: tests/spec/emit/types.rs
+description: |
+  
+  fn describe(pair: (int, Unknown)) -> string {
+    match assert_type<string>(pair.1) {
+      Some(text) => text,
+      None => "",
+    }
+  }
+  
+  fn test() {
+    if describe((1, "two")) != "two" {
+      panic("tuple argument lost its Unknown element")
+    }
+  }
+---
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+func describe(pair lisette.Tuple2[int, any]) string {
+	ret_1, ok_2 := pair.Second.(string)
+	if ok_2 {
+		text := ret_1
+		return text
+	} else {
+		return ""
+	}
+}
+
+func test() {
+	tup_1 := lisette.MakeTuple2[int, string](1, "two")
+	if describe(lisette.MakeTuple2[int, any](tup_1.First, tup_1.Second)) != "two" {
+		panic("tuple argument lost its Unknown element")
+	}
+}

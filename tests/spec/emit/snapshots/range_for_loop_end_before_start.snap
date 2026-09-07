@@ -1,6 +1,15 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nfn start() -> int { 0 }\nfn bound() -> int { 3 }\n\nfn main() {\n  for i in start()..bound() {\n    let _ = i\n  }\n}\n"
+description: |
+  
+  fn start() -> int { 0 }
+  fn bound() -> int { 3 }
+  
+  fn main() {
+    for i in start()..bound() {
+      let _ = i
+    }
+  }
 ---
 package main
 
@@ -14,8 +23,8 @@ func bound() int {
 
 func main() {
 	start_2 := start()
-	_bound_1 := bound()
-	for i := start_2; i < _bound_1; i++ {
+	bound_1 := bound()
+	for i := start_2; i < bound_1; i++ {
 		_ = i
 	}
 }

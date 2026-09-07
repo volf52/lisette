@@ -1,0 +1,62 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === foo/foo.go ===
+package foo
+
+type Foo struct {
+	Value int
+}
+
+func Foo_New(v int) Foo {
+	return Foo{Value: v}
+}
+
+
+// === main.go ===
+package main
+
+import (
+	"fmt"
+	lisette "github.com/ivov/lisette/prelude"
+	"github.com/user/myproject/foo"
+	"github.com/user/myproject/types"
+)
+
+func main() {
+	f := foo.Foo_New(42)
+	_ = types.MakeMyEnumMaybe(lisette.MakeOptionSome(f))
+	fmt.Println("OK")
+}
+
+
+// === types/enums.go ===
+package types
+
+import (
+	lisette "github.com/ivov/lisette/prelude"
+	"github.com/user/myproject/foo"
+)
+
+func MakeMyEnumMaybe(arg0 lisette.Option[foo.Foo]) MyEnum {
+	return MyEnum{Tag: MyEnumMaybe, Maybe: arg0}
+}
+
+type MyEnumTag uint8
+
+const (
+	MyEnumMaybe MyEnumTag = iota
+)
+
+type MyEnum struct {
+	Tag   MyEnumTag
+	Maybe lisette.Option[foo.Foo]
+}
+
+
+// === types/helpers.go ===
+package types
+
+func Ping() int {
+	return 1
+}

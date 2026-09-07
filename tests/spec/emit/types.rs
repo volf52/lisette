@@ -1,9 +1,1229 @@
 use crate::assert_emit_snapshot;
+use crate::assert_emit_snapshot_with_go_typedefs;
 
 #[test]
 fn simple_struct_definition() {
     let input = r#"
 struct Point { x: int, y: int }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_struct_field_emits_anonymously() {
+    let input = r#"
+pub struct Base { pub id: int }
+
+struct Outer {
+  embed Base,
+  extra: int,
+}
+
+fn make() -> Outer {
+  Outer { Base: Base { id: 1 }, extra: 2 }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn promoted_field_write_matches_read_name() {
+    let input = r#"
+pub struct Base { pub id: int, tag: string }
+
+struct Outer {
+  embed Base,
+}
+
+fn main() {
+  let mut o = Outer { Base: Base { id: 1, tag: "a" } }
+  o.id = 2
+  o.tag = "b"
+  let _ = o.id
+  let _ = o.tag
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn promoted_json_field_keeps_forced_export_name() {
+    let input = r#"
+#[json]
+struct Base {
+  value: int,
+  other_name: string,
+}
+
+struct Outer {
+  embed Base,
+}
+
+fn main() {
+  let mut o = Outer { Base: Base { value: 1, other_name: "a" } }
+  o.value = 2
+  o.other_name = "b"
+  let _ = o.value
+  let _ = o.other_name
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn promoted_field_write_survives_specialized_method_name() {
+    let input = r#"
+pub struct Base { pub id: int }
+
+struct Outer<T> {
+  embed Base,
+  pub value: T,
+}
+
+impl Outer<int> {
+  fn id(self) -> int {
+    0
+  }
+}
+
+fn main() {
+  let mut o: Outer<int> = Outer { Base: Base { id: 1 }, value: 5 }
+  o.id = 2
+  let _ = o.id
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_pointer_field_emits_star_type() {
+    let input = r#"
+pub struct Base { pub id: int }
+
+struct Outer {
+  embed Ref<Base>,
+}
+
+fn make(b: Ref<Base>) -> Outer {
+  Outer { Base: b }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_unexported_field_key_matches_type() {
+    let input = r#"
+struct inner { x: int }
+
+struct Outer {
+  embed inner,
+}
+
+fn make() -> Outer {
+  Outer { inner: inner { x: 1 } }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_lowercase_alias_field_keeps_case() {
+    let input = r#"
+pub struct Base { pub id: int }
+type p = Base
+
+struct Outer {
+  embed p,
+}
+
+fn read(o: Outer) -> int {
+  o.p.id
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_field_untagged_under_struct_json() {
+    let input = r#"
+struct inner { x: int }
+
+#[json]
+struct Outer {
+  embed inner,
+}
+
+fn read(o: Outer) -> int {
+  o.inner.x
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn iterate_enum_variants() {
+    let input = r#"
+#[iterate]
+pub enum BuildPhase {
+  Validate,
+  Parse,
+  Codegen,
+}
+
+fn count() -> int {
+  let mut total = 0
+  for _phase in BuildPhase.variants() {
+    total = total + 1
+  }
+  total
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_struct_synthesizes_to_string() {
+    let input = r#"
+#[display]
+struct Point { x: int, y: int }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_enum_synthesizes_to_string() {
+    let input = r#"
+#[display]
+enum Color { Red, Green }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_empty_struct_to_string() {
+    let input = r#"
+#[display]
+struct Blank {}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_tuple_struct_to_string() {
+    let input = r#"
+#[display]
+struct UserId(int)
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_generic_struct_to_string() {
+    let input = r#"
+#[display]
+struct Box<T> { value: T }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_user_to_string_suppresses_synthesis() {
+    let input = r#"
+#[display]
+struct Point { x: int, y: int }
+
+impl Point {
+  fn to_string(self) -> string {
+    "p"
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_to_string_delegates_to_user_stringer() {
+    let input = r#"
+#[display]
+struct Point { x: int, y: int }
+
+impl Point {
+  fn string(self) -> string {
+    "p"
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_display_struct_gets_shadow_stringer() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+struct Server {
+  embed Logger,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_display_shadow_is_transitive() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+struct Server {
+  embed Logger,
+  pub port: int,
+}
+
+struct Cluster {
+  embed Server,
+  pub name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_plain_struct_gets_no_shadow_stringer() {
+    let input = r#"
+struct Plain { pub v: int }
+
+struct Wrapper {
+  embed Plain,
+  pub tag: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_outer_over_embedded_display_needs_no_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+#[display]
+struct Server {
+  embed Logger,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_user_stringer_promotes_without_shadow() {
+    let input = r#"
+struct Named { pub who: string }
+
+impl Named {
+  fn string(self) -> string {
+    "Named!"
+  }
+}
+
+struct Holder {
+  embed Named,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_display_with_user_stringer_promotes_without_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+impl Logger {
+  fn string(self) -> string {
+    "custom"
+  }
+}
+
+struct Server {
+  embed Logger,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn deeper_promoted_stringer_does_not_block_shallower_display_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+struct N { pub n: int }
+
+impl N {
+  fn string(self) -> string {
+    "N"
+  }
+}
+
+struct P {
+  embed N,
+}
+
+struct C {
+  embed D,
+  embed P,
+  pub c: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_intermediate_user_stringer_stops_shadow_walk() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+struct Server {
+  embed Logger,
+  pub port: int,
+}
+
+impl Server {
+  fn string(self) -> string {
+    "srv"
+  }
+}
+
+struct Cluster {
+  embed Server,
+  pub name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_alias_of_display_gets_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+type Alias = Logger
+
+struct Server {
+  embed Alias,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_display_pointer_gets_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+struct Server {
+  embed Ref<Logger>,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_alias_to_ref_display_gets_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+type P = Ref<Logger>
+
+struct Server {
+  embed P,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_ref_to_alias_display_gets_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+type L = Logger
+
+struct Server {
+  embed Ref<L>,
+  pub port: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn two_embedded_display_stringers_are_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct A { pub a: int }
+
+#[display]
+struct B { pub b: int }
+
+struct C {
+  embed A,
+  embed B,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_display_and_user_stringer_are_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct A { pub a: int }
+
+struct N { pub n: int }
+
+impl N {
+  fn string(self) -> string {
+    "N!"
+  }
+}
+
+struct C {
+  embed A,
+  embed N,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn single_embedded_display_beside_plain_embed_shadows() {
+    let input = r#"
+#[display]
+struct A { pub a: int }
+
+struct P { pub p: int }
+
+struct C {
+  embed A,
+  embed P,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_interface_stringer_and_display_are_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+interface I {
+  fn string() -> string
+}
+
+struct C {
+  embed D,
+  embed I,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_interface_parent_stringer_and_display_are_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+interface Base {
+  fn string() -> string
+}
+
+interface I {
+  embed Base
+  fn area() -> int
+}
+
+struct C {
+  embed D,
+  embed I,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_interface_without_stringer_leaves_display_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+interface I {
+  fn area() -> int
+}
+
+struct C {
+  embed D,
+  embed I,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_interface_non_stringer_string_method_is_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+interface I {
+  fn string() -> int
+}
+
+struct C {
+  embed D,
+  embed I,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_generic_interface_stringer_and_display_are_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+interface Base<T> {
+  fn string() -> T
+}
+
+struct C {
+  embed D,
+  embed Base<string>,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn embedded_generic_parent_interface_stringer_and_display_are_ambiguous_no_shadow() {
+    let input = r#"
+#[display]
+struct D { pub x: int }
+
+interface Base<T> {
+  fn string() -> T
+}
+
+interface I {
+  embed Base<string>
+  fn area() -> int
+}
+
+struct C {
+  embed D,
+  embed I,
+  pub n: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn string_field_beside_embedded_display_blocks_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+struct Server {
+  embed Logger,
+  pub string: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tag_exported_string_field_on_embed_blocks_outer_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+#[json]
+struct Inner {
+  embed Logger,
+  string: int,
+}
+
+struct Outer {
+  embed Inner,
+  pub name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_tag_does_not_force_export_so_outer_still_shadows() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+#[tag]
+struct Inner {
+  embed Logger,
+  string: int,
+}
+
+struct Outer {
+  embed Inner,
+  pub name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn keyed_tag_forces_export_so_string_field_blocks_outer_shadow() {
+    let input = r#"
+#[display]
+struct Logger { pub prefix: string }
+
+#[tag("validate", "required")]
+struct Inner {
+  embed Logger,
+  string: int,
+}
+
+struct Outer {
+  embed Inner,
+  pub name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_struct_comparable_fields() {
+    let input = r#"
+#[equality]
+struct Point { x: int, y: int }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_struct_synthesizes_equals() {
+    let input = r#"
+#[equality]
+struct Order { id: int, tags: Slice<string> }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_struct_ref_field_compares_by_identity() {
+    let input = r#"
+#[equality]
+struct Node { value: int, next: Ref<Node> }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_struct_map_field() {
+    let input = r#"
+#[equality]
+struct Counts { name: string, totals: Map<string, int> }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_struct_nested_equality_field() {
+    let input = r#"
+#[equality]
+struct Inner { items: Slice<int> }
+
+#[equality]
+struct Outer { name: string, inner: Inner }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_slice_of_equality_struct_dispatches_equals() {
+    let input = r#"
+#[equality]
+struct Order { id: int, tags: Slice<string> }
+
+fn test(a: Slice<Order>, b: Slice<Order>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_map_of_equality_struct_dispatches_equals() {
+    let input = r#"
+#[equality]
+struct Order { id: int, tags: Slice<string> }
+
+fn test(a: Map<string, Order>, b: Map<string, Order>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_empty_struct() {
+    let input = r#"
+#[equality]
+struct Blank {}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_generic_struct_comparable() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { value: T }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_generic_struct_custom_equatable_bound() {
+    let input = r#"
+interface Equatable<T> {
+  fn equals(other: T) -> bool
+}
+
+#[equality]
+struct Box<T: Equatable<T>> { value: T }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_generic_enum_custom_equatable_bound() {
+    let input = r#"
+interface Equatable<T> {
+  fn equals(other: T) -> bool
+}
+
+#[equality]
+enum Pair<T: Equatable<T>> { Both(T, T) }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_generic_struct_slice_of_custom_equatable_bound() {
+    let input = r#"
+interface Equatable<T> {
+  fn equals(other: T) -> bool
+}
+
+#[equality]
+struct Box<T: Equatable<T>> { values: Slice<T> }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_user_equals_suppresses_synthesis() {
+    let input = r#"
+#[equality]
+struct Caseless { value: string }
+
+impl Caseless {
+  fn equals(self, other: Caseless) -> bool {
+    self.value == other.value
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_enum_unit_variants() {
+    let input = r#"
+#[equality]
+enum Color { Red, Green, Blue }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_enum_payload_variants() {
+    let input = r#"
+#[equality]
+enum Shape {
+  Circle(float64),
+  Rectangle(float64, float64),
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_enum_mixed_variants() {
+    let input = r#"
+#[equality]
+enum Message {
+  Quit,
+  Move { x: int, y: int },
+  Write(string),
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_enum_slice_payload() {
+    let input = r#"
+#[equality]
+enum Event {
+  Tags(Slice<string>),
+  Empty,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn nested_generic_instantiation_compares_natively() {
+    let input = r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+fn same(a: Box<Box<int>>, b: Box<Box<int>>) -> bool {
+  a == b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_recursive_enum_derefs_pointer_payload() {
+    let input = r#"
+#[equality]
+enum List {
+  Nil,
+  Cons(int, List),
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_mutually_recursive_enums_deref_pointer_payloads() {
+    let input = r#"
+#[equality]
+enum A {
+  End,
+  X(B),
+}
+
+#[equality]
+enum B {
+  Y(A),
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_indirect_recursive_enum_through_struct() {
+    let input = r#"
+#[equality]
+enum Tree {
+  Leaf,
+  Node(Pair),
+}
+
+#[equality]
+struct Pair {
+  l: Tree,
+  r: Tree,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_user_equals_over_function_field() {
+    let input = r#"
+#[equality]
+struct Handler { run: fn(int) -> int }
+
+impl Handler {
+  fn equals(self, other: Handler) -> bool {
+    true
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_matching_bound_generic_equals() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { value: T }
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_weaker_method_bound_is_usable() {
+    let input = r#"
+#[equality]
+struct Box<T: Ordered> { value: T }
+
+impl<T: Comparable> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    self.value == other.value
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_weaker_interface_method_bound_is_usable() {
+    let input = r#"
+interface Parent {
+  fn p()
+}
+
+interface Child {
+  embed Parent
+
+  fn c()
+}
+
+#[equality]
+struct Box<T: Child> { value: T }
+
+impl<T: Parent> Box<T> {
+  fn equals(self, other: Box<T>) -> bool {
+    true
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_field_private_cross_package_equals_uses_native() {
+    let input = r#"
+struct Foo { x: int }
+
+impl Foo {
+  fn equals(self, other: int) -> bool {
+    false
+  }
+}
+
+#[equality]
+struct Wrap { foo: Foo }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_slice_of_generic_synthesized_equality() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { items: Slice<T> }
+
+fn test(a: Slice<Box<int>>, b: Slice<Box<int>>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_nested_generic_synthesized_equality() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { items: Slice<T> }
+
+#[equality]
+struct Wrap { box: Box<int> }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_enum_payload_generic_synthesized_equality() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { items: Slice<T> }
+
+#[equality]
+enum Wrap { Wrapped(Box<int>) }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_renamed_generic_param_equals() {
+    let input = r#"
+#[equality]
+struct Box<T: Comparable> { value: T }
+
+impl<U: Comparable> Box<U> {
+  fn equals(self, other: Box<U>) -> bool {
+    self.value == other.value
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_equals_keeps_user_equals_live() {
+    let input = r#"
+struct Point { x: int }
+
+impl Point {
+  fn equals(self, other: Point) -> bool {
+    self.x == other.x
+  }
+}
+
+fn test(a: Slice<Point>, b: Slice<Point>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn slice_contains_keeps_user_equals_live() {
+    let input = r#"
+struct Point { x: int, y: int }
+
+impl Point {
+  fn equals(self, other: Point) -> bool {
+    self.x == other.x
+  }
+}
+
+fn main() {
+  let xs: Slice<Point> = [Point { x: 1, y: 0 }]
+  if !xs.contains(Point { x: 1, y: 9 }) {
+    panic("contains must use the user equals, not Go ==")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_equals_keeps_user_equals_live() {
+    let input = r#"
+struct Point { x: int }
+
+impl Point {
+  fn equals(self, other: Point) -> bool {
+    self.x == other.x
+  }
+}
+
+fn test(a: Map<string, Point>, b: Map<string, Point>) -> bool {
+  a.equals(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_synthesized_keeps_nested_user_equals_live() {
+    let input = r#"
+struct Inner { x: int }
+
+impl Inner {
+  fn equals(self, other: Inner) -> bool {
+    self.x == other.x
+  }
+}
+
+#[equality]
+struct Outer { inner: Inner }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn equality_synthesized_keeps_nested_slice_user_equals_live() {
+    let input = r#"
+struct Inner { x: int }
+
+impl Inner {
+  fn equals(self, other: Inner) -> bool {
+    self.x == other.x
+  }
+}
+
+#[equality]
+struct Outer { items: Slice<Inner> }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_satisfies_display_interface() {
+    let input = r#"
+interface Display {
+  fn to_string() -> string
+}
+
+#[display]
+struct Point { x: int, y: int }
+
+fn render(d: Display) -> string {
+  d.to_string()
+}
+
+fn use_it() -> string {
+  render(Point { x: 1, y: 2 })
+}
 "#;
     assert_emit_snapshot!(input);
 }
@@ -70,7 +1290,7 @@ fn enum_variant_construction_simple() {
 enum Color { Red, Green, Blue }
 
 fn test() -> Color {
-  Red
+  Color.Red
 }
 "#;
     assert_emit_snapshot!(input);
@@ -90,10 +1310,10 @@ fn test() -> Option<int> {
 fn generic_enum_with_constrained_impl_make_functions() {
     let input = r#"
 interface Displayable {
-  fn display(self) -> string
+  fn display() -> string
 }
 
-enum Either<L, R> {
+enum Either<L: Displayable, R: Displayable> {
   Left(L),
   Right(R),
 }
@@ -137,6 +1357,20 @@ fn type_alias_with_generic() {
 type IntBox = Box<int>
 
 struct Box<T> { value: T }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn non_generic_alias_pins_unconstrained_type_param() {
+    let input = r#"
+struct Phantom<T, P> { pub value: T }
+
+type IntPhantom = Phantom<int, string>
+
+fn make() -> IntPhantom {
+  IntPhantom { value: 7, .. }
+}
 "#;
     assert_emit_snapshot!(input);
 }
@@ -197,6 +1431,26 @@ struct Outer { pub item: Wrapper }
 fn get_val(o: Outer) -> int {
   o.item.val
 }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_type_alias_preserved_at_use_sites() {
+    let input = r#"
+type Pair = (int, int)
+
+struct Holder { p: Pair }
+
+fn use_it(h: Holder, x: Pair) -> int { h.p.0 + x.1 }
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn direct_tuple_field_stays_expanded() {
+    let input = r#"
+struct Holder { p: (int, int) }
 "#;
     assert_emit_snapshot!(input);
 }
@@ -309,6 +1563,25 @@ fn main() -> int {
 }
 
 #[test]
+fn generic_static_method_uses_receiver_bound() {
+    let input = r#"
+struct Box<T: Comparable> { value: T }
+
+impl<U> Box<U> {
+  fn new(value: U) -> Box<U> {
+    Box { value: value }
+  }
+}
+
+fn main() -> int {
+  let b = Box.new(42)
+  b.value
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn generic_static_method_explicit_type_arg() {
     let input = r#"
 struct Box<T> { value: T }
@@ -322,6 +1595,39 @@ impl<T> Box<T> {
 fn main() -> int {
   let b = Box.new<int>(42);
   b.value
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_receiver_method_ufcs_explicit_type_arg() {
+    let input = r#"
+struct Box<T> { value: T }
+
+impl<T> Box<T> {
+  fn get(self) -> T {
+    self.value
+  }
+}
+
+fn main() -> int {
+  let b = Box { value: 42 };
+  Box.get<int>(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_fn_explicit_unknown_type_arg() {
+    let input = r#"
+fn foo<T>(args: T) -> T {
+  args
+}
+
+fn test() {
+  let result = foo<Unknown>("Lilian")
 }
 "#;
     assert_emit_snapshot!(input);
@@ -455,7 +1761,7 @@ fn test() {
 fn interface_self_referential_fbound_erased() {
     let input = r#"
 pub interface Cloner<T: Cloner<T>> {
-  fn clone(self) -> T
+  fn clone() -> T
 }
 
 struct Foo{}
@@ -474,12 +1780,12 @@ fn main() {
 }
 
 #[test]
-fn interface_self_param_stripped() {
+fn interface_methods_emit_without_receiver() {
     let input = r#"
 interface Greetable {
-  fn greet(self) -> string;
-  fn name(self) -> string;
-  fn reset(self);
+  fn greet() -> string;
+  fn name() -> string;
+  fn reset();
 }
 "#;
     assert_emit_snapshot!(input);
@@ -491,7 +1797,7 @@ fn generic_enum_with_variant_field() {
 enum MyResult<T> { Success(T), Failure }
 
 fn test() -> MyResult<int> {
-  Success(42)
+  MyResult.Success(42)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -503,7 +1809,7 @@ fn generic_enum_with_multiple_variant_fields() {
 enum Either<L, R> { Left(L), Right(R) }
 
 fn test() -> Either<int, string> {
-  Left(42)
+  Either.Left(42)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -573,6 +1879,76 @@ fn main() {
   let p2 = Point { x: 3, ..p1 }
   let copy_1 = 7
   fmt.Println(p2.x, copy_1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_variant_spread_builds_fresh_literal() {
+    let input = r#"
+enum Cursor {
+  Point { id: int, x: int },
+  Area { id: int, w: int },
+}
+
+fn test() -> Cursor {
+  let base = Cursor.Point { id: 7, x: 10 };
+  Cursor.Area { w: 3, ..base }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_variant_spread_all_fields_assigned_discards_base_call() {
+    let input = r#"
+import "go:fmt"
+
+enum Cursor {
+  Point { id: int, x: int },
+  Area { id: int, w: int },
+}
+
+fn make_base() -> Cursor { fmt.Println("base"); Cursor.Point { id: 1, x: 2 } }
+
+fn test() -> Cursor {
+  Cursor.Area { id: 4, w: 3, ..make_base() }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_variant_spread_all_fields_assigned_consumes_identifier_base() {
+    let input = r#"
+enum Cursor {
+  Point { id: int, x: int },
+  Area { id: int, w: int },
+}
+
+fn test() -> Cursor {
+  let base = Cursor.Point { id: 1, x: 2 };
+  Cursor.Area { id: 4, w: 3, ..base }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_variant_spread_side_effecting_base_evaluated_once() {
+    let input = r#"
+import "go:fmt"
+
+enum Cursor {
+  Point { id: int, x: int },
+  Area { id: int, w: int },
+}
+
+fn make_base() -> Cursor { fmt.Println("base"); Cursor.Point { id: 1, x: 2 } }
+
+fn test() -> Cursor {
+  Cursor.Area { w: 3, ..make_base() }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -668,25 +2044,11 @@ fn test(arr: Slice<int>) -> Slice<int> {
 }
 
 #[test]
-fn slice_range_three_index_not_applied_to_strings() {
-    let input = r#"
-fn test_slice(arr: Slice<int>) -> Slice<int> {
-  arr[1..4]
-}
-
-fn test_string(s: string) -> string {
-  s[1..4]
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
 fn mutable_subslice_cloned() {
     let input = r#"
 fn test(arr: Slice<int>) {
   let view = arr[1..4]
-  let mut owned = arr[1..4]
+  let mut owned = arr[1..4].clone()
   owned[0] = 99
   let _ = view
 }
@@ -695,40 +2057,31 @@ fn test(arr: Slice<int>) {
 }
 
 #[test]
-fn string_range_exclusive() {
+fn mutable_subslice_through_alias_cloned() {
     let input = r#"
-fn test(s: string) -> string {
-  s[0..5]
+type Numbers = Slice<int>
+
+fn test() {
+  let xs: Numbers = [1, 2, 3]
+  let mut part = xs[0..2].clone()
+  part[0] = 99
+  let _ = xs
 }
 "#;
     assert_emit_snapshot!(input);
 }
 
 #[test]
-fn string_range_inclusive() {
+fn immutable_subslice_through_alias_capacity_capped() {
     let input = r#"
-fn test(s: string) -> string {
-  s[0..=4]
-}
-"#;
-    assert_emit_snapshot!(input);
-}
+type Numbers = Slice<int>
 
-#[test]
-fn string_range_from() {
-    let input = r#"
-fn test(s: string) -> string {
-  s[6..]
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn string_range_to() {
-    let input = r#"
-fn test(s: string) -> string {
-  s[..5]
+fn test() {
+  let xs: Numbers = [1, 2, 3]
+  let view = xs[0..2]
+  let grown = view.append(9)
+  let _ = grown
+  let _ = xs
 }
 "#;
     assert_emit_snapshot!(input);
@@ -867,6 +2220,14 @@ struct UserId(int)
 }
 
 #[test]
+fn pointer_backed_newtype_emits_no_stringer() {
+    let input = r#"
+struct Handle(Ref<int>)
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn tuple_struct_single_field_construction() {
     let input = r#"
 struct UserId(int)
@@ -885,6 +2246,146 @@ struct UserId(int)
 
 fn test(id: UserId) -> int {
   id.0
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_over_result_less_func_field_access() {
+    let input = r#"
+struct Cb(fn(int) -> ())
+
+fn test(cb: Cb) {
+  cb.0(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_over_func_with_result_field_access() {
+    let input = r#"
+struct Mapper(fn(int) -> int)
+
+fn test(m: Mapper) -> int {
+  m.0(21)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_over_receive_only_channel_field_access() {
+    let input = r#"
+struct Ticks(Receiver<int>)
+
+fn test(t: Ticks) -> Receiver<int> {
+  t.0
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn display_newtype_over_func_parenthesizes() {
+    let input = r#"
+#[display]
+struct Cb(fn(int) -> ())
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_over_type_named_like_func_keyword() {
+    let input = r#"
+struct funcRegistry { pub n: int }
+struct Holder(funcRegistry)
+
+fn test(h: Holder) -> int {
+  h.0.n
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn newtype_field_autofill_casts() {
+    let input = r#"
+struct GameModeParam(string)
+
+struct Inner { pub x: int }
+struct Wrapper(Inner)
+
+struct Name(string)
+struct DoubleName(Name)
+
+struct Command {
+  pub gamemode: GameModeParam,
+  pub wrapper: Wrapper,
+  pub double: DoubleName,
+}
+
+fn register() -> Command {
+  Command { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_struct_field_autofill_uses_f_names() {
+    let input = r#"
+struct MP(int, string)
+
+struct Holder {
+  pub p: MP,
+}
+
+fn make() -> Holder {
+  Holder { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_field_autofill_uses_constructor() {
+    let input = r#"
+struct Probe {
+  pub pair: (int, string),
+  pub nested: (Option<int>, (int, int)),
+}
+
+fn make() -> Probe {
+  Probe { .. }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_field_autofill_zeros_carry_their_element_types() {
+    let input = r#"
+type Meters = float64
+type Count = int
+struct Ticket(int)
+struct Weight(float64)
+
+struct Probe {
+  pub plain: (int, string),
+  pub floaty: (int, float64),
+  pub small: (float32, uint8),
+  pub bytes: (byte, string),
+  pub aliased: (Meters, int),
+  pub alias_of_int: (Count, string),
+  pub newtype: (Ticket, int),
+  pub newtype_float: (Weight, int),
+  pub nested: (int, (int, float64)),
+}
+
+fn make() -> Probe {
+  Probe { .. }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1159,6 +2660,18 @@ struct User {
 }
 
 #[test]
+fn later_struct_tag_attribute_can_disable_omitempty() {
+    let input = r#"
+#[json(omitempty)]
+#[json(!omitempty)]
+struct User {
+  id: int,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn struct_with_snake_case_oauth() {
     let input = r#"
 #[json(snake_case)]
@@ -1200,6 +2713,78 @@ struct User {
 }
 
 #[test]
+fn struct_with_tag_json_omitempty_option() {
+    let input = r#"
+struct User {
+  #[tag("json", omitempty)]
+  email: Option<string>,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_with_json_omitzero() {
+    let input = r#"
+#[json]
+struct User {
+  #[json(omitzero)]
+  created: Array<int, 2>,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_with_json_omitempty_and_omitzero() {
+    let input = r#"
+#[json]
+struct User {
+  #[json(omitempty, omitzero)]
+  name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_level_omitzero_reaches_fields() {
+    let input = r#"
+#[json(omitzero)]
+struct User {
+  id: int,
+  #[json(!omitzero)]
+  name: string,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn negated_omitzero_keeps_option_omitempty() {
+    let input = r#"
+#[json]
+struct User {
+  #[json(omitempty, !omitzero)]
+  email: Option<string>,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_with_yaml_option_omitempty() {
+    let input = r#"
+#[yaml(omitempty)]
+struct User {
+  name: string,
+  email: Option<string>,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn struct_with_multiple_raw_tags() {
     let input = r#"
 #[tag("validate")]
@@ -1222,6 +2807,180 @@ type Maybe<T> = Option<T>
 struct User {
   name: Maybe<string>,
   email: Option<string>,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_alias_of_option_in_return_position() {
+    let input = r#"
+type Maybe<T> = Option<T>
+
+fn test() -> Maybe<int> {
+  Some(42)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_binds_call_returning_option_alias() {
+    let input = r#"
+type MyOpt = Option<int>
+
+fn source() -> MyOpt {
+  Some(3)
+}
+
+fn main() {
+  let a = source()
+  let _ = a
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_binds_call_returning_result_alias() {
+    let input = r#"
+type MyRes = Result<int, error>
+
+fn source() -> MyRes {
+  Ok(3)
+}
+
+fn main() {
+  let a = source()
+  let _ = a
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_binds_call_returning_partial_alias() {
+    let input = r#"
+type MyPartial = Partial<int, error>
+
+fn source() -> MyPartial {
+  Partial.Ok(3)
+}
+
+fn main() {
+  let a = source()
+  let _ = a
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_binds_call_returning_nullable_option_alias() {
+    let input = r#"
+struct Point {
+  pub x: int,
+}
+
+type MaybePoint = Option<Ref<Point>>
+
+fn source(p: Ref<Point>) -> MaybePoint {
+  Some(p)
+}
+
+fn main() {
+  let point = Point { x: 1 }
+  let a = source(&point)
+  let _ = a
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagates_call_returning_result_alias() {
+    let input = r#"
+type MyRes = Result<int, error>
+
+fn source() -> MyRes {
+  Ok(5)
+}
+
+fn consume() -> Result<int, error> {
+  let n = source()?
+  Ok(n + 1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn propagates_call_returning_option_alias() {
+    let input = r#"
+type MyOpt = Option<int>
+
+fn source() -> MyOpt {
+  Some(5)
+}
+
+fn consume() -> Option<int> {
+  let n = source()?
+  Some(n + 1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn try_block_annotated_with_result_alias() {
+    let input = r#"
+type MyRes = Result<int, error>
+
+fn source() -> MyRes {
+  Ok(5)
+}
+
+fn main() {
+  let r: MyRes = try {
+    let n = source()?
+    n + 1
+  }
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recover_block_annotated_with_result_alias() {
+    let input = r#"
+type Recovered = Result<int, PanicValue>
+
+fn main() {
+  let r: Recovered = recover {
+    42
+  }
+  let _ = r
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tail_call_forwards_option_alias_return() {
+    let input = r#"
+type MyOpt = Option<int>
+
+fn source() -> MyOpt {
+  Some(3)
+}
+
+fn forward() -> MyOpt {
+  source()
+}
+
+fn main() {
+  let _ = forward()
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1267,6 +3026,31 @@ enum Tree {
 
 fn test() -> Tree {
   Tree.Node(Tree.Leaf(1), Tree.Leaf(2))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_layout_keeps_value_function_and_recursive_fields_distinct() {
+    let input = r#"
+enum Node {
+  Value(int),
+  Callback(fn() -> int),
+  Child(Node),
+}
+
+fn read(node: Node) -> int {
+  match node {
+    Node.Value(value) => value,
+    Node.Callback(call) => call(),
+    Node.Child(child) => read(child),
+  }
+}
+
+fn main() {
+  if read(Node.Child(Node.Callback(|| 7))) != 7 { panic("wrong field layout") }
+  if read(Node.Value(3)) != 3 { panic("wrong value field") }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1371,6 +3155,147 @@ fn list_sum(l: List) -> int {
     List.Cons(head, tail) => head + list_sum(tail),
     List.Nil => 0,
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recursive_enum_indirect_through_struct() {
+    let input = r#"
+enum Tree {
+  Leaf(int),
+  Node(Pair),
+}
+
+struct Pair {
+  l: Tree,
+  r: Tree,
+}
+
+fn sum(t: Tree) -> int {
+  match t {
+    Tree.Leaf(n) => n,
+    Tree.Node(p) => sum(p.l) + sum(p.r),
+  }
+}
+
+fn test() -> Tree {
+  Tree.Node(Pair { l: Tree.Leaf(1), r: Tree.Leaf(2) })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recursive_enum_through_array_payload() {
+    let input = r#"
+enum Tree {
+  Leaf(int),
+  Node(Array<Tree, 2>),
+}
+
+fn sum(t: Tree) -> int {
+  match t {
+    Tree.Leaf(n) => n,
+    Tree.Node(kids) => sum(kids[0]) + sum(kids[1]),
+  }
+}
+
+fn test() -> Tree {
+  Tree.Node([Tree.Leaf(1), Tree.Leaf(2)])
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recursive_generic_enum_payload_wrapped() {
+    let input = r#"
+enum Cycle<T> {
+  End,
+  Next(Link<T>),
+}
+
+struct Link<T> {
+  pub value: T,
+  pub next: Cycle<T>,
+}
+
+fn total(c: Cycle<int>) -> int {
+  match c {
+    Cycle.End => 0,
+    Cycle.Next(l) => l.value + total(l.next),
+  }
+}
+
+fn test() -> int {
+  total(Cycle.Next(Link { value: 5, next: Cycle.Next(Link { value: 6, next: Cycle.End }) }))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recursive_enums_mutual() {
+    let input = r#"
+enum A {
+  End,
+  X(B),
+}
+
+enum B {
+  Y(A),
+}
+
+fn test() -> A {
+  A.X(B.Y(A.End))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recursive_enum_indirect_through_mixed_generic_instantiations() {
+    let input = r#"
+enum Tree {
+  Leaf,
+  Node(Outer),
+}
+
+struct Outer {
+  a: Box<int>,
+  b: Box<Tree>,
+}
+
+struct Box<T> {
+  value: T,
+}
+
+fn test() -> Tree {
+  Tree.Node(Outer { a: Box { value: 1 }, b: Box { value: Tree.Leaf } })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn recursive_enum_indirect_through_alias() {
+    let input = r#"
+enum Tree {
+  Leaf(int),
+  Node(P),
+}
+
+type P = Pair
+
+struct Pair {
+  l: Tree,
+  r: Tree,
+}
+
+fn test() -> Tree {
+  Tree.Node(Pair { l: Tree.Leaf(1), r: Tree.Leaf(2) })
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1535,7 +3460,7 @@ fn test() -> int {
 fn generic_interface_constraint_with_type_args() {
     let input = r#"
 interface Mapper<A, B> {
-  fn map_value(self, a: A) -> B
+  fn map_value(a: A) -> B
 }
 
 fn apply_mapper<M: Mapper<int, string>>(m: M, val: int) -> string {
@@ -1549,7 +3474,7 @@ fn apply_mapper<M: Mapper<int, string>>(m: M, val: int) -> string {
 fn ref_bounded_generic_absorbs_ref_into_type_param() {
     let input = r#"
 interface Mutable {
-  fn mutate(self, val: string)
+  fn mutate(val: string)
 }
 
 struct Box {
@@ -1557,12 +3482,12 @@ struct Box {
 }
 
 impl Box {
-  fn mutate(self: Ref<Box>, val: string) {
+  fn mutate(self: mut Ref<Box>, val: string) {
     self.content = val
   }
 }
 
-fn apply_mutation<T: Mutable>(item: Ref<T>, val: string) {
+fn apply_mutation<T: Mutable>(item: mut Ref<T>, val: string) {
   item.mutate(val)
 }
 
@@ -1578,7 +3503,7 @@ fn test() {
 fn ref_bounded_generic_explicit_deref() {
     let input = r#"
 interface Greetable {
-  fn greet(self) -> string
+  fn greet() -> string
 }
 
 struct Person { name: string }
@@ -1600,7 +3525,7 @@ fn test() {
 }
 
 #[test]
-fn ref_receiver_preserves_snake_case_in_public_field() {
+fn ref_receiver_camel_cases_public_snake_case_field() {
     let input = r#"
 struct Foo {
   pub bar_baz: string,
@@ -1697,7 +3622,7 @@ struct UserId(int)
 
 fn main() {
   let mut id = UserId(1)
-  let r = &id
+  let mut r = &id
   r.* = UserId(2)
 }
 "#;
@@ -1775,6 +3700,31 @@ struct B(A)
 fn main() {
   let mut w = B(A([]))
   w = B(A(w.0.0.append(1)))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn double_newtype_option_return_stays_nil_encoded() {
+    let input = r#"
+struct Handle(Ref<int>)
+struct Alias(Handle)
+struct Table(Map<string, int>)
+struct Index(Table)
+
+fn handle(present: bool, n: Ref<int>) -> Option<Alias> {
+  if present { Some(Alias(Handle(n))) } else { None }
+}
+
+fn index(present: bool) -> Option<Index> {
+  if present { Some(Index(Table(Map.new<string, int>()))) } else { None }
+}
+
+fn main() {
+  let n = 1
+  let _ = handle(true, &n)
+  let _ = index(false)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1878,7 +3828,7 @@ fn test() -> int {
 fn pub_interface_methods_exported() {
     let input = r#"
 pub interface Describable {
-  fn describe(self) -> string
+  fn describe() -> string
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1888,7 +3838,7 @@ pub interface Describable {
 fn private_interface_methods_unexported() {
     let input = r#"
 interface Describable {
-  fn describe(self) -> string
+  fn describe() -> string
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1898,7 +3848,7 @@ interface Describable {
 fn pub_interface_impl_method_capitalized() {
     let input = r#"
 pub interface Printable {
-  fn display(self) -> string
+  fn display() -> string
 }
 
 struct Box {
@@ -1934,8 +3884,8 @@ fn test() {
 #[test]
 fn mutable_interface_var_uses_var_declaration() {
     let input = r#"
-interface Printable {
-  fn to_string(self) -> string
+pub interface Printable {
+  fn to_string() -> string
 }
 
 struct Box { label: string }
@@ -1945,6 +3895,55 @@ impl Box {
 
 fn test() {
   let p: Printable = Box { label: "hello" }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn typed_let_loop_interface_declares_annotated_type() {
+    let input = r#"
+interface Printable {
+  fn text() -> string
+}
+
+struct A {}
+struct B {}
+
+impl A { fn text(self) -> string { "a" } }
+impl B { fn text(self) -> string { "b" } }
+
+fn test() {
+  let mut p: Printable = loop {
+    break A {}
+  }
+  p = B {}
+  let _ = p
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn typed_let_propagate_interface_declares_annotated_type() {
+    let input = r#"
+interface Printable {
+  fn text() -> string
+}
+
+struct A {}
+struct B {}
+
+impl A { fn text(self) -> string { "a" } }
+impl B { fn text(self) -> string { "b" } }
+
+fn make_a() -> Result<A, string> { Ok(A {}) }
+
+fn run() -> Result<(), string> {
+  let mut p: Printable = make_a()?
+  p = B {}
+  let _ = p
+  Ok(())
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1962,6 +3961,23 @@ struct User {
 fn test() -> string {
   let u = User { name: "Alice", age: 30 };
   u.name
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn json_tagged_struct_field_access_before_definition() {
+    let input = r#"
+fn test() -> string {
+  let u = User { name: "Alice", age: 30 };
+  u.name
+}
+
+#[json]
+struct User {
+  name: string,
+  age: int,
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2035,6 +4051,15 @@ enum Status { Active, Inactive, Suspended }
 }
 
 #[test]
+fn json_enum_without_variants() {
+    let input = r#"
+#[json]
+enum Nothing {}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn json_enum_with_single_payload() {
     let input = r#"
 #[json]
@@ -2066,6 +4091,22 @@ fn json_enum_with_struct_variant() {
 enum Message {
   Move { x: int, y: int },
   Quit,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_marshal_json_method_without_json_attribute() {
+    let input = r#"
+enum Status {
+  Ready,
+}
+
+impl Status {
+  fn MarshalJSON(self) -> Result<Slice<byte>, error> {
+    Ok([])
+  }
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2132,10 +4173,10 @@ fn test() -> bool {
 fn constrained_impl_block_emits_bound() {
     let input = r#"
 interface Displayable {
-  fn display(self) -> string
+  fn display() -> string
 }
 
-struct Labeled<T> {
+struct Labeled<T: Displayable> {
   label: string,
   value: T,
 }
@@ -2206,6 +4247,287 @@ fn test() -> int {
 }
 
 #[test]
+fn partial_impl_repeated_type_var_uses_ufcs() {
+    let input = r#"
+struct Pair<A, B> {
+  a: A,
+  b: B,
+}
+
+impl<T> Pair<T, T> {
+  fn first(self) -> T {
+    self.a
+  }
+}
+
+fn test() -> int {
+  let p = Pair { a: 1, b: 2 };
+  p.first()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_primitive_arg_uses_ufcs() {
+    let input = r#"
+struct Pair<A, B> {
+  a: A,
+  b: B,
+}
+
+impl<B> Pair<int, B> {
+  fn left(self) -> int {
+    self.a
+  }
+}
+
+fn test() -> int {
+  let p = Pair { a: 1, b: "x" };
+  p.left()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_nominal_arg_uses_ufcs() {
+    let input = r#"
+struct User {
+  name: string,
+}
+
+struct Pair<A, B> {
+  a: A,
+  b: B,
+}
+
+impl<B> Pair<User, B> {
+  fn left(self) -> User {
+    self.a
+  }
+}
+
+fn test() -> string {
+  let p = Pair { a: User { name: "x" }, b: 1 };
+  p.left().name
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn specialized_impl_explicit_type_args() {
+    let input = r#"
+struct Box<T> { value: T }
+
+impl Box<int> {
+  fn keep<U>(self, x: U) -> U { x }
+}
+
+fn test() -> string {
+  let b = Box { value: 1 };
+  b.keep<string>("ok")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_repeated_explicit_type_args() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn keep<U>(self, x: U) -> U { x }
+}
+
+fn test() -> string {
+  let p = Pair { a: 1, b: 2 };
+  p.keep<int, string>("ok")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn specialized_impl_return_only_type_args() {
+    let input = r#"
+struct Box<T> { value: T }
+
+impl Box<int> {
+  fn make<U>(self) -> U { panic("boom") }
+}
+
+fn test() {
+  let b = Box { value: 1 };
+  let x: string = b.make();
+  let _ = x;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_repeated_return_only_type_args() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn make<U>(self) -> U { panic("boom") }
+}
+
+fn test() {
+  let p = Pair { a: 1, b: 2 };
+  let x: string = p.make();
+  let _ = x;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_primitive_receiver_return_only_type_args() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<B> Pair<int, B> {
+  fn make<U>(self) -> U { panic("boom") }
+}
+
+fn test() {
+  let p: Pair<int, bool> = Pair { a: 1, b: true };
+  let x: string = p.make();
+  let _ = x;
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn alias_partial_impl_ufcs_call() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn first(self) -> T { self.a }
+}
+
+type IntPair = Pair<int, int>
+
+fn test() -> int {
+  let p: IntPair = Pair { a: 1, b: 2 };
+  p.first()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn alias_specialized_impl_ufcs_call() {
+    let input = r#"
+struct Box<T> { value: T }
+
+impl Box<int> {
+  fn only_int(self) -> int { self.value }
+}
+
+type IntBox = Box<int>
+
+fn test() -> int {
+  let b: IntBox = Box { value: 7 };
+  b.only_int()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn specialized_impl_phantom_type_arg() {
+    let input = r#"
+struct Box<T> { value: T }
+
+impl Box<int> {
+  fn tag<U>(self) -> int { 1 }
+}
+
+fn test() -> int {
+  let b = Box { value: 1 };
+  b.tag<string>()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_phantom_type_arg() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn tag<U>(self) -> int { 1 }
+}
+
+fn test() -> int {
+  let p = Pair { a: 1, b: 2 };
+  p.tag<string>()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn partial_impl_method_only_explicit_type_arg() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<T> Pair<T, T> {
+  fn keep<U>(self, x: U) -> U { x }
+}
+
+fn test() -> string {
+  let p = Pair { a: 1, b: 2 };
+  p.keep<string>("ok")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn full_arity_type_args_with_nonreceiver_impl_generic() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<X, T> Pair<T, T> {
+  fn pick(self, x: X) -> X { x }
+}
+
+fn test() -> bool {
+  let p = Pair { a: 1, b: 2 };
+  p.pick<bool, int>(true)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn multi_impl_generic_method_only_type_arg() {
+    let input = r#"
+struct Pair<A, B> { a: A, b: B }
+
+impl<A, B> Pair<A, B> {
+  fn snd<U>(self, u: U) -> U { u }
+}
+
+fn test() -> bool {
+  let p: Pair<int, string> = Pair { a: 1, b: "x" };
+  p.snd<bool>(true)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn enum_variant_named_string() {
     let input = r#"
 enum ASTNode {
@@ -2257,7 +4579,7 @@ fn test() -> Marker {
 #[test]
 fn generic_enum_with_map_key_type_parameter() {
     let input = r#"
-enum Container<K, V> {
+enum Container<K: Comparable, V> {
   Empty,
   Indexed(Map<K, V>),
 }
@@ -2293,7 +4615,7 @@ fn test() -> MyColor {
 #[test]
 fn type_alias_map_comparable_constraint() {
     let input = r#"
-type KeyVal<K, V> = Map<K, V>
+type KeyVal<K: Comparable, V> = Map<K, V>
 
 fn test() -> KeyVal<string, int> {
   let mut m = Map.new<string, int>()
@@ -2307,8 +4629,8 @@ fn test() -> KeyVal<string, int> {
 #[test]
 fn interface_map_key_comparable_constraint() {
     let input = r#"
-interface Store<K, V> {
-  fn entries(self) -> Map<K, V>
+interface Store<K: Comparable, V> {
+  fn entries() -> Map<K, V>
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2336,7 +4658,7 @@ fn interface_private_method_keyword_escape() {
 import "go:fmt"
 
 interface Worker {
-  fn range(self) -> int
+  fn range() -> int
 }
 
 struct S {
@@ -2421,14 +4743,14 @@ fn main() {
 }
 
 #[test]
-fn embedded_interface_comparable_propagation() {
+fn embedded_interface_uses_declared_comparable_bound() {
     let input = r#"
-interface A<K> {
-  fn get(self, m: Map<K, int>) -> int
+interface A<K: Comparable> {
+  fn get(m: Map<K, int>) -> int
 }
 
-interface B<K> {
-  impl A<K>
+interface B<K: Comparable> {
+  embed A<K>
 }
 
 fn main() { let _ = 0 }
@@ -2437,18 +4759,18 @@ fn main() { let _ = 0 }
 }
 
 #[test]
-fn embedded_interface_comparable_transitive() {
+fn embedded_interface_chain_uses_declared_comparable_bounds() {
     let input = r#"
-interface A<K> {
-  fn get(self, m: Map<K, int>) -> int
+interface A<K: Comparable> {
+  fn get(m: Map<K, int>) -> int
 }
 
-interface B<K> {
-  impl A<K>
+interface B<K: Comparable> {
+  embed A<K>
 }
 
-interface C<K> {
-  impl B<K>
+interface C<K: Comparable> {
+  embed B<K>
 }
 
 fn main() { let _ = 0 }
@@ -2465,6 +4787,20 @@ fn main() {
   let f = Wrap.W
   let w = f(1)
   let _ = w
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn user_fn_option_tuple_return_call() {
+    let input = r#"
+fn maybe_pair(n: int) -> Option<(int, int)> {
+  if n > 0 { Some((n, n + 1)) } else { None }
+}
+fn main() {
+  let r = maybe_pair(5)
+  let _ = r
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2493,6 +4829,95 @@ enum E {
 fn main() {
   let e = E.Tag { x: 1 }
   let _ = e
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_contested_field_slots_are_variant_prefixed() {
+    let input = r#"
+enum Event {
+  Click { target: int },
+  Hover { target: string },
+}
+
+fn main() {
+  let a = Event.Click { target: 1 }
+  let b = Event.Hover { target: "x" }
+  let _ = a
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_contested_field_slot_prefixes_only_the_struct_field() {
+    let input = r#"
+enum Shape {
+  Circle(string),
+  Other { circle: int },
+}
+
+fn main() {
+  let a = Shape.Circle("x")
+  let b = Shape.Other { circle: 1 }
+  let _ = a
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_contested_field_slots_contest_through_normalization() {
+    let input = r#"
+enum Event {
+  Click { foo_bar: int, x_: int },
+  Hover { fooBar: string, x: string },
+}
+
+fn main() {
+  let a = Event.Click { foo_bar: 1, x_: 2 }
+  let b = Event.Hover { fooBar: "y", x: "z" }
+  let _ = a
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_uncontested_field_slot_stays_shared() {
+    let input = r#"
+enum Shape {
+  Rect { w: float64, h: float64 },
+  Square { w: float64 },
+}
+
+fn main() {
+  let a = Shape.Rect { w: 1.0, h: 2.0 }
+  let b = Shape.Square { w: 3.0 }
+  let _ = a
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_contested_field_json_keys_stay_source_spelled() {
+    let input = r#"
+#[json]
+enum Shape {
+  Rect { w: float64 },
+  Square { w: int },
+}
+
+fn main() {
+  let a = Shape.Square { w: 3 }
+  let _ = a
 }
 "#;
     assert_emit_snapshot!(input);
@@ -2631,6 +5056,107 @@ fn main() {
 }
 
 #[test]
+fn struct_user_pascal_string_method_suppresses_auto_stringer() {
+    let input = r#"
+struct A { a: string }
+
+impl A {
+  fn String(self) -> string {
+    self.a + "asdf"
+  }
+}
+
+fn main() {
+  let a = A { a: "text" }
+  let _ = a
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_struct_user_pascal_string_method_suppresses_auto_stringer() {
+    let input = r#"
+struct UserId(int)
+
+impl UserId {
+  fn String(self) -> string {
+    "custom"
+  }
+}
+
+fn main() {
+  let u = UserId(1)
+  let _ = u
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_user_pascal_string_method_suppresses_auto_stringer() {
+    let input = r#"
+enum Color {
+  Red,
+  Blue,
+}
+
+impl Color {
+  fn String(self) -> string {
+    "custom"
+  }
+}
+
+fn main() {
+  let c = Color.Red
+  let _ = c
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn ufcs_stringer_on_specialized_impl_does_not_suppress_auto() {
+    let input = r#"
+struct Box<T> { v: T }
+
+impl Box<int> {
+  fn String(self) -> string {
+    "int_box"
+  }
+}
+
+fn main() {
+  let _ = Box { v: 42 }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_user_pascal_string_and_go_string_methods() {
+    let input = r#"
+struct Point { x: int, y: int }
+
+impl Point {
+  fn String(self) -> string {
+    "custom display"
+  }
+
+  fn GoString(self) -> string {
+    "custom debug"
+  }
+}
+
+fn main() {
+  let p = Point { x: 1, y: 2 }
+  let _ = p
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn impl_methods_share_local_variable_name() {
     let input = r#"
 pub struct Calc {}
@@ -2646,6 +5172,1821 @@ impl Calc {
     total += 1
     total
   }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unknown_return_in_struct_field_emits_any() {
+    let input = r#"
+struct Bag {
+  pub callback: fn() -> Unknown,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unknown_return_in_callback_param_emits_any() {
+    let input = r#"
+fn run(callback: fn() -> Unknown) {}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn unknown_return_in_alias_emits_any() {
+    let input = r#"
+type Cb = fn() -> Unknown;
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_of_concrete_widens_to_unknown_elements_in_argument_position() {
+    let input = r#"
+fn describe(pair: (int, Unknown)) -> string {
+  match assert_type<string>(pair.1) {
+    Some(text) => text,
+    None => "",
+  }
+}
+
+fn test() {
+  if describe((1, "two")) != "two" {
+    panic("tuple argument lost its Unknown element")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn tuple_of_concrete_widens_to_unknown_elements_in_slice_literal() {
+    let input = r#"
+fn second(pair: (string, Unknown)) -> int {
+  match assert_type<int>(pair.1) {
+    Some(value) => value,
+    None => 0,
+  }
+}
+
+fn test() {
+  let pairs: Slice<(string, Unknown)> = [("one", 2)]
+  if second(pairs[0]) != 2 {
+    panic("slice element lost its Unknown element")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_annotated_unknown_declares_any_for_concrete_value() {
+    let input = r#"
+fn identity(value: int) -> int {
+  value
+}
+
+fn describe(value: Unknown) -> string {
+  match assert_type<string>(value) {
+    Some(text) => text,
+    None => "",
+  }
+}
+
+fn test() {
+  let mut value: Unknown = identity(1)
+  value = "two"
+  if describe(value) != "two" {
+    panic("annotated Unknown binding was declared at the concrete type")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_shadowing_annotated_unknown_declares_any() {
+    let input = r#"
+fn identity(value: int) -> int {
+  value
+}
+
+fn describe(value: Unknown) -> string {
+  match assert_type<string>(value) {
+    Some(text) => text,
+    None => "",
+  }
+}
+
+fn test() {
+  let value = 1
+  let mut value: Unknown = identity(value)
+  value = "two"
+  if describe(value) != "two" {
+    panic("shadowing Unknown binding was declared at the concrete type")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn let_annotated_unknown_declares_any_for_propagated_value() {
+    let input = r#"
+fn fallible() -> Result<int, error> {
+  Ok(1)
+}
+
+fn describe(value: Unknown) -> string {
+  match assert_type<string>(value) {
+    Some(text) => text,
+    None => "",
+  }
+}
+
+fn run() -> Result<string, error> {
+  let mut value: Unknown = fallible()?
+  value = "two"
+  Ok(describe(value))
+}
+
+fn test() {
+  let text = match run() {
+    Ok(text) => text,
+    Err(_) => "",
+  }
+  if text != "two" {
+    panic("propagated Unknown binding was declared at the concrete type")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn option_in_go_unknown_struct_field_stays_tagged() {
+    let input = r#"
+import "go:example.com/dyn"
+
+fn main() {
+  let _ = dyn.Bag {
+    Decl: Some("decl"),
+    Data: None,
+  }
+}
+"#;
+    let typedef = r#"
+pub struct Bag {
+  pub Decl: Unknown,
+  pub Data: Unknown,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/dyn", typedef)]);
+}
+
+#[test]
+fn option_assigned_to_go_unknown_field_stays_tagged() {
+    let input = r#"
+import "go:example.com/dyn"
+
+fn main() {
+  let mut obj = dyn.Bag { Decl: "", Data: None }
+  obj.Decl = None
+  let _ = obj
+}
+"#;
+    let typedef = r#"
+pub struct Bag {
+  pub Decl: Unknown,
+  pub Data: Unknown,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/dyn", typedef)]);
+}
+
+#[test]
+fn option_in_go_unknown_call_arg_stays_tagged() {
+    let input = r#"
+import "go:example.com/dyn"
+
+fn main() {
+  let _ = dyn.Store("k", None)
+  let _ = dyn.Store("k", Some(1))
+}
+"#;
+    let typedef = r#"
+pub fn Store(key: string, value: Unknown) -> int
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/dyn", typedef)]);
+}
+
+#[test]
+fn option_in_go_generic_slots_stays_tagged() {
+    let input = r#"
+import "go:example.com/generic"
+
+fn main() {
+  let option = Some(1)
+  let options: Slice<Option<int>> = [option]
+  generic.Store(option)
+  generic.StoreAll(options)
+  generic.StoreMany(option, option)
+  let loaded = generic.Load(option)
+  let loaded_all = generic.LoadAll(options)
+  let bag = generic.Bag { Value: option, Values: options }
+  generic.Store(bag.Value)
+  generic.Store(loaded)
+  generic.StoreAll(loaded_all)
+}
+"#;
+    let typedef = r#"
+pub fn Store<T>(value: T)
+pub fn StoreAll<T>(values: Slice<T>)
+pub fn StoreMany<T>(values: VarArgs<T>)
+pub fn Load<T>(value: T) -> T
+pub fn LoadAll<T>(values: Slice<T>) -> Slice<T>
+
+pub struct Bag<T> {
+  pub Value: T,
+  pub Values: Slice<T>,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/generic", typedef)]);
+}
+
+#[test]
+fn omitted_return_in_callback_param_stays_void() {
+    let input = r#"
+fn run(callback: fn(int)) {}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn impl_method_map_key_return_uses_declared_receiver_bound() {
+    let input = r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn make_map(self) -> Map<T, int> {
+    Map.new<T, int>()
+  }
+}
+
+fn main() {
+  let b = Box { value: "a" }
+  let _ = b.make_map()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn impl_method_map_key_body_uses_declared_struct_bound() {
+    let input = r#"
+struct Box<T: Comparable> {
+  value: T,
+}
+
+impl<T: Comparable> Box<T> {
+  fn count(self) -> int {
+    let m = Map.new<T, int>()
+    m.length()
+  }
+}
+
+fn main() {
+  let b = Box { value: "a" }
+  let _ = b.count()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn impl_method_map_key_body_uses_declared_enum_bound() {
+    let input = r#"
+enum Holder<T: Comparable> {
+  Empty,
+}
+
+impl<T: Comparable> Holder<T> {
+  fn count(self) -> int {
+    let m = Map.new<T, int>()
+    m.length()
+  }
+}
+
+fn main() {
+  let h: Holder<string> = Holder.Empty
+  let _ = h.count()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_comparable_bound_lowers_to_go_comparable() {
+    let input = r#"
+fn id<T: Comparable>(x: T) -> T {
+  x
+}
+
+fn main() {
+  let _ = id(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn builtin_ordered_bound_lowers_to_cmp_ordered_with_import() {
+    let input = r#"
+fn id<T: Ordered>(x: T) -> T {
+  x
+}
+
+fn main() {
+  let _ = id(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_alias_with_comparable_bound_in_struct_field() {
+    let input = r#"
+type Table<T: Comparable> = Map<T, int>
+
+struct Box<T: Comparable> {
+  table: Table<T>,
+}
+
+fn main() {
+  let b = Box { table: Map.new<string, int>() }
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_alias_with_comparable_bound_in_function_signature() {
+    let input = r#"
+type Table<T: Comparable> = Map<T, int>
+
+fn id<T: Comparable>(table: Table<T>) -> Table<T> {
+  table
+}
+
+fn main() {
+  let t = Map.new<string, int>()
+  let _ = id(t)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_alias_with_comparable_bound_in_enum_variant() {
+    let input = r#"
+type Table<T: Comparable> = Map<T, int>
+
+enum Holder<T: Comparable> {
+  Some(Table<T>),
+}
+
+fn main() {
+  let h = Holder.Some(Map.new<string, int>())
+  let _ = h
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_alias_with_comparable_bound_in_interface_method() {
+    let input = r#"
+type Table<T: Comparable> = Map<T, int>
+
+interface Uses<T: Comparable> {
+  fn id(table: Table<T>) -> Table<T>
+}
+
+fn main() {
+  let _ = 1
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_key_use_in_let_initializer_uses_declared_bound() {
+    let input = r#"
+fn is_empty<T: Comparable>() -> bool {
+  let empty = Map.new<T, int>().is_empty()
+  empty
+}
+
+fn main() {
+  let _ = is_empty<int>()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_key_use_in_tail_expression_uses_declared_bound() {
+    let input = r#"
+fn is_empty<T: Comparable>() -> bool {
+  Map.new<T, int>().is_empty()
+}
+
+fn main() {
+  let _ = is_empty<int>()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn map_key_use_in_if_condition_uses_declared_bound() {
+    let input = r#"
+fn score<T: Comparable>() -> int {
+  if Map.new<T, int>().is_empty() {
+    1
+  } else {
+    0
+  }
+}
+
+fn main() {
+  let _ = score<int>()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn explicit_named_and_comparable_bounds_on_function() {
+    let input = r#"
+interface Named {
+  fn name() -> string
+}
+
+struct Person {
+  value: string,
+}
+
+impl Person {
+  fn name(self) -> string {
+    self.value
+  }
+}
+
+fn count<T: Named + Comparable>(x: T) -> int {
+  let mut m: mut Map<T, int> = Map.new()
+  m[x] = 1
+  m.length()
+}
+
+fn main() {
+  let _ = count(Person { value: "Ada" })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn explicit_named_and_comparable_bounds_on_struct() {
+    let input = r#"
+interface Named {
+  fn name() -> string
+}
+
+struct Person {
+  value: string,
+}
+
+impl Person {
+  fn name(self) -> string {
+    self.value
+  }
+}
+
+struct Box<T: Named + Comparable> {
+  table: Map<T, int>,
+}
+
+fn main() {
+  let p = Person { value: "Ada" }
+  let _ = p.name()
+  let b: Box<Person> = Box { table: Map.new() }
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn ordered_bound_plus_map_key_use_stays_cmp_ordered() {
+    let input = r#"
+fn count<T: Ordered>(x: T) -> int {
+  let mut m: mut Map<T, int> = Map.new()
+  m[x] = 1
+  m.length()
+}
+
+fn main() {
+  let _ = count(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn alias_chain_uses_declared_comparable_bounds() {
+    let input = r#"
+type B<T: Comparable> = Map<T, int>
+type A<T: Comparable> = B<T>
+
+struct Box<T: Comparable> {
+  table: A<T>,
+}
+
+fn main() {
+  let b = Box { table: Map.new<string, int>() }
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn imported_types_named_like_prelude_wrappers_are_not_confused() {
+    let input = r#"
+import "go:example.com/box"
+
+fn use_ref(r: box.Ref<int>) -> int {
+  r.inner
+}
+
+fn use_slice(s: box.Slice<int>) -> int {
+  s.value
+}
+
+fn use_map(m: box.Map<string, int>) -> int {
+  m.val
+}
+
+fn make_ref() -> box.Ref<int> {
+  box.Ref { inner: 1 }
+}
+
+fn maybe_ref(r: box.Ref<int>) -> Option<box.Ref<int>> {
+  Some(r)
+}
+
+struct Holder {
+  r: box.Ref<int>,
+  s: box.Slice<int>,
+  m: box.Map<string, int>,
+}
+"#;
+    let typedef = r#"
+pub struct Ref<T> {
+  pub inner: T,
+}
+
+pub struct Slice<T> {
+  pub value: T,
+}
+
+pub struct Map<K, V> {
+  pub key: K,
+  pub val: V,
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/box", typedef)]);
+}
+
+#[test]
+fn prelude_wrappers_still_lower_to_native_go_forms() {
+    let input = r#"
+fn use_ref(r: Ref<int>) -> Ref<int> {
+  r
+}
+
+struct Holder {
+  r: Ref<int>,
+  s: Slice<int>,
+  m: Map<string, int>,
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+const ANON_STRUCT_TYPEDEF: &str = r#"
+#[go(anon_struct)]
+pub struct AnonX {
+  pub X: int,
+}
+
+pub fn PlainReturn() -> AnonX
+pub fn TakesAnon(p: AnonX)
+"#;
+
+#[test]
+fn go_anon_struct_read_renders_structurally() {
+    let input = r#"
+import anon "go:example.com/anon"
+
+fn read() -> int {
+  let r = anon.PlainReturn()
+  r.X
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/anon", ANON_STRUCT_TYPEDEF)]);
+}
+
+#[test]
+fn go_anon_struct_construction_renders_structurally() {
+    let input = r#"
+import anon "go:example.com/anon"
+
+fn build() {
+  anon.TakesAnon(anon.AnonX { X: 1 })
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/anon", ANON_STRUCT_TYPEDEF)]);
+}
+
+#[test]
+fn go_anon_struct_annotation_renders_structurally() {
+    let input = r#"
+import anon "go:example.com/anon"
+
+fn annotated() -> int {
+  let x: anon.AnonX = anon.PlainReturn()
+  x.X
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/anon", ANON_STRUCT_TYPEDEF)]);
+}
+
+#[test]
+fn go_anon_struct_zero_value_renders_structurally() {
+    let input = r#"
+import anon "go:example.com/anon"
+
+fn zero() {
+  anon.TakesAnon(anon.AnonX { .. })
+}
+"#;
+    assert_emit_snapshot_with_go_typedefs!(input, &[("go:example.com/anon", ANON_STRUCT_TYPEDEF)]);
+}
+
+#[test]
+fn conditional_impl_renamed_param_keeps_receiver_bound() {
+    let input = r#"
+struct Box<T: Ordered> { value: T }
+
+impl<U: Ordered> Box<U> {
+  fn less(self, other: Box<U>) -> bool {
+    self.value < other.value
+  }
+}
+
+fn main() {
+  let a = Box { value: 1 }
+  let b = Box { value: 2 }
+  let _ = a.less(b)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn clone_nested_slice_deep() {
+    let input = r#"
+fn main() {
+  let mut a = [[1, 2], [3, 4]]
+  let mut b = a.clone()
+  b[0][0] = 9
+  let _ = a
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn clone_map_slice_values_deep() {
+    let input = r#"
+fn main() {
+  let m = Map.from([("k", [1, 2])])
+  let mut m2 = m.clone()
+  m2["k"] = [9]
+  let _ = m
+  let _ = m2
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn clone_slice_of_tuples_deep() {
+    let input = r#"
+fn main() {
+  let a = [(1, [2, 3])]
+  let mut b = a.clone()
+  b[0] = (4, [5])
+  let _ = a
+  let _ = b
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn clone_user_method_dispatched() {
+    let input = r#"
+struct Doc { tags: mut Slice<string> }
+
+impl Doc {
+  fn clone(self) -> mut Doc {
+    Doc { tags: self.tags.clone() }
+  }
+}
+
+fn main() {
+  let d1 = Doc { tags: ["x"] }
+  let mut d2 = d1.clone()
+  d2.tags[0] = "y"
+  let _ = d1
+  let _ = d2
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn clone_enumerated_slice() {
+    let input = r#"
+fn main() {
+  let s = [1, 2, 3]
+  let e = s.enumerate()
+  let mut e2: EnumeratedSlice<int> = e.clone()
+  e2 = s.enumerate()
+  let _ = e
+  let _ = e2
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn clone_container_of_user_clone_stays_shallow() {
+    let input = r#"
+struct Doc { tags: Slice<string> }
+
+impl Doc {
+  fn clone(self) -> Doc {
+    Doc { tags: self.tags.clone() }
+  }
+}
+
+fn main() {
+  let docs = [Doc { tags: ["x"] }]
+  let copy = docs.clone()
+  let _ = docs
+  let _ = copy
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_struct_param_shadows_package_type() {
+    let input = r#"
+struct T {
+  v: int,
+}
+
+fn make_t() -> T {
+  T { v: 7 }
+}
+
+struct Box<T> {
+  item: T,
+}
+
+impl<T> Box<T> {
+  fn probe(self) -> int {
+    let mut opt = None
+    opt = Some(make_t())
+    match opt {
+      Some(t) => t.v,
+      None => 0,
+    }
+  }
+}
+
+fn test() -> int {
+  let b = Box { item: 42 }
+  b.probe()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_enum_param_shadows_package_type() {
+    let input = r#"
+struct T {
+  v: int,
+}
+
+enum Wrap<T> {
+  Empty,
+  Full(T),
+}
+
+fn test() -> int {
+  let w = Wrap.Full(99)
+  match w {
+    Wrap.Empty => 0,
+    Wrap.Full(n) => n,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn receiver_var_freshens_against_colliding_type_param() {
+    let input = r#"
+struct Box<b> {
+  item: b,
+}
+
+impl<b> Box<b> {
+  fn value(self) -> b {
+    self.item
+  }
+}
+
+fn test() -> int {
+  let boxed = Box { item: 7 }
+  boxed.value()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn synthesized_struct_methods_freshen_receiver_against_type_param() {
+    let input = r#"
+#[display]
+#[equality]
+struct Box<b: Comparable> {
+  pub item: b,
+}
+
+fn test() -> bool {
+  let x = Box { item: 7 }
+  let y = Box { item: 7 }
+  x == y
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn synthesized_enum_methods_freshen_receiver_against_type_param() {
+    let input = r#"
+#[display]
+#[json]
+enum Box<b> {
+  Empty,
+  Full(b),
+}
+
+fn test() -> string {
+  let x = Box.Full(7)
+  x.to_string()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn synthesized_equals_freshens_param_against_type_param() {
+    let input = r#"
+#[equality]
+struct Box<other: Comparable> {
+  pub item: other,
+}
+
+fn test() -> bool {
+  Box { item: 7 } == Box { item: 7 }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn synthesized_json_freshens_param_against_type_param() {
+    let input = r#"
+#[json]
+enum Box<data> {
+  Empty,
+  Full(data),
+}
+
+fn test() -> int {
+  match Box.Full(7) {
+    Box.Full(n) => n,
+    Box.Empty => 0,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn synthesized_json_freshens_local_against_receiver() {
+    let input = r#"
+#[json]
+enum Vault {
+  Full { a: int, b: int },
+}
+
+fn test() -> int {
+  match Vault.Full { a: 1, b: 2 } {
+    Vault.Full { a, b } => a + b,
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_error_interface_adapts_concrete_result_impl() {
+    let input = r#"
+import "go:errors"
+
+interface Foo<E: error> {
+  fn get() -> Result<int, E>
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> Result<int, error> {
+    Err(errors.New("failure"))
+  }
+}
+
+fn use_foo(_foo: Foo<error>) {}
+
+fn main() {
+  use_foo(Bar {})
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_error_interface_generic_impl_needs_no_adapter() {
+    let input = r#"
+import "go:errors"
+
+interface Foo<E: error> {
+  fn get(fail: bool) -> Result<int, E>
+}
+
+struct Bar<E: error> {
+  e: E,
+}
+
+impl<E: error> Bar<E> {
+  fn get(self, fail: bool) -> Result<int, E> {
+    if fail { Err(self.e) } else { Ok(42) }
+  }
+}
+
+fn run<E: error>(foo: Foo<E>) {
+  match foo.get(false) {
+    Ok(v) => { let _ = v },
+    Err(e) => { let _ = e },
+  }
+}
+
+fn main() {
+  run(Bar { e: errors.New("boom") })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_error_interface_consumed_generically() {
+    let input = r#"
+import "go:errors"
+
+interface Foo<E: error> {
+  fn get(fail: bool) -> Result<int, E>
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self, fail: bool) -> Result<int, error> {
+    if fail { Err(errors.New("boom")) } else { Ok(42) }
+  }
+}
+
+fn run<E: error>(foo: Foo<E>) {
+  match foo.get(false) {
+    Ok(v) => { let _ = v },
+    Err(e) => { let _ = e },
+  }
+}
+
+fn main() {
+  run(Bar {})
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_param_interface_return_wraps_concrete_result_impl() {
+    let input = r#"
+interface Foo<T> {
+  fn get() -> T
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> Result<int, error> {
+    Ok(1)
+  }
+}
+
+fn use_foo(foo: Foo<Result<int, error>>) {
+  match foo.get() {
+    Ok(v) => { let _ = v },
+    Err(e) => { let _ = e },
+  }
+}
+
+fn main() {
+  use_foo(Bar {})
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn aliased_result_return_adapts_to_generic_interface() {
+    let input = r#"
+import "go:errors"
+
+type R = Result<int, error>
+
+interface Foo<E: error> {
+  fn get() -> Result<int, E>
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> R {
+    Err(errors.New("x"))
+  }
+}
+
+fn use_foo(_foo: Foo<error>) {}
+
+fn main() {
+  use_foo(Bar {})
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_param_interface_matches_generic_result_impl_without_adapter() {
+    let input = r#"
+import "go:errors"
+
+interface Box<T> {
+  fn get() -> T
+}
+
+struct Bar<E: error> {
+  e: E,
+}
+
+impl<E: error> Bar<E> {
+  fn get(self) -> Result<int, E> {
+    Err(self.e)
+  }
+}
+
+fn consume<E: error>(box: Box<Result<int, E>>) {
+  match box.get() {
+    Ok(v) => { let _ = v },
+    Err(e) => { let _ = e },
+  }
+}
+
+fn pass<E: error>(b: Bar<E>) {
+  consume(b)
+}
+
+fn main() {
+  pass(Bar { e: errors.New("x") })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_param_interface_wraps_nullable_option_impl() {
+    let input = r#"
+struct Thing {
+  v: int,
+}
+
+interface Box<T> {
+  fn get() -> T
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) -> Option<Ref<Thing>> {
+    None
+  }
+}
+
+fn use_box(box: Box<Option<Ref<Thing>>>) {
+  match box.get() {
+    Some(t) => { let _ = t },
+    None => {},
+  }
+}
+
+fn main() {
+  use_box(Bar {})
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn bare_param_interface_wraps_void_impl_as_unit_value() {
+    let input = r#"
+interface Box<T> {
+  fn get() -> T
+}
+
+struct Bar {}
+
+impl Bar {
+  fn get(self) {}
+}
+
+fn consume(box: Box<()>) {
+  let _ = box.get()
+}
+
+fn main() {
+  consume(Bar {})
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn void_interface_discards_generic_unit_value_and_preserves_value_method() {
+    let input = r#"
+interface Mixed<T> {
+  fn run()
+  fn value() -> T
+}
+
+struct Bar<T> {
+  item: T,
+}
+
+impl<T> Bar<T> {
+  fn run(self) -> T {
+    self.item
+  }
+
+  fn value(self) -> T {
+    self.item
+  }
+}
+
+fn consume(mixed: Mixed<()>) {
+  mixed.run()
+  let _ = mixed.value()
+}
+
+fn main() {
+  consume(Bar { item: () })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_struct_adapter_declares_its_type_parameters() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<T> {
+  x: Option<T>,
+}
+
+impl<T> Bar<T> {
+  fn get(self) -> Option<T> {
+    self.x
+  }
+}
+
+fn consume<T>(box: Box<Option<T>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T>(b: Bar<T>) {
+  consume(b)
+}
+
+fn main() {
+  pass(Bar { x: Some(3) })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_declares_nested_type_parameter() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  xs: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.xs)
+  }
+}
+
+fn consume<T>(box: Box<Option<Slice<T>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T>(b: Bar<Slice<T>>) {
+  consume(b)
+}
+
+fn main() {
+  pass(Bar { xs: [1, 2] })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_declares_repeated_type_parameter_once() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Pair<A, B> {
+  a: A,
+  b: B,
+}
+
+impl<A, B> Pair<A, B> {
+  fn get(self) -> Option<A> {
+    Some(self.a)
+  }
+}
+
+fn consume<T>(box: Box<Option<T>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T>(p: Pair<T, T>) {
+  consume(p)
+}
+
+fn main() {
+  pass(Pair { a: 1, b: 2 })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_preserves_nested_parameter_constraint() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+fn consume<K: Comparable, V>(box: Box<Option<Map<K, V>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<K: Comparable, V>(b: Bar<Map<K, V>>) {
+  consume(b)
+}
+
+fn main() {
+  pass(Bar { m: Map.from([("a", 1)]) })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_uses_receiver_generic_bounds() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+fn consume<K: Comparable>(box: Box<Option<Map<K, int>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+struct Runner<K: Comparable> {
+  k: K,
+}
+
+impl<K: Comparable> Runner<K> {
+  fn run(self, b: Bar<Map<K, int>>) {
+    consume(b)
+  }
+}
+
+fn main() {
+  let r = Runner { k: "x" }
+  r.run(Bar { m: Map.from([("a", 1)]) })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_uses_separate_caller_contexts() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<T> {
+  x: Option<T>,
+}
+
+impl<T> Bar<T> {
+  fn get(self) -> Option<T> {
+    self.x
+  }
+}
+
+fn consume<T>(box: Box<Option<T>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn strong<T: Comparable>(b: Bar<T>) {
+  consume(b)
+}
+
+fn weak<T>(b: Bar<T>) {
+  consume(b)
+}
+
+fn main() {
+  strong(Bar { x: Some(1) })
+  weak(Bar { x: Some(2) })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_captures_complete_caller_context() {
+    let input = r#"
+interface Holder<X> {
+  fn h() -> X
+}
+
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  s: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.s)
+  }
+}
+
+struct IntHolder {}
+
+impl IntHolder {
+  fn h(self) -> int {
+    1
+  }
+}
+
+fn consume<T>(box: Box<Option<T>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<U, T: Holder<U>>(b: Bar<T>) {
+  consume(b)
+}
+
+fn main() {
+  pass<int, IntHolder>(Bar { s: IntHolder {} })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_pointer_map_key_stays_unconstrained() {
+    let input = r#"
+struct Thing { v: int }
+
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+fn consume<T>(box: Box<Option<Map<Ref<T>, int>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T>(b: Bar<Map<Ref<T>, int>>) {
+  consume(b)
+}
+
+fn main() {
+  let m: Map<Ref<Thing>, int> = Map.new()
+  pass(Bar { m: m })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_struct_map_key_requires_field_comparability() {
+    let input = r#"
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+struct Pair<A, B> {
+  a: A,
+  b: B,
+}
+
+fn consume<A: Comparable, B: Comparable>(box: Box<Option<Map<Pair<A, B>, int>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<A: Comparable, B: Comparable>(b: Bar<Map<Pair<A, B>, int>>) {
+  consume(b)
+}
+
+fn main() {
+  let m: Map<Pair<int, int>, int> = Map.new()
+  pass(Bar { m: m })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_captures_interface_parameter_bound() {
+    let input = r#"
+interface Foo<T: Comparable> {
+  fn f() -> T
+}
+
+struct IntFoo {}
+
+impl IntFoo {
+  fn f(self) -> int {
+    1
+  }
+}
+
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+fn consume<T: Comparable>(box: Box<Option<Foo<T>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T: Comparable>(b: Bar<Foo<T>>) {
+  consume(b)
+}
+
+fn main() {
+  let f: Foo<int> = IntFoo {}
+  pass(Bar { m: f })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_captures_alias_parameter_bound() {
+    let input = r#"
+type Wrapped<T: Comparable> = Slice<T>
+
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+fn consume<T: Comparable>(box: Box<Option<Wrapped<T>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T: Comparable>(b: Bar<Wrapped<T>>) {
+  consume(b)
+}
+
+fn main() {
+  let w: Wrapped<int> = [1, 2]
+  pass(Bar { m: w })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_copies_context_bound_for_composite_arg() {
+    let input = r#"
+struct Keyed<K: Comparable> {
+  k: K,
+}
+
+impl<K: Comparable> Keyed<K> {
+  fn get(self) -> Option<K> {
+    Some(self.k)
+  }
+}
+
+interface Box<U> {
+  fn get() -> U
+}
+
+fn consume<T: Comparable>(box: Box<Option<Array<T, 2>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T: Comparable>(k: Keyed<Array<T, 2>>) {
+  consume(k)
+}
+
+fn main() {
+  let a: Array<int, 2> = [1, 2]
+  pass(Keyed { k: a })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_enum_map_key_requires_payload_comparability() {
+    let input = r#"
+enum Maybe<T> {
+  Just(T),
+  Nothing,
+}
+
+interface Box<U> {
+  fn get() -> U
+}
+
+struct Bar<S> {
+  m: S,
+}
+
+impl<S> Bar<S> {
+  fn get(self) -> Option<S> {
+    Some(self.m)
+  }
+}
+
+fn consume<T: Comparable>(box: Box<Option<Map<Maybe<T>, int>>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn pass<T: Comparable>(b: Bar<Map<Maybe<T>, int>>) {
+  consume(b)
+}
+
+fn main() {
+  let m: Map<Maybe<int>, int> = Map.new()
+  pass(Bar { m: m })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_adapter_copies_sibling_referencing_bound() {
+    let input = r#"
+interface Holder<T> {
+  fn item() -> T
+}
+
+interface Box<U> {
+  fn get() -> U
+}
+
+struct IntHolder {}
+
+impl IntHolder {
+  fn item(self) -> int {
+    5
+  }
+}
+
+struct Wrap<A, B: Holder<A>> {
+  a: A,
+  b: B,
+}
+
+impl<A, B: Holder<A>> Wrap<A, B> {
+  fn get(self) -> Option<A> {
+    Some(self.a)
+  }
+}
+
+fn consume<A>(box: Box<Option<A>>) {
+  if let Some(v) = box.get() {
+    let _ = v
+  }
+}
+
+fn use_wrap<A, B: Holder<A>>(w: Wrap<A, B>) {
+  consume(w)
+}
+
+fn main() {
+  use_wrap(Wrap { a: 3, b: IntHolder {} })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn nullable_interface_reencodes_comma_ok_option_impl() {
+    let input = r#"
+struct Thing {
+  v: int,
+}
+
+interface Opt {
+  fn find() -> Option<Ref<Thing>>
+}
+
+struct Bar<T> {
+  x: Option<T>,
+}
+
+impl<T> Bar<T> {
+  fn find(self) -> Option<T> {
+    self.x
+  }
+}
+
+fn use_opt(o: Opt) {
+  match o.find() {
+    Some(t) => { let _ = t },
+    None => {},
+  }
+}
+
+fn main() {
+  use_opt(Bar { x: None })
 }
 "#;
     assert_emit_snapshot!(input);

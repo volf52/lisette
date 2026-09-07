@@ -1,6 +1,6 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: [first, ..rest]"
+description: "[first, ..rest]"
 ---
 LexResult {
     tokens: [
@@ -48,9 +48,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

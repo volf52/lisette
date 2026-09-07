@@ -1,10 +1,23 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \ninterface Displayable {\n  fn display(self) -> string\n}\n\nstruct Labeled<T> {\n  label: string,\n  value: T,\n}\n\nimpl<T: Displayable> Labeled<T> {\n  fn show(self) -> string {\n    self.label\n  }\n}\n"
+description: |
+  
+  interface Displayable {
+    fn display() -> string
+  }
+  
+  struct Labeled<T: Displayable> {
+    label: string,
+    value: T,
+  }
+  
+  impl<T: Displayable> Labeled<T> {
+    fn show(self) -> string {
+      self.label
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 type Displayable interface {
 	display() string
@@ -13,10 +26,6 @@ type Displayable interface {
 type Labeled[T Displayable] struct {
 	label string
 	value T
-}
-
-func (l Labeled[T]) String() string {
-	return fmt.Sprintf("Labeled { label: %v, value: %v }", l.label, l.value)
 }
 
 func (l Labeled[T]) show() string {

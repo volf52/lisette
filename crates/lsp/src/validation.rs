@@ -1,5 +1,7 @@
+use crate::protocol::Error;
+use std::borrow::Cow;
 /// All keywords, including contextual ones (`var`, `self`).
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "fn",
     "let",
     "if",
@@ -27,6 +29,7 @@ const KEYWORDS: &[&str] = &[
     "task",
     "try",
     "recover",
+    "assert",
     "as",
     "true",
     "false",
@@ -68,17 +71,11 @@ fn is_go_import(qualified_name: &str) -> bool {
     qualified_name.starts_with("go:")
 }
 
-pub(crate) fn rename_error(
-    message: impl Into<std::borrow::Cow<'static, str>>,
-) -> tower_lsp::jsonrpc::Error {
-    tower_lsp::jsonrpc::Error {
-        code: tower_lsp::jsonrpc::ErrorCode::InvalidParams,
-        message: message.into(),
-        data: None,
-    }
+pub(crate) fn rename_error(message: impl Into<Cow<'static, str>>) -> Error {
+    Error::invalid_params(message)
 }
 
-pub(crate) fn check_rename_guards(qualified_name: &str) -> Result<(), tower_lsp::jsonrpc::Error> {
+pub(crate) fn check_rename_guards(qualified_name: &str) -> Result<(), Error> {
     if is_prelude_symbol(qualified_name) {
         return Err(rename_error("Cannot rename prelude symbol"));
     }

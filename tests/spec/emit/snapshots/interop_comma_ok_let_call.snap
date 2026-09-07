@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:os\"\n\nfn main() {\n  let f = os.LookupEnv\n  let r = f(\"HOME\")\n  match r {\n    Some(v) => { let _ = v },\n    None => { let _ = \"\" },\n  }\n}\n"
+description: |
+  
+  import "go:os"
+  
+  fn main() {
+    let f = os.LookupEnv
+    let r = f("HOME")
+    match r {
+      Some(v) => { let _ = v },
+      None => { let _ = "" },
+    }
+  }
 ---
 package main
 
@@ -10,17 +21,9 @@ import (
 )
 
 func main() {
-	f := func(arg0 string) lisette.Option[string] {
-		ret_1, ret_2 := os.LookupEnv(arg0)
-		if ret_2 {
-			return lisette.MakeOptionSome[string](ret_1)
-		}
-		return lisette.MakeOptionNone[string]()
-	}
-	r := f("HOME")
+	f := os.LookupEnv
+	r := lisette.OptionFromCommaOk[string](f("HOME"))
 	if r.Tag == lisette.OptionSome {
 		_ = r.SomeVal
-	} else {
-		_ = ""
 	}
 }

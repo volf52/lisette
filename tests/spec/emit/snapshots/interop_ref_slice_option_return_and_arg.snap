@@ -1,0 +1,42 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:example.com/aws"
+  
+  fn main() {
+    let xs = aws.Make()
+    aws.Use(xs)
+  }
+---
+package main
+
+import (
+	"example.com/aws"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func main() {
+	src_1 := aws.Make()
+	src_2 := *src_1
+	wrapped_3 := make([]lisette.Option[string], len(src_2))
+	for i_4, v_5 := range src_2 {
+		if v_5 != nil {
+			wrapped_3[i_4] = lisette.MakeOptionSome[string](*v_5)
+		} else {
+			wrapped_3[i_4] = lisette.MakeOptionNone[string]()
+		}
+	}
+	xs := &wrapped_3
+	src_7 := *xs
+	unwrapped_8 := make([]*string, len(src_7))
+	for i_9, v_10 := range src_7 {
+		if v_10.Tag == lisette.OptionSome {
+			unwrapped_8[i_9] = &v_10.SomeVal
+		} else {
+			unwrapped_8[i_9] = nil
+		}
+	}
+	ref_11 := &unwrapped_8
+	aws.Use(ref_11)
+}

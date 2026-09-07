@@ -1,45 +1,59 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:strconv\"\n\nstruct Holder { f: fn(string) -> Result<int, error> }\n\nfn main() {\n  let mut m = Map.new<string, Holder>()\n  m[\"a\"] = Holder { f: strconv.Atoi }\n  let mut entry = m[\"a\"]\n  entry.f = strconv.Atoi\n  m[\"a\"] = entry\n  let r = m[\"a\"].f(\"1\")\n  match r {\n    Ok(v) => { let _ = v },\n    Err(_) => { let _ = 0 },\n  }\n}\n"
+description: |
+  
+  import "go:strconv"
+  
+  struct Holder { f: fn(string) -> Result<int, error> }
+  
+  fn main() {
+    let mut m = Map.new<string, Holder>()
+    m["a"] = Holder { f: strconv.Atoi }
+    let Some(found) = m.get("a") else { return; };
+    let mut entry = found
+    entry.f = strconv.Atoi
+    m["a"] = entry
+    let Some(h) = m.get("a") else { return; };
+    let r = h.f("1")
+    match r {
+      Ok(v) => { let _ = v },
+      Err(_) => { let _ = 0 },
+    }
+  }
 ---
 package main
 
 import (
-	"fmt"
 	lisette "github.com/ivov/lisette/prelude"
 	"strconv"
 )
 
 type Holder struct {
-	f func(string) lisette.Result[int, error]
-}
-
-func (h Holder) String() string {
-	return fmt.Sprintf("Holder { f: %v }", h.f)
+	f func(string) (int, error)
 }
 
 func main() {
 	m := make(map[string]Holder)
-	m["a"] = Holder{f: func(arg0 string) lisette.Result[int, error] {
-		ret_1, ret_2 := strconv.Atoi(arg0)
-		if ret_2 != nil {
-			return lisette.MakeResultErr[int, error](ret_2)
-		}
-		return lisette.MakeResultOk[int, error](ret_1)
-	}}
-	entry := m["a"]
-	entry.f = func(arg0 string) lisette.Result[int, error] {
-		ret_4, ret_5 := strconv.Atoi(arg0)
-		if ret_5 != nil {
-			return lisette.MakeResultErr[int, error](ret_5)
-		}
-		return lisette.MakeResultOk[int, error](ret_4)
+	m["a"] = Holder{f: strconv.Atoi}
+	found, ok_1 := m["a"]
+	if !ok_1 {
+		return
 	}
+	entry := found
+	entry.f = strconv.Atoi
 	m["a"] = entry
-	r := m["a"].f("1")
+	h, ok_2 := m["a"]
+	if !ok_2 {
+		return
+	}
+	ret_3, ret_4 := h.f("1")
+	var r lisette.Result[int, error]
+	if ret_4 != nil {
+		r = lisette.MakeResultErr[int, error](ret_4)
+	} else {
+		r = lisette.MakeResultOk[int, error](ret_3)
+	}
 	if r.Tag == lisette.ResultOk {
 		_ = r.OkVal
-	} else {
-		_ = 0
 	}
 }

@@ -1,0 +1,24 @@
+---
+source: tests/spec/build/mod.rs
+---
+// === main.go ===
+package main
+
+import lisette "github.com/ivov/lisette/prelude"
+
+type MyError struct {
+	msg string
+}
+
+func parse(s string) lisette.Result[int, MyError] {
+	if s == "ok" {
+		return lisette.MakeResultOk[int, MyError](1)
+	}
+	return lisette.MakeResultErr[int, MyError](MyError{msg: "bad"})
+}
+
+func main() {
+	subject_1 := parse("ok")
+	if subject_1.Tag == lisette.ResultOk {
+	}
+}

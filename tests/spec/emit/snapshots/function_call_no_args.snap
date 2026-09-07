@@ -1,13 +1,21 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nfn get_value() -> int {\n  42\n}\n\nfn test() -> int {\n  get_value()\n}\n"
+description: |
+  
+  fn get_value() -> int {
+    42
+  }
+  
+  fn test() -> int {
+    get_value()
+  }
 ---
 package main
 
-func get_value() int {
+func getValue() int {
 	return 42
 }
 
 func test() int {
-	return get_value()
+	return getValue()
 }

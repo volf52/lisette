@@ -1,6 +1,6 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: //// This is a divider, not a doc comment"
+description: "//// This is a divider, not a doc comment"
 ---
 LexResult {
     tokens: [
@@ -37,14 +37,5 @@ LexResult {
             code: "lex.excess_slashes_in_comment",
         },
     ],
-    trivia: Trivia {
-        comments: [
-            (
-                0,
-                41,
-            ),
-        ],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

@@ -1,6 +1,25 @@
 use ecow::EcoString;
 
+use crate::lex::rune_codepoint;
+use crate::program::{CallKind, DotAccessResolution};
+use crate::types;
 use crate::types::Type;
+use fmt::Formatter;
+use std::fmt;
+use std::fmt::Display;
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::ops::Index;
+use std::slice::Iter;
+use std::slice::IterMut;
+
+macro_rules! children {
+    () => { Vec::new() };
+    ($($expression:expr),+ $(,)?) => {{
+        let __children: Vec<&Expression> = vec![$($expression),+];
+        __children
+    }};
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadCodeCause {
@@ -17,48 +36,234 @@ pub enum DeadCodeCause {
 pub struct Binding {
     pub pattern: Pattern,
     pub annotation: Option<Annotation>,
-    pub typed_pattern: Option<TypedPattern>,
     pub ty: Type,
-    pub mutable: bool,
+    pub mut_span: Option<Span>,
 }
 
-impl std::fmt::Debug for Binding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Binding {
+    pub fn is_mutable(&self) -> bool {
+        self.mut_span.is_some()
+    }
+}
+
+impl fmt::Debug for Binding {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Binding");
         s.field("pattern", &self.pattern);
         s.field("annotation", &self.annotation);
-        s.field("typed_pattern", &self.typed_pattern);
         s.field("ty", &self.ty);
-        if self.mutable {
-            s.field("mutable", &self.mutable);
+        if self.mut_span.is_some() {
+            s.field("mut_span", &self.mut_span);
         }
         s.finish()
     }
 }
 
-pub type BindingId = u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct BindingId(u32);
+
+impl BindingId {
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifierResolution {
+    Unresolved,
+    Binding(BindingId),
+    Definition(EcoString),
+}
+
+impl IdentifierResolution {
+    pub fn binding_id(&self) -> Option<BindingId> {
+        match self {
+            Self::Binding(id) => Some(*id),
+            Self::Unresolved | Self::Definition(_) => None,
+        }
+    }
+
+    pub fn definition(&self) -> Option<&str> {
+        match self {
+            Self::Definition(definition) => Some(definition),
+            Self::Unresolved | Self::Binding(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LetMode {
+    Plain,
+    Assert,
+    Else {
+        block: Box<Expression>,
+        else_span: Span,
+    },
+    /// Parser recovery for the invalid combination `let assert ... else ...`.
+    InvalidAssertElse {
+        block: Box<Expression>,
+        else_span: Span,
+    },
+}
+
+impl LetMode {
+    pub fn is_assert(&self) -> bool {
+        matches!(self, Self::Assert | Self::InvalidAssertElse { .. })
+    }
+
+    pub fn else_block(&self) -> Option<&Expression> {
+        match self {
+            Self::Else { block, .. } | Self::InvalidAssertElse { block, .. } => Some(block),
+            Self::Plain | Self::Assert => None,
+        }
+    }
+
+    pub fn else_block_mut(&mut self) -> Option<&mut Expression> {
+        match self {
+            Self::Else { block, .. } | Self::InvalidAssertElse { block, .. } => Some(block),
+            Self::Plain | Self::Assert => None,
+        }
+    }
+
+    pub fn map_else(self, map: impl FnOnce(Expression, Span) -> Expression) -> Self {
+        match self {
+            Self::Else { block, else_span } => Self::Else {
+                block: Box::new(map(*block, else_span)),
+                else_span,
+            },
+            Self::InvalidAssertElse { block, else_span } => Self::InvalidAssertElse {
+                block: Box::new(map(*block, else_span)),
+                else_span,
+            },
+            Self::Plain => Self::Plain,
+            Self::Assert => Self::Assert,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionBody {
+    Declaration,
+    Definition(Box<Expression>),
+}
+
+impl FunctionBody {
+    pub fn definition(&self) -> Option<&Expression> {
+        match self {
+            Self::Declaration => None,
+            Self::Definition(body) => Some(body),
+        }
+    }
+
+    pub fn definition_mut(&mut self) -> Option<&mut Expression> {
+        match self {
+            Self::Declaration => None,
+            Self::Definition(body) => Some(body),
+        }
+    }
+
+    pub fn map_definition(self, map: impl FnOnce(Expression) -> Expression) -> Self {
+        match self {
+            Self::Declaration => Self::Declaration,
+            Self::Definition(body) => Self::Definition(Box::new(map(*body))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstInitializer {
+    Declaration,
+    Value(Box<Expression>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IfLetAlternative {
+    Absent,
+    Present {
+        expression: Box<Expression>,
+        else_span: Span,
+    },
+}
+
+impl IfLetAlternative {
+    pub fn expression(&self) -> Option<&Expression> {
+        match self {
+            Self::Absent => None,
+            Self::Present { expression, .. } => Some(expression),
+        }
+    }
+
+    pub fn expression_mut(&mut self) -> Option<&mut Expression> {
+        match self {
+            Self::Absent => None,
+            Self::Present { expression, .. } => Some(expression),
+        }
+    }
+
+    pub fn else_span(&self) -> Option<Span> {
+        match self {
+            Self::Absent => None,
+            Self::Present { else_span, .. } => Some(*else_span),
+        }
+    }
+}
+
+impl ConstInitializer {
+    pub fn value(&self) -> Option<&Expression> {
+        match self {
+            Self::Declaration => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+
+    pub fn value_mut(&mut self) -> Option<&mut Expression> {
+        match self {
+            Self::Declaration => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+
+    pub fn map_value(self, map: impl FnOnce(Expression) -> Expression) -> Self {
+        match self {
+            Self::Declaration => Self::Declaration,
+            Self::Value(value) => Self::Value(Box::new(map(*value))),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingKind {
     Let { mutable: bool },
-    Parameter { mutable: bool },
+    Parameter,
     MatchArm,
+    IfLet,
+    WhileLet,
 }
 
 impl BindingKind {
     pub fn is_mutable(&self) -> bool {
-        matches!(
-            self,
-            BindingKind::Let { mutable: true } | BindingKind::Parameter { mutable: true }
-        )
+        matches!(self, BindingKind::Let { mutable: true })
     }
 
     pub fn is_param(&self) -> bool {
-        matches!(self, BindingKind::Parameter { .. })
+        matches!(self, BindingKind::Parameter)
     }
 
     pub fn is_match_arm(&self) -> bool {
         matches!(self, BindingKind::MatchArm)
+    }
+
+    pub fn is_pattern_position(&self) -> bool {
+        matches!(
+            self,
+            BindingKind::MatchArm | BindingKind::IfLet | BindingKind::WhileLet
+        )
     }
 }
 
@@ -66,7 +271,6 @@ impl BindingKind {
 pub struct MatchArm {
     pub pattern: Pattern,
     pub guard: Option<Box<Expression>>,
-    pub typed_pattern: Option<TypedPattern>,
     pub expression: Box<Expression>,
 }
 
@@ -76,8 +280,8 @@ impl MatchArm {
     }
 }
 
-impl std::fmt::Debug for MatchArm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for MatchArm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("MatchArm");
         s.field("pattern", &self.pattern);
         if self.guard.is_some() {
@@ -88,22 +292,10 @@ impl std::fmt::Debug for MatchArm {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchOrigin {
-    Explicit,
-    IfLet { else_span: Option<Span> },
-}
-
 #[derive(Debug, Clone, PartialEq)]
-pub struct SelectArm {
-    pub pattern: SelectArmPattern,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SelectArmPattern {
+pub enum SelectArm {
     Receive {
         binding: Box<Pattern>,
-        typed_pattern: Option<TypedPattern>,
         receive_expression: Box<Expression>,
         body: Box<Expression>,
     },
@@ -127,6 +319,41 @@ pub enum RestPattern {
     Bind { name: EcoString, span: Span },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstructorPatternResolution {
+    Unresolved,
+    Const {
+        qualified_name: EcoString,
+    },
+    ConstValue {
+        qualified_name: EcoString,
+        value: Literal,
+    },
+    EnumVariant {
+        enum_name: EcoString,
+        variant_name: EcoString,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordPatternResolution {
+    Unresolved,
+    Struct {
+        struct_name: EcoString,
+    },
+    EnumVariant {
+        enum_name: EcoString,
+        variant_name: EcoString,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SequencePatternResolution {
+    Unresolved,
+    Slice { element_type: Type },
+    Array { element_type: Type, length: u64 },
+}
+
 impl RestPattern {
     pub fn is_present(&self) -> bool {
         !matches!(self, RestPattern::Absent)
@@ -148,6 +375,7 @@ pub enum Pattern {
         identifier: EcoString,
         fields: Vec<Self>,
         rest: bool,
+        resolution: ConstructorPatternResolution,
         ty: Type,
         span: Span,
     },
@@ -155,6 +383,7 @@ pub enum Pattern {
         identifier: EcoString,
         fields: Vec<StructFieldPattern>,
         rest: bool,
+        resolution: RecordPatternResolution,
         ty: Type,
         span: Span,
     },
@@ -172,7 +401,7 @@ pub enum Pattern {
     Slice {
         prefix: Vec<Self>,
         rest: RestPattern,
-        element_ty: Type,
+        resolution: SequencePatternResolution,
         span: Span,
     },
     Or {
@@ -182,8 +411,48 @@ pub enum Pattern {
     AsBinding {
         pattern: Box<Self>,
         name: EcoString,
+        name_span: Span,
         span: Span,
     },
+}
+
+/// Binding names introduced by a pattern, paired with their spans, in source order.
+pub fn collect_pattern_bindings(pattern: &Pattern) -> Vec<(String, Span)> {
+    match pattern {
+        Pattern::Identifier { identifier, span } => vec![(identifier.to_string(), *span)],
+        Pattern::Tuple { elements, .. } => {
+            elements.iter().flat_map(collect_pattern_bindings).collect()
+        }
+        Pattern::EnumVariant { fields, .. } => {
+            fields.iter().flat_map(collect_pattern_bindings).collect()
+        }
+        Pattern::Struct { fields, .. } => fields
+            .iter()
+            .flat_map(|f| collect_pattern_bindings(&f.value))
+            .collect(),
+        Pattern::Slice { prefix, rest, .. } => {
+            let mut bindings: Vec<_> = prefix.iter().flat_map(collect_pattern_bindings).collect();
+            if let RestPattern::Bind { name, span } = rest {
+                bindings.push((name.to_string(), *span));
+            }
+            bindings
+        }
+        Pattern::Or { patterns, .. } => patterns
+            .first()
+            .map(collect_pattern_bindings)
+            .unwrap_or_default(),
+        Pattern::AsBinding {
+            pattern,
+            name,
+            name_span,
+            ..
+        } => {
+            let mut bindings = collect_pattern_bindings(pattern);
+            bindings.push((name.to_string(), *name_span));
+            bindings
+        }
+        Pattern::WildCard { .. } | Pattern::Literal { .. } | Pattern::Unit { .. } => vec![],
+    }
 }
 
 impl Pattern {
@@ -228,6 +497,15 @@ impl Pattern {
             _ => None,
         }
     }
+
+    pub fn is_some_pattern(&self) -> bool {
+        let peeled = match self {
+            Pattern::AsBinding { pattern, .. } => pattern.as_ref(),
+            p => p,
+        };
+        matches!(peeled, Pattern::EnumVariant { identifier, fields, .. }
+            if types::unqualified_name(identifier) == "Some" && fields.len() == 1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,58 +514,19 @@ pub struct StructFieldPattern {
     pub value: Pattern,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TypedPattern {
-    Wildcard,
-    Literal(Literal),
-    EnumVariant {
-        enum_name: EcoString,
-        variant_name: EcoString,
-        variant_fields: Vec<EnumFieldDefinition>,
-        fields: Vec<TypedPattern>,
-        type_args: Vec<Type>,
-        field_types: Box<[Type]>,
-    },
-    EnumStructVariant {
-        enum_name: EcoString,
-        variant_name: EcoString,
-        variant_fields: Vec<EnumFieldDefinition>,
-        pattern_fields: Vec<(EcoString, TypedPattern)>,
-        type_args: Vec<Type>,
-    },
-    Struct {
-        struct_name: EcoString,
-        struct_fields: Vec<StructFieldDefinition>,
-        pattern_fields: Vec<(EcoString, TypedPattern)>,
-        type_args: Vec<Type>,
-    },
-    Slice {
-        prefix: Vec<TypedPattern>,
-        has_rest: bool,
-        element_type: Type,
-    },
-    Tuple {
-        arity: usize,
-        elements: Vec<TypedPattern>,
-    },
-    Or {
-        alternatives: Vec<TypedPattern>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FunctionDefinition {
-    pub name: EcoString,
+#[derive(Clone, Copy)]
+pub struct FunctionDefinitionView<'a> {
+    pub name: &'a EcoString,
     pub name_span: Span,
-    pub generics: Vec<Generic>,
-    pub params: Vec<Binding>,
-    pub body: Box<Expression>,
-    pub return_type: Type,
-    pub annotation: Annotation,
-    pub ty: Type,
+    pub generics: &'a [Generic],
+    pub params: &'a [Binding],
+    pub body: Option<&'a Expression>,
+    pub return_type: &'a Type,
+    pub annotation: &'a Annotation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VariantFields {
     Unit,
     Tuple(Vec<EnumFieldDefinition>),
@@ -309,11 +548,15 @@ impl VariantFields {
         }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, EnumFieldDefinition> {
+    pub fn as_slice(&self) -> &[EnumFieldDefinition] {
         match self {
-            VariantFields::Unit => [].iter(),
-            VariantFields::Tuple(fields) | VariantFields::Struct(fields) => fields.iter(),
+            VariantFields::Unit => &[],
+            VariantFields::Tuple(fields) | VariantFields::Struct(fields) => fields,
         }
+    }
+
+    pub fn iter(&self) -> Iter<'_, EnumFieldDefinition> {
+        self.as_slice().iter()
     }
 
     pub fn is_struct(&self) -> bool {
@@ -323,7 +566,7 @@ impl VariantFields {
 
 impl<'a> IntoIterator for &'a VariantFields {
     type Item = &'a EnumFieldDefinition;
-    type IntoIter = std::slice::Iter<'a, EnumFieldDefinition>;
+    type IntoIter = Iter<'a, EnumFieldDefinition>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -331,23 +574,17 @@ impl<'a> IntoIterator for &'a VariantFields {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnumVariant {
     pub doc: Option<String>,
+    pub attributes: Vec<Attribute>,
     pub name: EcoString,
     pub name_span: Span,
     pub fields: VariantFields,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ValueEnumVariant {
-    pub doc: Option<String>,
-    pub name: EcoString,
-    pub name_span: Span,
-    pub value: Literal,
-    pub value_span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnumFieldDefinition {
     pub name: EcoString,
     pub name_span: Span,
@@ -356,6 +593,7 @@ pub struct EnumFieldDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Attribute {
     pub name: String,
     pub args: Vec<AttributeArg>,
@@ -382,15 +620,101 @@ pub enum StructKind {
     Tuple,
 }
 
+/// The field collection carries the struct's shape so it cannot disagree with
+/// the fields it describes.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StructFields {
+    Record(Vec<StructFieldDefinition>),
+    Tuple(Vec<StructFieldDefinition>),
+}
+
+impl StructFields {
+    pub fn kind(&self) -> StructKind {
+        match self {
+            Self::Record(_) => StructKind::Record,
+            Self::Tuple(_) => StructKind::Tuple,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[StructFieldDefinition] {
+        match self {
+            Self::Record(fields) | Self::Tuple(fields) => fields,
+        }
+    }
+}
+
+/// The stored name of the tuple struct field accessed as `.{index}`.
+pub fn tuple_field_name(index: usize) -> EcoString {
+    format!("_{index}").into()
+}
+
+impl Deref for StructFields {
+    type Target = [StructFieldDefinition];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for StructFields {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Record(fields) | Self::Tuple(fields) => fields,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a StructFields {
+    type Item = &'a StructFieldDefinition;
+    type IntoIter = Iter<'a, StructFieldDefinition>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut StructFields {
+    type Item = &'a mut StructFieldDefinition;
+    type IntoIter = IterMut<'a, StructFieldDefinition>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            StructFields::Record(fields) | StructFields::Tuple(fields) => fields.iter_mut(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StructFieldDefinition {
     pub doc: Option<String>,
-    pub attributes: Vec<Attribute>,
     pub name: EcoString,
     pub name_span: Span,
     pub annotation: Annotation,
     pub visibility: Visibility,
     pub ty: Type,
+    pub kind: StructFieldKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StructFieldKind {
+    Named { attributes: Vec<Attribute> },
+    Embedded,
+}
+
+impl StructFieldDefinition {
+    pub fn attributes(&self) -> &[Attribute] {
+        match &self.kind {
+            StructFieldKind::Named { attributes } => attributes,
+            StructFieldKind::Embedded => &[],
+        }
+    }
+
+    pub fn is_embedded(&self) -> bool {
+        matches!(self.kind, StructFieldKind::Embedded)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,11 +725,210 @@ pub struct StructFieldAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StructSpread {
+    None,
+    From(Box<Expression>),
+    Autofill { span: Span },
+}
+
+impl StructSpread {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(crate) fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Self::None => None,
+            Self::From(e) => Some(e.get_span()),
+            Self::Autofill { span } => Some(*span),
+        }
+    }
+
+    pub fn as_expression(&self) -> Option<&Expression> {
+        match self {
+            Self::From(e) => Some(e),
+            Self::None | Self::Autofill { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct CallTypeArguments(CallTypeArgumentState);
+
+#[derive(Clone, PartialEq)]
+enum CallTypeArgumentState {
+    None,
+    Unresolved(Vec<Annotation>),
+    Resolved(Vec<ResolvedCallTypeArgument>),
+    CheckedWithoutTypes(Vec<Annotation>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct ResolvedCallTypeArgument {
+    annotation: Annotation,
+    ty: Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedCallTypeArguments<'a> {
+    arguments: &'a [ResolvedCallTypeArgument],
+}
+
+impl<'a> ResolvedCallTypeArguments<'a> {
+    pub fn len(self) -> usize {
+        self.arguments.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.arguments.is_empty()
+    }
+
+    pub fn first(self) -> Option<&'a Type> {
+        self.arguments.first().map(|argument| &argument.ty)
+    }
+
+    pub fn get(self, index: usize) -> Option<&'a Type> {
+        self.arguments.get(index).map(|argument| &argument.ty)
+    }
+
+    pub fn iter(self) -> impl ExactSizeIterator<Item = &'a Type> + Clone {
+        self.arguments.iter().map(|argument| &argument.ty)
+    }
+}
+
+impl Index<usize> for ResolvedCallTypeArguments<'_> {
+    type Output = Type;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.arguments[index].ty
+    }
+}
+
+impl fmt::Debug for CallTypeArguments {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            CallTypeArgumentState::None => f.write_str("None"),
+            CallTypeArgumentState::Unresolved(annotations) => {
+                f.debug_tuple("Unresolved").field(annotations).finish()
+            }
+            CallTypeArgumentState::Resolved(arguments) => {
+                let annotations = arguments
+                    .iter()
+                    .map(|argument| &argument.annotation)
+                    .collect::<Vec<_>>();
+                let types = arguments
+                    .iter()
+                    .map(|argument| &argument.ty)
+                    .collect::<Vec<_>>();
+                f.debug_struct("Resolved")
+                    .field("annotations", &annotations)
+                    .field("types", &types)
+                    .finish()
+            }
+            CallTypeArgumentState::CheckedWithoutTypes(annotations) => f
+                .debug_struct("Resolved")
+                .field("annotations", annotations)
+                .field("types", &Vec::<Type>::new())
+                .finish(),
+        }
+    }
+}
+
+impl CallTypeArguments {
+    pub const fn none() -> Self {
+        Self(CallTypeArgumentState::None)
+    }
+
+    pub fn unresolved(annotations: Vec<Annotation>) -> Self {
+        if annotations.is_empty() {
+            Self::none()
+        } else {
+            Self(CallTypeArgumentState::Unresolved(annotations))
+        }
+    }
+
+    pub fn resolved(arguments: impl IntoIterator<Item = (Annotation, Type)>) -> Self {
+        let arguments = arguments
+            .into_iter()
+            .map(|(annotation, ty)| ResolvedCallTypeArgument { annotation, ty })
+            .collect::<Vec<_>>();
+        if arguments.is_empty() {
+            Self::none()
+        } else {
+            Self(CallTypeArgumentState::Resolved(arguments))
+        }
+    }
+
+    pub fn checked_without_types(annotations: Vec<Annotation>) -> Self {
+        if annotations.is_empty() {
+            Self::none()
+        } else {
+            Self(CallTypeArgumentState::CheckedWithoutTypes(annotations))
+        }
+    }
+
+    pub fn annotations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Annotation> + DoubleEndedIterator + Clone {
+        let len = match &self.0 {
+            CallTypeArgumentState::None => 0,
+            CallTypeArgumentState::Unresolved(annotations)
+            | CallTypeArgumentState::CheckedWithoutTypes(annotations) => annotations.len(),
+            CallTypeArgumentState::Resolved(arguments) => arguments.len(),
+        };
+        (0..len).map(move |index| match &self.0 {
+            CallTypeArgumentState::None => unreachable!(),
+            CallTypeArgumentState::Unresolved(annotations)
+            | CallTypeArgumentState::CheckedWithoutTypes(annotations) => &annotations[index],
+            CallTypeArgumentState::Resolved(arguments) => &arguments[index].annotation,
+        })
+    }
+
+    pub fn resolved_types(&self) -> Option<ResolvedCallTypeArguments<'_>> {
+        let arguments: &[ResolvedCallTypeArgument] = match &self.0 {
+            CallTypeArgumentState::None | CallTypeArgumentState::CheckedWithoutTypes(_) => &[],
+            CallTypeArgumentState::Unresolved(_) => return None,
+            CallTypeArgumentState::Resolved(arguments) => arguments,
+        };
+        Some(ResolvedCallTypeArguments { arguments })
+    }
+
+    pub fn into_annotations(self) -> Vec<Annotation> {
+        match self.0 {
+            CallTypeArgumentState::None => Vec::new(),
+            CallTypeArgumentState::Unresolved(annotations)
+            | CallTypeArgumentState::CheckedWithoutTypes(annotations) => annotations,
+            CallTypeArgumentState::Resolved(arguments) => arguments
+                .into_iter()
+                .map(|argument| argument.annotation)
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self.0, CallTypeArgumentState::None)
+    }
+}
+
+impl Default for CallTypeArguments {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Annotation {
     Constructor {
         name: EcoString,
         params: Vec<Self>,
+        writable: bool,
+        mut_span: Option<Span>,
         span: Span,
     },
     Function {
@@ -421,13 +944,66 @@ pub enum Annotation {
     Opaque {
         span: Span,
     },
+    /// An integer literal in type-argument position, e.g. the `3` in
+    /// `Array<int, 3>`. Valid only as an `Array` size, rejected elsewhere.
+    Constant {
+        value: u64,
+        text: Option<String>,
+        span: Span,
+    },
+}
+
+impl fmt::Debug for Annotation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Constructor {
+                name,
+                params,
+                writable,
+                mut_span: _,
+                span,
+            } => {
+                let mut s = f.debug_struct("Constructor");
+                s.field("name", name).field("params", params);
+                if *writable {
+                    s.field("writable", writable);
+                }
+                s.field("span", span).finish()
+            }
+            Self::Function {
+                params,
+                return_type,
+                span,
+            } => f
+                .debug_struct("Function")
+                .field("params", params)
+                .field("return_type", return_type)
+                .field("span", span)
+                .finish(),
+            Self::Tuple { elements, span } => f
+                .debug_struct("Tuple")
+                .field("elements", elements)
+                .field("span", span)
+                .finish(),
+            Self::Unknown => write!(f, "Unknown"),
+            Self::Opaque { span } => f.debug_struct("Opaque").field("span", span).finish(),
+            Self::Constant { value, text, span } => f
+                .debug_struct("Constant")
+                .field("value", value)
+                .field("text", text)
+                .field("span", span)
+                .finish(),
+        }
+    }
 }
 
 impl Annotation {
-    pub fn unit() -> Self {
+    pub(crate) fn unit() -> Self {
         Self::Constructor {
             name: "Unit".into(),
             params: vec![],
+            writable: false,
+            mut_span: None,
             span: Span::dummy(),
         }
     }
@@ -438,6 +1014,7 @@ impl Annotation {
             Self::Function { span, .. } => *span,
             Self::Tuple { span, .. } => *span,
             Self::Opaque { span } => *span,
+            Self::Constant { span, .. } => *span,
             Self::Unknown => Span::dummy(),
         }
     }
@@ -449,10 +1026,6 @@ impl Annotation {
         }
     }
 
-    pub fn is_unit(&self) -> bool {
-        matches!(self, Self::Constructor { name, params, .. } if name == "Unit" && params.is_empty())
-    }
-
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
@@ -462,11 +1035,153 @@ impl Annotation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Generic {
     pub name: EcoString,
-    pub bounds: Vec<Annotation>,
+    bounds: GenericBounds,
     pub span: Span,
+}
+
+impl fmt::Debug for Generic {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let bounds = self.bounds().collect::<Vec<_>>();
+        let resolved_bounds = self
+            .resolved_bounds()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        f.debug_struct("Generic")
+            .field("name", &self.name)
+            .field("bounds", &bounds)
+            .field("resolved_bounds", &resolved_bounds)
+            .field("span", &self.span)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+enum GenericBounds {
+    Unresolved(Vec<Annotation>),
+    Resolved(Vec<ResolvedGenericBound>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct ResolvedGenericBound {
+    annotation: Annotation,
+    ty: Type,
+}
+
+impl Generic {
+    pub fn new(name: impl Into<EcoString>, bounds: Vec<Annotation>, span: Span) -> Self {
+        let bounds = if bounds.is_empty() {
+            GenericBounds::Resolved(Vec::new())
+        } else {
+            GenericBounds::Unresolved(bounds)
+        };
+        Self {
+            name: name.into(),
+            bounds,
+            span,
+        }
+    }
+
+    /// Constructs a generic whose bound annotations have already been resolved.
+    ///
+    /// This is primarily used when restoring semantic data from a cache: the
+    /// annotation remains available for diagnostics and emission, while the
+    /// resolved type remains the canonical semantic meaning of the bound.
+    pub fn resolved(
+        name: impl Into<EcoString>,
+        bounds: impl IntoIterator<Item = (Annotation, Type)>,
+        span: Span,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            bounds: GenericBounds::Resolved(
+                bounds
+                    .into_iter()
+                    .map(|(annotation, ty)| ResolvedGenericBound { annotation, ty })
+                    .collect(),
+            ),
+            span,
+        }
+    }
+
+    pub fn bounds(&self) -> impl Iterator<Item = &Annotation> + Clone {
+        let unresolved = match &self.bounds {
+            GenericBounds::Unresolved(bounds) => Some(bounds.as_slice()),
+            GenericBounds::Resolved(_) => None,
+        };
+        let resolved = match &self.bounds {
+            GenericBounds::Unresolved(_) => None,
+            GenericBounds::Resolved(bounds) => Some(bounds.as_slice()),
+        };
+        unresolved.into_iter().flatten().chain(
+            resolved
+                .into_iter()
+                .flatten()
+                .map(|bound| &bound.annotation),
+        )
+    }
+
+    pub fn bound_count(&self) -> usize {
+        match &self.bounds {
+            GenericBounds::Unresolved(bounds) => bounds.len(),
+            GenericBounds::Resolved(bounds) => bounds.len(),
+        }
+    }
+
+    pub fn bounds_are_resolved(&self) -> bool {
+        matches!(self.bounds, GenericBounds::Resolved(_))
+    }
+
+    pub fn resolved_bounds(&self) -> Option<impl Iterator<Item = &Type> + Clone> {
+        let GenericBounds::Resolved(bounds) = &self.bounds else {
+            return None;
+        };
+        Some(bounds.iter().map(|bound| &bound.ty))
+    }
+
+    pub fn for_each_bound_annotation_mut(&mut self, mut visit: impl FnMut(&mut Annotation)) {
+        match &mut self.bounds {
+            GenericBounds::Unresolved(annotations) => annotations.iter_mut().for_each(visit),
+            GenericBounds::Resolved(bounds) => {
+                bounds
+                    .iter_mut()
+                    .for_each(|bound| visit(&mut bound.annotation));
+            }
+        }
+    }
+
+    pub fn resolve_bounds_with(&mut self, mut resolve: impl FnMut(&Annotation) -> Type) {
+        let resolved = match &mut self.bounds {
+            GenericBounds::Unresolved(annotations) => annotations
+                .drain(..)
+                .map(|annotation| {
+                    let ty = resolve(&annotation);
+                    ResolvedGenericBound { annotation, ty }
+                })
+                .collect(),
+            GenericBounds::Resolved(bounds) => {
+                for bound in bounds {
+                    bound.ty = resolve(&bound.annotation);
+                }
+                return;
+            }
+        };
+        self.bounds = GenericBounds::Resolved(resolved);
+    }
+
+    pub fn retain_bounds(&mut self, mut keep: impl FnMut(&Annotation) -> bool) {
+        match &mut self.bounds {
+            GenericBounds::Unresolved(bounds) => bounds.retain(&mut keep),
+            GenericBounds::Resolved(bounds) => bounds.retain(|bound| keep(&bound.annotation)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -488,23 +1203,32 @@ impl Span {
 
     pub fn dummy() -> Self {
         Span {
-            file_id: 0,
+            file_id: u32::MAX,
             byte_offset: 0,
             byte_length: 0,
         }
     }
 
     pub fn is_dummy(&self) -> bool {
-        self.byte_length == 0
+        self.file_id == u32::MAX
     }
 
     pub fn end(&self) -> u32 {
         self.byte_offset + self.byte_length
     }
+
+    pub fn merge(self, other: Span) -> Span {
+        assert_eq!(
+            self.file_id, other.file_id,
+            "cannot merge spans from different files"
+        );
+        let start = self.byte_offset.min(other.byte_offset);
+        let end = self.end().max(other.end());
+        Span::new(self.file_id, start, end - start)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum Expression {
     Literal {
         literal: Literal,
@@ -521,7 +1245,7 @@ pub enum Expression {
         return_annotation: Annotation,
         return_type: Type,
         visibility: Visibility,
-        body: Box<Expression>,
+        body: FunctionBody,
         ty: Type,
         span: Span,
     },
@@ -540,11 +1264,7 @@ pub enum Expression {
     Let {
         binding: Box<Binding>,
         value: Box<Expression>,
-        mutable: bool,
-        mut_span: Option<Span>,
-        else_block: Option<Box<Expression>>,
-        else_span: Option<Span>,
-        typed_pattern: Option<TypedPattern>,
+        mode: LetMode,
         ty: Type,
         span: Span,
     },
@@ -552,21 +1272,21 @@ pub enum Expression {
         value: EcoString,
         ty: Type,
         span: Span,
-        binding_id: Option<BindingId>,
-        qualified: Option<EcoString>,
+        resolution: IdentifierResolution,
     },
     Call {
         expression: Box<Expression>,
         args: Vec<Expression>,
-        spread: Box<Option<Expression>>,
-        type_args: Vec<Annotation>,
+        spread: Option<Box<Expression>>,
+        type_arguments: CallTypeArguments,
         ty: Type,
         span: Span,
+        call_kind: CallKind,
     },
     If {
         condition: Box<Expression>,
         consequence: Box<Expression>,
-        alternative: Box<Expression>,
+        alternative: Option<Box<Expression>>,
         ty: Type,
         span: Span,
     },
@@ -574,16 +1294,13 @@ pub enum Expression {
         pattern: Pattern,
         scrutinee: Box<Expression>,
         consequence: Box<Expression>,
-        alternative: Box<Expression>,
-        typed_pattern: Option<TypedPattern>,
-        else_span: Option<Span>,
+        alternative: IfLetAlternative,
         ty: Type,
         span: Span,
     },
     Match {
         subject: Box<Expression>,
         arms: Vec<MatchArm>,
-        origin: MatchOrigin,
         ty: Type,
         span: Span,
     },
@@ -595,7 +1312,7 @@ pub enum Expression {
     StructCall {
         name: EcoString,
         field_assignments: Vec<StructFieldAssignment>,
-        spread: Box<Option<Expression>>,
+        spread: StructSpread,
         ty: Type,
         span: Span,
     },
@@ -604,6 +1321,7 @@ pub enum Expression {
         member: EcoString,
         ty: Type,
         span: Span,
+        resolution: DotAccessResolution,
     },
     Assignment {
         target: Box<Expression>,
@@ -664,7 +1382,7 @@ pub enum Expression {
         identifier: EcoString,
         identifier_span: Span,
         annotation: Option<Annotation>,
-        expression: Box<Expression>,
+        expression: ConstInitializer,
         visibility: Visibility,
         ty: Type,
         span: Span,
@@ -685,28 +1403,23 @@ pub enum Expression {
         body: Box<Expression>,
         ty: Type,
         span: Span,
-        needs_label: bool,
     },
     While {
         condition: Box<Expression>,
         body: Box<Expression>,
         span: Span,
-        needs_label: bool,
     },
     WhileLet {
         pattern: Pattern,
         scrutinee: Box<Expression>,
         body: Box<Expression>,
-        typed_pattern: Option<TypedPattern>,
         span: Span,
-        needs_label: bool,
     },
     For {
         binding: Box<Binding>,
         iterable: Box<Expression>,
         body: Box<Expression>,
         span: Span,
-        needs_label: bool,
     },
     Break {
         value: Option<Box<Expression>>,
@@ -725,28 +1438,19 @@ pub enum Expression {
         visibility: Visibility,
         span: Span,
     },
-    ValueEnum {
-        doc: Option<String>,
-        name: EcoString,
-        name_span: Span,
-        underlying_ty: Option<Annotation>,
-        variants: Vec<ValueEnumVariant>,
-        visibility: Visibility,
-        span: Span,
-    },
     Struct {
         doc: Option<String>,
         attributes: Vec<Attribute>,
         name: EcoString,
         name_span: Span,
         generics: Vec<Generic>,
-        fields: Vec<StructFieldDefinition>,
-        kind: StructKind,
+        fields: StructFields,
         visibility: Visibility,
         span: Span,
     },
     TypeAlias {
         doc: Option<String>,
+        attributes: Vec<Attribute>,
         name: EcoString,
         name_span: Span,
         generics: Vec<Generic>,
@@ -755,7 +1459,7 @@ pub enum Expression {
         visibility: Visibility,
         span: Span,
     },
-    ModuleImport {
+    PackageImport {
         name: EcoString,
         name_span: Span,
         alias: Option<ImportAlias>,
@@ -781,6 +1485,7 @@ pub enum Expression {
         index: Box<Expression>,
         ty: Type,
         span: Span,
+        from_colon_syntax: bool,
     },
     Task {
         expression: Box<Expression>,
@@ -788,6 +1493,11 @@ pub enum Expression {
         span: Span,
     },
     Defer {
+        expression: Box<Expression>,
+        ty: Type,
+        span: Span,
+    },
+    Assert {
         expression: Box<Expression>,
         ty: Type,
         span: Span,
@@ -814,12 +1524,11 @@ pub enum Expression {
         ty: Type,
         span: Span,
     },
-    NoOp,
 }
 
 impl Expression {
-    pub fn is_noop(&self) -> bool {
-        matches!(self, Expression::NoOp)
+    pub(crate) fn is_block(&self) -> bool {
+        matches!(self, Expression::Block { .. })
     }
 
     pub fn is_range(&self) -> bool {
@@ -827,21 +1536,14 @@ impl Expression {
     }
 
     pub fn is_conditional(&self) -> bool {
-        matches!(
-            self,
-            Expression::If { .. }
-                | Expression::IfLet { .. }
-                | Expression::Match {
-                    origin: MatchOrigin::IfLet { .. },
-                    ..
-                }
-        )
+        matches!(self, Expression::If { .. } | Expression::IfLet { .. })
     }
 
     pub fn is_control_flow(&self) -> bool {
         matches!(
             self,
             Expression::If { .. }
+                | Expression::IfLet { .. }
                 | Expression::Match { .. }
                 | Expression::Select { .. }
                 | Expression::For { .. }
@@ -851,53 +1553,21 @@ impl Expression {
         )
     }
 
-    pub fn callee_name(&self) -> Option<String> {
-        let Expression::Call { expression, .. } = self else {
-            return None;
-        };
-        match expression.as_ref() {
-            Expression::Identifier { value, .. } => Some(value.to_string()),
-            Expression::DotAccess {
-                expression: base,
-                member,
-                ..
-            } => {
-                if let Expression::Identifier { value, .. } = base.as_ref() {
-                    Some(format!("{}.{}", value, member))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+    pub fn is_temp_producing(&self) -> bool {
+        matches!(
+            self.unwrap_parens(),
+            Expression::If { .. }
+                | Expression::IfLet { .. }
+                | Expression::Match { .. }
+                | Expression::Block { .. }
+                | Expression::Loop { .. }
+                | Expression::Select { .. }
+                | Expression::TryBlock { .. }
+                | Expression::RecoverBlock { .. }
+        )
     }
 
-    pub fn to_function_signature(&self) -> FunctionDefinition {
-        match self {
-            Expression::Function {
-                name,
-                name_span,
-                generics,
-                params,
-                return_annotation,
-                return_type,
-                ty,
-                ..
-            } => FunctionDefinition {
-                name: name.clone(),
-                name_span: *name_span,
-                generics: generics.clone(),
-                params: params.clone(),
-                body: Box::new(Expression::NoOp),
-                return_type: return_type.clone(),
-                annotation: return_annotation.clone(),
-                ty: ty.clone(),
-            },
-            _ => panic!("to_function_signature called on non-Function expression"),
-        }
-    }
-
-    pub fn to_function_definition(&self) -> FunctionDefinition {
+    pub fn function_definition_view(&self) -> FunctionDefinitionView<'_> {
         match self {
             Expression::Function {
                 name,
@@ -907,23 +1577,21 @@ impl Expression {
                 return_annotation,
                 return_type,
                 body,
-                ty,
                 ..
-            } => FunctionDefinition {
-                name: name.clone(),
+            } => FunctionDefinitionView {
+                name,
                 name_span: *name_span,
-                generics: generics.clone(),
-                params: params.clone(),
-                body: body.clone(),
-                return_type: return_type.clone(),
-                annotation: return_annotation.clone(),
-                ty: ty.clone(),
+                generics,
+                params,
+                body: body.definition(),
+                return_type,
+                annotation: return_annotation,
             },
-            _ => panic!("to_function_definition called on non-Function expression"),
+            _ => panic!("function_definition_view called on non-Function expression"),
         }
     }
 
-    pub fn as_option_constructor(&self) -> Option<std::result::Result<(), ()>> {
+    pub fn as_option_constructor(&self) -> Option<Result<(), ()>> {
         let variant = match self {
             Expression::Identifier { value, .. } => Some(value.as_str()),
             _ => None,
@@ -936,7 +1604,11 @@ impl Expression {
         }
     }
 
-    pub fn as_result_constructor(&self) -> Option<std::result::Result<(), ()>> {
+    pub fn is_none_literal(&self) -> bool {
+        matches!(self.as_option_constructor(), Some(Err(())))
+    }
+
+    pub fn as_result_constructor(&self) -> Option<Result<(), ()>> {
         let variant = match self {
             Expression::Identifier { value, .. } => Some(value.as_str()),
             _ => None,
@@ -945,6 +1617,20 @@ impl Expression {
         match variant {
             "Result.Ok" | "Ok" => Some(Ok(())),
             "Result.Err" | "Err" => Some(Err(())),
+            _ => None,
+        }
+    }
+
+    pub fn as_partial_constructor(&self) -> Option<&'static str> {
+        let variant = match self {
+            Expression::Identifier { value, .. } => Some(value.as_str()),
+            _ => None,
+        }?;
+
+        match variant {
+            "Partial.Ok" => Some("Ok"),
+            "Partial.Err" => Some("Err"),
+            "Partial.Both" => Some("Both"),
             _ => None,
         }
     }
@@ -974,6 +1660,7 @@ impl Expression {
             | Self::Const { ty, .. }
             | Self::VariableDeclaration { ty, .. }
             | Self::Defer { ty, .. }
+            | Self::Assert { ty, .. }
             | Self::Reference { ty, .. }
             | Self::IndexedAccess { ty, .. }
             | Self::Task { ty, .. }
@@ -983,14 +1670,12 @@ impl Expression {
             | Self::Range { ty, .. }
             | Self::Cast { ty, .. } => ty.clone(),
             Self::Enum { .. }
-            | Self::ValueEnum { .. }
             | Self::Struct { .. }
             | Self::Assignment { .. }
             | Self::ImplBlock { .. }
             | Self::TypeAlias { .. }
-            | Self::ModuleImport { .. }
+            | Self::PackageImport { .. }
             | Self::Interface { .. }
-            | Self::NoOp
             | Self::RawGo { .. }
             | Self::While { .. }
             | Self::WhileLet { .. }
@@ -1013,7 +1698,6 @@ impl Expression {
             | Self::Match { span, .. }
             | Self::Tuple { span, .. }
             | Self::Enum { span, .. }
-            | Self::ValueEnum { span, .. }
             | Self::Struct { span, .. }
             | Self::StructCall { span, .. }
             | Self::DotAccess { span, .. }
@@ -1029,13 +1713,14 @@ impl Expression {
             | Self::Const { span, .. }
             | Self::VariableDeclaration { span, .. }
             | Self::Defer { span, .. }
+            | Self::Assert { span, .. }
             | Self::Reference { span, .. }
             | Self::IndexedAccess { span, .. }
             | Self::Task { span, .. }
             | Self::Select { span, .. }
             | Self::Loop { span, .. }
             | Self::TypeAlias { span, .. }
-            | Self::ModuleImport { span, .. }
+            | Self::PackageImport { span, .. }
             | Self::Interface { span, .. }
             | Self::Unit { span, .. }
             | Self::While { span, .. }
@@ -1045,7 +1730,7 @@ impl Expression {
             | Self::Continue { span, .. }
             | Self::Range { span, .. }
             | Self::Cast { span, .. } => *span,
-            Self::NoOp | Self::RawGo { .. } => Span::dummy(),
+            Self::RawGo { .. } => Span::dummy(),
         }
     }
 
@@ -1071,7 +1756,7 @@ impl Expression {
             } => {
                 condition.contains_break()
                     || consequence.contains_break()
-                    || alternative.contains_break()
+                    || alternative.as_deref().is_some_and(Self::contains_break)
             }
 
             Expression::IfLet {
@@ -1082,7 +1767,7 @@ impl Expression {
             } => {
                 scrutinee.contains_break()
                     || consequence.contains_break()
-                    || alternative.contains_break()
+                    || alternative.expression().is_some_and(Self::contains_break)
             }
 
             Expression::Match { subject, arms, .. } => {
@@ -1105,25 +1790,25 @@ impl Expression {
             } => {
                 expression.contains_break()
                     || args.iter().any(Self::contains_break)
-                    || spread.as_ref().as_ref().is_some_and(Self::contains_break)
+                    || spread.as_deref().is_some_and(Self::contains_break)
             }
 
             Expression::Function { .. } | Expression::Lambda { .. } => false,
 
-            Expression::Select { arms, .. } => arms.iter().any(|arm| match &arm.pattern {
-                SelectArmPattern::Receive { body, .. } => body.contains_break(),
-                SelectArmPattern::Send { body, .. } => body.contains_break(),
-                SelectArmPattern::MatchReceive { arms, .. } => {
+            Expression::Select { arms, .. } => arms.iter().any(|arm| match arm {
+                SelectArm::Receive { body, .. } => body.contains_break(),
+                SelectArm::Send { body, .. } => body.contains_break(),
+                SelectArm::MatchReceive { arms, .. } => {
                     arms.iter().any(|a| a.expression.contains_break())
                 }
-                SelectArmPattern::WildCard { body } => body.contains_break(),
+                SelectArm::WildCard { body } => body.contains_break(),
             }),
 
             Expression::Cast { expression, .. } => expression.contains_break(),
 
-            Expression::Let {
-                value, else_block, ..
-            } => value.contains_break() || else_block.as_ref().is_some_and(|e| e.contains_break()),
+            Expression::Let { value, mode, .. } => {
+                value.contains_break() || mode.else_block().is_some_and(Self::contains_break)
+            }
 
             Expression::Assignment { value, .. } => value.contains_break(),
 
@@ -1142,7 +1827,11 @@ impl Expression {
                 alternative,
                 ..
             } => {
-                if consequence.diverges().is_some() && alternative.diverges().is_some() {
+                if consequence.diverges().is_some()
+                    && alternative
+                        .as_deref()
+                        .is_some_and(|alternative| alternative.diverges().is_some())
+                {
                     Some(DeadCodeCause::DivergingIf)
                 } else {
                     None
@@ -1154,7 +1843,11 @@ impl Expression {
                 alternative,
                 ..
             } => {
-                if consequence.diverges().is_some() && alternative.diverges().is_some() {
+                if consequence.diverges().is_some()
+                    && alternative
+                        .expression()
+                        .is_some_and(|alternative| alternative.diverges().is_some())
+                {
                     Some(DeadCodeCause::DivergingIf)
                 } else {
                     None
@@ -1220,28 +1913,26 @@ impl Expression {
                         FormatStringPart::Text(_) => None,
                     })
                     .collect(),
-                _ => vec![],
+                _ => Vec::new(),
             },
-            Expression::Function { body, .. } => vec![body],
-            Expression::Lambda { body, .. } => vec![body],
+            Expression::Function { body, .. } => body.definition().into_iter().collect(),
+            Expression::Lambda { body, .. } => children![body],
             Expression::Block { items, .. } => items.iter().collect(),
-            Expression::Let {
-                value, else_block, ..
-            } => {
-                let mut c = vec![value.as_ref()];
-                if let Some(eb) = else_block {
+            Expression::Let { value, mode, .. } => {
+                let mut c = children![value.as_ref()];
+                if let Some(eb) = mode.else_block() {
                     c.push(eb);
                 }
                 c
             }
-            Expression::Identifier { .. } => vec![],
+            Expression::Identifier { .. } => Vec::new(),
             Expression::Call {
                 expression,
                 args,
                 spread,
                 ..
             } => {
-                let mut c = vec![expression.as_ref()];
+                let mut c = children![expression.as_ref()];
                 c.extend(args);
                 if let Some(s) = spread.as_ref() {
                     c.push(s);
@@ -1253,15 +1944,27 @@ impl Expression {
                 consequence,
                 alternative,
                 ..
-            } => vec![condition, consequence, alternative],
+            } => {
+                let mut c = children![condition, consequence];
+                if let Some(alternative) = alternative {
+                    c.push(alternative);
+                }
+                c
+            }
             Expression::IfLet {
                 scrutinee,
                 consequence,
                 alternative,
                 ..
-            } => vec![scrutinee, consequence, alternative],
+            } => {
+                let mut c = children![scrutinee, consequence];
+                if let Some(alternative) = alternative.expression() {
+                    c.push(alternative);
+                }
+                c
+            }
             Expression::Match { subject, arms, .. } => {
-                let mut c = vec![subject.as_ref()];
+                let mut c = children![subject.as_ref()];
                 for arm in arms {
                     if let Some(guard) = &arm.guard {
                         c.push(guard);
@@ -1278,45 +1981,47 @@ impl Expression {
             } => {
                 let mut c: Vec<&Expression> =
                     field_assignments.iter().map(|f| f.value.as_ref()).collect();
-                if let Some(s) = spread.as_ref() {
+                if let Some(s) = spread.as_expression() {
                     c.push(s);
                 }
                 c
             }
-            Expression::DotAccess { expression, .. } => vec![expression],
-            Expression::Assignment { target, value, .. } => vec![target, value],
-            Expression::Return { expression, .. } => vec![expression],
-            Expression::Propagate { expression, .. } => vec![expression],
+            Expression::DotAccess { expression, .. } => children![expression],
+            Expression::Assignment { target, value, .. } => children![target, value],
+            Expression::Return { expression, .. } => children![expression],
+            Expression::Propagate { expression, .. } => children![expression],
             Expression::TryBlock { items, .. } | Expression::RecoverBlock { items, .. } => {
                 items.iter().collect()
             }
             Expression::ImplBlock { methods, .. } => methods.iter().collect(),
-            Expression::Binary { left, right, .. } => vec![left, right],
-            Expression::Unary { expression, .. } => vec![expression],
-            Expression::Paren { expression, .. } => vec![expression],
-            Expression::Const { expression, .. } => vec![expression],
-            Expression::Loop { body, .. } => vec![body],
+            Expression::Binary { left, right, .. } => children![left, right],
+            Expression::Unary { expression, .. } => children![expression],
+            Expression::Paren { expression, .. } => children![expression],
+            Expression::Const { expression, .. } => expression.value().into_iter().collect(),
+            Expression::Loop { body, .. } => children![body],
             Expression::While {
                 condition, body, ..
-            } => vec![condition, body],
+            } => children![condition, body],
             Expression::WhileLet {
                 scrutinee, body, ..
-            } => vec![scrutinee, body],
-            Expression::For { iterable, body, .. } => vec![iterable, body],
-            Expression::Break { value, .. } => {
-                value.as_ref().map(|v| vec![v.as_ref()]).unwrap_or_default()
-            }
-            Expression::Reference { expression, .. } => vec![expression],
+            } => children![scrutinee, body],
+            Expression::For { iterable, body, .. } => children![iterable, body],
+            Expression::Break { value, .. } => value
+                .as_ref()
+                .map(|v| children![v.as_ref()])
+                .unwrap_or_default(),
+            Expression::Reference { expression, .. } => children![expression],
             Expression::IndexedAccess {
                 expression, index, ..
-            } => vec![expression, index],
-            Expression::Task { expression, .. } => vec![expression],
-            Expression::Defer { expression, .. } => vec![expression],
+            } => children![expression, index],
+            Expression::Task { expression, .. } => children![expression],
+            Expression::Defer { expression, .. } => children![expression],
+            Expression::Assert { expression, .. } => children![expression],
             Expression::Select { arms, .. } => {
-                let mut c = vec![];
+                let mut c = Vec::new();
                 for arm in arms {
-                    match &arm.pattern {
-                        SelectArmPattern::Receive {
+                    match arm {
+                        SelectArm::Receive {
                             receive_expression,
                             body,
                             ..
@@ -1324,26 +2029,24 @@ impl Expression {
                             c.push(receive_expression.as_ref());
                             c.push(body.as_ref());
                         }
-                        SelectArmPattern::Send {
+                        SelectArm::Send {
                             send_expression,
                             body,
                         } => {
                             c.push(send_expression.as_ref());
                             c.push(body.as_ref());
                         }
-                        SelectArmPattern::MatchReceive {
+                        SelectArm::MatchReceive {
                             receive_expression,
                             arms: match_arms,
                         } => {
                             c.push(receive_expression.as_ref());
                             for ma in match_arms {
-                                if let Some(guard) = &ma.guard {
-                                    c.push(guard);
-                                }
+                                c.extend(ma.guard.as_deref());
                                 c.push(&ma.expression);
                             }
                         }
-                        SelectArmPattern::WildCard { body } => {
+                        SelectArm::WildCard { body } => {
                             c.push(body.as_ref());
                         }
                     }
@@ -1351,7 +2054,7 @@ impl Expression {
                 c
             }
             Expression::Range { start, end, .. } => {
-                let mut c = vec![];
+                let mut c = Vec::new();
                 if let Some(s) = start {
                     c.push(s.as_ref());
                 }
@@ -1360,20 +2063,18 @@ impl Expression {
                 }
                 c
             }
-            Expression::Cast { expression, .. } => vec![expression],
+            Expression::Cast { expression, .. } => children![expression],
             Expression::Interface {
                 method_signatures, ..
             } => method_signatures.iter().collect(),
             Expression::Unit { .. }
             | Expression::Continue { .. }
             | Expression::Enum { .. }
-            | Expression::ValueEnum { .. }
             | Expression::Struct { .. }
             | Expression::TypeAlias { .. }
             | Expression::VariableDeclaration { .. }
-            | Expression::ModuleImport { .. }
-            | Expression::RawGo { .. }
-            | Expression::NoOp => vec![],
+            | Expression::PackageImport { .. }
+            | Expression::RawGo { .. } => Vec::new(),
         }
     }
 
@@ -1381,6 +2082,66 @@ impl Expression {
         match self {
             Expression::Paren { expression, .. } => expression.unwrap_parens(),
             other => other,
+        }
+    }
+
+    pub fn binding_id(&self) -> Option<BindingId> {
+        match self.unwrap_parens() {
+            Expression::Identifier { resolution, .. } => resolution.binding_id(),
+            _ => None,
+        }
+    }
+
+    pub fn as_integer(&self) -> Option<u64> {
+        match self.unwrap_parens() {
+            Expression::Literal {
+                literal: Literal::Integer { value, .. },
+                ..
+            } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Literals only, because a named constant carries a Go type of its own.
+    pub fn fold_constant(&self) -> Option<Constant> {
+        match self.unwrap_parens() {
+            // Negative literal text occurs only in patterns, so bail rather than
+            // misread the magnitude.
+            Expression::Literal {
+                literal: Literal::Integer { value, text },
+                ..
+            } if !text.as_deref().is_some_and(|text| text.starts_with('-')) => {
+                Some(Constant::Integer(*value as i128))
+            }
+            Expression::Literal {
+                literal: Literal::Char(text),
+                ..
+            } => rune_codepoint(text).map(|value| Constant::Integer(i128::from(value))),
+            Expression::Unary {
+                operator,
+                expression,
+                ..
+            } => fold_unary(operator, expression.fold_constant()?),
+            Expression::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } => fold_binary(*operator, left.fold_constant()?, right.fold_constant()?),
+            _ => None,
+        }
+    }
+
+    /// Inner expression of an explicit `x.*` deref, or `None` for anything else.
+    #[inline]
+    pub fn deref_inner(&self) -> Option<&Expression> {
+        match self {
+            Expression::Unary {
+                operator: UnaryOperator::Deref,
+                expression,
+                ..
+            } => Some(expression),
+            _ => None,
         }
     }
 
@@ -1451,11 +2212,7 @@ impl Expression {
         }
     }
 
-    pub fn is_function(&self) -> bool {
-        matches!(self, Expression::Function { .. })
-    }
-
-    pub fn set_public(self) -> Self {
+    pub(crate) fn set_public(self) -> Self {
         match self {
             Expression::Enum {
                 doc,
@@ -1476,23 +2233,6 @@ impl Expression {
                 visibility: Visibility::Public,
                 span,
             },
-            Expression::ValueEnum {
-                doc,
-                name,
-                name_span,
-                underlying_ty,
-                variants,
-                span,
-                ..
-            } => Expression::ValueEnum {
-                doc,
-                name,
-                name_span,
-                underlying_ty,
-                variants,
-                visibility: Visibility::Public,
-                span,
-            },
             Expression::Struct {
                 doc,
                 attributes,
@@ -1500,20 +2240,20 @@ impl Expression {
                 name_span,
                 generics,
                 fields,
-                kind,
                 span,
                 ..
             } => {
-                let fields = if kind == StructKind::Tuple {
-                    fields
-                        .into_iter()
-                        .map(|f| StructFieldDefinition {
-                            visibility: Visibility::Public,
-                            ..f
-                        })
-                        .collect()
-                } else {
-                    fields
+                let fields = match fields {
+                    StructFields::Tuple(fields) => StructFields::Tuple(
+                        fields
+                            .into_iter()
+                            .map(|f| StructFieldDefinition {
+                                visibility: Visibility::Public,
+                                ..f
+                            })
+                            .collect(),
+                    ),
+                    StructFields::Record(fields) => StructFields::Record(fields),
                 };
                 Expression::Struct {
                     doc,
@@ -1522,7 +2262,6 @@ impl Expression {
                     name_span,
                     generics,
                     fields,
-                    kind,
                     visibility: Visibility::Public,
                     span,
                 }
@@ -1592,6 +2331,7 @@ impl Expression {
             },
             Expression::TypeAlias {
                 doc,
+                attributes,
                 name,
                 name_span,
                 generics,
@@ -1601,6 +2341,7 @@ impl Expression {
                 ..
             } => Expression::TypeAlias {
                 doc,
+                attributes,
                 name,
                 name_span,
                 generics,
@@ -1636,9 +2377,8 @@ impl Expression {
         match self {
             Self::Block { items, .. } if items.is_empty() => false,
             Self::Unit { .. } => false,
-            Self::If { alternative, .. } | Self::IfLet { alternative, .. } => {
-                alternative.has_else()
-            }
+            Self::If { alternative, .. } => alternative.as_deref().is_some_and(Self::has_else),
+            Self::IfLet { alternative, .. } => alternative.expression().is_some_and(Self::has_else),
             _ => true,
         }
     }
@@ -1657,7 +2397,10 @@ pub enum Literal {
     /// Imaginary coefficient, e.g. `4i` stores `4.0`
     Imaginary(f64),
     Boolean(bool),
-    String(String),
+    String {
+        value: String,
+        raw: bool,
+    },
     FormatString(Vec<FormatStringPart>),
     Char(String),
     Slice(Vec<Expression>),
@@ -1673,6 +2416,7 @@ pub enum FormatStringPart {
 pub enum UnaryOperator {
     Negative,
     Not,
+    BitwiseNot,
     Deref,
 }
 
@@ -1682,6 +2426,12 @@ pub enum BinaryOperator {
     Subtraction,
     Multiplication,
     Division,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseAndNot,
+    ShiftLeft,
+    ShiftRight,
     LessThan,
     LessThanOrEqual,
     GreaterThan,
@@ -1694,14 +2444,42 @@ pub enum BinaryOperator {
     Pipeline,
 }
 
-impl std::fmt::Display for BinaryOperator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl BinaryOperator {
+    /// The compound-assignment form (`+=`, `<<=`, ...) for operators that have
+    /// one. Comparison, logical, and pipeline operators return `None`. Mirrors
+    /// the compound-assignment tokens accepted by `parse_assignment`.
+    pub fn compound_assignment_symbol(&self) -> Option<&'static str> {
+        match self {
+            BinaryOperator::Addition => Some("+="),
+            BinaryOperator::Subtraction => Some("-="),
+            BinaryOperator::Multiplication => Some("*="),
+            BinaryOperator::Division => Some("/="),
+            BinaryOperator::Remainder => Some("%="),
+            BinaryOperator::BitwiseAnd => Some("&="),
+            BinaryOperator::BitwiseOr => Some("|="),
+            BinaryOperator::BitwiseXor => Some("^="),
+            BinaryOperator::BitwiseAndNot => Some("&^="),
+            BinaryOperator::ShiftLeft => Some("<<="),
+            BinaryOperator::ShiftRight => Some(">>="),
+            _ => None,
+        }
+    }
+}
+
+impl Display for BinaryOperator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let symbol = match self {
             BinaryOperator::Addition => "+",
             BinaryOperator::Subtraction => "-",
             BinaryOperator::Multiplication => "*",
             BinaryOperator::Division => "/",
             BinaryOperator::Remainder => "%",
+            BinaryOperator::BitwiseAnd => "&",
+            BinaryOperator::BitwiseOr => "|",
+            BinaryOperator::BitwiseXor => "^",
+            BinaryOperator::BitwiseAndNot => "&^",
+            BinaryOperator::ShiftLeft => "<<",
+            BinaryOperator::ShiftRight => ">>",
             BinaryOperator::Equal => "==",
             BinaryOperator::NotEqual => "!=",
             BinaryOperator::LessThan => "<",
@@ -1728,6 +2506,7 @@ pub struct ParentInterface {
 pub enum Visibility {
     Public,
     Private,
+    Local,
 }
 
 impl Visibility {
@@ -1740,4 +2519,78 @@ impl Visibility {
 pub enum ImportAlias {
     Named(EcoString, Span),
     Blank(Span),
+}
+
+/// What a constant expression is worth, as far as `i128` folding determines it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Constant {
+    Integer(i128),
+    /// Constant, and past what `i128` holds, or divided by zero.
+    Unknown,
+}
+
+fn fold_unary(operator: &UnaryOperator, operand: Constant) -> Option<Constant> {
+    let Constant::Integer(value) = operand else {
+        return Some(Constant::Unknown);
+    };
+    match operator {
+        UnaryOperator::Negative => Some(or_unknown(value.checked_neg())),
+        UnaryOperator::BitwiseNot => Some(Constant::Integer(!value)),
+        _ => None,
+    }
+}
+
+fn fold_binary(operator: BinaryOperator, left: Constant, right: Constant) -> Option<Constant> {
+    // An operand with no value keeps the expression constant all the same.
+    let (Constant::Integer(left), Constant::Integer(right)) = (left, right) else {
+        return Some(Constant::Unknown);
+    };
+    let folded = match operator {
+        BinaryOperator::Addition => or_unknown(left.checked_add(right)),
+        BinaryOperator::Subtraction => or_unknown(left.checked_sub(right)),
+        BinaryOperator::Multiplication => or_unknown(left.checked_mul(right)),
+        BinaryOperator::Division => or_unknown(left.checked_div(right)),
+        BinaryOperator::Remainder => or_unknown(left.checked_rem(right)),
+        BinaryOperator::BitwiseAnd => Constant::Integer(left & right),
+        BinaryOperator::BitwiseOr => Constant::Integer(left | right),
+        BinaryOperator::BitwiseXor => Constant::Integer(left ^ right),
+        BinaryOperator::BitwiseAndNot => Constant::Integer(left & !right),
+        BinaryOperator::ShiftLeft => shift_left(left, right)?,
+        BinaryOperator::ShiftRight => shift_right(left, right)?,
+        // Go compares constants at full width, so neither side is range checked.
+        _ => Constant::Unknown,
+    };
+    Some(folded)
+}
+
+fn or_unknown(value: Option<i128>) -> Constant {
+    value.map_or(Constant::Unknown, Constant::Integer)
+}
+
+fn shift_left(left: i128, right: i128) -> Option<Constant> {
+    let Some(amount) = shift_amount(right) else {
+        return unusable_shift_count(right);
+    };
+    let shifted = left << amount;
+    Some(if shifted >> amount == left {
+        Constant::Integer(shifted)
+    } else {
+        Constant::Unknown
+    })
+}
+
+fn shift_right(left: i128, right: i128) -> Option<Constant> {
+    let Some(amount) = shift_amount(right) else {
+        return unusable_shift_count(right);
+    };
+    Some(Constant::Integer(left >> amount))
+}
+
+/// A negative shift is not a constant expression, and shift_count names it.
+fn unusable_shift_count(amount: i128) -> Option<Constant> {
+    (amount >= 0).then_some(Constant::Unknown)
+}
+
+fn shift_amount(amount: i128) -> Option<u32> {
+    (0..128).contains(&amount).then_some(amount as u32)
 }

@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:strconv\"\n\nfn main() {\n  let mut f: fn(string) -> Result<int, error> = strconv.Atoi\n  let r = f(\"42\")\n  let _ = r\n  f = strconv.Atoi\n  let r2 = f(\"99\")\n  let _ = r2\n}\n"
+description: |
+  
+  import "go:strconv"
+  
+  fn main() {
+    let mut f: fn(string) -> Result<int, error> = strconv.Atoi
+    let r = f("42")
+    let _ = r
+    f = strconv.Atoi
+    let r2 = f("99")
+    let _ = r2
+  }
 ---
 package main
 
@@ -10,20 +21,22 @@ import (
 )
 
 func main() {
-	f := func(arg0 string) lisette.Result[int, error] {
-		ret_1, ret_2 := strconv.Atoi(arg0)
-		if ret_2 != nil {
-			return lisette.MakeResultErr[int, error](ret_2)
-		}
-		return lisette.MakeResultOk[int, error](ret_1)
+	f := strconv.Atoi
+	ret_1, ret_2 := f("42")
+	var r lisette.Result[int, error]
+	if ret_2 != nil {
+		r = lisette.MakeResultErr[int, error](ret_2)
+	} else {
+		r = lisette.MakeResultOk[int, error](ret_1)
 	}
-	_ = f("42")
-	f = func(arg0 string) lisette.Result[int, error] {
-		ret_4, ret_5 := strconv.Atoi(arg0)
-		if ret_5 != nil {
-			return lisette.MakeResultErr[int, error](ret_5)
-		}
-		return lisette.MakeResultOk[int, error](ret_4)
+	_ = r
+	f = strconv.Atoi
+	ret_3, ret_4 := f("99")
+	var r2 lisette.Result[int, error]
+	if ret_4 != nil {
+		r2 = lisette.MakeResultErr[int, error](ret_4)
+	} else {
+		r2 = lisette.MakeResultOk[int, error](ret_3)
 	}
-	_ = f("99")
+	_ = r2
 }

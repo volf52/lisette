@@ -1,12 +1,20 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nfn do_nothing() {}\n\nfn test() {\n  let r = do_nothing()\n  let _ = r\n}\n"
+description: |
+  
+  fn do_nothing() {}
+  
+  fn test() {
+    let r = do_nothing()
+    let _ = r
+  }
 ---
 package main
 
-func do_nothing() {}
+func doNothing() {}
 
 func test() {
-	do_nothing()
-	_ = struct{}{}
+	doNothing()
+	r := struct{}{}
+	_ = r
 }

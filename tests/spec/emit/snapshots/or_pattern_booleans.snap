@@ -1,14 +1,18 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn test(a: bool, b: bool) -> string {\n  match (a, b) {\n    (true, true) | (false, false) => \"same\",\n    (true, false) | (false, true) => \"different\",\n  }\n}\n"
+description: |
+  
+  fn test(a: bool, b: bool) -> string {
+    match (a, b) {
+      (true, true) | (false, false) => "same",
+      (true, false) | (false, true) => "different",
+    }
+  }
 ---
 package main
 
-import lisette "github.com/ivov/lisette/prelude"
-
 func test(a, b bool) string {
-	subject_1 := lisette.MakeTuple2(a, b)
-	if (subject_1.First && subject_1.Second) || (!subject_1.First && !subject_1.Second) {
+	if (a && b) || (!a && !b) {
 		return "same"
 	}
 	return "different"

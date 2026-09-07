@@ -1,105 +1,90 @@
-use diagnostics::{DiagnosticSink, LisetteDiagnostic};
-use semantics::{checker::Checker, lint, pattern_analysis, store::Store};
-use syntax::{
-    desugar,
-    lex::Lexer,
-    parse::Parser,
-    program::{File, Visibility},
-};
+use diagnostics::{Fix, LisetteDiagnostic, apply_fixes};
+use syntax::{lex::Lexer, parse::Parser};
 
-use super::init_prelude;
-
-use crate::_harness::register_test_builtins;
-
-use super::TEST_MODULE_ID;
+use super::pipeline::{InferredTestFile, TEST_FILE_ID, infer_test_file};
 
 pub fn lint(source: &str) -> Vec<LisetteDiagnostic> {
-    let lex_result = Lexer::new(source, 0).lex();
+    let lex_result = Lexer::new(source, TEST_FILE_ID).lex();
     if lex_result.failed() {
         panic!("Lexing failed in lint test: {:?}", lex_result.errors);
     }
 
     let parse_result = Parser::new(lex_result.tokens, source).parse();
-    if parse_result.failed() {
+    if parse_result.has_errors() {
         panic!("Parsing failed in lint test: {:?}", parse_result.errors);
     }
 
-    let desugar_result = desugar::desugar(parse_result.ast);
-    if !desugar_result.errors.is_empty() {
+    let InferredTestFile { store, checker } = infer_test_file(source, parse_result.ast, &[]);
+    let inference_checkpoint = checker.sink.checkpoint();
+
+    passes::run(
+        &store,
+        &checker.facts,
+        &checker.sink,
+        passes::LintMode::Run,
+        passes::UnusedItemReporting::Report,
+    );
+
+    // Deferred inference errors surface during passes::run, mixed in with
+    // the error-severity lint diagnostics the tests assert on.
+    let deferred_codes = [
+        "infer.statement_as_tail",
+        "infer.type_not_inferred",
+        "infer.missing_type_argument",
+    ];
+    let (inference_diagnostics, pass_diagnostics) =
+        checker.sink.into_diagnostics_since(inference_checkpoint);
+    let mut diagnostics: Vec<LisetteDiagnostic> = inference_diagnostics
+        .into_iter()
+        .filter(|diagnostic| !diagnostic.is_error())
+        .collect();
+    diagnostics.extend(pass_diagnostics.into_iter().filter(|diagnostic| {
+        !diagnostic.is_error()
+            || !diagnostic
+                .code_str()
+                .is_some_and(|code| deferred_codes.contains(&code))
+    }));
+    diagnostics
+}
+
+pub fn apply_infer_fixes(source: &str) -> String {
+    let result = super::infer::infer(source);
+    let fixes: Vec<&Fix> = result
+        .errors
+        .iter()
+        .filter_map(LisetteDiagnostic::fix)
+        .collect();
+    assert!(!fixes.is_empty(), "expected at least one fix");
+    apply_fixes(source, fixes).source
+}
+
+pub fn apply_lint_fixes(source: &str) -> String {
+    let lints = lint(source);
+    let fixes: Vec<&Fix> = lints.iter().filter_map(LisetteDiagnostic::fix).collect();
+    let fixed = apply_fixes(source, fixes).source;
+
+    let reparsed = syntax::build_ast(&fixed, TEST_FILE_ID);
+    if !reparsed.errors.is_empty() {
         panic!(
-            "Desugaring failed in lint test: {:?}",
-            desugar_result.errors
+            "Applied fix produced source that no longer parses:\n{fixed}\nerrors: {:?}",
+            reparsed.errors
         );
     }
-    let ast = desugar_result.ast;
 
-    let mut store = Store::new();
-
-    store.add_module(TEST_MODULE_ID);
-
-    let file_id = store.new_file_id();
-    store.register_file(file_id, TEST_MODULE_ID);
-
-    let sink = DiagnosticSink::new();
-
-    init_prelude(&mut store);
-
-    let mut checker = Checker::new(&mut store, &sink);
-    checker.cursor.module_id = TEST_MODULE_ID.to_string();
-    register_test_builtins(&mut checker);
-    checker.put_prelude_in_scope();
-    checker.register_types_and_values(&ast, &Visibility::Private);
-
-    let mut typed_ast = vec![];
-
-    for expression in ast {
-        let type_var = checker.new_type_var();
-        let typed_expression = checker.infer_expression(expression, &type_var);
-        typed_ast.push(typed_expression);
-
-        if checker.failed() {
-            break;
-        }
+    let checked = super::infer::infer(source);
+    if !checked.errors.is_empty() {
+        panic!(
+            "Fix test input does not check:\n{source}\nerrors: {:?}",
+            checked.errors
+        );
     }
 
-    if !checker.failed() {
-        let pattern_ctx =
-            pattern_analysis::Context::new(checker.store, &checker.facts.or_pattern_error_spans);
-        for expression in &typed_ast {
-            pattern_analysis::check(expression, &pattern_ctx, checker.sink);
-        }
-        checker.facts.pattern_issues = pattern_ctx.take_issues();
+    let rechecked = super::infer::infer(&fixed);
+    if !rechecked.errors.is_empty() {
+        panic!(
+            "Applied fix produced source that no longer checks:\n{fixed}\nerrors: {:?}",
+            rechecked.errors
+        );
     }
-
-    if checker.failed() {
-        return vec![];
-    }
-
-    let typed_file = File {
-        id: file_id,
-        module_id: TEST_MODULE_ID.to_string(),
-        name: "test.lis".to_string(),
-        source: source.to_string(),
-        items: typed_ast,
-    };
-
-    checker.store.store_file(TEST_MODULE_ID, typed_file);
-
-    let lint_config = lint::LintConfig::default();
-    let module = checker.store.get_module(TEST_MODULE_ID).unwrap();
-    let file = module.files.get(&file_id).unwrap();
-
-    let go_package_names = checker.store.go_package_names.clone();
-    let lint_ctx = lint::LintContext {
-        ast: &file.items,
-        facts: &checker.facts,
-        module: Some(module),
-        config: &lint_config,
-        is_d_lis: file.is_d_lis(),
-        files: &module.files,
-        go_package_names: &go_package_names,
-    };
-    let lint_sink = DiagnosticSink::new();
-    lint::lint_file(&lint_ctx, &lint_sink);
-    lint_sink.take()
+    fixed
 }

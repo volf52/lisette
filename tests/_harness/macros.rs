@@ -4,7 +4,7 @@ macro_rules! assert_lex_snapshot {
         let lex_result = syntax::lex::Lexer::new($input, 0).lex();
 
         insta::with_settings!({
-            description => format!("input: {}", $input),
+            description => $crate::_harness::snapshot_description($input),
             prepend_module_to_snapshot => false,
             omit_expression => true,
         }, {
@@ -20,45 +20,11 @@ macro_rules! assert_parse_snapshot {
         let parse_result = syntax::parse::Parser::new(lex_result.tokens, $input).parse();
 
         insta::with_settings!({
-            description => format!("input: {}", $input),
+            description => $crate::_harness::snapshot_description($input),
             prepend_module_to_snapshot => false,
             omit_expression => true,
         }, {
             insta::assert_debug_snapshot!(parse_result.ast);
-        });
-    };
-}
-
-#[macro_export]
-macro_rules! assert_desugar_snapshot {
-    ($input:expr) => {
-        let lex_result = syntax::lex::Lexer::new($input, 0).lex();
-        assert!(
-            !lex_result.failed(),
-            "Lexer failed: {:?}",
-            lex_result.errors
-        );
-
-        let parse_result = syntax::parse::Parser::new(lex_result.tokens, $input).parse();
-        assert!(
-            !parse_result.failed(),
-            "Parser failed: {:?}",
-            parse_result.errors
-        );
-
-        let desugar_result = syntax::desugar::desugar(parse_result.ast);
-        assert!(
-            desugar_result.errors.is_empty(),
-            "Desugaring failed: {:?}",
-            desugar_result.errors
-        );
-
-        insta::with_settings!({
-            description => format!("input: {}", $input),
-            prepend_module_to_snapshot => false,
-            omit_expression => true,
-        }, {
-            insta::assert_debug_snapshot!(desugar_result.ast);
         });
     };
 }
@@ -119,44 +85,17 @@ macro_rules! assert_parse_error_snapshot {
 }
 
 #[macro_export]
-macro_rules! assert_desugar_error_snapshot {
-    ($source:expr) => {
-        use syntax::lex::Lexer;
-        use syntax::parse::Parser;
-        use syntax::desugar;
-
-        let lex_result = Lexer::new($source, 0).lex();
-        if lex_result.failed() {
-            panic!("Lexing failed in desugar error test");
-        }
-        let parse_result = Parser::new(lex_result.tokens, $source).parse();
-        if parse_result.failed() {
-            panic!("Parsing failed in desugar error test");
-        }
-        let desugar_result = desugar::desugar(parse_result.ast);
-        if desugar_result.errors.is_empty() {
-            panic!("Expected desugar errors but desugaring succeeded");
-        }
-
-        let output = $crate::_harness::formatting::format_parse_error_for_snapshot(
-            &desugar_result.errors[0],
-            $source,
-            "test.lis",
-        );
-
-        insta::with_settings!({
-            prepend_module_to_snapshot => false,
-            omit_expression => true,
-        }, {
-            insta::assert_snapshot!(output);
-        });
-    };
-}
-
-#[macro_export]
 macro_rules! assert_infer_error_snapshot {
     ($source:expr) => {
-        let result = $crate::_harness::infer::infer($source);
+        $crate::assert_infer_error_snapshot!(@render
+            $crate::_harness::infer::infer($source), $source);
+    };
+    ($source:expr, $typedefs:expr) => {
+        $crate::assert_infer_error_snapshot!(@render
+            $crate::_harness::infer::infer_with_go_typedefs($source, $typedefs), $source);
+    };
+    (@render $result:expr, $source:expr) => {
+        let result = $result;
         if result.errors.is_empty() {
             panic!("Expected errors but inference succeeded");
         }
@@ -177,7 +116,7 @@ macro_rules! assert_infer_error_snapshot {
 }
 
 #[macro_export]
-macro_rules! assert_multimodule_infer_error_snapshot {
+macro_rules! assert_multipackage_infer_error_snapshot {
     ($result:expr, $source:expr) => {
         if $result.errors.is_empty() {
             panic!("Expected errors but inference succeeded");
@@ -205,7 +144,7 @@ macro_rules! assert_emit_snapshot {
         let go_code = emit_result.go_code();
 
         insta::with_settings!({
-            description => format!("input: {}", $input),
+            description => $crate::_harness::snapshot_description($input),
             prepend_module_to_snapshot => false,
             omit_expression => true,
         }, {
@@ -221,7 +160,7 @@ macro_rules! assert_emit_snapshot_with_go_typedefs {
         let go_code = emit_result.go_code();
 
         insta::with_settings!({
-            description => format!("input: {}", $input),
+            description => $crate::_harness::snapshot_description($input),
             prepend_module_to_snapshot => false,
             omit_expression => true,
         }, {
@@ -254,6 +193,37 @@ macro_rules! assert_lint_snapshot {
 }
 
 #[macro_export]
+macro_rules! assert_fix_snapshot {
+    ($source:expr) => {
+        let fixed = $crate::_harness::lint::apply_lint_fixes($source);
+        if fixed == $source {
+            panic!("Expected a fix to change the source but it was unchanged");
+        }
+        let combined = format!(
+            "{}\n=== fixed ===\n{}",
+            $source.trim_matches('\n'),
+            fixed.trim_matches('\n'),
+        );
+        insta::with_settings!({
+            prepend_module_to_snapshot => false,
+            omit_expression => true,
+        }, {
+            insta::assert_snapshot!(combined);
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! assert_no_fix {
+    ($source:expr) => {
+        let fixed = $crate::_harness::lint::apply_lint_fixes($source);
+        if fixed != $source {
+            panic!("Expected no fix but the source changed to:\n{fixed}");
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! assert_no_lint_warnings {
     ($source:expr) => {
         let warnings = $crate::_harness::lint::lint($source);
@@ -262,6 +232,22 @@ macro_rules! assert_no_lint_warnings {
             panic!(
                 "Expected no lint warnings but got:\n{}",
                 warnings_str.join("\n")
+            );
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! assert_diagnostic_count {
+    ($source:expr, $expected:expr) => {
+        let diagnostics = $crate::_harness::lint::lint($source);
+        if diagnostics.len() != $expected {
+            let rendered: Vec<String> = diagnostics.iter().map(|d| format!("{:?}", d)).collect();
+            panic!(
+                "Expected {} diagnostics but got {}:\n{}",
+                $expected,
+                diagnostics.len(),
+                rendered.join("\n")
             );
         }
     };
@@ -297,7 +283,7 @@ macro_rules! assert_format_snapshot {
         );
 
         insta::with_settings!({
-            description => format!("input: {}", $input),
+            description => $crate::_harness::snapshot_description($input),
             prepend_module_to_snapshot => false,
             omit_expression => true,
         }, {

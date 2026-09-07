@@ -1,10 +1,16 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum Tag { A, B, C }\n\nfn test() -> bool {\n  let u1 = Tag.A\n  let u2 = Tag.B\n  u1 == u2\n}\n"
+description: |
+  
+  enum Tag { A, B, C }
+  
+  fn test() -> bool {
+    let u1 = Tag.A
+    let u2 = Tag.B
+    u1 == u2
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeTagA() Tag {
 	return Tag{Tag: TagA}
@@ -18,7 +24,7 @@ func MakeTagC() Tag {
 	return Tag{Tag: TagC}
 }
 
-type TagTag int
+type TagTag uint8
 
 const (
 	TagA TagTag = iota
@@ -28,19 +34,6 @@ const (
 
 type Tag struct {
 	Tag TagTag
-}
-
-func (t Tag) String() string {
-	switch t.Tag {
-	case TagA:
-		return "Tag.A"
-	case TagB:
-		return "Tag.B"
-	case TagC:
-		return "Tag.C"
-	default:
-		return fmt.Sprintf("Tag(%d)", t.Tag)
-	}
 }
 
 func test() bool {

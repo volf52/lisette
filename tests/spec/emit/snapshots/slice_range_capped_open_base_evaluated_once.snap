@@ -1,0 +1,23 @@
+---
+source: tests/spec/emit/expressions.rs
+description: |
+  
+  fn make_items() -> Slice<int> { [10, 20, 30] }
+  
+  fn test() -> int {
+    let ys = make_items()[1..]
+    ys.length()
+  }
+---
+package main
+
+func makeItems() []int {
+	return []int{10, 20, 30}
+}
+
+func test() int {
+	base_1 := makeItems()
+	len_2 := len(base_1)
+	ys := base_1[1:len_2:len_2]
+	return len(ys)
+}

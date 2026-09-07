@@ -1,0 +1,26 @@
+---
+source: tests/spec/emit/concurrency.rs
+description: |
+  
+  fn mark() -> int {
+    2
+  }
+  
+  fn test() {
+    let mut xs = [1]
+    defer xs.append(mark())
+  }
+---
+package main
+
+func mark() int {
+	return 2
+}
+
+func test() {
+	xs := []int{1}
+	arg_1 := mark()
+	defer func() {
+		_ = append(xs[:len(xs):len(xs)], arg_1)
+	}()
+}

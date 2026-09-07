@@ -1,148 +1,246 @@
-use crate::Emitter;
-use crate::is_order_sensitive;
-use crate::patterns::decision_tree;
-use crate::utils::DiscardGuard;
-use crate::write_line;
+use crate::Planner;
+use crate::Renderer;
+use crate::context::expression::ExpressionContext;
+use crate::patterns::binding_decls::pattern_has_bindings;
+use crate::patterns::sites::PatternSubject;
+use crate::plan::bodies::{LoweredBlock, LoweredStatement, directed};
+use crate::plan::values::CaptureBoundary;
+use crate::types::native::NativeGoType;
+use crate::types::shape::RangeShape;
 use syntax::ast::{Binding, Expression, Pattern};
+use syntax::types::Type;
 
-impl Emitter<'_> {
-    /// Extract a loop variable from a pattern, binding the identifier if present.
-    /// `fallback` controls what happens when the pattern is unused or non-identifier:
-    /// - `Some(hint)`: generate a fresh var (needed for C-style loops where `_` is invalid)
-    /// - `None`: use `"_"` (valid in `for range` syntax)
-    fn bind_loop_pattern(&mut self, pattern: &Pattern, fallback: Option<&str>) -> String {
-        if let Pattern::Identifier { identifier, .. } = pattern
-            && let Some(mut go_name) = self.go_name_for_binding(pattern)
-        {
-            if self.scope.bindings.has_go_name(&go_name) {
-                go_name = self.fresh_var(Some(&go_name));
-            }
-            return self.scope.bindings.add(identifier, go_name);
-        }
-        match fallback {
-            Some(hint) => self.fresh_var(Some(hint)),
-            None => "_".to_string(),
-        }
+impl Planner<'_> {
+    /// Lower a `for` statement, dispatching on iterable/pattern shape.
+    pub(crate) fn lower_for_statement(&mut self, full_expression: &Expression) -> LoweredStatement {
+        let Expression::For {
+            binding,
+            iterable,
+            body,
+            ..
+        } = full_expression
+        else {
+            unreachable!("lower_for_statement requires a For expression");
+        };
+        let iterable = iterable.as_ref();
+        let body = body.as_ref();
+        let iterable_ty = iterable.get_type();
+        let is_range = matches!(iterable, Expression::Range { .. });
+        let stored_range = (!is_range)
+            .then(|| self.range_shape(&iterable_ty))
+            .flatten()
+            .filter(|rs| {
+                matches!(
+                    rs,
+                    RangeShape::Range | RangeShape::RangeInclusive | RangeShape::RangeFrom
+                )
+            });
+        let string_view = recognize_string_view_loop(binding, iterable);
+        let is_simple = self.for_loop_is_simple(binding, iterable);
+        let map_tuple = self.for_loop_is_map_tuple(binding, iterable);
+
+        let directive = self.maybe_line_directive(&full_expression.get_span());
+        let plan = self.with_loop("_", |this| {
+            let (prologue, header, lowered_body) = if is_range {
+                this.lower_range_for(binding, iterable, body)
+            } else if let Some(range_shape) = stored_range {
+                this.lower_stored_range_for(binding, iterable, range_shape, body)
+            } else if let Some((kind, receiver)) = string_view {
+                match kind {
+                    StringViewKind::Runes => this.lower_runes_for(binding, receiver, body),
+                    StringViewKind::Bytes => this.lower_bytes_for(binding, receiver, body),
+                }
+            } else if map_tuple {
+                this.lower_map_tuple_for(binding, iterable, body)
+            } else if is_simple {
+                this.lower_simple_for(binding, iterable, body)
+            } else {
+                this.lower_pattern_site_for(binding, iterable, body)
+            };
+
+            this.build_source_loop(prologue, header, lowered_body)
+        });
+        directed(directive, LoweredStatement::Loop(plan))
     }
 
-    pub(crate) fn emit_for_loop(
+    /// Plan `expr` as an operand, pushing its setup into `prologue` and
+    /// returning the value text.
+    pub(crate) fn capture_operand_into(
         &mut self,
-        output: &mut String,
+        prologue: &mut Vec<LoweredStatement>,
+        expr: &Expression,
+    ) -> String {
+        let plan = self.plan_operand(expr, ExpressionContext::value());
+        let (setup, value) = plan.into_parts();
+        prologue.extend(setup);
+        value
+    }
+
+    /// `for i in stored_range`.
+    fn lower_stored_range_for(
+        &mut self,
+        binding: &Binding,
+        iterable: &Expression,
+        range_shape: RangeShape,
+        body: &Expression,
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        self.with_scope(|this| {
+            let mut prologue = Vec::new();
+            let range_var = if this.is_unmutated_identifier(iterable) {
+                this.capture_operand_into(&mut prologue, iterable)
+            } else {
+                this.capture_value_at_boundary(
+                    &mut prologue,
+                    iterable,
+                    "range",
+                    CaptureBoundary::LoopLifetime,
+                )
+            };
+            let loop_var = this.bind_loop_pattern(&binding.pattern, Some("i"));
+            let header = match range_shape {
+                RangeShape::Range => format!(
+                    "for {} := {}.Start; {} < {}.End; {}++ {{\n",
+                    loop_var, range_var, loop_var, range_var, loop_var
+                ),
+                RangeShape::RangeInclusive => format!(
+                    "for {} := {}.Start; {} <= {}.End; {}++ {{\n",
+                    loop_var, range_var, loop_var, range_var, loop_var
+                ),
+                RangeShape::RangeFrom => format!(
+                    "for {} := {}.Start; ; {}++ {{\n",
+                    loop_var, range_var, loop_var
+                ),
+                RangeShape::RangeTo | RangeShape::RangeToInclusive => {
+                    unreachable!("RangeTo/RangeToInclusive are not iterable")
+                }
+            };
+            let lowered_body = this.lower_block_as_body(body);
+            (prologue, header, lowered_body)
+        })
+    }
+
+    /// `for r in s.runes()`.
+    fn lower_runes_for(
+        &mut self,
+        binding: &Binding,
+        receiver: &Expression,
+        body: &Expression,
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        self.with_scope(|this| {
+            let mut prologue = Vec::new();
+            let receiver_str = this.capture_operand_into(&mut prologue, receiver);
+            let loop_var = this.bind_loop_pattern(&binding.pattern, None);
+            let header = if loop_var == "_" {
+                format!("for range {} {{\n", receiver_str)
+            } else {
+                format!("for _, {} := range {} {{\n", loop_var, receiver_str)
+            };
+            let lowered_body = this.lower_block_as_body(body);
+            (prologue, header, lowered_body)
+        })
+    }
+
+    /// `for b in s.bytes()`.
+    fn lower_bytes_for(
+        &mut self,
+        binding: &Binding,
+        receiver: &Expression,
+        body: &Expression,
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        self.with_scope(|this| {
+            let mut prologue = Vec::new();
+            let receiver_var = if this.is_unmutated_identifier(receiver) {
+                this.capture_operand_into(&mut prologue, receiver)
+            } else {
+                this.capture_value_at_boundary(
+                    &mut prologue,
+                    receiver,
+                    "s",
+                    CaptureBoundary::LoopLifetime,
+                )
+            };
+            let index_var = this.fresh_var(Some("i"));
+            let loop_var = this.bind_loop_pattern(&binding.pattern, None);
+            let mut header = format!(
+                "for {} := 0; {} < len({}); {}++ {{\n",
+                index_var, index_var, receiver_var, index_var
+            );
+            if loop_var != "_" {
+                header.push_str(&format!(
+                    "{} := {}[{}]\n",
+                    loop_var, receiver_var, index_var
+                ));
+            }
+            let lowered_body = this.lower_block_as_body(body);
+            (prologue, header, lowered_body)
+        })
+    }
+
+    /// Returns `(prologue, range_expression, single_var)`. Refs are deref'd;
+    /// `single_var` is set for iterables that yield one value per step (channels
+    /// and `iter.Seq<V>`), which use `for v := range` rather than `for _, v`.
+    fn capture_iterable_operand(
+        &mut self,
+        iterable: &Expression,
+    ) -> (Vec<LoweredStatement>, String, bool) {
+        let mut prologue = Vec::new();
+        let iter_raw = self.capture_operand_into(&mut prologue, iterable);
+        let iterable_ty = iterable.get_type();
+        let mut iter_expression = if iterable_ty.is_ref() {
+            format!("*{}", iter_raw)
+        } else {
+            iter_raw
+        };
+        let is_channel = self
+            .native_shape(&iterable_ty)
+            .is_some_and(|shape| matches!(shape, NativeGoType::Channel | NativeGoType::Receiver));
+        if is_channel {
+            self.require_stdlib();
+            iter_expression = format!("lisette.ChannelRange({})", iter_expression);
+        }
+        let single_var = is_channel || self.iter_seq_arity(&iterable_ty) == Some(1);
+        (prologue, iter_expression, single_var)
+    }
+
+    /// `for x in xs` over a non-specialized iterable.
+    fn lower_simple_for(
+        &mut self,
         binding: &Binding,
         iterable: &Expression,
         body: &Expression,
-        needs_label: bool,
-    ) {
-        self.maybe_set_loop_label(needs_label);
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        let (prologue, iter_expression, single_var) = self.capture_iterable_operand(iterable);
 
-        if let Expression::Range {
-            start,
-            end,
-            inclusive,
-            ..
-        } = iterable
-        {
-            self.emit_range_for_loop(output, binding, start, end, *inclusive, body);
-            return;
-        }
+        let (header, lowered_body) = self.with_scope(|this| {
+            let loop_var = this.bind_loop_pattern(&binding.pattern, None);
+            let header = if loop_var == "_" {
+                format!("for range {} {{\n", iter_expression)
+            } else if single_var {
+                format!("for {} := range {} {{\n", loop_var, iter_expression)
+            } else {
+                format!("for _, {} := range {} {{\n", loop_var, iter_expression)
+            };
+            (header, this.lower_block_as_body(body))
+        });
+        (prologue, header, lowered_body)
+    }
 
-        let iterable_ty = iterable.get_type().resolve();
-        if let Some(ty_name) = iterable_ty.get_name()
-            && matches!(ty_name, "Range" | "RangeInclusive" | "RangeFrom")
-        {
-            self.emit_stored_range_for_loop(output, binding, iterable, ty_name, body);
-            return;
-        }
-
-        let iter_expression = self.emit_operand(output, iterable);
-        let iter_expression = if iterable.get_type().resolve().is_ref() {
-            format!("*{}", iter_expression)
-        } else {
-            iter_expression
+    /// `for (k, v) in map`. Simple identifier/wildcard pairs bind directly
+    /// in the `range` header; compound patterns capture into fresh vars and
+    /// destructure inside the body.
+    fn lower_map_tuple_for(
+        &mut self,
+        binding: &Binding,
+        iterable: &Expression,
+        body: &Expression,
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        let Pattern::Tuple { elements, .. } = &binding.pattern else {
+            unreachable!("lower_map_tuple_for requires a tuple pattern");
         };
-
-        let is_channel = iterable_ty
-            .get_name()
-            .is_some_and(|n| n == "Channel" || n == "Receiver");
-
-        self.enter_scope();
-
-        if let Some(label) = self.current_loop_label() {
-            write_line!(output, "{}:", label);
-        }
-
-        match &binding.pattern {
-            Pattern::Identifier { .. } => {
-                self.emit_identifier_for_loop(
-                    output,
-                    &binding.pattern,
-                    &iter_expression,
-                    is_channel,
-                    body,
-                );
-            }
-            Pattern::WildCard { .. } => {
-                write_line!(output, "for range {} {{", iter_expression);
-                self.emit_block(output, body);
-                output.push_str("}\n");
-            }
-            Pattern::Tuple { elements, .. }
-                if elements.len() == 2
-                    && iterable_ty.get_name().is_some_and(|n| {
-                        n == "Map" || n == "OrderedMap" || n == "EnumeratedSlice"
-                    }) =>
-            {
-                self.emit_map_tuple_for_loop(output, elements, &iter_expression, body);
-            }
-            _ => {
-                self.emit_pattern_for_loop(output, binding, &iter_expression, is_channel, body);
-            }
-        }
-
-        self.exit_scope();
-    }
-
-    /// For loops over an identifier-bound iterable: `for x := range xs` (or
-    /// `for range xs` when the binding is discarded). Channels drop the index
-    /// position from the `range` form.
-    fn emit_identifier_for_loop(
-        &mut self,
-        output: &mut String,
-        pattern: &Pattern,
-        iter_expression: &str,
-        is_channel: bool,
-        body: &Expression,
-    ) {
-        let loop_var = self.bind_loop_pattern(pattern, None);
-        if loop_var == "_" {
-            write_line!(output, "for range {} {{", iter_expression);
-        } else if is_channel {
-            write_line!(output, "for {} := range {} {{", loop_var, iter_expression);
-        } else {
-            write_line!(
-                output,
-                "for _, {} := range {} {{",
-                loop_var,
-                iter_expression
-            );
-        }
-        self.emit_block(output, body);
-        output.push_str("}\n");
-    }
-
-    /// Tuple destructuring over a map-like iterable (`Map`, `OrderedMap`,
-    /// `EnumeratedSlice`). Simple identifier/wildcard element pairs bind
-    /// directly in the `range` header; compound patterns capture into fresh
-    /// vars and emit decision-tree bindings inside the loop body.
-    fn emit_map_tuple_for_loop(
-        &mut self,
-        output: &mut String,
-        elements: &[Pattern],
-        iter_expression: &str,
-        body: &Expression,
-    ) {
         let first = &elements[0];
         let second = &elements[1];
+
+        let (prologue, iter_expression, _) = self.capture_iterable_operand(iterable);
 
         let first_is_simple =
             matches!(first, Pattern::Identifier { .. } | Pattern::WildCard { .. });
@@ -151,229 +249,389 @@ impl Emitter<'_> {
             Pattern::Identifier { .. } | Pattern::WildCard { .. }
         );
 
-        if !first_is_simple || !second_is_simple {
-            let key_var = self.fresh_var(Some("key"));
-            let value_var = self.fresh_var(Some("value"));
-            write_line!(
-                output,
-                "for {}, {} := range {} {{",
-                key_var,
-                value_var,
-                iter_expression
-            );
-            let key_guard = DiscardGuard::new(output, &key_var);
-            let value_guard = DiscardGuard::new(output, &value_var);
-            let (_, key_bindings) = decision_tree::collect_pattern_info(self, first, None);
-            decision_tree::emit_tree_bindings(self, output, &key_bindings, &key_var);
-            let (_, value_bindings) = decision_tree::collect_pattern_info(self, second, None);
-            decision_tree::emit_tree_bindings(self, output, &value_bindings, &value_var);
-            self.emit_block(output, body);
-            key_guard.finish(output);
-            value_guard.finish(output);
-            output.push_str("}\n");
-            return;
-        }
+        let (header, lowered_body) = self.with_scope(|this| {
+            if first_is_simple && second_is_simple {
+                this.lower_map_tuple_simple_body(first, second, &iter_expression, body)
+            } else {
+                this.lower_map_tuple_compound_body(
+                    first,
+                    second,
+                    &binding.ty,
+                    &iter_expression,
+                    body,
+                )
+            }
+        });
+        (prologue, header, lowered_body)
+    }
 
+    /// Simple map-tuple element pair: bind directly in the `range` header.
+    fn lower_map_tuple_simple_body(
+        &mut self,
+        first: &Pattern,
+        second: &Pattern,
+        iter_expression: &str,
+        body: &Expression,
+    ) -> (String, LoweredBlock) {
         let first_is_discard =
             matches!(first, Pattern::WildCard { .. }) || self.go_name_for_binding(first).is_none();
         let second_is_discard = matches!(second, Pattern::WildCard { .. })
             || self.go_name_for_binding(second).is_none();
-        if first_is_discard && second_is_discard {
-            write_line!(output, "for range {} {{", iter_expression);
+        let header = if first_is_discard && second_is_discard {
+            format!("for range {} {{\n", iter_expression)
+        } else if second_is_discard {
+            let key = self.bind_loop_pattern(first, None);
+            format!("for {} := range {} {{\n", key, iter_expression)
         } else {
             let key = self.bind_loop_pattern(first, None);
             let value = self.bind_loop_pattern(second, None);
-            write_line!(
-                output,
-                "for {}, {} := range {} {{",
-                key,
-                value,
-                iter_expression
-            );
-        }
-        self.emit_block(output, body);
-        output.push_str("}\n");
+            format!("for {}, {} := range {} {{\n", key, value, iter_expression)
+        };
+        (header, self.lower_block_as_body(body))
     }
 
-    /// Compound-pattern for loop. Captures each element into a fresh `item`
-    /// var, emits decision-tree bindings inside the loop, and discards the
-    /// temp via `DiscardGuard` if the pattern doesn't reference it.
-    fn emit_pattern_for_loop(
+    /// Compound map-tuple element pattern: capture key/value into fresh vars,
+    /// destructure at the top of the body, discard the temp when unused.
+    fn lower_map_tuple_compound_body(
         &mut self,
-        output: &mut String,
-        binding: &Binding,
+        first: &Pattern,
+        second: &Pattern,
+        binding_ty: &Type,
         iter_expression: &str,
-        is_channel: bool,
         body: &Expression,
-    ) {
-        let (_, bindings) = decision_tree::collect_pattern_info(
-            self,
-            &binding.pattern,
-            binding.typed_pattern.as_ref(),
+    ) -> (String, LoweredBlock) {
+        let element_tys: &[Type] = match binding_ty {
+            Type::Tuple(tys) => tys.as_slice(),
+            _ => &[],
+        };
+        let first_ty = element_tys.first().unwrap_or(binding_ty);
+        let second_ty = element_tys.get(1).unwrap_or(binding_ty);
+
+        let key_var = self.fresh_var(Some("key"));
+        let value_var = self.fresh_var(Some("value"));
+        let header = format!(
+            "for {}, {} := range {} {{\n",
+            key_var, value_var, iter_expression
         );
-        if bindings.is_empty() {
-            write_line!(output, "for range {} {{", iter_expression);
-            self.emit_block(output, body);
-            output.push_str("}\n");
-            return;
-        }
-        let item_var = self.fresh_var(Some("item"));
-        if is_channel {
-            write_line!(output, "for {} := range {} {{", item_var, iter_expression);
-        } else {
-            write_line!(
-                output,
-                "for _, {} := range {} {{",
-                item_var,
-                iter_expression
+
+        let ((bindings, lowered_body), used) = self.capture_go_uses(|this| {
+            let mut bindings = String::new();
+            let key_statements = this.lower_irrefutable_pattern_site(
+                PatternSubject::for_value(key_var.clone()),
+                first,
+                first_ty,
             );
+            Renderer.render_lowered_block(
+                &mut bindings,
+                &LoweredBlock {
+                    statements: key_statements,
+                },
+            );
+            if !bindings.is_empty() {
+                this.scope.record_go_use(&key_var);
+            }
+            let after_key = bindings.len();
+            let value_statements = this.lower_irrefutable_pattern_site(
+                PatternSubject::for_value(value_var.clone()),
+                second,
+                second_ty,
+            );
+            Renderer.render_lowered_block(
+                &mut bindings,
+                &LoweredBlock {
+                    statements: value_statements,
+                },
+            );
+            if bindings.len() > after_key {
+                this.scope.record_go_use(&value_var);
+            }
+            (bindings, this.lower_block_as_body(body))
+        });
+
+        let mut inner = vec![LoweredStatement::RawGo(bindings)];
+        inner.extend(lowered_body.statements);
+        let body_block = LoweredBlock { statements: inner };
+
+        let references_value = used.contains(&value_var);
+        let references_key = used.contains(&key_var);
+
+        // Discard guards: value first, then key (insertion order matters).
+        let mut statements = Vec::new();
+        if !references_value {
+            statements.push(LoweredStatement::RawGo(format!("_ = {}\n", value_var)));
         }
-        let guard = DiscardGuard::new(output, &item_var);
-        decision_tree::emit_tree_bindings(self, output, &bindings, &item_var);
-        self.emit_block(output, body);
-        guard.finish(output);
-        output.push_str("}\n");
+        if !references_key {
+            statements.push(LoweredStatement::RawGo(format!("_ = {}\n", key_var)));
+        }
+        statements.extend(body_block.statements);
+        (header, LoweredBlock { statements })
     }
 
-    fn emit_range_for_loop(
+    /// `for <pattern> in iterable` catch-all. Bindless patterns use `for
+    /// range`; binding patterns capture an `item` temp and destructure it at
+    /// the top of the body.
+    fn lower_pattern_site_for(
         &mut self,
-        output: &mut String,
         binding: &Binding,
-        start: &Option<Box<Expression>>,
-        end: &Option<Box<Expression>>,
-        inclusive: bool,
+        iterable: &Expression,
         body: &Expression,
-    ) {
-        let mut start_expression = match start {
-            Some(s) => self.emit_operand(output, s),
-            None => "0".to_string(),
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        let (prologue, iter_expression, single_var) = self.capture_iterable_operand(iterable);
+
+        let (header, body_block) = self.with_scope(|this| {
+            if !pattern_has_bindings(&binding.pattern) {
+                let header = format!("for range {} {{\n", iter_expression);
+                (header, this.lower_block_as_body(body))
+            } else {
+                let item_var = this.fresh_var(Some("item"));
+                let header = if single_var {
+                    format!("for {} := range {} {{\n", item_var, iter_expression)
+                } else {
+                    format!("for _, {} := range {} {{\n", item_var, iter_expression)
+                };
+                let ((bindings, lowered_body), used) = this.capture_go_uses(|this| {
+                    let mut bindings = String::new();
+                    let binding_statements = this.lower_irrefutable_pattern_site(
+                        PatternSubject::for_value(item_var.clone()),
+                        &binding.pattern,
+                        &binding.ty,
+                    );
+                    Renderer.render_lowered_block(
+                        &mut bindings,
+                        &LoweredBlock {
+                            statements: binding_statements,
+                        },
+                    );
+                    if !bindings.is_empty() {
+                        this.scope.record_go_use(&item_var);
+                    }
+                    (bindings, this.lower_block_as_body(body))
+                });
+
+                let mut inner = vec![LoweredStatement::RawGo(bindings)];
+                inner.extend(lowered_body.statements);
+                let body_block = LoweredBlock { statements: inner };
+
+                let references_item = used.contains(&item_var);
+
+                let mut statements = Vec::new();
+                if !references_item {
+                    statements.push(LoweredStatement::RawGo(format!("_ = {}\n", item_var)));
+                }
+                statements.extend(body_block.statements);
+                (header, LoweredBlock { statements })
+            }
+        });
+        (prologue, header, body_block)
+    }
+
+    /// `for i in start..end`.
+    fn lower_range_for(
+        &mut self,
+        binding: &Binding,
+        iterable: &Expression,
+        body: &Expression,
+    ) -> (Vec<LoweredStatement>, String, LoweredBlock) {
+        let Expression::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } = iterable
+        else {
+            unreachable!("lower_range_for requires a Range iterable");
         };
 
-        let checkpoint = output.len();
-
-        let end_expression = end
-            .as_ref()
-            .map(|e| self.emit_force_capture(output, e, "_bound"));
-
-        // If the bound capture produced output and the start has side effects,
-        // hoist start to preserve left-to-right evaluation order.
-        if output.len() > checkpoint && start.as_ref().is_some_and(|s| is_order_sensitive(s)) {
+        let mut prologue = Vec::new();
+        let (mut start_expression, start_is_observable) = match start {
+            Some(start) => {
+                let plan = self.plan_operand(start, ExpressionContext::value());
+                let is_observable = plan.evaluation.stability.is_observable();
+                let (setup, value) = plan.into_parts();
+                prologue.extend(setup);
+                (value, is_observable)
+            }
+            None => ("0".to_string(), false),
+        };
+        let checkpoint = prologue.len();
+        let end_expression = end.as_ref().map(|end| {
+            self.capture_value_at_boundary(
+                &mut prologue,
+                end,
+                "bound",
+                CaptureBoundary::LoopLifetime,
+            )
+        });
+        if prologue.len() > checkpoint
+            && start
+                .as_ref()
+                .is_some_and(|start| start_is_observable && !self.is_unmutated_identifier(start))
+        {
+            // The end bound's capture inserted statements after the start value;
+            // hoist start into its own temp before them so it evaluates first.
             let var = self.fresh_var(Some("start"));
             self.declare(&var);
-            let statement = format!("{} := {}\n", var, start_expression);
-            output.insert_str(checkpoint, &statement);
+            prologue.insert(
+                checkpoint,
+                LoweredStatement::TempBind {
+                    name: var.clone(),
+                    value: start_expression,
+                },
+            );
             start_expression = var;
         }
 
-        self.enter_scope();
-
-        let loop_var = self.bind_loop_pattern(&binding.pattern, Some("_i"));
-
-        match end_expression {
-            Some(end_expression) => {
-                let operator = if inclusive { "<=" } else { "<" };
-                if let Some(label) = self.current_loop_label() {
-                    write_line!(output, "{}:", label);
+        let counts_from_zero = !*inclusive && start_expression == "0";
+        let (header, lowered_body) = self.with_scope(|this| {
+            let header = match end_expression {
+                Some(end_expression) if counts_from_zero => {
+                    let loop_var = this.bind_loop_pattern(&binding.pattern, None);
+                    if loop_var == "_" {
+                        format!("for range {} {{\n", end_expression)
+                    } else {
+                        format!("for {} := range {} {{\n", loop_var, end_expression)
+                    }
                 }
-                write_line!(
-                    output,
-                    "for {} := {}; {} {} {}; {}++ {{",
-                    loop_var,
-                    start_expression,
-                    loop_var,
-                    operator,
-                    end_expression,
-                    loop_var
-                );
-            }
-            None => {
-                if let Some(label) = self.current_loop_label() {
-                    write_line!(output, "{}:", label);
+                Some(end_expression) => {
+                    let loop_var = this.bind_loop_pattern(&binding.pattern, Some("i"));
+                    let operator = if *inclusive { "<=" } else { "<" };
+                    format!(
+                        "for {} := {}; {} {} {}; {}++ {{\n",
+                        loop_var, start_expression, loop_var, operator, end_expression, loop_var
+                    )
                 }
-                write_line!(
-                    output,
-                    "for {} := {}; ; {}++ {{",
-                    loop_var,
-                    start_expression,
-                    loop_var
-                );
-            }
-        }
-
-        self.emit_block(output, body);
-        output.push_str("}\n");
-
-        self.exit_scope();
+                None => {
+                    let loop_var = this.bind_loop_pattern(&binding.pattern, Some("i"));
+                    format!(
+                        "for {} := {}; ; {}++ {{\n",
+                        loop_var, start_expression, loop_var
+                    )
+                }
+            };
+            (header, this.lower_block_as_body(body))
+        });
+        (prologue, header, lowered_body)
     }
 
-    fn emit_stored_range_for_loop(
-        &mut self,
-        output: &mut String,
-        binding: &Binding,
-        iterable: &Expression,
-        ty_name: &str,
-        body: &Expression,
-    ) {
-        self.enter_scope();
-
-        let can_skip_copy = if let Expression::Identifier {
-            binding_id: Some(id),
-            ..
-        } = iterable
+    fn for_loop_is_simple(&self, binding: &Binding, iterable: &Expression) -> bool {
+        if !matches!(
+            &binding.pattern,
+            Pattern::Identifier { .. } | Pattern::WildCard { .. }
+        ) {
+            return false;
+        }
+        if matches!(iterable, Expression::Range { .. }) {
+            return false;
+        }
+        let iterable_ty = iterable.get_type();
+        if let Some(range_shape) = self.range_shape(&iterable_ty)
+            && matches!(
+                range_shape,
+                RangeShape::Range | RangeShape::RangeInclusive | RangeShape::RangeFrom
+            )
         {
-            !self.ctx.mutations.is_mutated(*id)
-        } else {
-            false
-        };
-        let range_var = if can_skip_copy {
-            self.emit_operand(output, iterable)
-        } else {
-            self.emit_force_capture(output, iterable, "_range")
-        };
-        let loop_var = self.bind_loop_pattern(&binding.pattern, Some("_i"));
-
-        if let Some(label) = self.current_loop_label() {
-            write_line!(output, "{}:", label);
+            return false;
         }
-
-        match ty_name {
-            "Range" => {
-                write_line!(
-                    output,
-                    "for {} := {}.Start; {} < {}.End; {}++ {{",
-                    loop_var,
-                    range_var,
-                    loop_var,
-                    range_var,
-                    loop_var
-                );
-            }
-            "RangeInclusive" => {
-                write_line!(
-                    output,
-                    "for {} := {}.Start; {} <= {}.End; {}++ {{",
-                    loop_var,
-                    range_var,
-                    loop_var,
-                    range_var,
-                    loop_var
-                );
-            }
-            "RangeFrom" => {
-                write_line!(
-                    output,
-                    "for {} := {}.Start; ; {}++ {{",
-                    loop_var,
-                    range_var,
-                    loop_var
-                );
-            }
-            _ => unreachable!("unexpected range kind: {}", ty_name),
+        if recognize_string_view_loop(binding, iterable).is_some() {
+            return false;
         }
+        true
+    }
 
-        self.emit_block(output, body);
-        output.push_str("}\n");
+    /// `for (k, v) in map` where the iterable is map-like and the pattern is a
+    /// 2-tuple. Both simple and compound element patterns route through
+    /// `lower_map_tuple_for`.
+    fn for_loop_is_map_tuple(&self, binding: &Binding, iterable: &Expression) -> bool {
+        let Pattern::Tuple { elements, .. } = &binding.pattern else {
+            return false;
+        };
+        elements.len() == 2 && self.is_map_tuple_iterable(&iterable.get_type())
+    }
 
-        self.exit_scope();
+    /// Extract a loop variable from a pattern, binding the identifier if present.
+    /// `fallback` controls what happens when the pattern is unused or non-identifier:
+    /// - `Some(hint)`: generate a fresh var (needed for C-style loops where `_` is invalid)
+    /// - `None`: use `"_"` (valid in `for range` syntax)
+    fn bind_loop_pattern(&mut self, pattern: &Pattern, fallback: Option<&str>) -> String {
+        if let Pattern::Identifier { identifier, .. } = pattern
+            && let Some(mut go_name) = self.go_name_for_binding(pattern)
+        {
+            if self.scope.has_binding_for_go_name(&go_name)
+                || self.scope.is_go_name_declared(&go_name)
+            {
+                go_name = self.fresh_var(Some(&go_name));
+            }
+            return self.scope.bind(identifier, go_name);
+        }
+        match fallback {
+            Some(hint) => self.fresh_var(Some(hint)),
+            None => "_".to_string(),
+        }
+    }
+
+    fn is_map_tuple_iterable(&self, iterable_ty: &Type) -> bool {
+        self.native_shape(iterable_ty)
+            .is_some_and(|shape| matches!(shape, NativeGoType::Map | NativeGoType::EnumeratedSlice))
+            || self.iter_seq_arity(iterable_ty) == Some(2)
+    }
+
+    fn iter_seq_arity(&self, iterable_ty: &Type) -> Option<usize> {
+        let Type::Nominal { id, .. } = iterable_ty.strip_refs() else {
+            return None;
+        };
+        match id.as_str() {
+            "go:iter.Seq" => Some(1),
+            "go:iter.Seq2" => Some(2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StringViewKind {
+    Bytes,
+    Runes,
+}
+
+/// Recognise `for x in s.bytes()` / `for x in s.runes()` for zero-alloc lowering.
+fn recognize_string_view_loop<'a>(
+    binding: &'a Binding,
+    iterable: &'a Expression,
+) -> Option<(StringViewKind, &'a Expression)> {
+    if !matches!(
+        &binding.pattern,
+        Pattern::Identifier { .. } | Pattern::WildCard { .. }
+    ) {
+        return None;
+    }
+
+    let Expression::Call {
+        expression, args, ..
+    } = iterable
+    else {
+        return None;
+    };
+
+    if !args.is_empty() {
+        return None;
+    }
+
+    let Expression::DotAccess {
+        expression: receiver,
+        member,
+        ..
+    } = expression.as_ref()
+    else {
+        return None;
+    };
+
+    if !receiver.get_type().has_name("string") {
+        return None;
+    }
+
+    match member.as_str() {
+        "bytes" => Some((StringViewKind::Bytes, receiver.as_ref())),
+        "runes" => Some((StringViewKind::Runes, receiver.as_ref())),
+        _ => None,
     }
 }

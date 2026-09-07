@@ -1,19 +1,29 @@
 ---
 source: tests/spec/emit/control_flow.rs
-description: "input: \nfn get_option() -> Option<int> { Some(42) }\n\nfn test() -> int {\n  match get_option() {\n    Some(x) if x > 0 => x,\n    Some(_) => 0,\n    None => -1,\n  }\n}\n"
+description: |
+  
+  fn get_option() -> Option<int> { Some(42) }
+  
+  fn test() -> int {
+    match get_option() {
+      Some(x) if x > 0 => x,
+      Some(_) => 0,
+      None => -1,
+    }
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func get_option() lisette.Option[int] {
-	return lisette.MakeOptionSome[int](42)
+func getOption() (int, bool) {
+	return 42, true
 }
 
 func test() int {
-	subject_1 := get_option()
-	if subject_1.Tag == lisette.OptionSome {
-		x := subject_1.SomeVal
+	option_1 := lisette.OptionFromCommaOk[int](getOption())
+	if option_1.Tag == lisette.OptionSome {
+		x := option_1.SomeVal
 		if x > 0 {
 			return x
 		}

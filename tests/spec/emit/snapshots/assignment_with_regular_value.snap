@@ -1,10 +1,12 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn test() {\n  let mut x = 0;\n  x = 42;\n}\n"
+description: |
+  
+  fn test() {
+    let mut x = 0;
+    x = 42;
+  }
 ---
 package main
 
-func test() {
-	_ = 0
-	_ = 42
-}
+func test() {}

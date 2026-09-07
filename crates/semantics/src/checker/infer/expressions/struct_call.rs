@@ -1,346 +1,713 @@
 use rustc_hash::FxHashSet as HashSet;
 
+use crate::checker::EnvResolve;
+use crate::zero::{MapZero, NoZero, NoZeroReason};
 use ecow::EcoString;
-use syntax::ast::{Expression, Span, StructFieldAssignment};
-use syntax::program::Definition;
-use syntax::types::{SubstitutionMap, Type, substitute};
+use syntax::ast::{Expression, Span, StructFieldAssignment, StructFields, StructSpread};
+use syntax::program::{Definition, DefinitionBody};
+use syntax::types::{SubstitutionMap, Type, substitute, unqualified_name};
 
-use super::super::Checker;
+use super::permission::{ConstructionGrant, MissingSupply};
+use crate::checker::infer::InferCtx;
+use crate::store::Store;
+use crate::zero;
+use std::marker::PhantomData;
+use syntax::ast::EnumFieldDefinition;
+use syntax::go_names;
+use syntax::program::AliasKind;
 
-impl Checker<'_, '_> {
-    pub(super) fn infer_struct_call(
-        &mut self,
-        struct_name: EcoString,
-        field_assignments: Vec<StructFieldAssignment>,
-        spread: Box<Option<Expression>>,
-        span: Span,
-        expected_ty: &Type,
-    ) -> Expression {
-        if let Some(qualified_name) = self.lookup_qualified_name(&struct_name)
-            && let Some(Definition::Struct {
-                ty: struct_ty,
-                fields: struct_fields,
-                ..
-            }) = self.store.get_definition(&qualified_name)
-        {
-            let struct_ty = struct_ty.clone();
-            let struct_fields = struct_fields.clone();
+/// Inputs to `infer_structish_fields` shared between struct and enum-variant literals.
+struct StructishCtx<'a, 'b, F> {
+    field_assignments: &'b [StructFieldAssignment],
+    target_ty: &'b Type,
+    owner_name: &'b str,
+    spread: &'b StructSpread,
+    span: Span,
+    all_fields: F,
+    map: &'b SubstitutionMap,
+    _marker: PhantomData<&'a ()>,
+}
 
-            self.track_name_usage(&qualified_name, &span, struct_name.len() as u32);
-            return self.infer_struct_call_for_struct(
-                struct_name,
-                qualified_name,
-                struct_ty,
-                struct_fields,
-                field_assignments,
-                spread,
-                span,
-                expected_ty,
-            );
-        }
+struct StructLiteral {
+    name: EcoString,
+    fields: Vec<StructFieldAssignment>,
+    spread: StructSpread,
+    span: Span,
+}
 
-        if let Some(qualified_name) = self.lookup_qualified_name(&struct_name)
-            && let Some(Definition::TypeAlias {
-                ty: alias_ty,
-                annotation,
-                ..
-            }) = self.store.get_definition(&qualified_name)
-        {
-            let alias_ty = alias_ty.clone();
-            let is_opaque = annotation.is_opaque();
-
-            let underlying = match &alias_ty {
-                Type::Forall { body, .. } => body.as_ref().clone(),
-                _ => alias_ty.clone(),
-            };
-            if let Type::Constructor { id: struct_id, .. } = &underlying
-                && let Some(Definition::Struct {
-                    ty: struct_ty,
-                    fields: struct_fields,
-                    ..
-                }) = self.store.get_definition(struct_id)
-            {
-                let struct_ty = struct_ty.clone();
-                let struct_fields = struct_fields.clone();
-                return self.infer_struct_call_for_struct(
-                    struct_name,
-                    struct_id.to_string(),
-                    struct_ty,
-                    struct_fields,
-                    field_assignments,
-                    spread,
-                    span,
-                    expected_ty,
-                );
-            }
-
-            // Opaque types (e.g., Go's sync.WaitGroup) can be zero-value instantiated
-            // with T{} even though they have no struct definition.
-            if is_opaque && field_assignments.is_empty() {
-                let (instantiated_ty, _) = self.instantiate(&alias_ty);
-                self.unify(expected_ty, &instantiated_ty, &span);
-                return Expression::StructCall {
-                    name: struct_name,
-                    field_assignments,
-                    spread,
-                    ty: instantiated_ty,
-                    span,
-                };
-            }
-        }
-
-        if let Some((type_part, variant_name)) = struct_name.rsplit_once('.')
-            && let Some(qualified_name) = self.lookup_qualified_name(type_part)
-            && let Some(Definition::TypeAlias { ty: alias_ty, .. }) =
-                self.store.get_definition(&qualified_name)
-        {
-            let alias_ty = alias_ty.clone();
-
-            let underlying = match &alias_ty {
-                Type::Forall { body, .. } => body.as_ref().clone(),
-                _ => alias_ty.clone(),
-            };
-            let variant_fields = if let Type::Constructor { id: enum_id, .. } = &underlying
-                && let Some(Definition::Enum { variants, .. }) = self.store.get_definition(enum_id)
-                && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
-                && variant.fields.is_struct()
-            {
-                Some(variant.fields.iter().cloned().collect::<Vec<_>>())
-            } else {
-                None
-            };
-
-            if let Some(variant_fields) = variant_fields {
-                let (instantiated_ty, map) = self.instantiate(&alias_ty);
-                let enum_ty = match instantiated_ty {
-                    Type::Function { return_type, .. } => *return_type,
-                    _ => instantiated_ty,
-                };
-                return self.infer_struct_call_for_enum_variant(
-                    struct_name,
-                    variant_fields,
-                    map,
-                    field_assignments,
-                    spread,
-                    span,
-                    expected_ty,
-                    enum_ty,
-                );
-            }
-        }
-
-        if let Some(ty) = self.lookup_type(&struct_name) {
-            let (value_constructor_type, map) = self.instantiate(&ty);
-
-            let pattern_ty = match value_constructor_type {
-                Type::Function { return_type, .. } => *return_type,
-                Type::Constructor { .. } => value_constructor_type,
-                _ => {
-                    self.sink
-                        .push(diagnostics::infer::struct_not_found(&struct_name, span));
-                    self.unify(expected_ty, &Type::Error, &span);
-                    return Expression::StructCall {
-                        name: struct_name,
-                        field_assignments,
-                        spread,
-                        ty: Type::Error,
-                        span,
-                    };
-                }
-            };
-
-            let resolved_ty = pattern_ty.resolve();
-            let variant_name = struct_name.split('.').next_back().unwrap_or(&struct_name);
-
-            if let Type::Constructor { id, .. } = &resolved_ty
-                && let Some(Definition::Enum { variants, .. }) = self.store.get_definition(id)
-                && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
-                && variant.fields.is_struct()
-            {
-                let variant_fields: Vec<_> = variant.fields.iter().cloned().collect();
-                return self.infer_struct_call_for_enum_variant(
-                    struct_name,
-                    variant_fields,
-                    map,
-                    field_assignments,
-                    spread,
-                    span,
-                    expected_ty,
-                    pattern_ty,
-                );
-            }
-        }
-
-        self.sink
-            .push(diagnostics::infer::struct_not_found(&struct_name, span));
-        self.unify(expected_ty, &Type::Error, &span);
+impl StructLiteral {
+    fn with_type(self, ty: Type) -> Expression {
         Expression::StructCall {
-            name: struct_name,
-            field_assignments,
-            spread,
-            ty: Type::Error,
-            span,
+            name: self.name,
+            field_assignments: self.fields,
+            spread: self.spread,
+            ty,
+            span: self.span,
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn infer_struct_call_for_struct(
+struct ResolvedStruct {
+    qualified_name: EcoString,
+    ty: Type,
+    fields: StructFields,
+    alias_underlying: Option<Type>,
+}
+
+struct ResolvedVariant {
+    fields: Vec<EnumFieldDefinition>,
+    substitutions: SubstitutionMap,
+    ty: Type,
+}
+
+impl InferCtx<'_> {
+    pub(super) fn infer_struct_call(
         &mut self,
-        struct_name: EcoString,
-        qualified_name: String,
-        struct_ty: Type,
-        struct_fields: Vec<syntax::ast::StructFieldDefinition>,
-        field_assignments: Vec<StructFieldAssignment>,
-        spread: Box<Option<Expression>>,
-        span: Span,
+        expression: Expression,
         expected_ty: &Type,
     ) -> Expression {
+        let Expression::StructCall {
+            name,
+            field_assignments,
+            spread,
+            span,
+            ..
+        } = expression
+        else {
+            unreachable!("infer_struct_call called with non-StructCall expression");
+        };
+        let literal = StructLiteral {
+            name,
+            fields: field_assignments,
+            spread,
+            span,
+        };
+        let store = self.store;
+
+        if let Some(resolved) = self
+            .as_struct(store, &literal)
+            .or_else(|| self.as_alias_struct(store, &literal.name))
+        {
+            return self.infer_struct_call_for_struct(literal, resolved, expected_ty);
+        }
+
+        // Opaque types (e.g., Go's sync.WaitGroup) can be zero-value instantiated
+        // with T{} even though they have no struct definition.
+        if let Some(qualified_name) = self.lookup_qualified_name(store, &literal.name)
+            && let Some(Definition {
+                ty: alias_ty,
+                body: DefinitionBody::TypeAlias { alias, .. },
+                ..
+            }) = store.get_definition(&qualified_name)
+            && matches!(alias, AliasKind::Opaque(_))
+            && literal.fields.is_empty()
+        {
+            let alias_ty = alias_ty.clone();
+            let (instantiated_ty, _) = self.instantiate(&alias_ty);
+            self.unify(expected_ty, &instantiated_ty, &literal.span);
+            let from_package = self.cursor.package_id().to_string();
+            if self
+                .has_zero(&instantiated_ty, &from_package, MapZero::Built)
+                .is_err()
+            {
+                self.sink.push(diagnostics::infer::hidden_state_no_zero(
+                    &instantiated_ty,
+                    literal.span,
+                ));
+            }
+            return literal.with_type(instantiated_ty);
+        }
+
+        if let Some(resolved) = self
+            .as_alias_variant(store, &literal.name)
+            .or_else(|| self.as_variant(store, &literal.name))
+        {
+            return self.infer_struct_call_for_enum_variant(literal, resolved, expected_ty);
+        }
+
+        if !self.may_name_uninferred_export(store, &literal.name) {
+            self.sink.push(diagnostics::infer::struct_not_found(
+                &literal.name,
+                literal.span,
+            ));
+        }
+        self.unify(expected_ty, &Type::Error, &literal.span);
+        literal.with_type(Type::Error)
+    }
+
+    fn as_struct(&mut self, store: &Store, literal: &StructLiteral) -> Option<ResolvedStruct> {
+        let qualified_name = self.lookup_qualified_name(store, &literal.name)?;
+        let Definition {
+            ty: struct_ty,
+            body:
+                DefinitionBody::Struct {
+                    fields: struct_fields,
+                    ..
+                },
+            ..
+        } = store.get_definition(&qualified_name)?
+        else {
+            return None;
+        };
+        let struct_ty = struct_ty.clone();
+        let struct_fields = struct_fields.clone();
+
+        self.track_name_usage(
+            store,
+            &qualified_name,
+            &literal.span,
+            literal.name.len() as u32,
+        );
+        Some(ResolvedStruct {
+            qualified_name,
+            ty: struct_ty,
+            fields: struct_fields,
+            alias_underlying: None,
+        })
+    }
+
+    /// Resolve a `type Alias = Struct` name to its underlying struct.
+    fn as_alias_struct(&mut self, store: &Store, name: &str) -> Option<ResolvedStruct> {
+        let qualified_name = self.lookup_qualified_name(store, name)?;
+        let Definition {
+            ty: alias_ty,
+            body: DefinitionBody::TypeAlias { alias, .. },
+            ..
+        } = store.get_definition(&qualified_name)?
+        else {
+            return None;
+        };
+        let alias_ty = alias_ty.clone();
+        let is_opaque = matches!(alias, AliasKind::Opaque(_));
+
+        let underlying = (!is_opaque).then(|| store.peel_alias(&alias_ty));
+        let Some(Type::Nominal { id: struct_id, .. }) = &underlying else {
+            return None;
+        };
+        let Definition {
+            ty: struct_ty,
+            body:
+                DefinitionBody::Struct {
+                    fields: struct_fields,
+                    ..
+                },
+            ..
+        } = store.get_definition(struct_id)?
+        else {
+            return None;
+        };
+        let struct_ty = struct_ty.clone();
+        let struct_fields = struct_fields.clone();
+        let struct_id_str: EcoString = struct_id.into();
+        // Deliberately None for a `Type::Forall` alias.
+        let alias_underlying = if matches!(&alias_ty, Type::Forall { .. }) {
+            None
+        } else {
+            underlying
+        };
+        Some(ResolvedStruct {
+            qualified_name: struct_id_str,
+            ty: struct_ty,
+            fields: struct_fields,
+            alias_underlying,
+        })
+    }
+
+    fn as_alias_variant(&mut self, store: &Store, name: &str) -> Option<ResolvedVariant> {
+        let (type_part, variant_name) = name.rsplit_once('.')?;
+        let qualified_name = self.lookup_qualified_name(store, type_part)?;
+        let Definition {
+            ty: alias_ty,
+            body:
+                DefinitionBody::TypeAlias {
+                    alias: AliasKind::Transparent { .. },
+                    ..
+                },
+            ..
+        } = store.get_definition(&qualified_name)?
+        else {
+            return None;
+        };
+        let alias_ty = alias_ty.clone();
+        let underlying = store.peel_alias(&alias_ty);
+        let Type::Nominal { id: enum_id, .. } = &underlying else {
+            return None;
+        };
+        let variants = store.variants_of(enum_id)?;
+        let variant = variants.iter().find(|v| v.name == variant_name)?;
+        if !variant.fields.is_struct() {
+            return None;
+        }
+        let variant_fields: Vec<_> = variant.fields.iter().cloned().collect();
+
+        let (instantiated_ty, map) = self.instantiate(&alias_ty);
+        let instantiated_target = store.peel_alias(&instantiated_ty);
+        let enum_ty = match instantiated_target {
+            Type::Function(f) => (*f.return_type).clone(),
+            other => other,
+        };
+        Some(ResolvedVariant {
+            fields: variant_fields,
+            substitutions: map,
+            ty: enum_ty,
+        })
+    }
+
+    fn as_variant(&mut self, store: &Store, name: &str) -> Option<ResolvedVariant> {
+        let ty = self.lookup_type(store, name)?;
+        let (value_constructor_type, map) = self.instantiate(&ty);
+
+        let pattern_ty = match value_constructor_type {
+            Type::Function(f) => (*f.return_type).clone(),
+            Type::Nominal { .. } => value_constructor_type,
+            _ => return None,
+        };
+
+        let resolved_ty = pattern_ty.resolve_in(&self.env);
+        let variant_name = unqualified_name(name);
+
+        let Type::Nominal { id, .. } = &resolved_ty else {
+            return None;
+        };
+        let variants = store.variants_of(id)?;
+        let variant = variants.iter().find(|v| v.name == variant_name)?;
+        if !variant.fields.is_struct() {
+            return None;
+        }
+        let variant_fields: Vec<_> = variant.fields.iter().cloned().collect();
+        Some(ResolvedVariant {
+            fields: variant_fields,
+            substitutions: map,
+            ty: pattern_ty,
+        })
+    }
+
+    fn infer_struct_call_for_struct(
+        &mut self,
+        literal: StructLiteral,
+        target: ResolvedStruct,
+        expected_ty: &Type,
+    ) -> Expression {
+        let StructLiteral {
+            name: struct_name,
+            fields: field_assignments,
+            spread,
+            span,
+        } = literal;
+        let ResolvedStruct {
+            qualified_name,
+            ty: struct_ty,
+            fields: struct_fields,
+            alias_underlying,
+        } = target;
+        let store = self.store;
         let (struct_call_ty, map) = self.instantiate(&struct_ty);
 
-        let new_spread = (*spread).map(|s| {
-            self.with_value_context(|checker| checker.infer_expression(s, &struct_call_ty))
-        });
+        if let Some(underlying) = alias_underlying {
+            self.unify(&struct_call_ty, &underlying, &span);
+        }
 
-        let struct_module = qualified_name.split('.').next().unwrap_or(&qualified_name);
-        let is_cross_module = struct_module != self.cursor.module_id
+        let peeled_expected = store.deep_resolve_alias(&expected_ty.resolve_in(&self.env));
+        if same_nominal(&peeled_expected, &struct_call_ty)
+            && !store.contains_unknown(&peeled_expected)
+        {
+            let _ =
+                self.speculatively(|this| this.try_unify(&peeled_expected, &struct_call_ty, &span));
+        }
+
+        let new_spread = self.infer_struct_spread(spread, &struct_call_ty);
+
+        let struct_package = store
+            .package_for_qualified_name(&qualified_name)
+            .unwrap_or(&qualified_name);
+        let is_cross_package = struct_package != self.cursor.package_id()
             || struct_name
                 .split_once('.')
-                .is_some_and(|(prefix, _)| self.imports.imported_modules.contains_key(prefix));
+                .is_some_and(|(prefix, _)| self.imports.namespace(prefix).is_some());
+        let is_go_imported = qualified_name.starts_with("go:");
 
-        let mut matched_fields = HashSet::default();
-        let new_field_assignments = field_assignments
-            .iter()
-            .map(|field| {
-                let field_definition = struct_fields.iter().find(|f| f.name == field.name);
-
-                let field_ty = match field_definition {
-                    Some(field_definition) => {
-                        matched_fields.insert(field.name.clone());
-
-                        if is_cross_module && !field_definition.visibility.is_public() {
-                            self.sink.push(diagnostics::infer::private_field_access(
-                                &field.name,
-                                &struct_name,
-                                field.name_span,
-                            ));
-                        }
-
-                        substitute(&field_definition.ty, &map)
-                    }
-                    None => {
-                        let available: Vec<String> =
-                            struct_fields.iter().map(|f| f.name.to_string()).collect();
-                        self.sink.push(diagnostics::infer::member_not_found(
-                            &struct_call_ty,
-                            &field.name,
-                            span,
-                            Some(&available),
-                        ));
-                        self.new_type_var()
-                    }
-                };
-
-                let new_value = self
-                    .with_value_context(|s| s.infer_expression((*field.value).clone(), &field_ty));
-
-                self.check_not_temp_producing(&new_value);
-
-                StructFieldAssignment {
-                    name: field.name.clone(),
-                    name_span: field.name_span,
-                    value: Box::new(new_value),
-                }
-            })
-            .collect();
-
-        if matched_fields.len() != struct_fields.len() && new_spread.is_none() {
-            let mut missing_fields: Vec<String> = struct_fields
-                .iter()
-                .filter(|f| !matched_fields.contains(f.name.as_str()))
-                .map(|f| f.name.to_string())
-                .collect();
-
-            missing_fields.sort();
-
-            self.sink.push(diagnostics::infer::struct_missing_fields(
-                &struct_name,
-                &missing_fields,
+        if is_go_imported
+            && !matches!(new_spread, StructSpread::From(_))
+            && let Some(def) = store.get_definition(&qualified_name)
+            && zero::go_struct_denies_zero(def, &struct_fields)
+        {
+            self.sink.push(diagnostics::infer::hidden_state_no_zero(
+                &struct_call_ty,
                 span,
             ));
         }
 
-        if let Some(ref spread_expression) = new_spread
-            && is_cross_module
+        let (new_field_assignments, matched_fields) = self.infer_structish_fields(
+            StructishCtx {
+                field_assignments: &field_assignments,
+                target_ty: &struct_call_ty,
+                owner_name: &struct_name,
+                spread: &new_spread,
+                span,
+                all_fields: struct_fields.iter().map(|f| (&f.name, &f.ty)),
+                map: &map,
+                _marker: PhantomData,
+            },
+            |checker, assignment| {
+                let def = struct_fields.iter().find(|f| f.name == assignment.name)?;
+                if is_cross_package && !def.visibility.is_public() {
+                    checker.sink.push(diagnostics::infer::private_field_access(
+                        &assignment.name,
+                        &struct_name,
+                        struct_package,
+                        assignment.name_span,
+                    ));
+                }
+                Some(&def.ty)
+            },
+        );
+
+        if let StructSpread::Autofill { span: spread_span } = &new_spread {
+            self.check_autofill_fields(
+                &struct_name,
+                struct_fields
+                    .iter()
+                    .filter(|f| !(is_go_imported && zero::hidden_embed_field(f)))
+                    .map(|f| (&f.name, &f.ty)),
+                &matched_fields,
+                &map,
+                *spread_span,
+            );
+        }
+
+        if let Some(spread_span) = new_spread.span()
+            && is_cross_package
+            && !is_go_imported
         {
+            let owning_package = store
+                .package_for_qualified_name(&qualified_name)
+                .unwrap_or(&qualified_name);
             for field in &struct_fields {
                 if !matched_fields.contains(&field.name) && !field.visibility.is_public() {
-                    self.sink.push(diagnostics::infer::private_field_in_spread(
-                        &field.name,
-                        &struct_name,
-                        spread_expression.get_span(),
-                    ));
+                    let diag = match &new_spread {
+                        StructSpread::Autofill { .. } => {
+                            diagnostics::infer::private_field_in_autofill(
+                                &field.name,
+                                &struct_name,
+                                owning_package,
+                                spread_span,
+                            )
+                        }
+                        _ => diagnostics::infer::private_field_in_spread(
+                            &field.name,
+                            &struct_name,
+                            owning_package,
+                            spread_span,
+                        ),
+                    };
+                    self.sink.push(diag);
                     break;
                 }
             }
         }
 
-        self.unify(expected_ty, &struct_call_ty, &span);
+        self.mark_writable_initializer_uses(
+            struct_fields
+                .iter()
+                .filter(|f| self.store.demotion_changes(&f.ty))
+                .map(|f| &f.name),
+            &new_field_assignments,
+        );
+
+        let grant = self.construction_grants_write(
+            struct_fields.iter().map(|f| (&f.name, &f.ty)),
+            &new_field_assignments,
+            &new_spread,
+        );
+        let struct_call_ty = if self.record_construction_grant(span, grant) {
+            struct_call_ty.make_writable()
+        } else {
+            struct_call_ty
+        };
+
+        let final_expected = store.deep_resolve_alias(&expected_ty.resolve_in(&self.env));
+        self.unify(&final_expected, &struct_call_ty, &span);
+
+        self.register_construction_obligations(&struct_name, &struct_call_ty, span);
 
         Expression::StructCall {
             name: struct_name,
             field_assignments: new_field_assignments,
-            spread: new_spread.into(),
+            spread: new_spread,
             ty: struct_call_ty,
             span,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Keeps `lint.unnecessary_mut` quiet on values feeding `mut`-declared fields.
+    fn mark_writable_initializer_uses<'f>(
+        &mut self,
+        mut_field_names: impl Iterator<Item = &'f EcoString>,
+        assignments: &[StructFieldAssignment],
+    ) {
+        for name in mut_field_names {
+            if let Some(assignment) = assignments.iter().find(|a| &a.name == name)
+                && let Some(root) =
+                    super::aliasing::place_root_name(assignment.value.unwrap_parens())
+                && let Some(binding_id) = self.scopes.lookup_binding_id(&root)
+            {
+                self.facts.mark_alias_mutated(binding_id);
+            }
+        }
+    }
+
+    fn construction_grants_write<'f>(
+        &self,
+        fields: impl Iterator<Item = (&'f EcoString, &'f Type)>,
+        assignments: &[StructFieldAssignment],
+        spread: &StructSpread,
+    ) -> ConstructionGrant {
+        let missing = match spread {
+            StructSpread::Autofill { .. } => MissingSupply::Zero,
+            StructSpread::From(base) => MissingSupply::Spread(base),
+            StructSpread::None => MissingSupply::Absent,
+        };
+        self.components_grant_write(
+            fields.map(|(name, ty)| {
+                let value = assignments
+                    .iter()
+                    .find(|a| &a.name == name)
+                    .map(|a| a.value.as_ref());
+                (name.to_string(), ty.clone(), value)
+            }),
+            missing,
+        )
+    }
+
     fn infer_struct_call_for_enum_variant(
         &mut self,
-        variant_name: EcoString,
-        variant_fields: Vec<syntax::ast::EnumFieldDefinition>,
-        map: SubstitutionMap,
-        field_assignments: Vec<StructFieldAssignment>,
-        spread: Box<Option<Expression>>,
-        span: Span,
+        literal: StructLiteral,
+        target: ResolvedVariant,
         expected_ty: &Type,
-        enum_ty: Type,
     ) -> Expression {
+        let StructLiteral {
+            name: variant_name,
+            fields: field_assignments,
+            spread,
+            span,
+        } = literal;
+        let ResolvedVariant {
+            fields: variant_fields,
+            substitutions: map,
+            ty: enum_ty,
+        } = target;
+        let store = self.store;
+        // The expected type unifies after the grant, so a binding captures the promoted form.
+        let resolved_enum = enum_ty.resolve_in(&self.env);
+        if let Type::Nominal { id, .. } = &resolved_enum {
+            let variant_last = unqualified_name(&variant_name);
+            let qualified = id.with_segment(variant_last).to_string();
+            self.track_name_usage(store, &qualified, &span, span.byte_length);
+        }
+
+        let new_spread = self.infer_struct_spread(spread, &enum_ty);
+
+        let (new_field_assignments, matched_fields) = self.infer_structish_fields(
+            StructishCtx {
+                field_assignments: &field_assignments,
+                target_ty: &enum_ty,
+                owner_name: &variant_name,
+                spread: &new_spread,
+                span,
+                all_fields: variant_fields.iter().map(|f| (&f.name, &f.ty)),
+                map: &map,
+                _marker: PhantomData,
+            },
+            |_checker, assignment| {
+                variant_fields
+                    .iter()
+                    .find(|f| f.name == assignment.name)
+                    .map(|f| &f.ty)
+            },
+        );
+
+        if let StructSpread::Autofill { span: spread_span } = &new_spread {
+            self.check_autofill_fields(
+                &variant_name,
+                variant_fields.iter().map(|f| (&f.name, &f.ty)),
+                &matched_fields,
+                &map,
+                *spread_span,
+            );
+        }
+
+        if let StructSpread::From(spread_expression) = &new_spread {
+            self.check_enum_spread_fields(
+                &resolved_enum,
+                &variant_name,
+                &variant_fields,
+                &matched_fields,
+                spread_expression.get_span(),
+            );
+        }
+
+        if let Type::Nominal { id, .. } = &resolved_enum {
+            let enum_id = id.as_str();
+            self.register_construction_obligations(enum_id, &enum_ty, span);
+        }
+
+        self.mark_writable_initializer_uses(
+            variant_fields
+                .iter()
+                .filter(|f| self.store.demotion_changes(&f.ty))
+                .map(|f| &f.name),
+            &new_field_assignments,
+        );
+
+        // The same construction grant as struct literals.
+        let grant = self.construction_grants_write(
+            variant_fields.iter().map(|f| (&f.name, &f.ty)),
+            &new_field_assignments,
+            &new_spread,
+        );
+        let enum_ty = if self.record_construction_grant(span, grant) {
+            enum_ty.resolve_in(&self.env).make_writable()
+        } else {
+            enum_ty
+        };
+
         self.unify(expected_ty, &enum_ty, &span);
 
-        let new_spread = (*spread)
-            .map(|s| self.with_value_context(|checker| checker.infer_expression(s, &enum_ty)));
+        Expression::StructCall {
+            name: variant_name,
+            field_assignments: new_field_assignments,
+            spread: new_spread,
+            ty: enum_ty,
+            span,
+        }
+    }
 
-        let mut matched_fields = HashSet::default();
-        let new_field_assignments: Vec<StructFieldAssignment> = field_assignments
+    fn infer_struct_spread(&mut self, spread: StructSpread, target_ty: &Type) -> StructSpread {
+        match spread {
+            StructSpread::None => StructSpread::None,
+            StructSpread::From(s) => {
+                let inferred =
+                    self.with_value_context(|checker| checker.infer_expression(*s, target_ty));
+                StructSpread::From(Box::new(inferred))
+            }
+            StructSpread::Autofill { span } => StructSpread::Autofill { span },
+        }
+    }
+
+    fn check_enum_spread_fields(
+        &mut self,
+        resolved_enum: &Type,
+        written_name: &str,
+        variant_fields: &[EnumFieldDefinition],
+        matched_fields: &HashSet<EcoString>,
+        spread_span: Span,
+    ) {
+        let store = self.store;
+        let Type::Nominal { id, .. } = resolved_enum else {
+            return;
+        };
+        let Some(variants) = store.variants_of(id) else {
+            return;
+        };
+        let enum_name = unqualified_name(id);
+        let target_variant = unqualified_name(written_name);
+        let written_enum = written_name
+            .rsplit_once('.')
+            .map_or(enum_name, |(prefix, _)| prefix);
+        let Some(target_index) = variants.iter().position(|v| v.name == target_variant) else {
+            return;
+        };
+        let slots = go_names::enum_field_slots(enum_name, variants);
+        let missing: Vec<String> = variant_fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !matched_fields.contains(&field.name))
+            .filter(|(field_index, field)| {
+                let Some(target_slot) = slots[target_index].get(*field_index) else {
+                    return false;
+                };
+                !variants.iter().enumerate().all(|(other_variant, variant)| {
+                    variant
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .any(|(other_index, other)| {
+                            other.name == field.name
+                                && slots[other_variant].get(other_index) == Some(target_slot)
+                        })
+                })
+            })
+            .map(|(_, field)| field.name.to_string())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let counterexample = missing.iter().find_map(|field_name| {
+            variants
+                .iter()
+                .find(|variant| !variant.fields.iter().any(|f| f.name == field_name.as_str()))
+                .map(|variant| (variant.name.as_str(), field_name.as_str()))
+        });
+        let builtin_collisions = missing
+            .iter()
+            .filter(|field_name| {
+                go_names::is_builtin_enum_member(&go_names::snake_to_camel(field_name))
+            })
+            .count();
+        let reason = if builtin_collisions == missing.len() {
+            diagnostics::infer::SeparateSlotReason::BuiltinMember
+        } else if builtin_collisions == 0 {
+            diagnostics::infer::SeparateSlotReason::ConflictingTypes
+        } else {
+            diagnostics::infer::SeparateSlotReason::Mixed
+        };
+        self.sink
+            .push(diagnostics::infer::enum_spread_missing_fields(
+                written_enum,
+                target_variant,
+                &missing,
+                counterexample,
+                reason,
+                spread_span,
+            ));
+    }
+
+    fn infer_structish_fields<'a, FindDef>(
+        &mut self,
+        ctx: StructishCtx<'a, '_, impl Iterator<Item = (&'a EcoString, &'a Type)> + Clone>,
+        mut find_def: FindDef,
+    ) -> (Vec<StructFieldAssignment>, HashSet<EcoString>)
+    where
+        FindDef: FnMut(&mut Self, &StructFieldAssignment) -> Option<&'a Type>,
+    {
+        let mut matched = HashSet::default();
+        let mut unknown_fields: Vec<EcoString> = vec![];
+        let new_assignments: Vec<StructFieldAssignment> = ctx
+            .field_assignments
             .iter()
             .map(|field| {
-                let field_definition = variant_fields.iter().find(|f| f.name == field.name);
-
-                let field_ty = match field_definition {
-                    Some(field_definition) => {
-                        matched_fields.insert(field.name.clone());
-                        substitute(&field_definition.ty, &map)
+                let field_ty = match find_def(self, field) {
+                    Some(def_ty) => {
+                        matched.insert(field.name.clone());
+                        substitute(&self.component_expected_type(def_ty, &field.value), ctx.map)
                     }
                     None => {
                         let available: Vec<String> =
-                            variant_fields.iter().map(|f| f.name.to_string()).collect();
+                            ctx.all_fields.clone().map(|(n, _)| n.to_string()).collect();
+                        unknown_fields.push(field.name.clone());
                         self.sink.push(diagnostics::infer::member_not_found(
-                            &enum_ty,
+                            ctx.target_ty,
                             &field.name,
-                            span,
+                            ctx.span,
                             Some(&available),
+                            None,
+                            false,
                         ));
                         self.new_type_var()
                     }
                 };
-
                 let new_value = self
                     .with_value_context(|s| s.infer_expression((*field.value).clone(), &field_ty));
-
-                self.check_not_temp_producing(&new_value);
-
                 StructFieldAssignment {
                     name: field.name.clone(),
                     name_span: field.name_span,
@@ -349,28 +716,98 @@ impl Checker<'_, '_> {
             })
             .collect();
 
-        if matched_fields.len() != variant_fields.len() && new_spread.is_none() {
-            let mut missing_fields: Vec<String> = variant_fields
-                .iter()
-                .filter(|f| !matched_fields.contains(f.name.as_str()))
-                .map(|f| f.name.to_string())
+        if ctx.spread.is_none() {
+            let mut missing: Vec<String> = ctx
+                .all_fields
+                .clone()
+                .filter(|(n, _)| !matched.contains(n.as_str()))
+                .map(|(n, _)| n.to_string())
                 .collect();
+            if !unknown_fields.is_empty() {
+                let all_field_names: Vec<String> =
+                    ctx.all_fields.clone().map(|(n, _)| n.to_string()).collect();
+                for unknown in &unknown_fields {
+                    if let Some(suggested) =
+                        diagnostics::infer::find_similar_name(unknown, &all_field_names)
+                        && let Some(position) = missing.iter().position(|f| f == &suggested)
+                    {
+                        missing.remove(position);
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                missing.sort();
+                self.sink.push(diagnostics::infer::struct_missing_fields(
+                    ctx.owner_name,
+                    &missing,
+                    ctx.span,
+                ));
+            }
+        }
 
-            missing_fields.sort();
+        (new_assignments, matched)
+    }
 
-            self.sink.push(diagnostics::infer::struct_missing_fields(
-                &variant_name,
-                &missing_fields,
-                span,
+    fn check_autofill_fields<'a>(
+        &mut self,
+        owner_name: &str,
+        fields: impl Iterator<Item = (&'a EcoString, &'a Type)>,
+        matched_fields: &HashSet<EcoString>,
+        map: &SubstitutionMap,
+        spread_span: Span,
+    ) {
+        let from_package = self.cursor.package_id().to_string();
+        for (name, ty) in fields {
+            if matched_fields.contains(name.as_str()) {
+                continue;
+            }
+            let resolved = substitute(ty, map).resolve_in(&self.env);
+            let Err(no_zero) = self.has_zero(&resolved, &from_package, MapZero::Built) else {
+                continue;
+            };
+            let chain: Vec<&str> = no_zero.chain.iter().map(EcoString::as_str).collect();
+            let cause = match &no_zero.reason {
+                NoZeroReason::PrivateField {
+                    struct_name,
+                    field,
+                    owning_package,
+                } => diagnostics::infer::FieldNoZeroCause::PrivateField {
+                    struct_name,
+                    field,
+                    owning_package,
+                },
+                NoZeroReason::HiddenGoState { go_type } => {
+                    diagnostics::infer::FieldNoZeroCause::HiddenGoState { go_type }
+                }
+                NoZeroReason::NoZeroForType | NoZeroReason::NilMap => {
+                    diagnostics::infer::FieldNoZeroCause::Type
+                }
+            };
+            self.sink.push(diagnostics::infer::field_no_zero(
+                owner_name,
+                name,
+                &no_zero.leaf_ty,
+                &chain,
+                cause,
+                spread_span,
             ));
         }
-
-        Expression::StructCall {
-            name: variant_name,
-            field_assignments: new_field_assignments,
-            spread: new_spread.into(),
-            ty: enum_ty,
-            span,
-        }
     }
+
+    pub(crate) fn has_zero(
+        &self,
+        ty: &Type,
+        from_package: &str,
+        map_zero: MapZero,
+    ) -> Result<(), NoZero> {
+        let store = self.store;
+        zero::has_zero(store, ty, from_package, map_zero)
+    }
+}
+
+pub(super) fn same_nominal(a: &Type, b: &Type) -> bool {
+    matches!(
+        (a, b),
+        (Type::Nominal { id: ai, .. }, Type::Nominal { id: bi, .. }) if ai == bi
+    )
 }

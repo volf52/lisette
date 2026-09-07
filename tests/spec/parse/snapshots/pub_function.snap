@@ -1,6 +1,8 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \npub fn greet() { }\n"
+description: |
+  
+  pub fn greet() { }
 ---
 [
     Function {
@@ -15,24 +17,26 @@ description: "input: \npub fn greet() { }\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
-        visibility: Public,
-        body: Block {
-            items: [],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 16,
-                byte_length: 3,
-            },
+        return_type: Var {
+            id: uninferred,
         },
-        ty: Variable(
-            -1,
+        visibility: Public,
+        body: Definition(
+            Block {
+                items: [],
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 16,
+                    byte_length: 3,
+                },
+            },
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 5,

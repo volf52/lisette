@@ -1,23 +1,21 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nimport \"go:bytes\"\n\nfn main() {\n  let f = bytes.Buffer.ReadString\n  let mut buf = bytes.Buffer {}\n  let _ = f(&buf, 10)\n}\n"
+description: |
+  
+  import "go:bytes"
+  
+  fn main() {
+    let f = bytes.Buffer.ReadString
+    let mut buf = bytes.Buffer {}
+    let _ = f(&buf, 10)
+  }
 ---
 package main
 
-import (
-	"bytes"
-	lisette "github.com/ivov/lisette/prelude"
-)
+import "bytes"
 
 func main() {
-	fn_1 := (*bytes.Buffer).ReadString
-	f := func(arg0 *bytes.Buffer, arg1 uint8) lisette.Result[string, error] {
-		ret_2, ret_3 := fn_1(arg0, arg1)
-		if ret_3 != nil {
-			return lisette.MakeResultErr[string, error](ret_3)
-		}
-		return lisette.MakeResultOk[string, error](ret_2)
-	}
+	f := (*bytes.Buffer).ReadString
 	buf := bytes.Buffer{}
-	_ = f(&buf, 10)
+	f(&buf, 10)
 }

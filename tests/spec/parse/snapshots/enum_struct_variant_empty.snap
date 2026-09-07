@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nenum Token {\n  Eof {},\n}\n"
+description: |
+  
+  enum Token {
+    Eof {},
+  }
 ---
 [
     Enum {
@@ -16,6 +20,7 @@ description: "input: \nenum Token {\n  Eof {},\n}\n"
         variants: [
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Eof",
                 name_span: Span {
                     file_id: 0,

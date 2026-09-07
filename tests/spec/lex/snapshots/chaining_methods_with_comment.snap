@@ -1,6 +1,9 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: method1()\n            // comment\n            .method2()"
+description: |-
+  method1()
+              // comment
+              .method2()
 ---
 LexResult {
     tokens: [
@@ -60,14 +63,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [
-            (
-                22,
-                32,
-            ),
-        ],
-        doc_comments: [],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

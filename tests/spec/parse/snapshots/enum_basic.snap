@@ -1,6 +1,13 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nenum Status {\n  Pending,\n  Processing,\n  Complete,\n  Failed,\n}\n"
+description: |
+  
+  enum Status {
+    Pending,
+    Processing,
+    Complete,
+    Failed,
+  }
 ---
 [
     Enum {
@@ -16,6 +23,7 @@ description: "input: \nenum Status {\n  Pending,\n  Processing,\n  Complete,\n  
         variants: [
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Pending",
                 name_span: Span {
                     file_id: 0,
@@ -26,6 +34,7 @@ description: "input: \nenum Status {\n  Pending,\n  Processing,\n  Complete,\n  
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Processing",
                 name_span: Span {
                     file_id: 0,
@@ -36,6 +45,7 @@ description: "input: \nenum Status {\n  Pending,\n  Processing,\n  Complete,\n  
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Complete",
                 name_span: Span {
                     file_id: 0,
@@ -46,6 +56,7 @@ description: "input: \nenum Status {\n  Pending,\n  Processing,\n  Complete,\n  
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Failed",
                 name_span: Span {
                     file_id: 0,

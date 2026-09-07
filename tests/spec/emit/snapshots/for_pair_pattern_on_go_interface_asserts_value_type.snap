@@ -1,0 +1,29 @@
+---
+source: tests/spec/emit/patterns.rs
+description: |
+  
+  import "go:example.com/shapes"
+  
+  fn sum_areas(items: Map<string, shapes.Shape>) -> int {
+    let mut total = 0
+    for (_, shapes.Rect { W: w, H: h }) in items {
+      total = total + w * h
+    }
+    total
+  }
+---
+package main
+
+import "example.com/shapes"
+
+func sumAreas(items map[string]shapes.Shape) int {
+	total := 0
+	for key_1, value_2 := range items {
+		_ = key_1
+		asserted_3 := value_2.(shapes.Rect)
+		w := asserted_3.W
+		h := asserted_3.H
+		total += w * h
+	}
+	return total
+}

@@ -1,10 +1,14 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum Either<L, R> { Left(L), Right(R) }\n\nfn test() -> Either<int, string> {\n  Left(42)\n}\n"
+description: |
+  
+  enum Either<L, R> { Left(L), Right(R) }
+  
+  fn test() -> Either<int, string> {
+    Either.Left(42)
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeEitherLeft[L any, R any](arg0 L) Either[L, R] {
 	return Either[L, R]{Tag: EitherLeft, Left: arg0}
@@ -14,7 +18,7 @@ func MakeEitherRight[L any, R any](arg0 R) Either[L, R] {
 	return Either[L, R]{Tag: EitherRight, Right: arg0}
 }
 
-type EitherTag int
+type EitherTag uint8
 
 const (
 	EitherLeft EitherTag = iota
@@ -25,17 +29,6 @@ type Either[L any, R any] struct {
 	Tag   EitherTag
 	Left  L
 	Right R
-}
-
-func (e Either[L, R]) String() string {
-	switch e.Tag {
-	case EitherLeft:
-		return fmt.Sprintf("Either.Left(%v)", e.Left)
-	case EitherRight:
-		return fmt.Sprintf("Either.Right(%v)", e.Right)
-	default:
-		return fmt.Sprintf("Either(%d)", e.Tag)
-	}
 }
 
 func test() Either[int, string] {

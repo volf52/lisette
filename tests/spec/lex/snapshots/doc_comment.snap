@@ -1,6 +1,6 @@
 ---
 source: tests/spec/lex/mod.rs
-description: "input: /// This is a doc comment"
+description: /// This is a doc comment
 ---
 LexResult {
     tokens: [
@@ -18,14 +18,5 @@ LexResult {
         },
     ],
     errors: [],
-    trivia: Trivia {
-        comments: [],
-        doc_comments: [
-            (
-                0,
-                25,
-            ),
-        ],
-        blank_lines: [],
-    },
+    blank_lines: [],
 }

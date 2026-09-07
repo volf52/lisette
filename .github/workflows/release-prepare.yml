@@ -1,0 +1,114 @@
+name: Prepare release PR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    name: Prepare release PR
+    if: "${{ github.repository == 'ivov/lisette' && (github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore: release')) }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-prepare-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # ratchet:release-plz/action@v0.5
+        id: release-plz
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - uses: taiki-e/install-action@1329c298aa20c3257846c9b2e0e55967df3e3c37 # ratchet:taiki-e/install-action@v2
+        if: ${{ steps.release-plz.outputs.pr != '' && steps.release-plz.outputs.pr != '{}' }}
+        with:
+          tool: git-cliff@2.13.1
+
+      - name: Bump version if breaking label
+        if: ${{ steps.release-plz.outputs.pr != '' && steps.release-plz.outputs.pr != '{}' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          PR_JSON: ${{ steps.release-plz.outputs.pr }}
+        run: |
+          set -euo pipefail
+          LAST_TAG=$(git tag --list 'lisette-v*' --sort=-v:refname | head -1)
+          WANT_MINOR=false
+          for sha in $(gh pr list --state merged --label breaking --limit 100 --json mergeCommit --jq '.[].mergeCommit.oid'); do
+            if git merge-base --is-ancestor "$LAST_TAG" "$sha" && git merge-base --is-ancestor "$sha" origin/main; then
+              WANT_MINOR=true
+            fi
+          done
+          if [ "$WANT_MINOR" = "false" ]; then
+            echo "No unreleased breaking-labeled PRs"
+            exit 0
+          fi
+
+          IFS=. read -r MAJOR MINOR _ <<< "${LAST_TAG#lisette-v}"
+          if [ "$MAJOR" -eq 0 ]; then
+            TARGET="0.$((MINOR + 1)).0"
+          else
+            TARGET="$((MAJOR + 1)).0.0"
+          fi
+          BRANCH=$(echo "$PR_JSON" | jq -er '.head_branch')
+          PR_NUM=$(echo "$PR_JSON" | jq -er '.number')
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+          CURRENT=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$(printf '%s\n%s\n' "$TARGET" "$CURRENT" | sort -V | head -1)" = "$TARGET" ]; then
+            echo "Version already $CURRENT, at or above target $TARGET"
+            git checkout -
+            exit 0
+          fi
+
+          git grep -l "\"=${CURRENT}\"" -- '*.toml' | xargs sed -i "s/\"=${CURRENT}\"/\"=${TARGET}\"/g"
+          sed -i "s/^version = \"${CURRENT}\"/version = \"${TARGET}\"/" Cargo.toml
+          cargo update --workspace
+          git -c "user.name=github-actions[bot]" \
+              -c "user.email=41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -am "chore: bump to ${TARGET} for breaking-labeled changes"
+          git push origin "HEAD:${BRANCH}"
+          gh pr edit "$PR_NUM" --title "chore: release v${TARGET}"
+          git checkout -
+
+      - name: Regenerate changelog with full-repo scope
+        if: ${{ steps.release-plz.outputs.pr != '' && steps.release-plz.outputs.pr != '{}' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          PR_JSON: ${{ steps.release-plz.outputs.pr }}
+        run: |
+          set -euo pipefail
+          BRANCH=$(echo "$PR_JSON" | jq -er '.head_branch')
+          PR_NUM=$(echo "$PR_JSON" | jq -er '.number')
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+
+          NEW_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          TAG="lisette-v${NEW_VERSION}"
+          git-cliff --config cliff.toml --tag "$TAG" -o CHANGELOG.md
+          git-cliff --config cliff.toml --tag "$TAG" --unreleased --strip all > /tmp/pr-body.md
+          sed -i -e '/./,$!d' -e "s|^## \[${NEW_VERSION}\].*|## ${NEW_VERSION} (upcoming)|" /tmp/pr-body.md
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "CHANGELOG.md unchanged after regeneration"
+          else
+            git -c "user.name=github-actions[bot]" \
+                -c "user.email=41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -m "chore: regenerate changelog with full-repo scope" CHANGELOG.md
+            git push origin "HEAD:${BRANCH}"
+          fi
+
+          gh pr edit "$PR_NUM" --body-file /tmp/pr-body.md

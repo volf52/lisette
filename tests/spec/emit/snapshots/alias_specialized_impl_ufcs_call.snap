@@ -1,0 +1,33 @@
+---
+source: tests/spec/emit/types.rs
+description: |
+  
+  struct Box<T> { value: T }
+  
+  impl Box<int> {
+    fn only_int(self) -> int { self.value }
+  }
+  
+  type IntBox = Box<int>
+  
+  fn test() -> int {
+    let b: IntBox = Box { value: 7 };
+    b.only_int()
+  }
+---
+package main
+
+type Box[T any] struct {
+	value T
+}
+
+func Box_onlyInt(self Box[int]) int {
+	return self.value
+}
+
+type IntBox = Box[int]
+
+func test() int {
+	b := Box[int]{value: 7}
+	return Box_onlyInt(b)
+}

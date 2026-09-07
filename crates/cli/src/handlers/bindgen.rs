@@ -1,32 +1,30 @@
 use std::path::Path;
 use std::process::Command;
 
+use stdlib::Target;
+
 use crate::cli_error;
+use crate::command::BindgenTarget;
+use crate::go_cli;
+use std::env;
+use std::fs;
 
-pub fn bindgen(
-    target_pkg: &str,
-    output: Option<String>,
-    version: Option<String>,
-    verbose: bool,
-) -> i32 {
-    if let Err(code) = crate::go_cli::require_go() {
-        return code;
-    }
-
-    if target_pkg == "stdlib" {
-        let source_dir = Path::new("bindgen");
-        if !source_dir.exists() {
-            cli_error!(
-                "Failed to generate std bindings",
-                "Bindgen source not found at `bindgen`",
-                "Run this command from the Lisette project root"
-            );
-            return 1;
+pub fn bindgen(target: BindgenTarget, verbose: bool) -> i32 {
+    match target {
+        BindgenTarget::Stdlib { version } => {
+            let source_dir = Path::new("bindgen");
+            if !source_dir.exists() {
+                cli_error!(
+                    "Failed to generate std bindings",
+                    "Bindgen source not found at `bindgen`",
+                    "Run this command from the Lisette project root"
+                );
+                return 1;
+            }
+            bindgen_std(source_dir, version, verbose)
         }
-        return bindgen_std(source_dir, version, verbose);
+        BindgenTarget::Package { name, output } => bindgen_pkg(&name, output, verbose),
     }
-
-    bindgen_pkg(target_pkg, output, verbose)
 }
 
 fn bindgen_pkg(target_pkg: &str, output: Option<String>, verbose: bool) -> i32 {
@@ -43,11 +41,12 @@ fn bindgen_pkg(target_pkg: &str, output: Option<String>, verbose: bool) -> i32 {
     }
 
     // lis bindgen writes to a user-specified path, not the typedef cache
-    let workspace = crate::workspace::GoWorkspace::new(Path::new("."), Path::new(""));
+    let workspace =
+        crate::workspace::GoWorkspace::new(Path::new("."), Path::new(""), Target::host());
 
     match workspace.run_bindgen(target_pkg) {
         Ok(content) => {
-            if let Err(e) = std::fs::write(&output_path, &content) {
+            if let Err(e) = fs::write(&output_path, &content) {
                 cli_error!(
                     "Failed to write bindings",
                     format!("Could not write to {}: {}", output_path, e),
@@ -60,11 +59,11 @@ fn bindgen_pkg(target_pkg: &str, output: Option<String>, verbose: bool) -> i32 {
             0
         }
         Err(msg) => {
-            cli_error!(
-                "Failed to generate bindings",
-                msg,
-                "Check Go installation with `go version`"
-            );
+            let (detail, hint) = match go_cli::toolchain_failure_for(&msg) {
+                Some(failure) => (failure.message, failure.hint),
+                None => (msg, "Check Go installation with `go version`"),
+            };
+            cli_error!("Failed to generate bindings", detail, hint);
             1
         }
     }
@@ -77,7 +76,7 @@ fn bindgen_std(source_dir: &Path, version: Option<String>, verbose: bool) -> i32
         eprintln!("Generating stdlib bindings to {}", out_dir);
     }
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
         Err(e) => {
             cli_error!(
@@ -129,11 +128,14 @@ fn bindgen_std(source_dir: &Path, version: Option<String>, verbose: bool) -> i32
             1
         }
         Err(e) => {
-            cli_error!(
-                "Failed to generate std bindings",
-                format!("Failed to run bindgen: {}", e),
-                "Check Go installation with `go version`"
-            );
+            let (detail, hint) = match go_cli::toolchain_failure() {
+                Some(failure) => (failure.message, failure.hint),
+                None => (
+                    format!("Failed to run bindgen: {}", e),
+                    "Check Go installation with `go version`",
+                ),
+            };
+            cli_error!("Failed to generate std bindings", detail, hint);
             1
         }
     }

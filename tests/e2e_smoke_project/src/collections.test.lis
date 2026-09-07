@@ -1,0 +1,468 @@
+import "go:slices"
+
+#[test]
+fn slice_fold_sum() {
+  let nums = [1, 2, 3, 4, 5]
+  assert nums.fold(0, |acc, x| acc + x) == 15
+}
+
+#[test]
+fn slice_fold_product() {
+  let nums = [1, 2, 3, 4, 5]
+  assert nums.fold(1, |acc, x| acc * x) == 120
+}
+
+#[test]
+fn slice_fold_empty() {
+  let empty: Slice<int> = []
+  assert empty.fold(42, |acc, x| acc + x) == 42
+}
+
+#[test]
+fn slice_find_some() {
+  let nums = [1, 2, 3, 4, 5]
+  let result = match nums.find(|x| x > 3) {
+    Some(4) => 100,
+    _ => 0,
+  }
+  assert result == 100
+}
+
+#[test]
+fn slice_find_none() {
+  let nums = [1, 2, 3, 4, 5]
+  let result = match nums.find(|x| x > 100) {
+    None => 100,
+    _ => 0,
+  }
+  assert result == 100
+}
+
+#[test]
+fn slice_find_empty() {
+  let empty: Slice<int> = []
+  let result = match empty.find(|x| x > 0) {
+    None => 100,
+    _ => 0,
+  }
+  assert result == 100
+}
+
+#[test]
+fn slice_enumerate() {
+  let items = [10, 20, 30]
+  let mut sum = 0
+  for (i, v) in items.enumerate() {
+    sum = sum + i * 100 + v
+  }
+  assert sum == 360
+}
+
+#[test]
+fn enumerated_slice_filter() {
+  let items = [10, 20, 30, 40]
+  let evens = items.enumerate().filter(|(i, _)| i % 2 == 0)
+  let result = if evens.length() == 2 {
+    let (i0, v0) = evens[0]
+    let (i1, v1) = evens[1]
+    if i0 == 0 && v0 == 10 && i1 == 2 && v1 == 30 { 100 } else { 0 }
+  } else {
+    0
+  }
+  assert result == 100
+}
+
+#[test]
+fn slice_join() {
+  let result = ["hello", "world"].join(", ")
+  assert result == "hello, world"
+}
+
+#[test]
+fn map_from() {
+  let m = Map.from([("a", 1), ("b", 2)])
+  let result = if m.length() == 2 {
+    match m.get("a") {
+      Some(1) => 100,
+      _ => 0,
+    }
+  } else {
+    0
+  }
+  assert result == 100
+}
+
+#[test]
+fn string_range_slicing() {
+  let s = "hello world"
+  let result = if s.substring(0..5) == "hello" {
+    if s.substring(6..) == "world" { if s.substring(..5) == "hello" { 100 } else { 0 } } else { 0 }
+  } else {
+    0
+  }
+  assert result == 100
+}
+
+// Fixed-size arrays, exercised at runtime (the emit-only paths otherwise).
+type Vec3 = Array<int, 3>
+
+const LANE_COUNT = 3
+
+struct Mixer {
+  pub lanes: Array<int, LANE_COUNT>
+}
+
+enum Colour { Red, Green }
+
+#[test]
+fn array_size_from_constant() {
+  let mixer = Mixer { lanes: Array.new<int, LANE_COUNT>() }
+  assert mixer.lanes.length() == 3
+  let filled: Array<int, LANE_COUNT> = [7, 8, 9]
+  assert filled[1] == 8
+}
+
+#[test]
+fn array_index_length_get() {
+  let a: Array<int, 3> = [10, 20, 30]
+  assert a.length() == 3
+  assert a[2] == 30
+  assert a.get(1).unwrap_or(-1) == 20
+  assert a.get(5).unwrap_or(-1) == -1
+  assert a.get(-1).unwrap_or(-1) == -1
+}
+
+#[test]
+fn array_equality_and_inequality() {
+  let a: Array<int, 3> = [1, 2, 3]
+  let b: Array<int, 3> = [1, 2, 3]
+  let c: Array<int, 3> = [1, 2, 9]
+  assert a == b
+  assert a != c
+}
+
+#[test]
+fn array_for_loop_and_to_slice() {
+  let a: Array<int, 3> = [1, 2, 3]
+  let mut sum = 0
+  for x in a { sum += x }
+  assert sum == 6
+  assert a.to_slice().length() == 3
+}
+
+#[test]
+fn array_to_slice_chain_reads() {
+  let a: Array<int, 3> = [1, 2, 3]
+  assert a.to_slice().contains(2)
+  assert a.to_slice().equals([1, 2, 3])
+  assert a.to_slice().get(1).unwrap_or(-1) == 2
+  assert !a.to_slice().is_empty()
+  assert a.to_slice().clone().length() == 3
+  let names: Array<string, 2> = ["a", "b"]
+  assert names.to_slice().join("-") == "a-b"
+}
+
+#[test]
+fn array_to_slice_copies_before_arguments_run() {
+  let mut a: Array<int, 3> = [1, 2, 3]
+  let bump = || {
+    a[0] = 99
+    return 99
+  }
+  assert !a.to_slice().contains(bump())
+  assert a[0] == 99
+}
+
+#[test]
+fn array_direct_mutation() {
+  let mut a: Array<int, 3> = [1, 2, 3]
+  a[0] = 9
+  assert a[0] == 9
+}
+
+#[test]
+fn array_mutation_through_ref() {
+  let mut a: Array<int, 3> = [1, 2, 3]
+  let mut r = &a
+  r.*[1] = 8
+  assert a[1] == 8
+}
+
+#[test]
+fn array_new_fills_option_with_none() {
+  let a = Array.new<Option<int>, 2>()
+  assert a[0].unwrap_or(-99) == -99
+}
+
+#[test]
+fn array_from_matches_exact_length() {
+  let exact: Option<Array<int, 3>> = Array.from([1, 2, 3])
+  let head = if let Some(a) = exact { a[0] + a[2] } else { -1 }
+  assert head == 4
+  let short: Option<Array<int, 3>> = Array.from([1, 2])
+  assert short.is_none()
+  let long: Option<Array<int, 3>> = Array.from([1, 2, 3, 4])
+  assert long.is_none()
+}
+
+#[test]
+fn array_from_copies_the_source() {
+  let mut source = [1, 2, 3]
+  let copied = Array.from<int, 3>(source)
+  source[0] = 99
+  let first = if let Some(a) = copied { a[0] } else { -1 }
+  assert first == 1
+}
+
+#[test]
+fn array_from_builds_an_element_without_a_zero() {
+  let mut colours = Slice.new<Colour>()
+  colours = colours.append(Colour.Red)
+  colours = colours.append(Colour.Green)
+  let matched = if let Some(a) = Array.from<Colour, 2>(colours) {
+    a[0] == Colour.Red && a[1] == Colour.Green
+  } else {
+    false
+  }
+  assert matched
+}
+
+#[test]
+fn array_from_function_element() {
+  let fs: Slice<fn(int) -> int> = [|x| x + 1, |y| y * 2]
+  let called = if let Some(a) = Array.from<fn(int) -> int, 2>(fs) {
+    a[0](10) + a[1](10)
+  } else {
+    -1
+  }
+  assert called == 31
+}
+
+#[test]
+fn array_from_zero_length_accepts_only_an_empty_slice() {
+  let empty: Option<Array<int, 0>> = Array.from(Slice.new<int>())
+  assert empty.is_some()
+  let filled: Option<Array<int, 0>> = Array.from([1])
+  assert filled.is_none()
+}
+
+#[test]
+fn array_from_named_constant_size() {
+  let lanes: Option<Array<int, LANE_COUNT>> = Array.from([4, 5, 6])
+  let size = if let Some(a) = lanes { a.length() } else { -1 }
+  assert size == 3
+}
+
+enum Shade {
+  #[default]
+  Pale,
+  Deep,
+}
+
+enum LaterDefault {
+  First,
+  #[default]
+  Second,
+}
+
+struct Wall {
+  pub name: string,
+  pub shade: Shade,
+}
+
+struct LaterBox {
+  pub mode: LaterDefault,
+}
+
+#[test]
+fn default_variant_zero_fills_an_array() {
+  let mut a = Array.new<Shade, 3>()
+  assert a[0] == Shade.Pale && a[2] == Shade.Pale
+  a[1] = Shade.Deep
+  assert a[1] == Shade.Deep
+}
+
+#[test]
+fn default_variant_zero_fills_a_slice() {
+  let s = Slice.make<Shade>(2)
+  assert s.length() == 2 && s[1] == Shade.Pale
+}
+
+#[test]
+fn default_variant_fills_a_struct_spread() {
+  let wall = Wall { name: "hall", .. }
+  assert wall.shade == Shade.Pale
+}
+
+#[test]
+fn default_variant_after_the_first_is_used() {
+  let mut a = Array.new<LaterDefault, 2>()
+  assert a[0] == LaterDefault.Second && a[1] == LaterDefault.Second
+  a[0] = LaterDefault.First
+  assert a[0] == LaterDefault.First
+}
+
+#[test]
+fn default_variant_answers_a_missing_map_key() {
+  let shades = Map.new<string, Shade>()
+  assert shades["absent"] == Shade.Pale
+}
+
+#[test]
+fn later_default_variant_answers_a_missing_map_key() {
+  let modes = Map.new<string, LaterDefault>()
+  assert modes["absent"] == LaterDefault.Second
+}
+
+#[test]
+fn later_default_variant_reaches_through_a_struct() {
+  let boxes = Map.new<string, LaterBox>()
+  assert boxes["absent"].mode == LaterDefault.Second
+}
+
+#[test]
+fn array_alias_at_use_sites() {
+  let x: Vec3 = [1, 2, 3]
+  assert x.length() == 3
+  assert x.get(0).unwrap_or(0) == 1
+  assert x[2] == 3
+}
+
+#[test]
+fn slice_new_empty() {
+  let s = Slice.new<int>()
+  let grown = s.append(1, 2)
+  assert s.is_empty() && grown.length() == 2
+}
+
+#[test]
+fn slice_capacity() {
+  let s = slices.Grow([1, 2], 1)
+  assert s.length() == 2 && s.capacity() > s.length()
+}
+
+#[test]
+fn slice_append_spread() {
+  let a = [1, 2]
+  let b = [3, 4]
+  let combined = a.append(b...)
+  assert combined.length() == 4 && combined[3] == 4
+}
+
+#[test]
+fn slice_copy_from() {
+  let mut dst = [0, 0, 0]
+  let src = [1, 2, 3]
+  let copied = dst.copy_from(src)
+  assert copied == 3 && dst[0] == 1 && dst[2] == 3
+}
+
+#[test]
+fn slice_contains() {
+  let nums = [1, 2, 3]
+  assert nums.contains(2) && !nums.contains(9)
+}
+
+#[test]
+fn slice_equals() {
+  let a = [1, 2, 3]
+  let b = [1, 2, 3]
+  let c = [1, 2, 4]
+  assert a.equals(b) && !a.equals(c)
+}
+
+#[test]
+fn slice_any() {
+  let nums = [1, 2, 3]
+  assert nums.any(|x| x > 2) && !nums.any(|x| x > 10)
+}
+
+#[test]
+fn slice_all() {
+  let evens = [2, 4, 6]
+  let mixed = [1, 2, 3]
+  assert evens.all(|x| x % 2 == 0) && !mixed.all(|x| x % 2 == 0)
+}
+
+#[test]
+fn slice_clone() {
+  let original = [1, 2, 3]
+  let mut cloned = original.clone()
+  assert cloned.equals(original)
+  cloned[0] = 99
+  assert original[0] == 1 && cloned[0] == 99
+}
+
+#[test]
+fn enumerated_slice_map() {
+  let items = [10, 20, 30]
+  let indexed = items.enumerate().map(|(i, v)| i * 100 + v)
+  assert indexed[0] == 10 && indexed[1] == 120 && indexed[2] == 230
+}
+
+#[test]
+fn enumerated_slice_fold() {
+  let items = [10, 20, 30]
+  let total = items.enumerate().fold(0, |acc, (i, v)| acc + i + v)
+  assert total == 63
+}
+
+#[test]
+fn enumerated_slice_find() {
+  let items = [10, 20, 30]
+  let result = match items.enumerate().find(|(i, _)| i == 1) {
+    Some((i, v)) => i * 100 + v,
+    None => 0,
+  }
+  assert result == 120
+}
+
+#[test]
+fn map_new_empty() {
+  let m = Map.new<string, int>()
+  assert m.is_empty()
+}
+
+#[test]
+fn map_delete() {
+  let mut m = Map.from([("a", 1), ("b", 2)])
+  m.delete("a")
+  let result = match m.get("a") {
+    Some(_) => 0,
+    None => m.length(),
+  }
+  assert result == 1
+}
+
+#[test]
+fn map_clone() {
+  let original = Map.from([("a", 1), ("b", 2)])
+  let mut cloned = original.clone()
+  assert cloned.equals(original)
+  cloned.delete("a")
+  assert cloned.get("a").is_none() && original.get("a").is_some() && original.length() == 2
+}
+
+#[test]
+fn map_equals() {
+  let a = Map.from([("x", 1)])
+  let b = Map.from([("x", 1)])
+  let c = Map.from([("x", 2)])
+  assert a.equals(b) && !a.equals(c)
+}
+
+#[test]
+fn nested_slice_clone_severs() {
+  let a = [[1, 2], [3, 4]]
+  let mut b = a.clone()
+  b[0][0] = 9
+  assert a[0][0] == 1 && b[0][0] == 9
+}
+
+#[test]
+fn map_slice_values_clone_severs() {
+  let m = Map.from([("k", [1, 2])])
+  let mut m2 = m.clone()
+  m2["k"][0] = 9
+  assert m["k"][0] == 1 && m2["k"][0] == 9
+}

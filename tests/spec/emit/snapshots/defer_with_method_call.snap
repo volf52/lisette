@@ -1,16 +1,27 @@
 ---
 source: tests/spec/emit/concurrency.rs
-description: "input: \nimport \"go:fmt\"\n\nstruct Resource {}\n\nimpl Resource {\n  fn close(self) {\n    fmt.Print(\"closed\");\n  }\n}\n\nfn test() {\n  let r = Resource {};\n  defer r.close()\n}\n"
+description: |
+  
+  import "go:fmt"
+  
+  struct Resource {}
+  
+  impl Resource {
+    fn close(self) {
+      fmt.Print("closed");
+    }
+  }
+  
+  fn test() {
+    let r = Resource {};
+    defer r.close()
+  }
 ---
 package main
 
 import "fmt"
 
 type Resource struct{}
-
-func (r Resource) String() string {
-	return "Resource"
-}
 
 func (r Resource) close() {
 	fmt.Print("closed")

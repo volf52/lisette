@@ -1,6 +1,12 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test(ch: Sender<int>) {\n  select {\n    ch.send(42) => print(\"sent\"),\n  }\n}\n"
+description: |
+  
+  fn test(ch: Sender<int>) {
+    select {
+      ch.send(42) => print("sent"),
+    }
+  }
 ---
 [
     Function {
@@ -44,47 +50,46 @@ description: "input: \nfn test(ch: Sender<int>) {\n  select {\n    ch.send(42) =
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
         ],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Select {
-                    arms: [
-                        SelectArm {
-                            pattern: Send {
+        body: Definition(
+            Block {
+                items: [
+                    Select {
+                        arms: [
+                            Send {
                                 send_expression: Call {
                                     expression: DotAccess {
                                         expression: Identifier {
                                             value: "ch",
-                                            ty: Variable(
-                                                -1,
-                                            ),
+                                            ty: Var {
+                                                id: uninferred,
+                                            },
                                             span: Span {
                                                 file_id: 0,
                                                 byte_offset: 43,
                                                 byte_length: 2,
                                             },
-                                            binding_id: None,
-                                            qualified: None,
+                                            resolution: Unresolved,
                                         },
                                         member: "send",
-                                        ty: Variable(
-                                            -1,
-                                        ),
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
                                         span: Span {
                                             file_id: 0,
                                             byte_offset: 43,
                                             byte_length: 7,
                                         },
+                                        resolution: Unresolved,
                                     },
                                     args: [
                                         Literal {
@@ -92,9 +97,9 @@ description: "input: \nfn test(ch: Sender<int>) {\n  select {\n    ch.send(42) =
                                                 value: 42,
                                                 text: None,
                                             },
-                                            ty: Variable(
-                                                -1,
-                                            ),
+                                            ty: Var {
+                                                id: uninferred,
+                                            },
                                             span: Span {
                                                 file_id: 0,
                                                 byte_offset: 51,
@@ -103,38 +108,39 @@ description: "input: \nfn test(ch: Sender<int>) {\n  select {\n    ch.send(42) =
                                         },
                                     ],
                                     spread: None,
-                                    type_args: [],
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                                    type_arguments: None,
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 43,
                                         byte_length: 11,
                                     },
+                                    call_kind: Unresolved,
                                 },
                                 body: Call {
                                     expression: Identifier {
                                         value: "print",
-                                        ty: Variable(
-                                            -1,
-                                        ),
+                                        ty: Var {
+                                            id: uninferred,
+                                        },
                                         span: Span {
                                             file_id: 0,
                                             byte_offset: 58,
                                             byte_length: 5,
                                         },
-                                        binding_id: None,
-                                        qualified: None,
+                                        resolution: Unresolved,
                                     },
                                     args: [
                                         Literal {
-                                            literal: String(
-                                                "sent",
-                                            ),
-                                            ty: Variable(
-                                                -1,
-                                            ),
+                                            literal: String {
+                                                value: "sent",
+                                                raw: false,
+                                            },
+                                            ty: Var {
+                                                id: uninferred,
+                                            },
                                             span: Span {
                                                 file_id: 0,
                                                 byte_offset: 64,
@@ -143,41 +149,42 @@ description: "input: \nfn test(ch: Sender<int>) {\n  select {\n    ch.send(42) =
                                         },
                                     ],
                                     spread: None,
-                                    type_args: [],
-                                    ty: Variable(
-                                        -1,
-                                    ),
+                                    type_arguments: None,
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
                                     span: Span {
                                         file_id: 0,
                                         byte_offset: 58,
                                         byte_length: 13,
                                     },
+                                    call_kind: Unresolved,
                                 },
                             },
+                        ],
+                        ty: Var {
+                            id: uninferred,
                         },
-                    ],
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 30,
-                        byte_length: 46,
+                        span: Span {
+                            file_id: 0,
+                            byte_offset: 30,
+                            byte_length: 46,
+                        },
                     },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 26,
-                byte_length: 52,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 26,
+                    byte_length: 52,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

@@ -1,0 +1,132 @@
+use super::*;
+use crate::diagnostics::ReplaceImporter;
+use std::mem;
+use syntax::ast::ImportAlias;
+
+impl TaskState {
+    /// Register a Go package (stdlib or third-party). Unlike regular packages,
+    /// Go packages export everything as public and do not put their own package
+    /// in scope (no self-references like `MyPackage.Type`). `cache_path` is the
+    /// on-disk typedef location, or `None` for embedded stdlib typedefs.
+    pub fn parse_and_register_go_package(
+        &mut self,
+        store: &mut Store,
+        package_id: &str,
+        source: &str,
+        cache_path: Option<PathBuf>,
+        locator: &TypedefLocator,
+    ) {
+        if store.has(package_id) {
+            return;
+        }
+
+        store.add_package(package_id);
+
+        if let Some(pkg_name) = stdlib::declared_package_name(source) {
+            store
+                .go_package_names
+                .insert(package_id.to_string(), pkg_name.to_string());
+        }
+
+        let file_id = store.new_file_id();
+        let filename = format!("{}.d.lis", package_id.replace('/', "_"));
+
+        let build_result = syntax::build_ast(source, file_id);
+        if build_result.has_errors() {
+            let discarded = cache_path.as_deref().is_some_and(|path| {
+                locator.discard_typedef(path);
+                !path.exists()
+            });
+            self.sink
+                .push(diagnostics::package_graph::corrupt_go_typedef(
+                    package_id.strip_prefix("go:").unwrap_or(package_id),
+                    discarded,
+                    self.script.is_some(),
+                ));
+        }
+
+        let file = File {
+            id: file_id,
+            package_id: package_id.to_string(),
+            parse_status: build_result.status,
+            name: filename.clone(),
+            display_path: filename,
+            source_path: cache_path,
+            source: source.to_string(),
+            items: build_result.ast,
+            file_comment: build_result.file_comment,
+        };
+
+        let imports = file.imports();
+
+        let replace_importer = package_id.strip_prefix("go:").and_then(|pkg| {
+            match locator.validate_declaration(pkg) {
+                deps::DeclarationStatus::DeclaredReplacement { .. } => {
+                    Some(ReplaceImporter::Module(pkg))
+                }
+                deps::DeclarationStatus::DeclaredLocal { .. } => Some(ReplaceImporter::Local(pkg)),
+                _ => None,
+            }
+        });
+
+        for import in &imports {
+            if let Some(go_pkg) = import.name.strip_prefix("go:") {
+                if matches!(import.alias, Some(ImportAlias::Blank(_))) {
+                    continue;
+                }
+
+                let import_package_id = format!("go:{}", go_pkg);
+
+                if store.has(&import_package_id) {
+                    continue;
+                }
+
+                match locator.find_typedef_content(go_pkg) {
+                    deps::TypedefLocatorResult::Found { content, origin } => {
+                        self.parse_and_register_go_package(
+                            store,
+                            &import_package_id,
+                            content.as_ref(),
+                            origin.into_cache_path(),
+                            locator,
+                        );
+                    }
+                    other => {
+                        emit_for_locator_result(
+                            &other,
+                            &GoImportSite {
+                                go_pkg,
+                                name_span: Some(import.name_span),
+                                target: locator.target(),
+                                script: self.script,
+                                replace_importer,
+                                transitive_importer: package_id.strip_prefix("go:"),
+                            },
+                            &self.sink,
+                        );
+                    }
+                }
+            }
+        }
+
+        store.store_file(file);
+
+        self.with_file_context_mut(
+            store,
+            FileContext::ImportedTypedef {
+                package_id,
+                file_id,
+                imports: &imports,
+            },
+            |this, store| {
+                let mut items = mem::take(
+                    &mut store
+                        .get_file_mut(file_id)
+                        .expect("file must exist after store_file")
+                        .items,
+                );
+                this.register_types_and_values(store, &mut items, &Visibility::Public);
+            },
+        );
+    }
+}

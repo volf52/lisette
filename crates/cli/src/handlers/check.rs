@@ -1,17 +1,70 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::go_cli;
+use crate::output;
+use crate::reference;
 use deps::TypedefLocator;
-use diagnostics::render::{self, Filter};
+use diagnostics::render::{self, Filter, OutputFormat};
+use diagnostics::{Fix, apply_fixes};
 use lisette::fs::LocalFileSystem;
-use lisette::pipeline::{CompileConfig, CompilePhase, CompileResult, compile};
+use lisette::fs::collect_lis_filepaths_recursive;
+use lisette::fs::relative_to_cwd;
+use lisette::pipeline::{
+    CompileConfig, CompileEntry, CompileInput, CompileMode, CompileResult, CompileScope,
+    ProjectKind, compile,
+};
+use std::time::Duration;
+
+use semantics::loader::{Loader, MemoryLoader};
 
 use crate::cli_error;
-use crate::typedef_regen::generate_missing_typedefs;
+use crate::command::CheckAction;
+use crate::handlers::build::ProjectLayout;
+use crate::handlers::project::FileTarget;
+use crate::lock::acquire_target_lock;
+use crate::workspace::{GoWorkspace, WorkspaceBindgen, warm_typedefs};
 
-pub fn check(path: Option<String>, errors_only: bool, warnings_only: bool) -> i32 {
+struct CheckOptions {
+    filter: Filter,
+    format: OutputFormat,
+    action: CheckAction,
+    target: stdlib::Target,
+}
+
+struct ScannedSources {
+    sources: Vec<PathBuf>,
+    test_sources: Vec<PathBuf>,
+}
+
+struct ReadFailure;
+
+impl CheckOptions {
+    fn fixes(&self) -> bool {
+        matches!(self.action, CheckAction::Fix)
+    }
+
+    fn deny_warnings(&self) -> bool {
+        matches!(
+            self.action,
+            CheckAction::Inspect {
+                deny_warnings: true
+            }
+        )
+    }
+}
+
+pub fn check(
+    path: Option<String>,
+    filter: Filter,
+    action: CheckAction,
+    format: OutputFormat,
+    build_target: stdlib::Target,
+) -> i32 {
     let target = path.unwrap_or_else(|| ".".to_string());
     let target_path = Path::new(&target);
 
@@ -24,99 +77,242 @@ pub fn check(path: Option<String>, errors_only: bool, warnings_only: bool) -> i3
         return 1;
     }
 
-    let filter = Filter {
-        errors_only,
-        warnings_only,
+    let options = CheckOptions {
+        filter,
+        format,
+        action,
+        target: build_target,
     };
 
     if !target_path.is_dir() {
-        return check_single_file(target_path, &filter, false, TypedefLocator::default());
+        return check_file(target_path, &options);
     }
 
     if target_path.join("lisette.toml").exists() {
-        return check_project(target_path, &filter);
+        return check_project(target_path, &options);
     }
 
-    check_loose_dir(target_path, &filter)
+    check_loose_dir(target_path, &options)
 }
 
-fn check_project(project_path: &Path, filter: &Filter) -> i32 {
-    let root_main = project_path.join("main.lis");
-    let src_main = project_path.join("src/main.lis");
+struct Snapshot {
+    source: Option<String>,
+    locator: TypedefLocator,
+}
 
-    if root_main.exists() {
-        cli_error!(
-            "Misplaced entrypoint",
-            "Found `main.lis` in project root, expected it at `src/main.lis`",
-            "Move `main.lis` to `src/main.lis`"
-        );
-        return 1;
-    }
-
-    if !src_main.exists() {
-        cli_error!(
-            "Failed to lint and typecheck project",
-            format!("No `src/main.lis` at `{}`", project_path.display()),
-            "Create `src/main.lis`"
-        );
-        return 1;
-    }
-
-    let (manifest, locator) = match deps::TypedefLocator::from_project_with_manifest(project_path) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            cli_error!("Failed to check project", msg, "Fix `lisette.toml`");
-            return 1;
+impl Snapshot {
+    fn read(file: &Path, target: stdlib::Target) -> Self {
+        let bare = || TypedefLocator::new(Default::default(), None, target);
+        let Ok(source) = fs::read_to_string(file) else {
+            return Self {
+                source: None,
+                locator: bare(),
+            };
+        };
+        let locator =
+            super::script::script_locator(&source, file, super::script_deps::Mode::Offline, target)
+                .map_or_else(|_| bare(), |(locator, _)| locator);
+        Self {
+            source: Some(source),
+            locator,
         }
+    }
+
+    fn of(locator: TypedefLocator) -> Self {
+        Self {
+            source: None,
+            locator,
+        }
+    }
+}
+
+fn check_file(file_path: &Path, options: &CheckOptions) -> i32 {
+    match super::project::resolve_file_target(file_path) {
+        FileTarget::ProjectEntry { root } | FileTarget::ProjectPackage { root } => {
+            check_project(&root, options)
+        }
+        FileTarget::Script { inside_project } => check_single_file(
+            file_path,
+            options,
+            CompileScope::Script { inside_project },
+            Snapshot::read(file_path, options.target),
+            "main",
+            None,
+        ),
+    }
+}
+
+fn check_project(project_path: &Path, options: &CheckOptions) -> i32 {
+    let layout = match super::build::resolve_project_layout(project_path) {
+        Some(layout) => layout,
+        None => return 1,
     };
 
-    if let Err(code) = generate_missing_typedefs(project_path, &manifest) {
-        return code;
+    let (manifest, locator) =
+        match TypedefLocator::from_project_with_manifest(project_path, options.target) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                cli_error!("Failed to check project", msg, "Fix `lisette.toml`");
+                return 1;
+            }
+        };
+
+    let target_dir = project_path.join("target");
+    if let Err(e) = fs::create_dir_all(&target_dir) {
+        cli_error!(
+            "Failed to check project",
+            format!("Failed to create target directory: {}", e),
+            "Check directory permissions"
+        );
+        return 1;
     }
 
-    check_single_file(&src_main, filter, true, locator)
+    let target_lock = match acquire_target_lock(&target_dir) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+
+    let _ = reference::write_to(project_path);
+
+    let go_directive = go_cli::go_directive_for(layout.kind);
+    if let Err(e) =
+        go_cli::write_go_mod(&target_dir, &manifest.project.name, &locator, &go_directive)
+    {
+        cli_error!(
+            "Failed to check project",
+            e,
+            "Check file permissions on `target/go.mod`"
+        );
+        return 1;
+    }
+
+    let typedef_cache_dir = deps::typedef_cache_dir(project_path);
+
+    // Batch-warm the typedef cache so the lazy path during compile is all hits.
+    {
+        let workspace = GoWorkspace::new(&target_dir, &typedef_cache_dir, locator.target());
+        warm_typedefs(project_path, &workspace, &locator);
+    }
+
+    let bindgen = Arc::new(WorkspaceBindgen::new(
+        target_dir,
+        typedef_cache_dir,
+        locator.target(),
+    ));
+    let locator = locator.with_bindgen(bindgen);
+
+    let go_module = manifest.project.name.clone();
+    let ProjectLayout {
+        kind,
+        sources,
+        test_sources,
+    } = layout;
+    let scanned = ScannedSources {
+        sources,
+        test_sources,
+    };
+    let result = match kind {
+        ProjectKind::Binary => {
+            let src_main = project_path.join("src").join("main.lis");
+            check_single_file(
+                &src_main,
+                options,
+                CompileScope::Project(project_path.to_path_buf()),
+                Snapshot::of(locator),
+                &go_module,
+                Some(scanned),
+            )
+        }
+        ProjectKind::Library => {
+            let start = Instant::now();
+            let src_dir = project_path.join("src");
+            let result = compile_project_entry(
+                &src_dir,
+                CompileInput::Library,
+                CompileScope::Project(project_path.to_path_buf()),
+                locator,
+                &go_module,
+                Some(scanned),
+            );
+            report_check(&result, options, start)
+        }
+    };
+    drop(target_lock);
+    result
 }
 
 fn check_single_file(
     file_path: &Path,
-    filter: &Filter,
-    load_siblings: bool,
-    locator: TypedefLocator,
+    options: &CheckOptions,
+    scope: CompileScope,
+    snapshot: Snapshot,
+    go_module: &str,
+    scanned: Option<ScannedSources>,
 ) -> i32 {
     let start = Instant::now();
-    let Some((result, source, filename)) = compile_single_file(file_path, load_siblings, locator)
-    else {
-        return 1; // Read error already reported by compile_single_file
+    let result = match compile_single_file(file_path, scope, snapshot, go_module, scanned) {
+        Ok(result) => result,
+        Err(ReadFailure) => return 1,
     };
-    let counts = render::render_all(
-        &result.errors,
-        &result.lints,
-        |file_id| {
-            result
-                .sources
-                .get(&file_id)
-                .map(|info| (info.source.clone(), info.filename.clone()))
-        },
-        result.user_file_count,
-        filter,
-        &source,
-        &filename,
-    );
-    render::print_summary(
-        counts.files,
-        start.elapsed(),
-        counts.errors,
-        counts.warnings,
-    );
-    counts.errors
+    report_check(&result, options, start)
+}
+
+fn report_check(result: &CompileResult, options: &CheckOptions, start: Instant) -> i32 {
+    let unix = matches!(options.format, OutputFormat::Unix);
+    if options.fixes() {
+        let mut summary = FixSummary::default();
+        apply_result_fixes(result, &mut summary);
+        print_fix_summary(&summary, start.elapsed());
+        return i32::from(summary.write_failures > 0);
+    }
+
+    let get_source = |file_id: u32| {
+        result
+            .sources
+            .get(&file_id)
+            .map(|info| (info.source.clone(), info.filename.clone()))
+    };
+    let counts = if unix {
+        let (output, counts) = render::render_unix(
+            &result.diagnostics,
+            render::SourceCache::new(get_source),
+            result.user_file_count,
+            &options.filter,
+        );
+        print!("{}", output);
+        counts
+    } else {
+        render::render_all(
+            &result.diagnostics,
+            render::SourceCache::new(get_source),
+            result.user_file_count,
+            &options.filter,
+        )
+    };
+    if !unix {
+        if counts.errors + counts.warnings + counts.info == 0 {
+            eprintln!();
+        }
+        render::print_summary(
+            counts.files,
+            start.elapsed(),
+            counts.errors,
+            counts.warnings,
+            counts.info,
+        );
+    }
+    exit_code(counts.errors, counts.warnings, options.deny_warnings())
 }
 
 fn compile_single_file(
     file_path: &Path,
-    load_siblings: bool,
-    locator: TypedefLocator,
-) -> Option<(CompileResult, String, String)> {
-    let source = match fs::read_to_string(file_path) {
+    scope: CompileScope,
+    snapshot: Snapshot,
+    go_module: &str,
+    scanned: Option<ScannedSources>,
+) -> Result<CompileResult, ReadFailure> {
+    let Snapshot { source, locator } = snapshot;
+    let source = match source.ok_or(()).or_else(|_| fs::read_to_string(file_path)) {
         Ok(s) => s,
         Err(e) => {
             cli_error!(
@@ -124,36 +320,88 @@ fn compile_single_file(
                 format!("Failed to read `{}`: {}", file_path.display(), e),
                 "Check file permissions"
             );
-            return None;
+            return Err(ReadFailure);
         }
     };
 
-    let filename = file_path
+    let entry_name = file_path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("main.lis");
+        .unwrap_or("main.lis")
+        .to_string();
+    let entry_display =
+        relative_to_cwd(file_path).unwrap_or_else(|| file_path.display().to_string());
 
-    let config = CompileConfig {
-        target_phase: CompilePhase::Check,
-        go_module: "main".to_string(),
-        standalone_mode: !load_siblings,
-        load_siblings,
-        debug: false,
-        project_root: locator.project_root().map(|p| p.to_path_buf()),
+    let input = CompileInput::Binary(CompileEntry {
+        source: &source,
+        filename: &entry_name,
+        display_path: &entry_display,
+    });
+    if matches!(scope, CompileScope::Script { .. }) {
+        return Ok(compile_entry(
+            input,
+            scope,
+            &locator,
+            go_module,
+            &MemoryLoader::new(),
+        ));
+    }
+
+    let working_dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(compile_project_entry(
+        working_dir,
+        input,
+        scope,
         locator,
-    };
-
-    let working_dir = file_path.parent().and_then(|p| p.to_str()).unwrap_or(".");
-
-    let fs = LocalFileSystem::new(working_dir);
-    let result = compile(&source, filename, &config, &fs);
-    let display_filename = file_path.display().to_string();
-
-    Some((result, source, display_filename))
+        go_module,
+        scanned,
+    ))
 }
 
-fn check_loose_dir(dir: &Path, filter: &Filter) -> i32 {
-    let mut files = lisette::fs::collect_lis_filepaths_recursive(dir);
+fn compile_project_entry(
+    dir: &Path,
+    input: CompileInput<'_>,
+    scope: CompileScope,
+    locator: TypedefLocator,
+    go_module: &str,
+    scanned: Option<ScannedSources>,
+) -> CompileResult {
+    let project_root = locator.project_root().map(|p| p.to_path_buf());
+
+    let fs = match scanned {
+        Some(ScannedSources {
+            sources,
+            test_sources,
+        }) => LocalFileSystem::with_scanned_sources(
+            dir,
+            project_root.as_deref(),
+            sources,
+            test_sources,
+        ),
+        None => LocalFileSystem::new(dir.to_str().unwrap_or("."), project_root.as_deref()),
+    };
+    compile_entry(input, scope, &locator, go_module, &fs)
+}
+
+fn compile_entry(
+    input: CompileInput<'_>,
+    scope: CompileScope,
+    locator: &TypedefLocator,
+    go_module: &str,
+    loader: &dyn Loader,
+) -> CompileResult {
+    let config = CompileConfig {
+        mode: CompileMode::Check,
+        go_module,
+        entry_package_name: "main",
+        scope,
+        locator,
+    };
+    compile(input, config, loader)
+}
+
+fn check_loose_dir(dir: &Path, options: &CheckOptions) -> i32 {
+    let mut files = collect_lis_filepaths_recursive(dir);
     files.sort();
 
     if files.is_empty() {
@@ -165,60 +413,219 @@ fn check_loose_dir(dir: &Path, filter: &Filter) -> i32 {
         return 1;
     }
 
-    let mut dirs: HashMap<PathBuf, Vec<PathBuf>> = HashMap::default();
-    for file_path in &files {
-        if let Some(parent) = file_path.parent() {
-            dirs.entry(parent.to_path_buf())
-                .or_default()
-                .push(file_path.clone());
+    let mut projects: Vec<PathBuf> = Vec::new();
+    let mut loose: Vec<(&PathBuf, bool)> = Vec::new();
+    for file in &files {
+        match super::project::resolve_file_target(file) {
+            FileTarget::ProjectEntry { root } | FileTarget::ProjectPackage { root } => {
+                if !projects.contains(&root) {
+                    projects.push(root);
+                }
+            }
+            FileTarget::Script { .. } if file.to_string_lossy().ends_with(".d.lis") => {}
+            FileTarget::Script { inside_project } => loose.push((file, inside_project)),
         }
+    }
+
+    let mut project_code = 0;
+    for root in &projects {
+        project_code |= check_project(root, options);
+    }
+    if loose.is_empty() && !projects.is_empty() {
+        return project_code;
     }
 
     let mut total_errors = 0;
     let mut total_warnings = 0;
+    let mut total_info = 0;
     let mut total_files = 0;
     let mut read_failures = 0;
 
+    let unix = matches!(options.format, OutputFormat::Unix);
     let start = Instant::now();
 
-    for dir_files in dirs.values() {
-        let mut compiled = None;
-        let mut dir_read_failures = 0;
-        for file in dir_files {
-            if let Some(result) = compile_single_file(file, true, TypedefLocator::default()) {
-                compiled = Some(result);
-                break;
-            }
-            dir_read_failures += 1;
-        }
+    let mut fix_summary = FixSummary::default();
 
-        let Some((result, source, filename)) = compiled else {
-            read_failures += dir_read_failures;
+    for (file, inside_project) in loose {
+        let Ok(compiled) = compile_single_file(
+            file,
+            CompileScope::Script { inside_project },
+            Snapshot::read(file, options.target),
+            "main",
+            None,
+        ) else {
+            read_failures += 1;
             continue;
         };
-        let counts = render::render_all(
-            &result.errors,
-            &result.lints,
-            |file_id| {
-                result
-                    .sources
-                    .get(&file_id)
-                    .map(|info| (info.source.clone(), info.filename.clone()))
-            },
-            result.user_file_count,
-            filter,
-            &source,
-            &filename,
-        );
+
+        if options.fixes() {
+            apply_result_fixes(&compiled, &mut fix_summary);
+            continue;
+        }
+
+        let get_source = |file_id: u32| {
+            compiled
+                .sources
+                .get(&file_id)
+                .map(|info| (info.source.clone(), info.filename.clone()))
+        };
+        let counts = if unix {
+            let (output, counts) = render::render_unix(
+                &compiled.diagnostics,
+                render::SourceCache::new(get_source),
+                compiled.user_file_count,
+                &options.filter,
+            );
+            print!("{}", output);
+            counts
+        } else {
+            render::render_all(
+                &compiled.diagnostics,
+                render::SourceCache::new(get_source),
+                compiled.user_file_count,
+                &options.filter,
+            )
+        };
         total_errors += counts.errors;
         total_warnings += counts.warnings;
-        total_files += result.user_file_count;
+        total_info += counts.info;
+        total_files += compiled.user_file_count;
     }
 
     let elapsed = start.elapsed();
 
-    let all_errors = total_errors + read_failures;
-    render::print_summary(total_files, elapsed, all_errors, total_warnings);
+    if options.fixes() {
+        print_fix_summary(&fix_summary, elapsed);
+        return project_code | i32::from(fix_summary.write_failures > 0);
+    }
 
-    all_errors
+    let all_errors = total_errors + read_failures;
+    if !unix {
+        if total_errors + total_warnings + total_info == 0 {
+            eprintln!();
+        }
+        render::print_summary(total_files, elapsed, all_errors, total_warnings, total_info);
+    }
+
+    project_code | exit_code(all_errors, total_warnings, options.deny_warnings())
+}
+
+fn exit_code(errors: usize, warnings: usize, deny_warnings: bool) -> i32 {
+    i32::from(errors > 0 || (deny_warnings && warnings > 0))
+}
+
+#[derive(Default)]
+struct FixSummary {
+    applied: usize,
+    files_changed: usize,
+    write_failures: usize,
+}
+
+fn apply_result_fixes(result: &CompileResult, summary: &mut FixSummary) {
+    let mut by_file: HashMap<u32, Vec<&Fix>> = HashMap::default();
+    for diagnostic in result.diagnostics.iter() {
+        let Some(fix) = diagnostic.fix() else {
+            continue;
+        };
+        let Some(file_id) = diagnostic.file_id() else {
+            continue;
+        };
+        by_file.entry(file_id).or_default().push(fix);
+    }
+
+    for (file_id, fixes) in by_file {
+        let Some(info) = result.sources.get(&file_id) else {
+            continue;
+        };
+        let path = Path::new(&info.filename);
+        if !path.is_file() {
+            continue;
+        }
+
+        let applied = apply_fixes(&info.source, fixes);
+        if applied.applied == 0 {
+            continue;
+        }
+
+        let errors_before = syntax::build_ast(&info.source, file_id).errors.len();
+        let errors_after = syntax::build_ast(&applied.source, file_id).errors.len();
+        if errors_after >= errors_before.max(1) {
+            cli_error!(
+                "Skipped a fix",
+                format!(
+                    "Applying fixes to `{}` would produce invalid syntax",
+                    info.filename
+                ),
+                "Re-run `lis check` to see the remaining diagnostics"
+            );
+            summary.write_failures += 1;
+            continue;
+        }
+
+        match fs::File::create(path).and_then(|mut file| file.write_all(applied.source.as_bytes()))
+        {
+            Ok(()) => {
+                summary.applied += applied.applied;
+                summary.files_changed += 1;
+            }
+            Err(e) => {
+                cli_error!(
+                    "Failed to write fix",
+                    format!("Failed to write `{}`: {}", info.filename, e),
+                    "Check file permissions"
+                );
+                summary.write_failures += 1;
+            }
+        }
+    }
+}
+
+fn print_fix_summary(summary: &FixSummary, elapsed: Duration) {
+    let time_display = output::format_elapsed(elapsed);
+
+    eprintln!();
+
+    if summary.files_changed == 0 {
+        eprintln!("  ✓ No fixes applied {}", time_display);
+    } else {
+        let fix_word = if summary.applied == 1 { "fix" } else { "fixes" };
+        let location = if summary.files_changed == 1 {
+            "in 1 file".to_string()
+        } else {
+            format!("across {} files", summary.files_changed)
+        };
+        eprintln!(
+            "  ✓ Applied {} {} {} {}",
+            summary.applied, fix_word, location, time_display
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_code;
+
+    #[test]
+    fn warnings_are_ignored_without_deny() {
+        assert_eq!(exit_code(0, 3, false), 0);
+        assert_eq!(exit_code(2, 3, false), 1);
+    }
+
+    #[test]
+    fn deny_makes_warnings_fail_the_check() {
+        assert_eq!(exit_code(0, 1, true), 1);
+        assert_eq!(exit_code(0, 3, true), 1);
+    }
+
+    #[test]
+    fn deny_with_no_warnings_still_passes() {
+        assert_eq!(exit_code(0, 0, true), 0);
+    }
+
+    #[test]
+    fn diagnostic_totals_never_wrap_to_a_false_success() {
+        assert_eq!(exit_code(0, 256, true), 1);
+        assert_eq!(exit_code(256, 0, false), 1);
+        assert_eq!(exit_code(128, 128, true), 1);
+    }
 }

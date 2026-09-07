@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn test(nested: ((int, int), int)) {\n  let x = nested.0.0;\n}\n"
+description: |
+  
+  fn test(nested: ((int, int), int)) {
+    let x = nested.0.0;
+  }
 ---
 [
     Function {
@@ -70,97 +74,94 @@ description: "input: \nfn test(nested: ((int, int), int)) {\n  let x = nested.0.
                         },
                     },
                 ),
-                typed_pattern: None,
-                ty: Variable(
-                    -1,
-                ),
+                ty: Var {
+                    id: uninferred,
+                },
             },
         ],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
+        return_type: Var {
+            id: uninferred,
+        },
         visibility: Private,
-        body: Block {
-            items: [
-                Let {
-                    binding: Binding {
-                        pattern: Identifier {
-                            identifier: "x",
-                            span: Span {
-                                file_id: 0,
-                                byte_offset: 44,
-                                byte_length: 1,
+        body: Definition(
+            Block {
+                items: [
+                    Let {
+                        binding: Binding {
+                            pattern: Identifier {
+                                identifier: "x",
+                                span: Span {
+                                    file_id: 0,
+                                    byte_offset: 44,
+                                    byte_length: 1,
+                                },
+                            },
+                            annotation: None,
+                            ty: Var {
+                                id: uninferred,
                             },
                         },
-                        annotation: None,
-                        typed_pattern: None,
-                        ty: Variable(
-                            -1,
-                        ),
-                    },
-                    value: DotAccess {
-                        expression: DotAccess {
-                            expression: Identifier {
-                                value: "nested",
-                                ty: Variable(
-                                    -1,
-                                ),
+                        value: DotAccess {
+                            expression: DotAccess {
+                                expression: Identifier {
+                                    value: "nested",
+                                    ty: Var {
+                                        id: uninferred,
+                                    },
+                                    span: Span {
+                                        file_id: 0,
+                                        byte_offset: 48,
+                                        byte_length: 6,
+                                    },
+                                    resolution: Unresolved,
+                                },
+                                member: "0",
+                                ty: Var {
+                                    id: uninferred,
+                                },
                                 span: Span {
                                     file_id: 0,
                                     byte_offset: 48,
-                                    byte_length: 6,
+                                    byte_length: 8,
                                 },
-                                binding_id: None,
-                                qualified: None,
+                                resolution: Unresolved,
                             },
                             member: "0",
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                             span: Span {
                                 file_id: 0,
                                 byte_offset: 48,
-                                byte_length: 8,
+                                byte_length: 10,
                             },
+                            resolution: Unresolved,
                         },
-                        member: "0",
-                        ty: Variable(
-                            -1,
-                        ),
+                        mode: Plain,
+                        ty: Var {
+                            id: uninferred,
+                        },
                         span: Span {
                             file_id: 0,
-                            byte_offset: 48,
-                            byte_length: 10,
+                            byte_offset: 40,
+                            byte_length: 18,
                         },
                     },
-                    mutable: false,
-                    mut_span: None,
-                    else_block: None,
-                    else_span: None,
-                    typed_pattern: None,
-                    ty: Variable(
-                        -1,
-                    ),
-                    span: Span {
-                        file_id: 0,
-                        byte_offset: 40,
-                        byte_length: 18,
-                    },
+                ],
+                ty: Var {
+                    id: uninferred,
                 },
-            ],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 36,
-                byte_length: 25,
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 36,
+                    byte_length: 25,
+                },
             },
-        },
-        ty: Variable(
-            -1,
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

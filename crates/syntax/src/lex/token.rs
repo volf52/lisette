@@ -5,7 +5,13 @@ pub struct Token<'source> {
     pub kind: TokenKind,
     pub text: &'source str,
     pub byte_offset: u32,
-    pub byte_length: u32,
+    pub(crate) byte_length: u32,
+}
+
+impl Token<'_> {
+    pub fn end_offset(self) -> u32 {
+        self.byte_offset + self.byte_length
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,6 +19,7 @@ pub enum TokenKind {
     Integer,
     Imaginary,
     String,
+    RawString,
     FormatStringStart,
     FormatStringText,
     FormatStringInterpolationStart,
@@ -24,6 +31,8 @@ pub enum TokenKind {
     Identifier,
     Comment,
     DocComment,
+    FileComment,
+    Shebang,
     Semicolon,
     LeftParen,
     RightParen,
@@ -55,6 +64,12 @@ pub enum TokenKind {
     StarEqual,
     SlashEqual,
     PercentEqual,
+    AmpersandEqual,
+    PipeEqual,
+    CaretEqual,
+    ShiftLeftEqual,  // <<=
+    ShiftRightEqual, // >>=
+    AndNotEqual,     // &^=
     Caret,
     Percent,
     Bang,
@@ -64,7 +79,11 @@ pub enum TokenKind {
     Hash,
     DotDot,
     DotDotEqual,
+    Ellipsis,
     Backtick,
+    ShiftLeft,  // <<
+    ShiftRight, // >>
+    AndNot,     // &^ - Short hand for `x & (^y)` in Go
     Function,
     Let,
     If,
@@ -92,6 +111,7 @@ pub enum TokenKind {
     Task,
     Try,
     Recover,
+    Assert,
     As,
     Directive,
     EOF,
@@ -106,6 +126,7 @@ impl fmt::Display for TokenKind {
             Integer => "integer",
             Imaginary => "imaginary",
             String => "string",
+            RawString => "raw string",
             FormatStringStart => "format string",
             FormatStringText => "format string",
             FormatStringInterpolationStart => "`{`",
@@ -117,6 +138,8 @@ impl fmt::Display for TokenKind {
             Identifier => "identifier",
             Comment => "comment",
             DocComment => "doc comment",
+            FileComment => "file comment",
+            Shebang => "shebang",
             Semicolon => "`;`",
             LeftParen => "`(`",
             RightParen => "`)`",
@@ -148,6 +171,12 @@ impl fmt::Display for TokenKind {
             StarEqual => "`*=`",
             SlashEqual => "`/=`",
             PercentEqual => "`%=`",
+            AmpersandEqual => "`&=`",
+            PipeEqual => "`|=`",
+            CaretEqual => "`^=`",
+            ShiftLeftEqual => "`<<=`",
+            ShiftRightEqual => "`>>=`",
+            AndNotEqual => "`&^=`",
             Caret => "`^`",
             Percent => "`%`",
             Bang => "`!`",
@@ -157,7 +186,11 @@ impl fmt::Display for TokenKind {
             Hash => "`#`",
             DotDot => "`..`",
             DotDotEqual => "`..=`",
+            Ellipsis => "`...`",
             Backtick => "`` ` ``",
+            ShiftLeft => "`<<`",
+            ShiftRight => "`>>`",
+            AndNot => "`&^`",
             Function => "`fn`",
             Let => "`let`",
             If => "`if`",
@@ -185,6 +218,7 @@ impl fmt::Display for TokenKind {
             Task => "`task`",
             Try => "`try`",
             Recover => "`recover`",
+            Assert => "`assert`",
             As => "`as`",
             Directive => "directive",
             EOF => "end of file",
@@ -196,7 +230,7 @@ impl fmt::Display for TokenKind {
 }
 
 impl TokenKind {
-    pub fn from_keyword(s: &str) -> Option<Self> {
+    pub(crate) fn from_keyword(s: &str) -> Option<Self> {
         use TokenKind::*;
 
         match s {
@@ -227,12 +261,13 @@ impl TokenKind {
             "task" => Some(Task),
             "try" => Some(Try),
             "recover" => Some(Recover),
+            "assert" => Some(Assert),
             "as" => Some(As),
             _ => None,
         }
     }
 
-    pub fn is_keyword(&self) -> bool {
+    pub(crate) fn is_keyword(&self) -> bool {
         use TokenKind::*;
         matches!(
             self,
@@ -263,18 +298,23 @@ impl TokenKind {
                 | Task
                 | Try
                 | Recover
+                | Assert
                 | As
         )
     }
 
-    pub fn from_three_char_symbol(c1: char, c2: char, c3: char) -> Option<Self> {
+    pub(crate) fn from_three_char_symbol(c1: char, c2: char, c3: char) -> Option<Self> {
         match (c1, c2, c3) {
             ('.', '.', '=') => Some(TokenKind::DotDotEqual),
+            ('.', '.', '.') => Some(TokenKind::Ellipsis),
+            ('<', '<', '=') => Some(TokenKind::ShiftLeftEqual),
+            ('>', '>', '=') => Some(TokenKind::ShiftRightEqual),
+            ('&', '^', '=') => Some(TokenKind::AndNotEqual),
             _ => None,
         }
     }
 
-    pub fn from_two_char_symbol(c1: char, c2: char) -> Option<Self> {
+    pub(crate) fn from_two_char_symbol(c1: char, c2: char) -> Option<Self> {
         use TokenKind::*;
 
         match (c1, c2) {
@@ -293,11 +333,17 @@ impl TokenKind {
             ('*', '=') => Some(StarEqual),
             ('/', '=') => Some(SlashEqual),
             ('%', '=') => Some(PercentEqual),
+            ('&', '=') => Some(AmpersandEqual),
+            ('|', '=') => Some(PipeEqual),
+            ('^', '=') => Some(CaretEqual),
+            ('&', '^') => Some(AndNot),
+            ('<', '<') => Some(ShiftLeft),
+            ('>', '>') => Some(ShiftRight),
             _ => None,
         }
     }
 
-    pub fn from_one_char_symbol(c: char) -> Option<Self> {
+    pub(crate) fn from_one_char_symbol(c: char) -> Option<Self> {
         use TokenKind::*;
 
         match c {

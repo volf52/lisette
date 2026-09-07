@@ -1,29 +1,31 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:strconv\"\n\ntype F = fn(string) -> Result<int, error>\n\nfn main() {\n  let mut f: F = |s| Ok(0)\n  let u = { f = strconv.Atoi }\n  let _ = u\n  let _ = f(\"1\")\n}\n"
+description: |
+  
+  import "go:strconv"
+  
+  type F = fn(string) -> Result<int, error>
+  
+  fn main() {
+    let mut f: F = |s| Ok(0)
+    let u = { f = strconv.Atoi }
+    let _ = u
+    let _ = f("1")
+  }
 ---
 package main
 
-import (
-	lisette "github.com/ivov/lisette/prelude"
-	"strconv"
-)
+import "strconv"
 
-type F func(string) lisette.Result[int, error]
+type F func(string) (int, error)
 
 func main() {
-	f := func(_ string) lisette.Result[int, error] {
-		return lisette.MakeResultOk[int, error](0)
+	var f F = func(_ string) (int, error) {
+		return 0, nil
 	}
 	var u any
-	f = func(arg0 string) lisette.Result[int, error] {
-		ret_1, ret_2 := strconv.Atoi(arg0)
-		if ret_2 != nil {
-			return lisette.MakeResultErr[int, error](ret_2)
-		}
-		return lisette.MakeResultOk[int, error](ret_1)
-	}
+	f = strconv.Atoi
 	u = struct{}{}
 	_ = u
-	_ = f("1")
+	f("1")
 }

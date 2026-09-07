@@ -101,6 +101,24 @@ fn char_escaped_quote() {
 }
 
 #[test]
+fn char_escaped_hex() {
+    let input = "'\\x41'";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn char_escaped_unicode() {
+    let input = "'\\u{e9}'";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn char_escaped_capital_unicode() {
+    let input = "'\\U0001F600'";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
 fn comment() {
     let input = "42; // meaning of life";
     assert_lex_snapshot!(input);
@@ -181,6 +199,84 @@ fn doc_comment_vs_comment() {
 #[test]
 fn doc_comment_four_slashes_is_comment() {
     let input = "//// This is a divider, not a doc comment";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn file_comment() {
+    let input = "//! This is a file comment";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn file_comment_strips_one_leading_space() {
+    let input = "//!  two spaces\n//!no space";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn file_comment_bare() {
+    let input = "//!";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn file_comment_multiline_before_fn() {
+    let input = "//! First line\n//! Second line\nfn foo() {}";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn file_comment_vs_comment_vs_doc_comment() {
+    let input = "//! file comment\n// comment\n/// doc";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang() {
+    let input = "#!/usr/bin/env -S lis run\nfn main() {}";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang_alone() {
+    let input = "#!/usr/bin/env -S lis run";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang_before_file_comment() {
+    let input = "#!/usr/bin/env -S lis run\n//! A tool.\nfn main() {}";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn inner_attribute_is_not_a_shebang() {
+    let input = "#![foo]\nfn main() {}";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang_below_the_first_line_is_not_a_shebang() {
+    let input = "fn main() {}\n#!/usr/bin/env -S lis run";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang_without_an_interpreter_is_not_a_shebang() {
+    let input = "#!\nfn main() {}";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang_ends_at_a_carriage_return() {
+    let input = "#!/usr/bin/env -S lis run\rfn main() {}";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn shebang_leaves_a_carriage_return_newline_out_of_the_token() {
+    let input = "#!/usr/bin/env -S lis run\r\nfn main() {}";
     assert_lex_snapshot!(input);
 }
 
@@ -700,18 +796,6 @@ fn octal_with_underscores() {
 }
 
 #[test]
-fn octal_legacy() {
-    let input = "0755";
-    assert_lex_snapshot!(input);
-}
-
-#[test]
-fn octal_legacy_with_underscores() {
-    let input = "0644_755";
-    assert_lex_snapshot!(input);
-}
-
-#[test]
 fn binary_basic() {
     let input = "0b1010";
     assert_lex_snapshot!(input);
@@ -811,5 +895,197 @@ fn no_asi_before_closing_bracket() {
     let input = "arr[
     0
 ]";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_empty() {
+    let input = "r\"\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_simple() {
+    let input = "r\"hello\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_backslash() {
+    let input = "r\"a\\b\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_regex() {
+    let input = "r\"([a-zA-Z])(\\d)\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_windows_path() {
+    let input = "r\"C:\\Users\\me\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_with_escape_like_content() {
+    let input = "r\"\\n\\t\\u{1234}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_unterminated_eof() {
+    let input = "r\"abc";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_unterminated_eof_after_newline() {
+    let input = "r\"abc\nlet x = 1";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_followed_by_string() {
+    let input = "r\"a\"\"b\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn identifier_r_not_raw_string() {
+    let input = "let r = 1";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn identifier_r_followed_by_string_with_newline() {
+    let input = "r\n\"hello\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_fstring_interpolation_rejected() {
+    let input = "f\"{r\"\\d\"}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_nested_fstring_interpolation_rejected() {
+    let input = "f\"{f\"{r\"x\"}\"}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_in_fstring_boundary_scanner_alignment() {
+    let input = "f\"{r\"\\d\"}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_nul_byte_rejected() {
+    let input = "r\"a\0b\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_raw_format_string_fr() {
+    let input = "fr\"abc\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_raw_format_string_rf() {
+    let input = "rf\"abc\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_raw_format_string_suppresses_inner_cascade() {
+    let input = "fr\"\\d+\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_hash_delimited_raw_string_single() {
+    let input = "r#\"foo\"#";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_hash_delimited_raw_string_double() {
+    let input = "r##\"foo\"##";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_hash_delimited_raw_string_with_embedded_quote() {
+    let input = "r#\"foo \"bar\" baz\"#";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_hash_delimited_raw_string_suppresses_escape_cascade() {
+    let input = "r#\"\\d+\"#";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn r_followed_by_hash_without_quote_is_identifier() {
+    let input = "let r = 1; r#";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_rf_in_fstring_interpolation() {
+    let input = "f\"{rf\"abc\"}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_fr_in_fstring_interpolation() {
+    let input = "f\"{fr\"abc\"}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn unsupported_hash_delimited_in_fstring_interpolation() {
+    let input = "f\"{r#\"abc\"#}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn string_literal_multiline() {
+    let input = "\"a\nb\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn raw_string_multiline() {
+    let input = "r\"a\nb\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn format_string_multiline_text() {
+    let input = "f\"hello\n{name}\nworld\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn format_string_multiline_text_no_interpolation() {
+    let input = "f\"a\nb\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn multiline_format_string_interpolation_recovery_no_spurious_unterminated() {
+    let input = "let s = f\"result: {\n  match n {\n    0 => \"zero\",\n  }\n}\"";
+    assert_lex_snapshot!(input);
+}
+
+#[test]
+fn multiline_string_blank_lines_trivia_unaffected() {
+    let input = "let a = 1\n\nlet s = \"x\ny\"\n\nlet b = 2";
     assert_lex_snapshot!(input);
 }

@@ -1,13 +1,12 @@
-use tower_lsp::{LspService, Server};
+use std::sync::Arc;
+
+use deps::BindgenSetup;
+
+use crate::workspace::WorkspaceBindgenSetup;
+use lsp::protocol;
+use std::io;
 
 pub fn lsp() -> i32 {
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    rt.block_on(async {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-
-        let (service, socket) = LspService::new(lsp::Backend::new);
-        Server::new(stdin, stdout, socket).serve(service).await;
-    });
-    0
+    let setup: Arc<dyn BindgenSetup> = Arc::new(WorkspaceBindgenSetup);
+    protocol::serve(io::stdin().lock(), io::stdout(), Some(setup))
 }

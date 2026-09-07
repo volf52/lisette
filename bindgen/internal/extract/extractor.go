@@ -5,7 +5,9 @@ import (
 	"go/doc"
 	"go/types"
 	"os"
+	"runtime"
 	"sort"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -21,31 +23,76 @@ const (
 )
 
 type SymbolExport struct {
-	Name                 string
-	Kind                 SymbolExportKind
-	Doc                  string
-	GoType               types.Type
-	Obj                  types.Object
-	ReceiverVariable     *types.Var
-	BaseType             *types.Named // for methods
-	IsPromoted           bool         // true if promoted from an embedded field
-	NeedsPointerReceiver bool         // for promoted methods: true if only in pointer method set
-	OriginalTypeName     string       // for promoted methods: declaring type name
-	OriginalPkgPath      string       // for promoted methods: declaring type's package path
+	Name             string
+	Kind             SymbolExportKind
+	Doc              string
+	GoType           types.Type
+	Obj              types.Object
+	ReceiverVariable *types.Var
+	BaseType         *types.Named // for methods
+	IsPromoted       bool         // true if promoted from an embedded field
+	OriginalTypeName string       // for promoted methods: declaring type name
+	OriginalPkgPath  string       // for promoted methods: declaring type's package path
+	Unexported       bool         // a directly-declared unexported method, recorded as a seal
 }
 
-var loadConfig = &packages.Config{
-	Mode: packages.NeedName |
-		packages.NeedTypes |
-		packages.NeedTypesInfo |
-		packages.NeedSyntax |
-		packages.NeedDeps |
-		packages.NeedImports,
-	Env: append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=-mod=mod"), // cgo types are unexported anyway; -mod=mod resolves indirect deps
+func currentLoadConfig(targetGOOS, targetGOARCH string, cgo bool) *packages.Config {
+	return &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedSyntax |
+			packages.NeedDeps |
+			packages.NeedImports,
+		Env: buildLoaderEnv(targetGOOS, targetGOARCH, cgo),
+	}
 }
 
-func LoadPackage(path string) (*packages.Package, error) {
-	pkgs, err := packages.Load(loadConfig, path)
+// buildLoaderEnv cross-compiles when targetGOOS/targetGOARCH are set, and an
+// empty one keeps the ambient value. Stdlib generation keeps cgo off so the
+// cross-target builds need no C cross-toolchains.
+func buildLoaderEnv(targetGOOS, targetGOARCH string, cgo bool) []string {
+	env := os.Environ()
+	if targetGOOS != "" || targetGOARCH != "" {
+		filtered := make([]string, 0, len(env))
+		for _, e := range env {
+			if (targetGOOS != "" && strings.HasPrefix(e, "GOOS=")) ||
+				(targetGOARCH != "" && strings.HasPrefix(e, "GOARCH=")) {
+				continue
+			}
+			filtered = append(filtered, e)
+		}
+		env = filtered
+		if targetGOOS != "" {
+			env = append(env, "GOOS="+targetGOOS)
+		}
+		if targetGOARCH != "" {
+			env = append(env, "GOARCH="+targetGOARCH)
+		}
+	}
+
+	cgoEnabled := "CGO_ENABLED=0"
+	if cgo {
+		cgoEnabled = "CGO_ENABLED=1"
+	}
+	return append(env, cgoEnabled, "GOFLAGS=-mod=mod")
+}
+
+// A zero target means the host, never the ambient GOOS. A cross load keeps cgo
+// off, as `go build` does when it cross-compiles.
+func packageLoadConfig(targetGOOS, targetGOARCH string) *packages.Config {
+	if targetGOOS == "" {
+		targetGOOS = runtime.GOOS
+	}
+	if targetGOARCH == "" {
+		targetGOARCH = runtime.GOARCH
+	}
+	cgo := targetGOOS == runtime.GOOS && targetGOARCH == runtime.GOARCH
+	return currentLoadConfig(targetGOOS, targetGOARCH, cgo)
+}
+
+func LoadPackage(path, targetGOOS, targetGOARCH string) (*packages.Package, error) {
+	pkgs, err := packages.Load(packageLoadConfig(targetGOOS, targetGOARCH), path)
 	if err != nil {
 		return nil, err
 	}
@@ -69,24 +116,48 @@ func LoadPackage(path string) (*packages.Package, error) {
 	return pkg, nil
 }
 
-func LoadPackages(paths []string) ([]*packages.Package, error) {
-	pkgs, err := packages.Load(loadConfig, paths...)
+func LoadPackages(paths []string, targetGOOS, targetGOARCH string) ([]*packages.Package, error) {
+	return loadCheckedPackages(paths, targetGOOS, targetGOARCH, nil)
+}
+
+// LoadStdPackages loads the `std` pattern, dropping roots matched by skip.
+// Load errors fail the call only for kept roots: internal packages may not
+// type-check on every platform and are never converted.
+func LoadStdPackages(targetGOOS, targetGOARCH string, skip func(string) bool) ([]*packages.Package, error) {
+	return loadCheckedPackages([]string{"std"}, targetGOOS, targetGOARCH, skip)
+}
+
+func loadCheckedPackages(patterns []string, targetGOOS, targetGOARCH string, skip func(string) bool) ([]*packages.Package, error) {
+	pkgs, err := packages.Load(currentLoadConfig(targetGOOS, targetGOARCH, false), patterns...)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []*packages.Package
+	var kept []*packages.Package
+	var failures []string
 	for _, pkg := range pkgs {
-		if len(pkg.Errors) > 0 {
+		if skip != nil && skip(pkg.PkgPath) {
 			continue
 		}
-		result = append(result, pkg)
+		if len(pkg.Errors) > 0 {
+			failures = append(failures, fmt.Sprintf("%s: %v", pkg.PkgPath, pkg.Errors))
+			continue
+		}
+		kept = append(kept, pkg)
+	}
+	if len(failures) > 0 {
+		return nil, fmt.Errorf("packages.Load reported errors:\n  %s", strings.Join(failures, "\n  "))
 	}
 
-	return result, nil
+	return kept, nil
 }
 
-func ExtractExports(pkg *packages.Package) []SymbolExport {
+// Like LoadPackages but keeps errored packages so the caller can classify them.
+func LoadPackagesAll(paths []string, targetGOOS, targetGOARCH string) ([]*packages.Package, error) {
+	return packages.Load(packageLoadConfig(targetGOOS, targetGOARCH), paths...)
+}
+
+func ExtractExports(pkg *packages.Package, embedFaithful func(*types.Var) bool) []SymbolExport {
 	if pkg == nil || pkg.Types == nil {
 		return nil
 	}
@@ -97,6 +168,7 @@ func ExtractExports(pkg *packages.Package) []SymbolExport {
 
 	pkgScope := pkg.Types.Scope()
 	pkgNames := pkgScope.Names()
+	sealNames := sealMethodNames(pkgScope)
 
 	for _, name := range pkgNames {
 		obj := pkgScope.Lookup(name)
@@ -126,7 +198,7 @@ func ExtractExports(pkg *packages.Package) []SymbolExport {
 			})
 
 			if named, ok := o.Type().(*types.Named); ok {
-				methodExports := extractMethods(named, pkg, docPkg)
+				methodExports := extractMethods(named, pkg, docPkg, sealNames, embedFaithful)
 				exports = append(exports, methodExports...)
 			}
 
@@ -150,6 +222,19 @@ func ExtractExports(pkg *packages.Package) []SymbolExport {
 		}
 	}
 
+	for _, named := range unexportedEmbedTargets(pkg, embedFaithful) {
+		obj := named.Obj()
+		exports = append(exports, SymbolExport{
+			Name:       obj.Name(),
+			Kind:       ExportType,
+			Doc:        getDocForObject(docPkg, obj.Name()),
+			GoType:     named,
+			Obj:        obj,
+			Unexported: true,
+		})
+		exports = append(exports, extractMethods(named, pkg, docPkg, sealNames, embedFaithful)...)
+	}
+
 	sort.Slice(exports, func(i, j int) bool {
 		if exports[i].Kind != exports[j].Kind {
 			return exports[i].Kind < exports[j].Kind
@@ -160,15 +245,92 @@ func ExtractExports(pkg *packages.Package) []SymbolExport {
 	return exports
 }
 
-func extractMethods(named *types.Named, pkg *packages.Package, docPkg *doc.Package) []SymbolExport {
-	var exports []SymbolExport
+// unexportedEmbedTargets returns the same-package unexported struct types reached
+// as faithful embed targets from exported types, in deterministic name order.
+func unexportedEmbedTargets(pkg *packages.Package, embedFaithful func(*types.Var) bool) []*types.Named {
+	recorded := map[string]*types.Named{}
+	visited := map[string]bool{}
 
-	declaredMethods := make(map[string]bool)
-	for method := range named.Methods() {
-		declaredMethods[method.Name()] = true
+	var visit func(named *types.Named)
+	visit = func(named *types.Named) {
+		st, ok := named.Underlying().(*types.Struct)
+		if !ok {
+			return
+		}
+		if visited[named.Obj().Name()] {
+			return
+		}
+		visited[named.Obj().Name()] = true
+		for field := range st.Fields() {
+			if !field.Embedded() {
+				continue
+			}
+			t := field.Type()
+			if ptr, ok := t.(*types.Pointer); ok {
+				t = ptr.Elem()
+			}
+			embedded, ok := t.(*types.Named)
+			if !ok {
+				continue
+			}
+			obj := embedded.Obj()
+			if obj.Pkg() == nil || obj.Pkg().Path() != pkg.PkgPath {
+				continue
+			}
+			if !obj.Exported() && embedFaithful(field) {
+				recorded[obj.Name()] = embedded
+			}
+			visit(embedded)
+		}
 	}
 
-	valMethodSet := types.NewMethodSet(named)
+	scope := pkg.Types.Scope()
+	for _, name := range scope.Names() {
+		if tn, ok := scope.Lookup(name).(*types.TypeName); ok && tn.Exported() {
+			if named, ok := tn.Type().(*types.Named); ok {
+				visit(named)
+			}
+		}
+	}
+
+	names := make([]string, 0, len(recorded))
+	for name := range recorded {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]*types.Named, 0, len(names))
+	for _, name := range names {
+		out = append(out, recorded[name])
+	}
+	return out
+}
+
+// sealMethodNames collects the unexported method names that seal some exported
+// interface in the package. Only these are recorded on concrete types (so an
+// embedder can satisfy the seal). Other unexported helpers stay out.
+func sealMethodNames(scope *types.Scope) map[string]bool {
+	seal := map[string]bool{}
+	for _, name := range scope.Names() {
+		tn, ok := scope.Lookup(name).(*types.TypeName)
+		if !ok || !tn.Exported() {
+			continue
+		}
+		iface, ok := tn.Type().Underlying().(*types.Interface)
+		if !ok || !iface.IsMethodSet() {
+			continue
+		}
+		for m := range iface.Methods() {
+			if !m.Exported() {
+				seal[m.Name()] = true
+			}
+		}
+	}
+	return seal
+}
+
+func extractMethods(named *types.Named, pkg *packages.Package, docPkg *doc.Package, sealNames map[string]bool, embedFaithful func(*types.Var) bool) []SymbolExport {
+	var exports []SymbolExport
+
 	ptrMethodSet := types.NewMethodSet(types.NewPointer(named))
 
 	docPkgCache := map[string]*doc.Package{pkg.PkgPath: docPkg}
@@ -176,17 +338,38 @@ func extractMethods(named *types.Named, pkg *packages.Package, docPkg *doc.Packa
 	for sel := range ptrMethodSet.Methods() {
 		methodObj := sel.Obj()
 
-		if !methodObj.Exported() {
-			continue
-		}
-
 		fn, ok := methodObj.(*types.Func)
 		if !ok {
 			continue
 		}
 
-		isPromoted := !declaredMethods[methodObj.Name()]
-		needsPointerReceiver := valMethodSet.Lookup(methodObj.Pkg(), methodObj.Name()) == nil
+		index := sel.Index()
+		isPromoted := len(index) > 1
+
+		if !methodObj.Exported() {
+			// Record a directly-declared unexported method only when it seals an
+			// exported interface here. Helpers and promoted ones (slice 5) are skipped.
+			if isPromoted || !sealNames[methodObj.Name()] {
+				continue
+			}
+			sig := fn.Type().(*types.Signature)
+			exports = append(exports, SymbolExport{
+				Name:             methodObj.Name(),
+				Kind:             ExportMethod,
+				GoType:           fn.Type(),
+				Obj:              fn,
+				ReceiverVariable: sig.Recv(),
+				BaseType:         named,
+				Unexported:       true,
+			})
+			continue
+		}
+
+		if isPromoted {
+			if st, ok := named.Underlying().(*types.Struct); ok && embedFaithful(st.Field(index[0])) {
+				continue
+			}
+		}
 
 		sig := fn.Type().(*types.Signature)
 		recv := sig.Recv()
@@ -214,21 +397,34 @@ func extractMethods(named *types.Named, pkg *packages.Package, docPkg *doc.Packa
 		methodDoc := getMethodDoc(lookupDocPkg, docTypeName, methodObj.Name())
 
 		exports = append(exports, SymbolExport{
-			Name:                 methodObj.Name(),
-			Kind:                 ExportMethod,
-			Doc:                  methodDoc,
-			GoType:               fn.Type(),
-			Obj:                  fn,
-			ReceiverVariable:     recv,
-			BaseType:             named,
-			IsPromoted:           isPromoted,
-			NeedsPointerReceiver: needsPointerReceiver,
-			OriginalTypeName:     originalTypeName,
-			OriginalPkgPath:      originalPkgPath,
+			Name:             methodObj.Name(),
+			Kind:             ExportMethod,
+			Doc:              methodDoc,
+			GoType:           fn.Type(),
+			Obj:              fn,
+			ReceiverVariable: recv,
+			BaseType:         named,
+			IsPromoted:       isPromoted,
+			OriginalTypeName: originalTypeName,
+			OriginalPkgPath:  originalPkgPath,
 		})
 	}
 
 	return exports
+}
+
+// IsInternalPackagePath reports whether path is a Go internal package.
+func IsInternalPackagePath(path string) bool {
+	if path == "internal" {
+		return true
+	}
+	if strings.HasPrefix(path, "internal/") {
+		return true
+	}
+	if strings.HasSuffix(path, "/internal") {
+		return true
+	}
+	return strings.Contains(path, "/internal/")
 }
 
 func resolveDocPkg(cache map[string]*doc.Package, pkg *packages.Package, path string) *doc.Package {

@@ -1,7 +1,7 @@
 ---
 source: tests/ui/errors/mod.rs
 ---
-  [error] Duplicate constant
+  ✕ Duplicate constant
    ╭─[test.lis:3:7]
  2 │ const MAX = 100
  3 │ const MAX = 200
@@ -9,4 +9,4 @@ source: tests/ui/errors/mod.rs
    ·        ╰── already defined
  4 │ 
    ╰────
-  help: `MAX` is already defined in this module. Rename or remove this definition · code: [infer.duplicate_definition]
+  help: `MAX` is already defined in this package. Rename or remove this definition · code: [infer.duplicate_definition]

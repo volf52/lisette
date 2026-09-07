@@ -1,0 +1,57 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:fmt"
+  import "go:example.com/aws"
+  
+  fn run() -> Result<(), error> {
+    let xs = aws.Make()?
+    for x in xs {
+      match x {
+        Some(v) => fmt.Println(v),
+        None => fmt.Println("none"),
+      }
+    }
+    Ok(())
+  }
+  
+  fn main() {
+    let _ = run()
+  }
+---
+package main
+
+import (
+	"example.com/aws"
+	"fmt"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+func run() error {
+	ret_1, ret_2 := aws.Make()
+	if ret_2 != nil {
+		return ret_2
+	}
+	wrapped_3 := make([]lisette.Option[string], len(ret_1))
+	for i_4, v_5 := range ret_1 {
+		if v_5 != nil {
+			wrapped_3[i_4] = lisette.MakeOptionSome[string](*v_5)
+		} else {
+			wrapped_3[i_4] = lisette.MakeOptionNone[string]()
+		}
+	}
+	xs := wrapped_3
+	for _, x := range xs {
+		if x.Tag == lisette.OptionSome {
+			fmt.Println(x.SomeVal)
+		} else {
+			fmt.Println("none")
+		}
+	}
+	return nil
+}
+
+func main() {
+	run()
+}

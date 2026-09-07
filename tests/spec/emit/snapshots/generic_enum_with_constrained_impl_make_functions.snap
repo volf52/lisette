@@ -1,10 +1,39 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \ninterface Displayable {\n  fn display(self) -> string\n}\n\nenum Either<L, R> {\n  Left(L),\n  Right(R),\n}\n\nimpl<L: Displayable, R: Displayable> Either<L, R> {\n  fn display(self) -> string {\n    match self {\n      Either.Left(l) => {\n        let s = l.display()\n        f\"Left({s})\"\n      },\n      Either.Right(r) => {\n        let s = r.display()\n        f\"Right({s})\"\n      },\n    }\n  }\n}\n\nstruct Name { value: string }\nimpl Name { fn display(self) -> string { self.value } }\n\nfn test() -> Either<Name, Name> {\n  Either.Left(Name { value: \"hello\" })\n}\n"
+description: |
+  
+  interface Displayable {
+    fn display() -> string
+  }
+  
+  enum Either<L: Displayable, R: Displayable> {
+    Left(L),
+    Right(R),
+  }
+  
+  impl<L: Displayable, R: Displayable> Either<L, R> {
+    fn display(self) -> string {
+      match self {
+        Either.Left(l) => {
+          let s = l.display()
+          f"Left({s})"
+        },
+        Either.Right(r) => {
+          let s = r.display()
+          f"Right({s})"
+        },
+      }
+    }
+  }
+  
+  struct Name { value: string }
+  impl Name { fn display(self) -> string { self.value } }
+  
+  fn test() -> Either<Name, Name> {
+    Either.Left(Name { value: "hello" })
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeEitherLeft[L Displayable, R Displayable](arg0 L) Either[L, R] {
 	return Either[L, R]{Tag: EitherLeft, Left: arg0}
@@ -18,7 +47,7 @@ type Displayable interface {
 	display() string
 }
 
-type EitherTag int
+type EitherTag uint8
 
 const (
 	EitherLeft EitherTag = iota
@@ -31,34 +60,17 @@ type Either[L Displayable, R Displayable] struct {
 	Right R
 }
 
-func (e Either[L, R]) String() string {
-	switch e.Tag {
-	case EitherLeft:
-		return fmt.Sprintf("Either.Left(%v)", e.Left)
-	case EitherRight:
-		return fmt.Sprintf("Either.Right(%v)", e.Right)
-	default:
-		return fmt.Sprintf("Either(%d)", e.Tag)
-	}
-}
-
 func (e Either[L, R]) display() string {
 	if e.Tag == EitherLeft {
-		l := e.Left
-		s := l.display()
-		return fmt.Sprintf("Left(%v)", s)
+		s := e.Left.display()
+		return "Left(" + s + ")"
 	}
-	r := e.Right
-	s := r.display()
-	return fmt.Sprintf("Right(%v)", s)
+	s := e.Right.display()
+	return "Right(" + s + ")"
 }
 
 type Name struct {
 	value string
-}
-
-func (n Name) String() string {
-	return fmt.Sprintf("Name { value: %v }", n.value)
 }
 
 func (n Name) display() string {

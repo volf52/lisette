@@ -1,13 +1,21 @@
 ---
 source: tests/spec/emit/functions.rs
-description: "input: \nfn accept_float(x: float64) -> float64 {\n  x\n}\n\nfn test() -> float64 {\n  accept_float(42)\n}\n"
+description: |
+  
+  fn accept_float(x: float64) -> float64 {
+    x
+  }
+  
+  fn test() -> float64 {
+    accept_float(42)
+  }
 ---
 package main
 
-func accept_float(x float64) float64 {
+func acceptFloat(x float64) float64 {
 	return x
 }
 
 func test() float64 {
-	return accept_float(42)
+	return acceptFloat(42)
 }

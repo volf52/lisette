@@ -1,16 +1,20 @@
-use syntax::ast::{Expression, UnaryOperator};
+use syntax::ast::Expression;
+use syntax::types::peel_to_range_type;
 
-use crate::Emitter;
-use crate::utils::Staged;
-use crate::write_line;
+use crate::Planner;
+use crate::context::expression::ExpressionContext;
+use crate::is_order_sensitive;
+use crate::plan::values::{CaptureBoundary, GoExpression, ValuePlan};
+use crate::types::native::NativeGoType;
 
-impl Emitter<'_> {
-    pub(crate) fn emit_index_access(
+impl Planner<'_> {
+    /// Plan an index/slice access. Range-literal and range-typed-variable
+    /// slice forms bridge through their string emitters.
+    pub(crate) fn plan_index_access(
         &mut self,
-        output: &mut String,
         expression: &Expression,
         index: &Expression,
-    ) -> String {
+    ) -> ValuePlan {
         if let Expression::Range {
             start,
             end,
@@ -18,150 +22,225 @@ impl Emitter<'_> {
             ..
         } = index
         {
-            return self.emit_range_slice(
-                output,
-                expression,
-                start.as_deref(),
-                end.as_deref(),
-                *inclusive,
-            );
+            return self.plan_range_slice(expression, start.as_deref(), end.as_deref(), *inclusive);
         }
 
-        let base_staged = self.stage_base_with_deref(expression);
+        let mut base_staged = self.stage_base_with_deref(expression);
 
-        // Range-typed variable as index (e.g. `items[r]` where `r: Range<int>`).
-        let index_ty = index.get_type().resolve();
-        if let Some(range_kind) = index_ty.get_name()
-            && matches!(
-                range_kind,
-                "Range" | "RangeInclusive" | "RangeFrom" | "RangeTo" | "RangeToInclusive"
-            )
+        // Range-typed variable as index (e.g. `items[r]` where `r: Range<int>`,
+        // or `r: Prefix` where `type Prefix = RangeTo<int>`).
+        let index_ty = index.get_type();
+        if let Some(range_kind) = peel_to_range_type(&index_ty, |id| self.facts.definition(id))
+            .and_then(|ty| ty.get_name().map(str::to_owned))
         {
-            let needs_cap = expression.get_type().resolve().has_name("Slice");
-            output.push_str(&base_staged.setup);
-            let index_string = self.emit_or_capture(output, index, "range");
-            return self.emit_range_var_slice(
-                &base_staged.value,
-                &index_string,
-                range_kind,
-                needs_cap,
+            let needs_cap = self.is_native_shape(&expression.get_type(), NativeGoType::Slice);
+            if base_staged.evaluation.effect.has_call() {
+                self.pin_staged(&mut base_staged, "base");
+            }
+            let index_staged = self.stage_or_capture(index, "range");
+            let sequenced = self.sequence_values(
+                vec![base_staged, index_staged],
+                CaptureBoundary::SiblingSequence,
+                "base",
+            );
+            let effect = sequenced.effect;
+            let contains_deferred_evaluation = sequenced.contains_deferred_evaluation();
+            let (setup, values) = sequenced.into_rendered();
+            let value = emit_range_var_slice(&values[0], &values[1], &range_kind, needs_cap);
+            return ValuePlan::computed(
+                setup,
+                GoExpression::opaque_with_deferred_evaluation(value, contains_deferred_evaluation),
+                effect,
             );
         }
 
-        let index_staged = self.stage_composite(index);
-        let values = self.sequence(output, vec![base_staged, index_staged], "_base");
-        format!("{}[{}]", values[0], values[1])
+        self.sequence_indexed_access(expression, base_staged, index, "base")
     }
 
-    /// Stage an indexable base expression, unwrapping an explicit deref into
-    /// a parenthesized `(*x)` form while preserving evaluation-order setup.
-    fn stage_base_with_deref(&mut self, expression: &Expression) -> Staged {
-        let Expression::Unary {
-            operator: UnaryOperator::Deref,
-            expression: inner,
-            ..
-        } = expression
-        else {
-            return self.stage_operand(expression);
-        };
-        let s = self.stage_operand(inner);
-        Staged {
-            value: format!("(*{})", s.value),
-            setup: s.setup,
-            has_side_effects: s.has_side_effects,
+    pub(crate) fn sequence_indexed_access(
+        &mut self,
+        base: &Expression,
+        mut base_staged: ValuePlan,
+        index: &Expression,
+        prefix: &str,
+    ) -> ValuePlan {
+        let index_staged = self.lower_composite_value(index, ExpressionContext::value());
+        if base_staged.setup.is_empty()
+            && is_order_sensitive(base)
+            && (base_staged.evaluation.effect.has_call()
+                || index_staged.evaluation.effect.has_call())
+        {
+            self.pin_staged(&mut base_staged, prefix);
         }
+        let sequenced = self.sequence_values(
+            vec![base_staged, index_staged],
+            CaptureBoundary::SiblingSequence,
+            prefix,
+        );
+        let effect = sequenced.effect;
+        let setup = sequenced.setup;
+        let mut values = sequenced.values.into_iter();
+        let base = values.next().expect("indexed access has a base");
+        let index = values.next().expect("indexed access has an index");
+        ValuePlan::computed(setup, GoExpression::index(base, index), effect)
     }
 
-    /// Emit `base[start:end]` (or the three-index form for slices to prevent
+    pub(crate) fn stage_base_with_deref(&mut self, expression: &Expression) -> ValuePlan {
+        let Some(inner) = expression.deref_inner() else {
+            return self.plan_operand(expression, ExpressionContext::value());
+        };
+        let mut staged = self
+            .plan_operand(inner, ExpressionContext::value())
+            .unary("*")
+            .parenthesized();
+        staged.make_observable();
+        staged
+    }
+
+    /// Plan `base[start:end]` (or the three-index form for slices to prevent
     /// append-through-alias corruption). Strings use two-index slicing because
     /// immutability makes the backing array safe to share.
-    fn emit_range_slice(
+    fn plan_range_slice(
         &mut self,
-        output: &mut String,
         expression: &Expression,
         start: Option<&Expression>,
         end: Option<&Expression>,
         inclusive: bool,
-    ) -> String {
-        let needs_cap = expression.get_type().resolve().has_name("Slice");
+    ) -> ValuePlan {
+        let needs_cap = self.is_native_shape(&expression.get_type(), NativeGoType::Slice);
         let base_staged = self.stage_base_with_deref(expression);
 
         let mut all_stages = vec![base_staged];
         if let Some(s) = start {
-            all_stages.push(self.stage_operand(s));
+            all_stages.push(self.plan_operand(s, ExpressionContext::value()));
         }
         if let Some(e) = end {
-            all_stages.push(self.stage_operand(e));
+            all_stages.push(self.plan_operand(e, ExpressionContext::value()));
         }
-        let values = self.sequence(output, all_stages, "_base");
-        let base_str = &values[0];
-
-        let (start_str, end_expression) = if start.is_some() {
-            (values[1].as_str(), values.get(2).map(|s| s.as_str()))
-        } else {
-            ("", values.get(1).map(|s| s.as_str()))
-        };
-
-        let end_str = match (end_expression, inclusive) {
-            (None, _) => String::new(),
-            (Some(e), false) => e.to_string(),
-            (Some(e), true) => format!("{}+1", e),
-        };
+        let sequenced = self.sequence_values(all_stages, CaptureBoundary::SiblingSequence, "base");
+        let effect = sequenced.effect;
+        let mut setup = sequenced.setup;
+        let mut values = sequenced.values.into_iter();
+        let mut base = values.next().expect("slice access has a base");
+        let mut start_value = start.map(|_| values.next().expect("slice access has a start"));
+        let mut end_value = end.map(|_| values.next().expect("slice access has an end"));
+        if inclusive && let Some(end_expression) = end_value.take() {
+            end_value = Some(GoExpression::compact_binary(
+                end_expression,
+                "+",
+                GoExpression::literal("1".to_string()),
+            ));
+        }
 
         if !needs_cap {
-            return format!("{}[{}:{}]", base_str, start_str, end_str);
+            return ValuePlan::computed(
+                setup,
+                GoExpression::slice(base, start_value.as_ref(), end_value.as_ref(), None),
+                effect,
+            );
         }
 
-        if end_str.is_empty() {
-            let len_var = self.fresh_var(Some("len"));
-            self.declare(&len_var);
-            write_line!(output, "{} := len({})", len_var, base_str);
-            return format!("{}[{}:{}:{}]", base_str, start_str, len_var, len_var);
+        if end_value
+            .as_ref()
+            .is_none_or(GoExpression::contains_deferred_evaluation)
+        {
+            let base_expr = expression.deref_inner().unwrap_or(expression);
+            if is_order_sensitive(base_expr) {
+                base = GoExpression::name(self.hoist_tmp_value_statement(
+                    &mut setup,
+                    "base",
+                    &base.rendered(),
+                ));
+            }
+            let Some(end_expression) = end_value else {
+                let length = GoExpression::name(self.hoist_tmp_value_statement(
+                    &mut setup,
+                    "len",
+                    &format!("len({})", base.rendered()),
+                ));
+                return ValuePlan::computed(
+                    setup,
+                    GoExpression::slice(base, start_value.as_ref(), Some(&length), Some(&length)),
+                    effect,
+                );
+            };
+            if start.is_some_and(is_order_sensitive) {
+                start_value = start_value.map(|start_expression| {
+                    GoExpression::name(self.hoist_tmp_value_statement(
+                        &mut setup,
+                        "start",
+                        &start_expression.rendered(),
+                    ))
+                });
+            }
+            let end_variable = GoExpression::name(self.hoist_tmp_value_statement(
+                &mut setup,
+                "end",
+                &end_expression.rendered(),
+            ));
+            return ValuePlan::computed(
+                setup,
+                GoExpression::slice(
+                    base,
+                    start_value.as_ref(),
+                    Some(&end_variable),
+                    Some(&end_variable),
+                ),
+                effect,
+            );
         }
 
-        if end_str.contains('(') {
-            let end_var = self.fresh_var(Some("end"));
-            self.declare(&end_var);
-            write_line!(output, "{} := {}", end_var, end_str);
-            return format!("{}[{}:{}:{}]", base_str, start_str, end_var, end_var);
-        }
+        ValuePlan::computed(
+            setup,
+            GoExpression::slice(
+                base,
+                start_value.as_ref(),
+                end_value.as_ref(),
+                end_value.as_ref(),
+            ),
+            effect,
+        )
+    }
+}
 
-        format!("{}[{}:{}:{}]", base_str, start_str, end_str, end_str)
+pub(crate) fn range_var_bounds(
+    range_var: &str,
+    range_kind: &str,
+) -> (Option<String>, Option<String>) {
+    match range_kind {
+        "Range" => (
+            Some(format!("{}.Start", range_var)),
+            Some(format!("{}.End", range_var)),
+        ),
+        "RangeInclusive" => (
+            Some(format!("{}.Start", range_var)),
+            Some(format!("{}.End+1", range_var)),
+        ),
+        "RangeFrom" => (Some(format!("{}.Start", range_var)), None),
+        "RangeTo" => (None, Some(format!("{}.End", range_var))),
+        "RangeToInclusive" => (None, Some(format!("{}.End+1", range_var))),
+        _ => unreachable!("unexpected range kind: {}", range_kind),
+    }
+}
+
+/// Slice expression from a range-typed variable. `needs_cap` adds a
+/// third index that caps capacity at length to block append-through-alias
+/// corruption; range field accesses (`.End`) are pure, so repeating them
+/// in the cap position is safe.
+fn emit_range_var_slice(base: &str, range: &str, range_kind: &str, needs_cap: bool) -> String {
+    let (start, end) = range_var_bounds(range, range_kind);
+    let start_str = start.as_deref().unwrap_or("");
+    let end_str = end.as_deref().unwrap_or("");
+
+    if !needs_cap {
+        return format!("{}[{}:{}]", base, start_str, end_str);
     }
 
-    /// Emit a Go slice expression from a range-typed variable index.
-    ///
-    /// When `needs_cap` is true, appends a third index to cap capacity at
-    /// length, preventing append-through-alias corruption on shared backing
-    /// arrays. Range field accesses (e.g. `.End`) are pure, so repeating
-    /// them in the cap position is safe.
-    fn emit_range_var_slice(
-        &self,
-        base: &str,
-        range: &str,
-        range_kind: &str,
-        needs_cap: bool,
-    ) -> String {
-        let (start, end) = match range_kind {
-            "Range" => (format!("{}.Start", range), format!("{}.End", range)),
-            "RangeInclusive" => (format!("{}.Start", range), format!("{}.End+1", range)),
-            "RangeFrom" => (format!("{}.Start", range), String::new()),
-            "RangeTo" => (String::new(), format!("{}.End", range)),
-            "RangeToInclusive" => (String::new(), format!("{}.End+1", range)),
-            _ => unreachable!("unexpected range kind: {}", range_kind),
-        };
+    let bound = if end_str.is_empty() {
+        format!("len({})", base)
+    } else {
+        end_str.to_string()
+    };
 
-        if !needs_cap {
-            return format!("{}[{}:{}]", base, start, end);
-        }
-
-        // For open-ended ranges, cap at len(base).
-        let cap = if end.is_empty() {
-            format!("len({})", base)
-        } else {
-            end.clone()
-        };
-
-        format!("{}[{}:{}:{}]", base, start, end, cap)
-    }
+    format!("{}[{}:{}:{}]", base, start_str, bound, bound)
 }

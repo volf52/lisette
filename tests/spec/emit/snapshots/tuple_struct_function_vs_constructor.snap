@@ -1,21 +1,29 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Point(int, int)\n\nfn add_points(a: Point, b: Point) -> Point {\n  let Point(x1, y1) = a;\n  let Point(x2, y2) = b;\n  Point(x1 + x2, y1 + y2)\n}\n\nfn test() -> Point {\n  let p1 = Point(1, 2);\n  let p2 = Point(3, 4);\n  add_points(p1, p2)\n}\n"
+description: |
+  
+  struct Point(int, int)
+  
+  fn add_points(a: Point, b: Point) -> Point {
+    let Point(x1, y1) = a;
+    let Point(x2, y2) = b;
+    Point(x1 + x2, y1 + y2)
+  }
+  
+  fn test() -> Point {
+    let p1 = Point(1, 2);
+    let p2 = Point(3, 4);
+    add_points(p1, p2)
+  }
 ---
 package main
-
-import "fmt"
 
 type Point struct {
 	F0 int
 	F1 int
 }
 
-func (p Point) String() string {
-	return fmt.Sprintf("Point(%v, %v)", p.F0, p.F1)
-}
-
-func add_points(a, b Point) Point {
+func addPoints(a, b Point) Point {
 	x1 := a.F0
 	y1 := a.F1
 	x2 := b.F0
@@ -35,5 +43,5 @@ func test() Point {
 		F0: 3,
 		F1: 4,
 	}
-	return add_points(p1, p2)
+	return addPoints(p1, p2)
 }

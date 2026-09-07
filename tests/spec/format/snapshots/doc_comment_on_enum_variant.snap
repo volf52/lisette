@@ -1,0 +1,22 @@
+---
+source: tests/spec/format/mod.rs
+description: |-
+  /// Enum doc
+  enum Color {
+    /// Doc for R
+    R,
+    /// Doc for G
+    G,
+    /// Doc for B
+    B,
+  }
+---
+/// Enum doc
+enum Color {
+  /// Doc for R
+  R,
+  /// Doc for G
+  G,
+  /// Doc for B
+  B,
+}

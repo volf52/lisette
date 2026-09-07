@@ -1,10 +1,26 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \npub interface Printable {\n  fn display(self) -> string\n}\n\nstruct Box {\n  value: string,\n}\n\nimpl Box {\n  fn display(self) -> string {\n    self.value\n  }\n}\n\nfn describe(p: Printable) -> string {\n  p.display()\n}\n"
+description: |
+  
+  pub interface Printable {
+    fn display() -> string
+  }
+  
+  struct Box {
+    value: string,
+  }
+  
+  impl Box {
+    fn display(self) -> string {
+      self.value
+    }
+  }
+  
+  fn describe(p: Printable) -> string {
+    p.display()
+  }
 ---
 package main
-
-import "fmt"
 
 type Printable interface {
 	Display() string
@@ -12,10 +28,6 @@ type Printable interface {
 
 type Box struct {
 	value string
-}
-
-func (b Box) String() string {
-	return fmt.Sprintf("Box { value: %v }", b.value)
 }
 
 func (b Box) Display() string {

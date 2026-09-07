@@ -1,18 +1,21 @@
 ---
 source: tests/spec/emit/concurrency.rs
-description: "input: \nstruct Message { id: int, data: int }\n\nfn test(ch: Receiver<Message>) -> int {\n  select {\n    let Some(Message { id, data }) = ch.receive() => id + data,\n    _ => 0,\n  }\n}\n"
+description: |
+  
+  struct Message { id: int, data: int }
+  
+  fn test(ch: Receiver<Message>) -> int {
+    select {
+      let Some(Message { id, data }) = ch.receive() => id + data,
+      _ => 0,
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 type Message struct {
 	id   int
 	data int
-}
-
-func (m Message) String() string {
-	return fmt.Sprintf("Message { id: %v, data: %v }", m.id, m.data)
 }
 
 func test(ch <-chan Message) int {
@@ -21,16 +24,13 @@ func test(ch <-chan Message) int {
 		select {
 		case recv_2, ok := <-ch_1:
 			if ok {
-				id := recv_2.id
-				data := recv_2.data
-				return id + data
+				return recv_2.id + recv_2.data
+			} else {
+				ch_1 = nil
+				continue
 			}
-			ch_1 = nil
-			continue
 		default:
 			return 0
 		}
-		break
 	}
-	panic("unreachable")
 }

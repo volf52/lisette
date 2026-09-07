@@ -1,13 +1,18 @@
 use ecow::EcoString;
 
-use super::{MAX_TUPLE_ARITY, ParseError, Parser};
-use crate::ast::{Annotation, Binding, Literal, Pattern, RestPattern, Span, StructFieldPattern};
+use super::strings::cook_string_contents;
+use super::{MAX_TUPLE_ARITY, ParamMode, ParseError, Parser};
+use crate::ast::{
+    Annotation, Binding, ConstructorPatternResolution, Literal, Pattern, RecordPatternResolution,
+    RestPattern, SequencePatternResolution, Span, StructFieldPattern,
+};
 use crate::lex::Token;
 use crate::lex::TokenKind::*;
-use crate::types::Type;
+use crate::types::{CompoundKind, SimpleKind, Type};
+use std::string;
 
 impl<'source> Parser<'source> {
-    pub fn parse_pattern_allowing_or(&mut self) -> Pattern {
+    pub(crate) fn parse_pattern_allowing_or(&mut self) -> Pattern {
         let start = self.current_token();
         let first = self.parse_pattern();
 
@@ -22,39 +27,42 @@ impl<'source> Parser<'source> {
 
         Pattern::Or {
             patterns,
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_pattern(&mut self) -> Pattern {
-        if !self.enter_recursion() {
-            let span = self.span_from_token(self.current_token());
-            self.resync_on_error();
-            return Pattern::WildCard { span };
-        }
-        let start = self.current_token();
-        let mut result = self.parse_pattern_inner();
-        if self.advance_if(As) {
-            if !self.is(Identifier) {
-                self.track_error("expected identifier after `as`", "Use `as <name>`");
-            } else if self.current_token().text == "_" {
-                self.track_error(
-                    "`_` is not a valid `as` alias",
-                    "Use a named binding, or omit `as _`",
-                );
-                self.next();
-            } else {
-                let name: EcoString = self.current_token().text.into();
-                self.next();
-                result = Pattern::AsBinding {
-                    pattern: Box::new(result),
-                    name,
-                    span: self.span_from_tokens(start),
-                };
+    pub(crate) fn parse_pattern(&mut self) -> Pattern {
+        if let Some(result) = self.with_recursion(|parser| {
+            let start = parser.current_token();
+            let mut result = parser.parse_pattern_inner();
+            if parser.advance_if(As) {
+                if !parser.is(Identifier) {
+                    parser.track_error("expected identifier after `as`", "Use `as <name>`");
+                } else if parser.current_token().text == "_" {
+                    parser.track_error(
+                        "`_` is not a valid `as` alias",
+                        "Use a named binding, or omit `as _`",
+                    );
+                    parser.next();
+                } else {
+                    let name: EcoString = parser.current_token().text.into();
+                    let name_span = parser.span_from_token(parser.current_token());
+                    parser.next();
+                    result = Pattern::AsBinding {
+                        pattern: Box::new(result),
+                        name,
+                        name_span,
+                        span: parser.span_from_offset(start.byte_offset),
+                    };
+                }
             }
+            result
+        }) {
+            return result;
         }
-        self.leave_recursion();
-        result
+        let span = self.span_from_token(self.current_token());
+        self.resync_on_error();
+        Pattern::WildCard { span }
     }
 
     fn parse_pattern_inner(&mut self) -> Pattern {
@@ -63,9 +71,37 @@ impl<'source> Parser<'source> {
         if self.current_token().kind.is_keyword() {
             let keyword = self.current_token().text.to_string();
             let span = self.span_from_token(start);
-            let error = ParseError::new("Reserved keyword", span, "reserved keyword")
-                .with_parse_code("keyword_as_binding")
-                .with_help(format!("Rename binding `{}`", keyword));
+            let help = match keyword.as_str() {
+                "task" => {
+                    "Rename this binding. `task` is a keyword reserved for spawning concurrent work"
+                        .to_string()
+                }
+                "type" => {
+                    "Rename this binding. `type` is a keyword reserved for declaring named types"
+                        .to_string()
+                }
+                "select" => {
+                    "Rename this binding. `select` is a keyword reserved for waiting on multiple channel operations"
+                        .to_string()
+                }
+                "match" => {
+                    "Rename this binding. `match` is a keyword reserved for pattern matching"
+                        .to_string()
+                }
+                "recover" => {
+                    "Rename this binding. `recover` is a keyword reserved for catching panics"
+                        .to_string()
+                }
+                "defer" => {
+                    "Rename this binding. `defer` is a keyword reserved for scheduling cleanup"
+                        .to_string()
+                }
+                _ => format!("Rename binding `{}`", keyword),
+            };
+            let error =
+                ParseError::new("Reserved keyword", span, "cannot be used as a binding name")
+                    .with_parse_code("keyword_as_binding")
+                    .with_help(help);
             self.errors.push(error);
             self.next();
             return Pattern::Identifier {
@@ -79,6 +115,7 @@ impl<'source> Parser<'source> {
             Float => self.parse_float_pattern(),
             Boolean => self.parse_boolean_pattern(),
             String => self.parse_string_pattern(),
+            RawString => self.parse_string_pattern(),
             Char => self.parse_char_pattern(),
 
             Imaginary => {
@@ -88,7 +125,7 @@ impl<'source> Parser<'source> {
                 );
                 self.next();
                 Pattern::WildCard {
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
 
@@ -103,7 +140,7 @@ impl<'source> Parser<'source> {
             _ => {
                 self.unexpected_token("pattern");
                 Pattern::WildCard {
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
         }
@@ -123,7 +160,7 @@ impl<'source> Parser<'source> {
                 else {
                     return int_pattern;
                 };
-                let span = self.span_from_tokens(start);
+                let span = self.span_from_offset(start.byte_offset);
                 if value > i64::MIN.unsigned_abs() {
                     self.track_error_at(
                         span,
@@ -146,7 +183,7 @@ impl<'source> Parser<'source> {
                 }
             }
             Float => {
-                let span = self.span_from_tokens(start);
+                let span = self.span_from_offset(start.byte_offset);
                 self.track_error_at(
                     span,
                     "not allowed",
@@ -154,7 +191,7 @@ impl<'source> Parser<'source> {
                 );
                 self.next();
                 Pattern::WildCard {
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
             _ => {
@@ -163,7 +200,7 @@ impl<'source> Parser<'source> {
                     "Negative patterns require a number, e.g., `-5`",
                 );
                 Pattern::WildCard {
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
         }
@@ -208,7 +245,7 @@ impl<'source> Parser<'source> {
         Pattern::Literal {
             literal,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -217,7 +254,7 @@ impl<'source> Parser<'source> {
         let float_text = start.text.to_string();
         self.next();
 
-        let span = self.span_from_tokens(start);
+        let span = self.span_from_offset(start.byte_offset);
         self.error_float_pattern_not_allowed(span, &float_text);
 
         Pattern::WildCard { span }
@@ -231,24 +268,37 @@ impl<'source> Parser<'source> {
         Pattern::Literal {
             literal: Literal::Boolean(b),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
     fn parse_string_pattern(&mut self) -> Pattern {
         let start = self.current_token();
         let s = start.text;
+        let kind = start.kind;
         self.next();
-        let s_stripped = if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-            s[1..s.len() - 1].to_string()
+        let (value, raw) = if kind == RawString {
+            let stripped = if s.len() >= 3 && s.starts_with("r\"") && s.ends_with('"') {
+                &s[2..s.len() - 1]
+            } else if s.len() >= 2 && s.starts_with("r\"") {
+                &s[2..]
+            } else {
+                s
+            };
+            (cook_string_contents(stripped), true)
         } else {
-            s.to_string()
+            let stripped = if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+                &s[1..s.len() - 1]
+            } else {
+                s
+            };
+            (cook_string_contents(stripped), false)
         };
 
         Pattern::Literal {
-            literal: Literal::String(s_stripped),
+            literal: Literal::String { value, raw },
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -265,7 +315,7 @@ impl<'source> Parser<'source> {
         Pattern::Literal {
             literal: Literal::Char(char_str),
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -276,7 +326,7 @@ impl<'source> Parser<'source> {
         if self.advance_if(RightParen) {
             return Pattern::Unit {
                 ty: Type::uninferred(),
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             };
         }
 
@@ -303,7 +353,7 @@ impl<'source> Parser<'source> {
 
         self.ensure(RightParen);
 
-        let span = self.span_from_tokens(start);
+        let span = self.span_from_offset(start.byte_offset);
 
         if elements.len() > MAX_TUPLE_ARITY {
             self.error_tuple_arity(elements.len(), span);
@@ -320,20 +370,14 @@ impl<'source> Parser<'source> {
         let mut rest = RestPattern::Absent;
 
         while self.is_not(RightSquareBracket) {
-            if let Some((binding, rest_start)) = self.try_parse_rest() {
+            if let Some(parsed_rest) = self.try_parse_rest() {
                 if rest.is_present() {
                     self.track_error(
                         "multiple rest patterns in slice pattern",
                         "Only one `..` or `..rest` is allowed.",
                     );
                 } else {
-                    rest = match binding {
-                        Some(name) => RestPattern::Bind {
-                            name,
-                            span: self.span_from_tokens(rest_start),
-                        },
-                        None => RestPattern::Discard(self.span_from_tokens(rest_start)),
-                    };
+                    rest = parsed_rest;
                 }
                 self.expect_comma_or(RightSquareBracket);
                 continue;
@@ -342,7 +386,7 @@ impl<'source> Parser<'source> {
             if rest.is_present() {
                 let suffix_start = self.current_token();
                 self.parse_pattern();
-                let suffix_span = self.span_from_tokens(suffix_start);
+                let suffix_span = self.span_from_offset(suffix_start.byte_offset);
                 let error = ParseError::new("Invalid pattern", suffix_span, "not supported")
                     .with_parse_code("suffix_slice_pattern")
                     .with_help("Use `[first, ..rest]` instead of `[..rest, last]`.")
@@ -356,13 +400,13 @@ impl<'source> Parser<'source> {
             self.expect_comma_or(RightSquareBracket);
         }
 
-        let span = self.span_from_tokens(start);
         self.ensure(RightSquareBracket);
+        let span = self.span_from_offset(start.byte_offset);
 
         Pattern::Slice {
             prefix: elements,
             rest,
-            element_ty: Type::uninferred(),
+            resolution: SequencePatternResolution::Unresolved,
             span,
         }
     }
@@ -408,7 +452,7 @@ impl<'source> Parser<'source> {
             LeftCurlyBrace => self.parse_struct_pattern(full_name, start),
             LeftParen => self.parse_enum_variant_pattern(full_name, start),
             _ => {
-                let span = self.span_from_tokens(start);
+                let span = self.span_from_offset(start.byte_offset);
                 if full_name == "_" {
                     Pattern::WildCard { span }
                 } else if full_name.contains('.') || self.is_uppercase(&full_name) {
@@ -416,6 +460,7 @@ impl<'source> Parser<'source> {
                         identifier: full_name.into(),
                         fields: vec![],
                         rest: false,
+                        resolution: ConstructorPatternResolution::Unresolved,
                         ty: Type::uninferred(),
                         span,
                     }
@@ -429,10 +474,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn parse_qualified_pattern_name(
-        &mut self,
-        initial: std::string::String,
-    ) -> std::string::String {
+    fn parse_qualified_pattern_name(&mut self, initial: string::String) -> string::String {
         let mut name = initial;
 
         while self.advance_if(Dot) {
@@ -447,11 +489,7 @@ impl<'source> Parser<'source> {
         name
     }
 
-    fn parse_struct_pattern(
-        &mut self,
-        name: std::string::String,
-        start: Token<'source>,
-    ) -> Pattern {
+    fn parse_struct_pattern(&mut self, name: string::String, start: Token<'source>) -> Pattern {
         self.ensure(LeftCurlyBrace);
 
         let mut fields = Vec::new();
@@ -475,7 +513,7 @@ impl<'source> Parser<'source> {
 
             let field_start = self.current_token();
             let field_name = self.read_identifier();
-            let field_name_span = self.span_from_tokens(field_start);
+            let field_name_span = self.span_from_offset(field_start.byte_offset);
 
             if let Some((_, first_span)) = seen_fields.iter().find(|(n, _)| n == &field_name) {
                 self.error_duplicate_field_in_pattern(&field_name, *first_span, field_name_span);
@@ -510,14 +548,15 @@ impl<'source> Parser<'source> {
             identifier: name.into(),
             fields,
             rest,
+            resolution: RecordPatternResolution::Unresolved,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
     fn parse_enum_variant_pattern(
         &mut self,
-        name: std::string::String,
+        name: string::String,
         start: Token<'source>,
     ) -> Pattern {
         self.ensure(LeftParen);
@@ -541,28 +580,27 @@ impl<'source> Parser<'source> {
             identifier: name.into(),
             fields,
             rest,
+            resolution: ConstructorPatternResolution::Unresolved,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_binding(&mut self) -> Binding {
+    pub(crate) fn parse_binding(&mut self) -> Binding {
         Binding {
             pattern: self.parse_pattern(),
             annotation: self.parse_optional_type_annotation(),
-            typed_pattern: None,
             ty: Type::uninferred(),
-            mutable: false,
+            mut_span: None,
         }
     }
 
-    pub fn parse_binding_allowing_or(&mut self) -> Binding {
+    pub(crate) fn parse_binding_allowing_or(&mut self) -> Binding {
         Binding {
             pattern: self.parse_pattern_allowing_or(),
             annotation: self.parse_optional_type_annotation(),
-            typed_pattern: None,
             ty: Type::uninferred(),
-            mutable: false,
+            mut_span: None,
         }
     }
 
@@ -582,13 +620,13 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_binding_with_type(&mut self) -> Binding {
+    pub(crate) fn parse_binding_with_type(&mut self, mode: ParamMode, is_first: bool) -> Binding {
         if self.is_current_uppercase() && self.stream.peek_ahead(1).kind == Colon {
             let start = self.current_token();
             let name = start.text.to_string();
             self.next();
 
-            let span = self.span_from_tokens(start);
+            let span = self.span_from_offset(start.byte_offset);
             self.error_uppercase_binding(span);
 
             return Binding {
@@ -597,9 +635,8 @@ impl<'source> Parser<'source> {
                     span,
                 },
                 annotation: self.parse_optional_type_annotation(),
-                typed_pattern: None,
                 ty: Type::uninferred(),
-                mutable: false,
+                mut_span: None,
             };
         }
 
@@ -619,11 +656,14 @@ impl<'source> Parser<'source> {
                     next.byte_offset + next.byte_length - amp_token.byte_offset
                 };
                 let span = Span::new(self.file_id, amp_token.byte_offset, span_len);
-                self.track_error_at(
-                    span,
-                    "invalid syntax",
-                    "Lisette methods receive `self` by reference. Use `self` instead",
-                );
+                let help = if is_mut_self {
+                    "A writable receiver is `self: mut Ref<T>`, where `T` is the type \
+                     this `impl` targets."
+                } else {
+                    "A read-only receiver is `self: Ref<T>`, where `T` is the type \
+                     this `impl` targets. For a copy, use `self`."
+                };
+                self.track_error_at(span, "invalid syntax", help);
                 self.next();
                 if is_mut_self {
                     self.next();
@@ -631,58 +671,144 @@ impl<'source> Parser<'source> {
             }
         }
 
-        let is_mut = self.advance_if(Mut);
+        let marker_span = self.parse_mut_span();
+        let mut_span = None;
 
         let pattern = self.parse_pattern();
 
-        if let Pattern::Identifier { identifier, .. } = &pattern
+        if is_first
+            && let Pattern::Identifier { identifier, .. } = &pattern
             && identifier == "self"
             && self.is_not(Colon)
         {
+            self.reject_self_marker(marker_span);
             return Binding {
                 pattern,
                 annotation: None,
-                typed_pattern: None,
                 ty: Type::uninferred(),
-                mutable: false,
+                mut_span: None,
             };
         }
 
-        self.ensure(Colon);
+        if mode == ParamMode::TestFunction && self.is_not(Colon) {
+            self.reject_parameter_marker(marker_span, None);
+            return Binding {
+                pattern,
+                annotation: None,
+                ty: Type::uninferred(),
+                mut_span,
+            };
+        }
+
+        if !self.ensure_in_place(Colon) && !self.can_recover_annotation() {
+            self.reject_parameter_marker(marker_span, None);
+            return Binding {
+                pattern,
+                annotation: None,
+                ty: Type::uninferred(),
+                mut_span,
+            };
+        }
+
         let annotation = self.parse_annotation();
+        self.reject_parameter_marker(marker_span, Some(&annotation));
 
         Binding {
             pattern,
             annotation: Some(annotation),
-            typed_pattern: None,
             ty: Type::uninferred(),
-            mutable: is_mut,
+            mut_span,
         }
     }
 
-    fn try_parse_rest(&mut self) -> Option<(Option<EcoString>, Token<'source>)> {
+    fn reject_parameter_marker(
+        &mut self,
+        marker_span: Option<Span>,
+        annotation: Option<&Annotation>,
+    ) {
+        let Some(span) = marker_span else { return };
+        let refuses_permission = match annotation {
+            Some(Annotation::Constructor { name, .. }) => match CompoundKind::from_name(name) {
+                Some(kind) => !kind.accepts_write_qualifier(),
+                None => SimpleKind::from_name(name).is_some() || name == "Array",
+            },
+            Some(Annotation::Tuple { .. } | Annotation::Function { .. }) => true,
+            _ => false,
+        };
+        let error = if refuses_permission {
+            ParseError::new("Syntax error", span, "parameters are immutable")
+                .with_parse_code("syntax_error")
+                .with_help("Rebind with `let mut` inside the body to mutate a local copy.")
+        } else {
+            ParseError::new("Syntax error", span, "`mut` goes on the parameter's type")
+                .with_parse_code("syntax_error")
+                .with_help(
+                    "Place the permission right before the type, as in `items: mut Slice<int>`, \
+                     or rebind with `let mut` inside the body for a local copy.",
+                )
+        };
+        if !self.too_many_errors() {
+            self.errors.push(error);
+        }
+    }
+
+    fn reject_self_marker(&mut self, marker_span: Option<Span>) {
+        let Some(span) = marker_span else { return };
+        let error = ParseError::new("Syntax error", span, "`mut` goes on the receiver's type")
+            .with_parse_code("syntax_error")
+            .with_help(
+                "A writable receiver is `self: mut Ref<T>`, where `T` is the type \
+                 this `impl` targets.",
+            );
+        if !self.too_many_errors() {
+            self.errors.push(error);
+        }
+    }
+
+    pub(crate) fn parse_mut_span(&mut self) -> Option<Span> {
+        if self.is_not(Mut) {
+            return None;
+        }
+        let token = self.current_token();
+        self.next();
+        Some(Span::new(
+            self.file_id,
+            token.byte_offset,
+            token.byte_length,
+        ))
+    }
+
+    fn try_parse_rest(&mut self) -> Option<RestPattern> {
         if self.is(DotDot) {
             let rest_start = self.current_token();
             self.ensure(DotDot);
             if self.is(Identifier) {
-                let name: EcoString = self.current_token().text.into();
+                let name_token = self.current_token();
+                let name: EcoString = name_token.text.into();
                 self.next();
-                return Some((Some(name), rest_start));
+                return Some(RestPattern::Bind {
+                    name,
+                    span: self.span_from_token(name_token),
+                });
             }
-            return Some((None, rest_start));
+            return Some(RestPattern::Discard(
+                self.span_from_offset(rest_start.byte_offset),
+            ));
         }
 
         if self.is(Identifier) {
-            let text = self.current_token().text;
-            if let Some(binding) = text.strip_prefix("..") {
-                let rest_start = self.current_token();
+            let token = self.current_token();
+            if let Some(binding) = token.text.strip_prefix("..") {
                 self.next();
-                let name = if binding.is_empty() {
-                    None
-                } else {
-                    Some(EcoString::from(binding))
-                };
-                return Some((name, rest_start));
+                if binding.is_empty() {
+                    return Some(RestPattern::Discard(self.span_from_token(token)));
+                }
+                let name_span =
+                    Span::new(self.file_id, token.byte_offset + 2, binding.len() as u32);
+                return Some(RestPattern::Bind {
+                    name: EcoString::from(binding),
+                    span: name_span,
+                });
             }
         }
 
@@ -697,13 +823,14 @@ impl<'source> Parser<'source> {
         self.is(Identifier) && self.is_uppercase(self.current_token().text)
     }
 
-    pub fn can_start_pattern(&self) -> bool {
+    pub(crate) fn can_start_pattern(&self) -> bool {
         matches!(
             self.current_token().kind,
             Integer
                 | Float
                 | Boolean
                 | String
+                | RawString
                 | Char
                 | LeftParen
                 | LeftSquareBracket

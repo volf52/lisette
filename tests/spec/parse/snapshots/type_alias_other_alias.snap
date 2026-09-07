@@ -1,10 +1,14 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \ntype ID = int;\ntype ProductID = ID;\n"
+description: |
+  
+  type ID = int;
+  type ProductID = ID;
 ---
 [
     TypeAlias {
         doc: None,
+        attributes: [],
         name: "ID",
         name_span: Span {
             file_id: 0,
@@ -21,9 +25,9 @@ description: "input: \ntype ID = int;\ntype ProductID = ID;\n"
                 byte_length: 3,
             },
         },
-        ty: Variable(
-            -1,
-        ),
+        ty: Var {
+            id: uninferred,
+        },
         visibility: Private,
         span: Span {
             file_id: 0,
@@ -33,6 +37,7 @@ description: "input: \ntype ID = int;\ntype ProductID = ID;\n"
     },
     TypeAlias {
         doc: None,
+        attributes: [],
         name: "ProductID",
         name_span: Span {
             file_id: 0,
@@ -49,9 +54,9 @@ description: "input: \ntype ID = int;\ntype ProductID = ID;\n"
                 byte_length: 2,
             },
         },
-        ty: Variable(
-            -1,
-        ),
+        ty: Var {
+            id: uninferred,
+        },
         visibility: Private,
         span: Span {
             file_id: 0,

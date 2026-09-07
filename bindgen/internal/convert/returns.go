@@ -8,10 +8,44 @@ import (
 	"sync"
 )
 
+func ioInterfaceFromPackage(pkg *types.Package, name string) *types.Interface {
+	if pkg == nil {
+		return nil
+	}
+	seen := make(map[*types.Package]bool)
+	var walk func(*types.Package) *types.Interface
+	walk = func(p *types.Package) *types.Interface {
+		if p == nil || seen[p] {
+			return nil
+		}
+		seen[p] = true
+		if p.Path() == "io" {
+			obj := p.Scope().Lookup(name)
+			if obj == nil {
+				return nil
+			}
+			iface, _ := obj.Type().Underlying().(*types.Interface)
+			return iface
+		}
+		for _, imp := range p.Imports() {
+			if iface := walk(imp); iface != nil {
+				return iface
+			}
+		}
+		return nil
+	}
+	return walk(pkg)
+}
+
 // ReturnsToLisette converts a Go function's return types to Lisette.
-// The qualifiedName is used for config lookups (e.g. "LookupEnv" or "Rat.Float64").
-func ReturnsToLisette(signature *types.Signature, conv *Converter, qualifiedName string) TypeResult {
-	return returnsToLisetteRecursive(signature, make(map[types.Type]bool), conv, qualifiedName)
+// qualifiedName addresses config lookups. A nil obj skips nil-witness
+// demotions.
+func ReturnsToLisette(signature *types.Signature, conv *Converter, obj types.Object, qualifiedName string) TypeResult {
+	return returnsToLisetteRecursive(signature, make(map[types.Type]bool), conv, obj, qualifiedName, nil)
+}
+
+func returnsToLisetteWithSubstitutions(signature *types.Signature, conv *Converter, obj types.Object, qualifiedName string, substitutions map[string]string) TypeResult {
+	return returnsToLisetteRecursive(signature, make(map[types.Type]bool), conv, obj, qualifiedName, substitutions)
 }
 
 // maybeWrapNilableFunction wraps function-typed returns in Option.
@@ -23,16 +57,16 @@ func ReturnsToLisette(signature *types.Signature, conv *Converter, qualifiedName
 func maybeWrapNilableFunction(t types.Type, lisetteType string, conv *Converter, qualifiedName string) (string, bool) {
 	switch t.(type) {
 	case *types.Signature:
-		if conv != nil && conv.cfg != nil && conv.cfg.IsNonNilableReturn(conv.currentPkgPath, qualifiedName) {
+		if conv != nil && conv.cfg.IsNonNilableReturn(conv.currentPkgPath, qualifiedName) {
 			return lisetteType, false
 		}
-		return fmt.Sprintf("Option<%s>", lisetteType), true
+		return optionOf(lisetteType), true
 	case *types.Named:
 		if _, ok := t.Underlying().(*types.Signature); !ok {
 			return lisetteType, false
 		}
-		if conv != nil && conv.cfg != nil && conv.cfg.ShouldWrapNilableReturn(conv.currentPkgPath, qualifiedName) {
-			return fmt.Sprintf("Option<%s>", lisetteType), true
+		if conv != nil && conv.cfg.ShouldWrapNilableReturn(conv.currentPkgPath, qualifiedName) {
+			return optionOf(lisetteType), true
 		}
 		return lisetteType, false
 	default:
@@ -40,22 +74,30 @@ func maybeWrapNilableFunction(t types.Type, lisetteType string, conv *Converter,
 	}
 }
 
-func returnsToLisetteRecursive(signature *types.Signature, seen map[types.Type]bool, conv *Converter, qualifiedName string) TypeResult {
+func returnsToLisetteRecursive(signature *types.Signature, seen map[types.Type]bool, conv *Converter, obj types.Object, qualifiedName string, substitutions map[string]string) TypeResult {
 	results := signature.Results()
 
 	if results.Len() == 0 {
-		if conv != nil && conv.cfg != nil && conv.cfg.IsNeverReturn(conv.currentPkgPath, qualifiedName) {
+		if fn, ok := obj.(*types.Func); ok && isBuiltinDivergenceAxiom(fn) {
 			return TypeResult{LisetteType: "Never"}
+		}
+		if conv != nil {
+			if conv.cfg.IsNeverReturn(conv.currentPkgPath, qualifiedName) {
+				return TypeResult{LisetteType: "Never"}
+			}
+			if diverges, ok := conv.divergence.Function(obj); ok && diverges {
+				return TypeResult{LisetteType: "Never"}
+			}
 		}
 		return TypeResult{LisetteType: "()"}
 	}
 
 	if results.Len() == 1 {
 		if isErrorType(results.At(0).Type()) {
-			if conv.cfg != nil && conv.cfg.HasDirectError(conv.currentPkgPath, qualifiedName) {
+			if conv.cfg.HasDirectError(conv.currentPkgPath, qualifiedName) {
 				return TypeResult{LisetteType: "error"}
 			}
-			if conv.cfg != nil && conv.cfg.HasNilableError(conv.currentPkgPath, qualifiedName) {
+			if conv.cfg.HasNilableError(conv.currentPkgPath, qualifiedName) {
 				return TypeResult{LisetteType: "Option<error>"}
 			}
 			if looksLikeNilableError(qualifiedName, signature) {
@@ -67,7 +109,7 @@ func returnsToLisetteRecursive(signature *types.Signature, seen map[types.Type]b
 		if isPointerToErrorImpl(results.At(0).Type()) {
 			return TypeResult{LisetteType: "error", IsDirectError: true}
 		}
-		elem := toLisetteRecursive(results.At(0).Type(), seen, conv)
+		elem := conv.resultType(obj, results, 0, seen, substitutions, qualifiedName)
 		if elem.SkipReason == nil {
 			wrapped, applied := maybeWrapNilableFunction(results.At(0).Type(), elem.LisetteType, conv, qualifiedName)
 			elem.LisetteType = wrapped
@@ -80,22 +122,32 @@ func returnsToLisetteRecursive(signature *types.Signature, seen map[types.Type]b
 
 	last := results.At(results.Len() - 1)
 
+	if allErrorResults(results) {
+		elems := make([]string, results.Len())
+		for i := range elems {
+			elems[i] = "Option<error>"
+		}
+		return TypeResult{LisetteType: fmt.Sprintf("(%s)", strings.Join(elems, ", "))}
+	}
+
 	if isErrorType(last.Type()) {
-		inner := collectReturnTypes(results, 0, results.Len()-1, seen, conv, qualifiedName)
+		partial := conv.cfg.IsPartialResult(conv.currentPkgPath, qualifiedName) ||
+			isPartialIOMethod(signature, qualifiedName)
+		var demoted map[int]bool
+		if !partial {
+			demoted = nilWitnessDemotions(conv, obj, results, 0, results.Len()-1, qualifiedName, true)
+		}
+		inner := collectReturnTypes(results, 0, results.Len()-1, seen, conv, obj, qualifiedName, substitutions, demoted)
 		innerType := inner.LisetteType
 		if inner.SkipReason != nil {
 			innerType = "Unknown"
 		}
-		if (conv.cfg != nil && conv.cfg.IsPartialResult(conv.currentPkgPath, qualifiedName)) ||
-			isPartialIOMethod(signature, qualifiedName) {
-			return TypeResult{
-				LisetteType:          fmt.Sprintf("Partial<%s, error>", innerType),
-				SkipReason:           inner.SkipReason,
-				NilableReturnApplied: inner.NilableReturnApplied,
-			}
+		wrapped := resultOf(innerType)
+		if partial {
+			wrapped = partialOf(innerType)
 		}
 		return TypeResult{
-			LisetteType:          fmt.Sprintf("Result<%s, error>", innerType),
+			LisetteType:          wrapped,
 			SkipReason:           inner.SkipReason,
 			NilableReturnApplied: inner.NilableReturnApplied,
 		}
@@ -104,14 +156,14 @@ func returnsToLisetteRecursive(signature *types.Signature, seen map[types.Type]b
 	// (T, bool) -> Option<T> when bool indicates presence/success
 	if isBoolType(last.Type()) {
 		if shouldConvertToOption(last.Name(), conv, qualifiedName) {
-			nilable := results.Len() == 2 && isNilableGoType(results.At(0).Type())
-			inner := collectReturnTypes(results, 0, results.Len()-1, seen, conv, qualifiedName)
+			nilable := results.Len() == 2 && isDemotableGoType(results.At(0).Type())
+			inner := collectReturnTypes(results, 0, results.Len()-1, seen, conv, obj, qualifiedName, substitutions, nil)
 			innerType := inner.LisetteType
 			if inner.SkipReason != nil {
 				innerType = "Unknown"
 			}
 			return TypeResult{
-				LisetteType:          fmt.Sprintf("Option<%s>", innerType),
+				LisetteType:          optionOf(innerType),
 				SkipReason:           inner.SkipReason,
 				CommaOk:              nilable,
 				NilableReturnApplied: inner.NilableReturnApplied,
@@ -119,12 +171,47 @@ func returnsToLisetteRecursive(signature *types.Signature, seen map[types.Type]b
 		}
 	}
 
-	return collectReturnTypes(results, 0, results.Len(), seen, conv, qualifiedName)
+	demoted := nilWitnessDemotions(conv, obj, results, 0, results.Len(), qualifiedName, false)
+	return collectReturnTypes(results, 0, results.Len(), seen, conv, obj, qualifiedName, substitutions, demoted)
+}
+
+// nilWitnessDemotions: result indices demoted to Option by a witnessed nil
+// return. A non_nilable_return pin cancels.
+func nilWitnessDemotions(conv *Converter, obj types.Object, results *types.Tuple, start, end int, qualifiedName string, withNilError bool) map[int]bool {
+	if conv == nil || obj == nil {
+		return nil
+	}
+	facts, ok := conv.nilness.Function(obj)
+	if !ok || !facts.HasBody {
+		return nil
+	}
+	// promoted methods record pins under the declaring type's key
+	if conv.cfg.IsNonNilableReturn(conv.currentPkgPath, qualifiedName) {
+		return nil
+	}
+	if fn, ok := obj.(*types.Func); ok && fn.Pkg() != nil &&
+		conv.cfg.IsNonNilableReturn(fn.Pkg().Path(), qualifiedFunctionName(fn)) {
+		return nil
+	}
+	witnesses := facts.NilWitness
+	if withNilError {
+		witnesses = facts.NilWithNilError
+	}
+	var demoted map[int]bool
+	for i := start; i < end && i < len(witnesses); i++ {
+		if witnesses[i] && isDemotableGoType(results.At(i).Type()) {
+			if demoted == nil {
+				demoted = make(map[int]bool)
+			}
+			demoted[i] = true
+		}
+	}
+	return demoted
 }
 
 // shouldConvertToOption determines if a (T, bool) return should become Option<T>.
 func shouldConvertToOption(boolName string, conv *Converter, qualifiedName string) bool {
-	if conv.cfg != nil && conv.cfg.HasBoolAsFlag(conv.currentPkgPath, qualifiedName) {
+	if conv.cfg.HasBoolAsFlag(conv.currentPkgPath, qualifiedName) {
 		return false
 	}
 
@@ -145,7 +232,112 @@ func shouldConvertToOption(boolName string, conv *Converter, qualifiedName strin
 // crates/syntax/src/parse/mod.rs.
 const maxReturnTupleArity = 5
 
-func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Type]bool, conv *Converter, qualifiedName string) TypeResult {
+func concreteResultType(t types.Type) types.Type {
+	if typeParam, ok := types.Unalias(t).(*types.TypeParam); ok {
+		if core := coreType(typeParam); core != nil {
+			return core
+		}
+	}
+	return t
+}
+
+// resultPermission is how much of one logical result may be written.
+type resultPermission uint8
+
+const (
+	resultReadOnly resultPermission = iota
+	resultOuterWritable
+	resultFullyWritable
+)
+
+// permissionFor keeps the container around element sharing fresh, since the
+// shared storage sits inside the result.
+func permissionFor(depth ViewDepth) resultPermission {
+	if depth == DepthElement {
+		return resultOuterWritable
+	}
+	return resultReadOnly
+}
+
+// resultPermissionOf reports how much of one logical result is writable: a
+// pointer, a curated writable return, or a container that is fresh or views
+// only mutated storage.
+func (c *Converter) resultPermissionOf(obj types.Object, results *types.Tuple, index int, qualifiedName string) resultPermission {
+	t := concreteResultType(results.At(index).Type())
+	if !goWritableCapability(t) {
+		return resultReadOnly
+	}
+	if _, isPointer := t.Underlying().(*types.Pointer); isPointer {
+		return resultFullyWritable
+	}
+	if c != nil && c.cfg.HasWritableReturn(c.currentPkgPath, qualifiedName) {
+		return resultFullyWritable
+	}
+	if c == nil || c.mutation == nil || obj == nil {
+		return resultReadOnly
+	}
+	fn, isFunc := obj.(*types.Func)
+	if !isFunc {
+		return resultReadOnly
+	}
+	sig, isSig := fn.Type().(*types.Signature)
+	if !isSig {
+		return resultReadOnly
+	}
+	views, recorded := c.mutation.Views(obj)
+	overrides, hasOverride := c.cfg.ViewOverrides(c.currentPkgPath, qualifiedName)
+	if (!recorded || !views.Analyzed) && !hasOverride {
+		return resultReadOnly
+	}
+	views, _ = ResolveViews(views, overrides, hasOverride, sig)
+	if index >= len(views.Results) {
+		return resultReadOnly
+	}
+	view := views.Results[index]
+	if view.Opaque || view.Shared {
+		return resultReadOnly
+	}
+	mutation, _ := c.mutation.Function(obj)
+	mutParams := c.cfg.MutatingParams(c.currentPkgPath, qualifiedName)
+	nonMutParams := c.cfg.NonMutatingParams(c.currentPkgPath, qualifiedName)
+	params := sig.Params()
+	names := paramNames(sig)
+	permission := resultFullyWritable
+	for i, depth := range view.Params {
+		if depth == DepthNone {
+			continue
+		}
+		// A variadic source has no `mut` spelling, so it never proves writability.
+		if i >= params.Len() || (sig.Variadic() && i == params.Len()-1) {
+			permission = min(permission, permissionFor(depth))
+			continue
+		}
+		source := params.At(i)
+		naming := paramNaming{emitted: names[i], goName: source.Name()}
+		if !isMutableParam(mutation.Mutates(i), mutParams, nonMutParams, naming, source.Type(), fn.Name()) {
+			permission = min(permission, permissionFor(depth))
+		}
+	}
+	if view.Receiver != DepthNone && !mutation.ReceiverMutates &&
+		!c.cfg.MutatesReceiver(c.currentPkgPath, qualifiedName) {
+		permission = min(permission, permissionFor(view.Receiver))
+	}
+	return permission
+}
+
+// resultType renders one logical result, writable at every layer when the facts allow.
+func (c *Converter) resultType(obj types.Object, results *types.Tuple, index int, seen map[types.Type]bool, substitutions map[string]string, qualifiedName string) TypeResult {
+	t := results.At(index).Type()
+	switch c.resultPermissionOf(obj, results, index, qualifiedName) {
+	case resultFullyWritable:
+		return writableRecursive(t, seen, c, substitutions, false)
+	case resultOuterWritable:
+		return outerWritableType(t, seen, c, substitutions)
+	}
+	return toLisetteRecursive(t, seen, c, substitutions)
+}
+
+func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Type]bool, conv *Converter, obj types.Object, qualifiedName string, substitutions map[string]string, demoted map[int]bool) TypeResult {
 	count := end - start
 
 	if count == 0 {
@@ -153,9 +345,12 @@ func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Typ
 	}
 
 	if count == 1 {
-		elem := toLisetteRecursive(results.At(start).Type(), seen, conv)
+		elem := conv.resultType(obj, results, start, seen, substitutions, qualifiedName)
 		if elem.SkipReason == nil {
 			wrapped, applied := maybeWrapNilableFunction(results.At(start).Type(), elem.LisetteType, conv, qualifiedName)
+			if demoted[start] && !applied {
+				wrapped = optionOf(wrapped)
+			}
 			elem.LisetteType = wrapped
 			if applied {
 				elem.NilableReturnApplied = true
@@ -174,13 +369,15 @@ func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Typ
 	var elems []string
 	anyApplied := false
 	for i := start; i < end; i++ {
-		elem := toLisetteRecursive(results.At(i).Type(), seen, conv)
+		elem := conv.resultType(obj, results, i, seen, substitutions, qualifiedName)
 		if elem.SkipReason != nil {
 			return elem
 		}
 		wrapped, applied := maybeWrapNilableFunction(results.At(i).Type(), elem.LisetteType, conv, qualifiedName)
 		if applied {
 			anyApplied = true
+		} else if demoted[i] {
+			wrapped = optionOf(wrapped)
 		}
 		elems = append(elems, wrapped)
 	}
@@ -191,7 +388,23 @@ func collectReturnTypes(results *types.Tuple, start, end int, seen map[types.Typ
 	}
 }
 
+func allErrorResults(results *types.Tuple) bool {
+	if results.Len() < 2 {
+		return false
+	}
+	for v := range results.Variables() {
+		if !isErrorType(v.Type()) {
+			return false
+		}
+	}
+	return true
+}
+
 func isErrorType(t types.Type) bool {
+	if _, ok := t.(*types.TypeParam); ok {
+		return false
+	}
+
 	if named, ok := t.(*types.Named); ok {
 		if named.Obj().Name() == "error" && named.Obj().Pkg() == nil {
 			return true
@@ -262,14 +475,17 @@ func universeErrorInterface() *types.Interface {
 // partialIOMethod maps io interface names to their methods that return
 // non-exclusive (T, error) results.
 var partialIOMethods = map[string]string{
-	"io.Reader":   "Read",
-	"io.Writer":   "Write",
-	"io.ReaderAt": "ReadAt",
-	"io.WriterAt": "WriteAt",
+	"io.Reader":       "Read",
+	"io.Writer":       "Write",
+	"io.ReaderAt":     "ReadAt",
+	"io.WriterAt":     "WriteAt",
+	"io.StringWriter": "WriteString",
+	"io.ReaderFrom":   "ReadFrom",
+	"io.WriterTo":     "WriteTo",
 }
 
-// isPartialIOMethod returns true if the method's receiver type implements
-// io.Reader, io.Writer, io.ReaderAt, or io.WriterAt, and the method is the
+// isPartialIOMethod returns true if the method's receiver type implements one
+// of the io partial-progress interfaces and the method name matches the
 // corresponding interface method. These methods return (T, error) where both
 // values may be simultaneously meaningful.
 func isPartialIOMethod(signature *types.Signature, qualifiedName string) bool {
@@ -297,11 +513,15 @@ func isPartialIOMethod(signature *types.Signature, qualifiedName string) bool {
 		if methodName != ifaceMethod {
 			continue
 		}
-		iface := lookupIOInterface(ifacePath)
-		if iface == nil {
-			continue
+		// ReaderFrom/WriterTo reference other io types, so the importer-loaded
+		// interface fails types.Implements; fall back to the receiver's import graph.
+		if iface := lookupIOInterface(ifacePath); iface != nil &&
+			(types.Implements(named, iface) || types.Implements(types.NewPointer(named), iface)) {
+			return true
 		}
-		if types.Implements(named, iface) || types.Implements(types.NewPointer(named), iface) {
+		ifaceName := ifacePath[strings.LastIndexByte(ifacePath, '.')+1:]
+		if iface := ioInterfaceFromPackage(named.Obj().Pkg(), ifaceName); iface != nil &&
+			(types.Implements(named, iface) || types.Implements(types.NewPointer(named), iface)) {
 			return true
 		}
 	}

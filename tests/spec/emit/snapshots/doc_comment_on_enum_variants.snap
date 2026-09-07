@@ -1,10 +1,18 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \n/// Result of a network operation.\nenum NetworkResult {\n  /// The operation succeeded.\n  Success,\n  /// The operation timed out.\n  Timeout,\n  /// The operation failed with an error code.\n  Error(int),\n}\n"
+description: |
+  
+  /// Result of a network operation.
+  enum NetworkResult {
+    /// The operation succeeded.
+    Success,
+    /// The operation timed out.
+    Timeout,
+    /// The operation failed with an error code.
+    Error(int),
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeNetworkResultSuccess() NetworkResult {
 	return NetworkResult{Tag: NetworkResultSuccess}
@@ -19,7 +27,7 @@ func MakeNetworkResultError(arg0 int) NetworkResult {
 }
 
 // Result of a network operation.
-type NetworkResultTag int
+type NetworkResultTag uint8
 
 const (
 	// The operation succeeded.
@@ -33,17 +41,4 @@ const (
 type NetworkResult struct {
 	Tag   NetworkResultTag
 	Error int
-}
-
-func (n NetworkResult) String() string {
-	switch n.Tag {
-	case NetworkResultSuccess:
-		return "NetworkResult.Success"
-	case NetworkResultTimeout:
-		return "NetworkResult.Timeout"
-	case NetworkResultError:
-		return fmt.Sprintf("NetworkResult.Error(%v)", n.Error)
-	default:
-		return fmt.Sprintf("NetworkResult(%d)", n.Tag)
-	}
 }

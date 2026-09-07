@@ -1,22 +1,50 @@
-use super::{MAX_TUPLE_ARITY, Parser};
-use crate::ast::{Annotation, Expression, Generic, Span, Visibility};
+use super::{MAX_TUPLE_ARITY, ParamMode, Parser};
+use crate::EcoString;
+use crate::ast::{
+    Annotation, Attribute, Expression, FunctionBody, Generic, Literal, Span, Visibility,
+};
+use crate::lex::Token;
 use crate::lex::TokenKind::*;
 use crate::types::Type;
+use std::string;
 
 impl<'source> Parser<'source> {
-    pub fn parse_annotation(&mut self) -> Annotation {
-        if !self.enter_recursion() {
-            self.resync_on_error();
-            return Annotation::Unknown;
+    pub(crate) fn parse_annotation(&mut self) -> Annotation {
+        if let Some(result) = self.with_recursion(Parser::parse_annotation_inner) {
+            return result;
         }
-        let result = self.parse_annotation_inner();
-        self.leave_recursion();
-        result
+        self.resync_on_error();
+        Annotation::Unknown
     }
 
     fn parse_annotation_inner(&mut self) -> Annotation {
+        if self.at_recovery_boundary() {
+            self.track_error("expected a type", "Add the missing type");
+            return Annotation::Unknown;
+        }
+
+        if self.is(Mut) {
+            return self.parse_writable_annotation();
+        }
+
         match self.current_token().kind {
-            Function => self.parse_function_annotation(),
+            Function if self.stream.peek_ahead(1).kind == LeftParen => {
+                self.parse_function_annotation()
+            }
+            Function => {
+                let start = self.current_token();
+                self.track_error(
+                    "incomplete function type",
+                    "A function type is written `fn(int) -> int`",
+                );
+                self.next();
+                let return_type = self.parse_function_return_annotation();
+                Annotation::Function {
+                    params: vec![],
+                    return_type: return_type.into(),
+                    span: self.span_from_offset(start.byte_offset),
+                }
+            }
             LeftParen => self.parse_tuple_annotation(),
             LeftSquareBracket => {
                 let start = self.current_token();
@@ -49,21 +77,69 @@ impl<'source> Parser<'source> {
                     return Annotation::Constructor {
                         name: "Slice".into(),
                         params: vec![],
+                        writable: false,
+                        mut_span: None,
                         span: error_span,
                     };
                 }
-                let span = self.span_from_tokens(start);
-                self.track_error(
-                    "unexpected `[` in type",
-                    "Use `Slice<T>` for slice types or `Array<T, N>` for fixed-size arrays.",
-                );
+                let span = self.span_from_offset(start.byte_offset);
+                self.track_error("unexpected `[` in type", "Use `Slice<T>` for slice types.");
                 Annotation::Constructor {
                     name: "".into(),
                     params: vec![],
+                    writable: false,
+                    mut_span: None,
                     span,
                 }
             }
+            Integer => self.parse_constant_annotation(),
             _ => self.parse_named_annotation(),
+        }
+    }
+
+    fn parse_constant_annotation(&mut self) -> Annotation {
+        let token = self.current_token();
+        let span = Span::new(self.file_id, token.byte_offset, token.byte_length);
+        let (value, text) = match self.parse_integer_text(token.text) {
+            Literal::Integer { value, text } => (value, text),
+            _ => (0, None),
+        };
+        self.next();
+        Annotation::Constant { value, text, span }
+    }
+
+    fn parse_writable_annotation(&mut self) -> Annotation {
+        let mut_token = self.current_token();
+        let mut_span = Span::new(self.file_id, mut_token.byte_offset, mut_token.byte_length);
+        self.next();
+        while self.is(Mut) {
+            self.track_error("duplicate `mut` qualifier", "Write `mut` once.");
+            self.next();
+        }
+        let inner = self.parse_annotation_inner();
+        match inner {
+            Annotation::Constructor {
+                name,
+                params,
+                writable: _,
+                mut_span: _,
+                span,
+            } => Annotation::Constructor {
+                name,
+                params,
+                writable: true,
+                mut_span: Some(mut_span),
+                span,
+            },
+            other => {
+                self.track_error_at(
+                    mut_span,
+                    "`mut` does not apply to this type",
+                    "Write `mut` on the reference type it protects, as in `mut Slice<int>`. \
+                     A tuple or function type cannot carry it.",
+                );
+                other
+            }
         }
     }
 
@@ -71,35 +147,143 @@ impl<'source> Parser<'source> {
         let start = self.current_token();
         let name = self.read_identifier_sequence();
 
-        let params = if self.advance_if(LeftAngleBracket) {
+        if self.advance_if(LeftAngleBracket) {
             let mut type_params = vec![];
 
-            while self.can_start_annotation() {
-                type_params.push(self.parse_annotation());
+            // A type-arg is a type or an integer size (the `N` in `Array<T, N>`).
+            while self.can_start_annotation() || self.at_size_position_value() {
+                if self.can_start_annotation() {
+                    type_params.push(self.parse_annotation());
+                } else {
+                    type_params.push(self.parse_size_type_arg());
+                }
                 match self.current_token().kind {
-                    RightAngleBracket => break,
+                    RightAngleBracket | ShiftRight => break,
                     Comma => self.next(),
                     _ => break,
                 }
-                if self.is(RightAngleBracket) {
+                if self.is_right_angle_like() {
                     self.track_error("expected type", "Add a type or remove the trailing comma.");
                 }
             }
 
-            if !self.advance_if(RightAngleBracket) {
+            if !self.advance_if_right_angle() {
                 self.track_error("expected `>`", "Add `>` to close the type arguments.");
             }
 
-            type_params
-        } else {
-            vec![]
-        };
+            return Annotation::Constructor {
+                name,
+                params: type_params,
+                writable: false,
+                mut_span: None,
+                span: self.span_from_offset(start.byte_offset),
+            };
+        }
+
+        if matches!(self.current_token().kind, LeftParen | LeftSquareBracket) {
+            return self.parse_misdelimited_type_args(name, start);
+        }
 
         Annotation::Constructor {
             name,
-            params,
-            span: self.span_from_tokens(start),
+            params: vec![],
+            writable: false,
+            mut_span: None,
+            span: self.span_from_offset(start.byte_offset),
         }
+    }
+
+    fn parse_misdelimited_type_args(
+        &mut self,
+        name: EcoString,
+        start: Token<'source>,
+    ) -> Annotation {
+        let open = self.current_token();
+        let close_kind = if open.kind == LeftParen {
+            RightParen
+        } else {
+            RightSquareBracket
+        };
+        let open_end = (open.byte_offset + open.byte_length) as usize;
+        self.next();
+
+        let mut type_params = vec![];
+        while self.current_token().kind != close_kind && !self.at_eof() {
+            if !self.can_start_annotation() {
+                break;
+            }
+            type_params.push(self.parse_annotation());
+            if !self.advance_if(Comma) {
+                break;
+            }
+        }
+
+        while self.current_token().kind != close_kind && !self.at_eof() {
+            self.next();
+        }
+
+        let close = self.current_token();
+        let close_start = close.byte_offset as usize;
+        let consumed = self.advance_if(close_kind);
+        let close_end = if consumed {
+            (close.byte_offset + close.byte_length) as usize
+        } else {
+            close_start
+        };
+
+        let inner = self.source[open_end..close_start].trim();
+        let corrected = format!("{}<{}>", name, inner);
+        let original = &self.source[start.byte_offset as usize..close_end];
+
+        let label_span = Span::new(
+            self.file_id,
+            open.byte_offset,
+            (close_end as u32).saturating_sub(open.byte_offset),
+        );
+        self.error_angle_brackets_for_generics(
+            label_span,
+            format!("Write `{corrected}` instead of `{original}`"),
+        );
+
+        Annotation::Constructor {
+            name,
+            params: type_params,
+            writable: false,
+            mut_span: None,
+            span: self.span_from_offset(start.byte_offset),
+        }
+    }
+
+    /// A value literal where an `Array` size goes. Non-integers are matched too,
+    /// so `parse_size_type_arg` can reject them with one clear error.
+    pub(crate) fn at_size_position_value(&self) -> bool {
+        matches!(
+            self.current_token().kind,
+            Integer | Float | String | RawString | Char | Boolean | Imaginary | Minus | Plus
+        )
+    }
+
+    /// Parse an `Array` size. Only an integer literal is valid, anything else
+    /// gets one clear error instead of derailing into a parse cascade.
+    pub(crate) fn parse_size_type_arg(&mut self) -> Annotation {
+        let start = self.current_token();
+        if start.kind == Integer {
+            return self.parse_constant_annotation();
+        }
+
+        // A signed number is two tokens, so consume both to keep `<...>` closing.
+        self.next();
+        if matches!(start.kind, Minus | Plus)
+            && matches!(self.current_token().kind, Integer | Float)
+        {
+            self.next();
+        }
+        self.track_error_at(
+            self.span_from_offset(start.byte_offset),
+            "Array size must be an integer literal",
+            "Array sizes are whole numbers, e.g. `Array<string, 3>`",
+        );
+        Annotation::Unknown
     }
 
     fn parse_function_annotation(&mut self) -> Annotation {
@@ -109,19 +293,24 @@ impl<'source> Parser<'source> {
 
         let mut params = vec![];
 
-        while self.is_not(RightParen) {
+        while self.is_not(RightParen) && !self.at_recovery_boundary() {
+            let start_position = self.stream.position;
             params.push(self.parse_annotation());
+            if self.at_recovery_boundary() {
+                break;
+            }
             self.expect_comma_or(RightParen);
+            self.ensure_progress(start_position, RightParen);
         }
 
-        self.ensure(RightParen);
+        self.ensure_in_place(RightParen);
 
         let return_type = self.parse_function_return_annotation();
 
         Annotation::Function {
             params,
             return_type: return_type.into(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
@@ -132,15 +321,20 @@ impl<'source> Parser<'source> {
         let mut annotations = vec![];
         let mut has_trailing_comma = false;
 
-        while self.is_not(RightParen) {
+        while self.is_not(RightParen) && !self.at_recovery_boundary() {
+            let start_position = self.stream.position;
             annotations.push(self.parse_annotation());
             has_trailing_comma = self.is(Comma);
+            if self.at_recovery_boundary() {
+                break;
+            }
             self.expect_comma_or(RightParen);
+            self.ensure_progress(start_position, RightParen);
         }
 
-        self.ensure(RightParen);
+        self.ensure_in_place(RightParen);
 
-        let span = self.span_from_tokens(start);
+        let span = self.span_from_offset(start.byte_offset);
 
         if annotations.is_empty() {
             return Annotation::unit();
@@ -163,31 +357,30 @@ impl<'source> Parser<'source> {
         }
     }
 
-    pub fn parse_generics(&mut self) -> Vec<Generic> {
+    pub(crate) fn parse_generics(&mut self) -> Vec<Generic> {
         if !self.advance_if(LeftAngleBracket) {
             return vec![];
         }
 
         let mut generics = vec![];
 
-        while self.is_not(RightAngleBracket) {
+        while !self.is_right_angle_like() && !self.at_eof() {
             generics.push(self.parse_generic());
             self.expect_comma_or(RightAngleBracket);
         }
 
-        self.ensure(RightAngleBracket);
+        if !self.advance_if_right_angle() {
+            self.ensure(RightAngleBracket);
+        }
 
         generics
     }
 
     fn parse_generic(&mut self) -> Generic {
         let start = self.current_token();
-
-        Generic {
-            name: self.read_identifier(),
-            bounds: self.parse_generic_bounds(),
-            span: self.span_from_tokens(start),
-        }
+        let name = self.read_identifier();
+        let bounds = self.parse_generic_bounds();
+        Generic::new(name, bounds, self.span_from_offset(start.byte_offset))
     }
 
     fn parse_generic_bounds(&mut self) -> Vec<Annotation> {
@@ -195,7 +388,7 @@ impl<'source> Parser<'source> {
             return vec![];
         }
 
-        if self.is(RightAngleBracket) || self.is(Comma) {
+        if self.is_right_angle_like() || self.is(Comma) {
             self.track_error(
                 "expected bound after `:`",
                 "Provide a bound like `T: Display`.",
@@ -205,9 +398,9 @@ impl<'source> Parser<'source> {
 
         let mut bounds = vec![];
 
-        while self.is_not(RightAngleBracket) && self.is_not(Comma) {
+        while !self.is_right_angle_like() && self.is_not(Comma) {
             bounds.push(self.parse_annotation());
-            if self.is(RightAngleBracket) || self.is(Comma) {
+            if self.is_right_angle_like() || self.is(Comma) {
                 break;
             }
             if !self.advance_if(Plus) {
@@ -217,7 +410,7 @@ impl<'source> Parser<'source> {
                 );
                 break;
             }
-            if self.is(RightAngleBracket) || self.is(Comma) {
+            if self.is_right_angle_like() || self.is(Comma) {
                 self.track_error(
                     "expected bound after `+`",
                     "Provide a bound or remove the trailing `+`.",
@@ -228,7 +421,7 @@ impl<'source> Parser<'source> {
         bounds
     }
 
-    pub fn parse_function_return_annotation(&mut self) -> Annotation {
+    pub(crate) fn parse_function_return_annotation(&mut self) -> Annotation {
         if self.advance_if(Arrow) {
             return self.parse_annotation();
         }
@@ -236,10 +429,10 @@ impl<'source> Parser<'source> {
         Annotation::Unknown
     }
 
-    pub fn parse_interface_method(
+    pub(crate) fn parse_interface_method(
         &mut self,
-        doc: Option<std::string::String>,
-        attributes: Vec<crate::ast::Attribute>,
+        doc: Option<string::String>,
+        attributes: Vec<Attribute>,
     ) -> Expression {
         self.ensure(Function);
 
@@ -251,7 +444,7 @@ impl<'source> Parser<'source> {
         if self.is(LeftAngleBracket) {
             let generics_start = self.current_token();
             let generics = self.parse_generics(); // consume and discard
-            let generics_span = self.span_from_tokens(generics_start);
+            let generics_span = self.span_from_offset(generics_start.byte_offset);
             self.error_interface_method_with_type_parameters(generics_span, generics.len());
         }
 
@@ -261,17 +454,21 @@ impl<'source> Parser<'source> {
             name,
             name_span,
             generics: vec![],
-            params: self.parse_function_params(),
+            params: self.parse_function_params(ParamMode::Strict),
             return_annotation: self.parse_function_return_annotation(),
             return_type: Type::uninferred(),
             visibility: Visibility::Private,
-            body: Expression::NoOp.into(),
+            body: FunctionBody::Declaration,
             ty: Type::uninferred(),
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 
-    pub fn parse_type_alias_with_doc(&mut self, doc: Option<std::string::String>) -> Expression {
+    pub(crate) fn parse_type_alias_with_doc(
+        &mut self,
+        doc: Option<string::String>,
+        attributes: Vec<Attribute>,
+    ) -> Expression {
         let start = self.current_token();
 
         self.ensure(Type);
@@ -285,19 +482,20 @@ impl<'source> Parser<'source> {
             self.parse_annotation()
         } else {
             Annotation::Opaque {
-                span: self.span_from_tokens(start),
+                span: self.span_from_offset(start.byte_offset),
             }
         };
 
         Expression::TypeAlias {
             doc,
+            attributes,
             name,
             name_span,
             generics,
             annotation,
             ty: Type::uninferred(),
             visibility: Visibility::Private,
-            span: self.span_from_tokens(start),
+            span: self.span_from_offset(start.byte_offset),
         }
     }
 }

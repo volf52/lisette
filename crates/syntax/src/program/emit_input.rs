@@ -3,61 +3,31 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use ecow::EcoString;
 
 use crate::ast::{BindingId as AstBindingId, Pattern, RestPattern, Span};
-use crate::types::Type;
+use crate::types::Symbol;
 
-use super::{Definition, File, ModuleInfo};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ReceiverId(Span);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiverCoercion {
-    /// Insert `&` to convert `T` to `Ref<T>`
-    AutoAddress,
-    /// Insert `*` to convert `Ref<T>` to `T`
-    AutoDeref,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CoercionInfo {
-    receivers: HashMap<ReceiverId, ReceiverCoercion>,
-}
-
-impl CoercionInfo {
-    pub fn mark_coercion(&mut self, span: Span, coercion: ReceiverCoercion) {
-        self.receivers.insert(ReceiverId(span), coercion);
-    }
-
-    pub fn get_coercion(&self, span: Span) -> Option<ReceiverCoercion> {
-        self.receivers.get(&ReceiverId(span)).copied()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct BindingId(Span);
+use super::{Definition, File};
 
 #[derive(Debug, Clone, Default)]
 pub struct UnusedInfo {
-    bindings: HashSet<BindingId>,
-    definitions: HashSet<BindingId>,
-    pub imports_by_module: HashMap<EcoString, HashSet<EcoString>>,
+    symbols: HashSet<Span>,
+    pub imports_by_package: HashMap<EcoString, HashSet<EcoString>>,
 }
 
 impl UnusedInfo {
     pub fn mark_binding_unused(&mut self, span: Span) {
-        self.bindings.insert(BindingId(span));
+        self.symbols.insert(span);
     }
 
     pub fn is_unused_binding(&self, pattern: &Pattern) -> bool {
         match pattern {
-            Pattern::Identifier { span, .. } => self.bindings.contains(&BindingId(*span)),
+            Pattern::Identifier { span, .. } => self.symbols.contains(span),
             Pattern::AsBinding { span, name, .. } => {
                 let name_span = Span::new(
                     span.file_id,
                     span.byte_offset + span.byte_length - name.len() as u32,
                     name.len() as u32,
                 );
-                self.bindings.contains(&BindingId(name_span))
+                self.symbols.contains(&name_span)
             }
             _ => false,
         }
@@ -65,174 +35,264 @@ impl UnusedInfo {
 
     pub fn is_unused_rest_binding(&self, rest: &RestPattern) -> bool {
         match rest {
-            RestPattern::Bind { span, .. } => self.bindings.contains(&BindingId(*span)),
+            RestPattern::Bind { span, .. } => self.symbols.contains(span),
             _ => false,
         }
     }
 
     pub fn mark_definition_unused(&mut self, span: Span) {
-        self.definitions.insert(BindingId(span));
+        self.symbols.insert(span);
     }
 
     pub fn is_unused_definition(&self, span: &Span) -> bool {
-        self.definitions.contains(&BindingId(*span))
+        self.symbols.contains(span)
+    }
+
+    pub fn merge(&mut self, other: UnusedInfo) {
+        let UnusedInfo {
+            symbols,
+            imports_by_package,
+        } = other;
+        self.symbols.extend(symbols);
+        for (package, imports) in imports_by_package {
+            self.imports_by_package
+                .entry(package)
+                .or_default()
+                .extend(imports);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TestFunction {
+    qualified_name: Symbol,
+    pub title: Option<String>,
+    pub doc: Option<String>,
+    pub span: Span,
+}
+
+impl TestFunction {
+    pub fn new(
+        package_id: &str,
+        name: &str,
+        title: Option<String>,
+        doc: Option<String>,
+        span: Span,
+    ) -> Self {
+        Self {
+            qualified_name: Symbol::from_parts(package_id, name),
+            title,
+            doc,
+            span,
+        }
+    }
+
+    pub fn package_id(&self) -> &str {
+        self.qualified_name
+            .without_last_segment()
+            .expect("test names are constructed with a package")
+    }
+
+    pub fn qualified_name(&self) -> &str {
+        self.qualified_name.as_str()
+    }
+
+    pub fn name(&self) -> &str {
+        self.qualified_name.last_segment()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TestIndex {
+    tests: Vec<TestFunction>,
+}
+
+impl TestIndex {
+    pub fn push(&mut self, test: TestFunction) {
+        self.tests.push(test);
+    }
+
+    pub fn tests(&self) -> &[TestFunction] {
+        &self.tests
+    }
+
+    pub fn contains_qualified(&self, qualified_name: &str) -> bool {
+        self.tests
+            .iter()
+            .any(|test| test.qualified_name == qualified_name)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EqualityIndex {
+    by_id: HashMap<String, EqualityInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EqualityKind {
+    DeclaredMethod,
+    SynthesizedMethod,
+    UfcsLowered,
+}
+
+#[derive(Debug, Clone)]
+struct EqualityInfo {
+    kind: EqualityKind,
+    private_to_package: Option<String>,
+}
+
+fn visible_from(private_to_package: &Option<String>, current_package: &str) -> bool {
+    match private_to_package {
+        None => true,
+        Some(package) => package == current_package,
+    }
+}
+
+impl EqualityIndex {
+    pub fn insert_declared_method(&mut self, id: String, private_to_package: Option<String>) {
+        self.by_id.insert(
+            id,
+            EqualityInfo {
+                kind: EqualityKind::DeclaredMethod,
+                private_to_package,
+            },
+        );
+    }
+
+    pub fn insert_synthesized_method(&mut self, id: String, private_to_package: Option<String>) {
+        self.by_id.insert(
+            id,
+            EqualityInfo {
+                kind: EqualityKind::SynthesizedMethod,
+                private_to_package,
+            },
+        );
+    }
+
+    pub fn insert_ufcs_lowered(&mut self, id: String, private_to_package: Option<String>) {
+        self.by_id.insert(
+            id,
+            EqualityInfo {
+                kind: EqualityKind::UfcsLowered,
+                private_to_package,
+            },
+        );
+    }
+
+    pub fn usable_from(&self, id: &str, current_package: &str) -> bool {
+        matches!(
+            self.by_id.get(id),
+            Some(EqualityInfo {
+                kind: EqualityKind::DeclaredMethod | EqualityKind::SynthesizedMethod,
+                private_to_package,
+            }) if visible_from(private_to_package, current_package)
+        )
+    }
+
+    pub fn is_ufcs_lowered_from(&self, id: &str, current_package: &str) -> bool {
+        matches!(
+            self.by_id.get(id),
+            Some(EqualityInfo {
+                kind: EqualityKind::UfcsLowered,
+                private_to_package,
+            }) if visible_from(private_to_package, current_package)
+        )
+    }
+
+    pub fn is_synthesized(&self, id: &str) -> bool {
+        matches!(
+            self.by_id.get(id),
+            Some(EqualityInfo {
+                kind: EqualityKind::SynthesizedMethod,
+                ..
+            })
+        )
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MutationInfo {
-    bindings: HashSet<AstBindingId>,
+    bindings: HashMap<AstBindingId, BindingMutation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingMutation {
+    Direct,
+    ThroughAlias,
+}
+
+impl BindingMutation {
+    pub fn merged_with(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ThroughAlias, _) | (_, Self::ThroughAlias) => Self::ThroughAlias,
+            (Self::Direct, Self::Direct) => Self::Direct,
+        }
+    }
 }
 
 impl MutationInfo {
-    pub fn mark_binding_mutated(&mut self, id: AstBindingId) {
-        self.bindings.insert(id);
+    pub fn record(&mut self, id: AstBindingId, mutation: BindingMutation) {
+        self.bindings
+            .entry(id)
+            .and_modify(|current| *current = current.merged_with(mutation))
+            .or_insert(mutation);
+    }
+
+    pub fn mutation(&self, id: AstBindingId) -> Option<BindingMutation> {
+        self.bindings.get(&id).copied()
     }
 
     pub fn is_mutated(&self, id: AstBindingId) -> bool {
-        self.bindings.contains(&id)
+        self.bindings.contains_key(&id)
+    }
+
+    pub fn is_alias_mutated(&self, id: AstBindingId) -> bool {
+        self.mutation(id) == Some(BindingMutation::ThroughAlias)
     }
 }
 
-/// What a dot access resolved to during type checking.
-///
-/// Pre-computed in semantics to avoid re-derivation in the emitter.
-/// The emitter can use this to skip cascading `try_classify_*` lookups.
-/// `is_exported` indicates whether the Go name should be capitalized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DotAccessKind {
-    /// Named struct field access
-    StructField { is_exported: bool },
-    /// Tuple struct field access (e.g., `point.0` on `struct Point(int, int)`).
-    /// `is_newtype` is true when the struct has exactly 1 field and no generics,
-    /// meaning access should emit a type cast rather than `.F0`.
-    TupleStructField { is_newtype: bool },
-    /// Tuple element access (e.g., `t.0`, `t.1`)
-    TupleElement,
-    /// Module member access (e.g., `mod.func`)
-    ModuleMember,
-    /// Value enum variant (Go constant, e.g., `reflect.String`)
-    ValueEnumVariant,
-    /// ADT enum variant constructor (e.g., `makeColorRed[T]()`)
-    EnumVariant,
-    /// Instance method (has `self` receiver)
-    InstanceMethod { is_exported: bool },
-    /// Instance method used as a first-class value (not called).
-    /// E.g., `Point.area` used as a callback. The emitter needs to know
-    /// whether the receiver is a pointer to emit Go method expression syntax.
-    InstanceMethodValue {
-        is_exported: bool,
-        is_pointer_receiver: bool,
-    },
-    /// Static method (no `self` receiver)
-    StaticMethod { is_exported: bool },
-}
-
-/// What kind of native built-in type (Slice, Map, Channel, etc.) a call targets.
-///
-/// Defined in `syntax` so that semantics can classify calls without depending on
-/// emit-specific types. The emitter maps this to its internal `NativeGoType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeTypeKind {
-    Slice,
-    EnumeratedSlice,
-    Map,
-    Channel,
-    Sender,
-    Receiver,
-    String,
-}
-
-impl NativeTypeKind {
-    pub fn from_type(ty: &Type) -> Option<Self> {
-        let resolved = ty.resolve().strip_refs();
-        if let Type::Constructor { ref id, .. } = resolved
-            && (id.starts_with("@import/go:") || id.starts_with("go:"))
-        {
-            return None;
-        }
-        let name = resolved.get_name()?;
-        Self::from_name(name)
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "Slice" => Some(Self::Slice),
-            "EnumeratedSlice" => Some(Self::EnumeratedSlice),
-            "Map" => Some(Self::Map),
-            "Channel" => Some(Self::Channel),
-            "Sender" => Some(Self::Sender),
-            "Receiver" => Some(Self::Receiver),
-            "string" => Some(Self::String),
-            _ => None,
-        }
-    }
-}
-
-/// What a call expression resolved to during type checking.
-///
-/// Pre-computed in semantics to avoid re-derivation in the emitter's call dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallKind {
-    /// Regular function or method call
-    Regular,
-    /// Tuple struct constructor (e.g., `Point(1, 2)`)
-    TupleStructConstructor,
-    /// Type assertion (`assert_type`)
-    AssertType,
-    /// UFCS method call: `receiver.method()` where method is a free function
-    UfcsMethod,
-    /// Native type constructor (e.g., `Channel.new`, `Map.new`, `Slice.new`)
-    NativeConstructor(NativeTypeKind),
-    /// Native type instance method via dot access (e.g., `slice.append(x)`)
-    NativeMethod(NativeTypeKind),
-    /// Native type method via identifier (e.g., `Slice.contains(s, x)`)
-    NativeMethodIdentifier(NativeTypeKind),
-    /// Receiver method in UFCS syntax: `Type.method(receiver, args)`
-    ReceiverMethodUfcs { is_public: bool },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ResolutionId(Span);
-
-/// Pre-computed resolution metadata from type checking.
-///
-/// Follows the same pattern as `CoercionInfo`: keyed by expression span,
-/// populated during inference, consumed by the emitter.
-#[derive(Debug, Clone, Default)]
-pub struct ResolutionInfo {
-    dot_accesses: HashMap<ResolutionId, DotAccessKind>,
-    calls: HashMap<ResolutionId, CallKind>,
-}
-
-impl ResolutionInfo {
-    pub fn mark_dot_access(&mut self, span: Span, kind: DotAccessKind) {
-        self.dot_accesses.insert(ResolutionId(span), kind);
-    }
-
-    pub fn get_dot_access(&self, span: Span) -> Option<DotAccessKind> {
-        self.dot_accesses.get(&ResolutionId(span)).copied()
-    }
-
-    pub fn mark_call(&mut self, span: Span, meta: CallKind) {
-        self.calls.insert(ResolutionId(span), meta);
-    }
-
-    pub fn get_call(&self, span: Span) -> Option<CallKind> {
-        self.calls.get(&ResolutionId(span)).copied()
-    }
-}
-
+#[derive(Default)]
 pub struct EmitInput {
     pub files: HashMap<u32, File>,
-    pub definitions: HashMap<EcoString, Definition>,
-    pub modules: HashMap<String, ModuleInfo>,
-    pub entry_module_id: String,
+    pub definitions: HashMap<Symbol, Definition>,
+    pub entry_package_id: String,
     pub unused: UnusedInfo,
     pub mutations: MutationInfo,
-    pub coercions: CoercionInfo,
-    pub resolutions: ResolutionInfo,
-    pub cached_modules: HashSet<String>,
-    pub ufcs_methods: HashSet<(String, String)>,
+    pub cached_packages: HashSet<String>,
+    pub equality_index: EqualityIndex,
+    pub test_index: TestIndex,
     pub go_package_names: HashMap<String, String>,
+    pub go_package_ids: HashSet<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(offset: u32) -> Span {
+        Span::new(0, offset, 1)
+    }
+
+    #[test]
+    fn merge_extends_bindings_definitions_and_imports() {
+        let mut a = UnusedInfo::default();
+        a.mark_binding_unused(span(0));
+        a.mark_definition_unused(span(1));
+        a.imports_by_package
+            .insert("m1".into(), HashSet::from_iter(["x".into()]));
+
+        let mut b = UnusedInfo::default();
+        b.mark_binding_unused(span(2));
+        b.mark_definition_unused(span(3));
+        b.imports_by_package
+            .insert("m1".into(), HashSet::from_iter(["y".into()]));
+        b.imports_by_package
+            .insert("m2".into(), HashSet::from_iter(["z".into()]));
+
+        a.merge(b);
+
+        assert_eq!(a.symbols.len(), 4);
+        assert_eq!(a.imports_by_package["m1"].len(), 2);
+        assert_eq!(a.imports_by_package["m2"].len(), 1);
+    }
 }

@@ -1,10 +1,17 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nenum List {\n  Cons(int, Ref<List>),\n  Nil,\n}\n\nfn test() -> List {\n  List.Cons(42, &List.Nil)\n}\n"
+description: |
+  
+  enum List {
+    Cons(int, Ref<List>),
+    Nil,
+  }
+  
+  fn test() -> List {
+    List.Cons(42, &List.Nil)
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeListCons(arg0 int, arg1 *List) List {
 	return List{Tag: ListCons, Cons0: arg0, Cons1: arg1}
@@ -14,7 +21,7 @@ func MakeListNil() List {
 	return List{Tag: ListNil}
 }
 
-type ListTag int
+type ListTag uint8
 
 const (
 	ListCons ListTag = iota
@@ -25,17 +32,6 @@ type List struct {
 	Tag   ListTag
 	Cons0 int
 	Cons1 *List
-}
-
-func (l List) String() string {
-	switch l.Tag {
-	case ListCons:
-		return fmt.Sprintf("List.Cons(%v, %v)", l.Cons0, l.Cons1)
-	case ListNil:
-		return "List.Nil"
-	default:
-		return fmt.Sprintf("List(%d)", l.Tag)
-	}
 }
 
 func test() List {

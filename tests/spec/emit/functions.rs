@@ -410,12 +410,147 @@ fn test() -> rune {
 }
 
 #[test]
+fn cast_rune_to_string() {
+    let input = r#"
+fn test() -> string {
+  'A' as string
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn cast_precedence_with_addition() {
     let input = r#"
 fn test() -> float64 {
   let a: int = 1;
   let b: int = 2;
   a as float64 + b as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_to_float_pins_integer_type() {
+    let input = r#"
+fn heal(level: int, potency: float64) -> float64 {
+  ((2 << level) as float64) * potency
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_nested_shift_to_float_pins_integer_type() {
+    let input = r#"
+fn scale(level: int) -> float64 {
+  ((2 << level) + 3) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_variable_shift_to_float_needs_no_pin() {
+    let input = r#"
+fn scale(base: int, level: int) -> float64 {
+  (base << level) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_constant_shift_to_float_needs_no_pin() {
+    let input = r#"
+fn scale() -> float64 {
+  (2 << 3) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_with_constant_arithmetic_base_pins() {
+    let input = r#"
+fn scale(level: int) -> float64 {
+  ((1 + 1) << level) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_constant_shift_with_arithmetic_count_needs_no_pin() {
+    let input = r#"
+fn scale() -> float64 {
+  (1 << (50 + 50)) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_with_const_count_needs_no_pin() {
+    let input = r#"
+const SHIFT = 60 + 8
+
+fn scale() -> float64 {
+  (1 << SHIFT) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_with_local_const_count_needs_no_pin() {
+    let input = r#"
+fn scale() -> float64 {
+  const SHIFT = 60 + 8
+  (1 << SHIFT) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_imported_const_shifted_operand_pins() {
+    let input = r#"
+import "go:math"
+
+fn scale(level: int) -> float64 {
+  (math.MaxInt8 << level) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_forward_alias_const_stays_const() {
+    let input = r#"
+const SHIFT = LATER
+const LATER = 60 + 8
+
+fn scale() -> float64 {
+  (1 << SHIFT) as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn cast_shift_imported_const_count_no_pin_but_var_count_pins() {
+    let input = r#"
+import "go:math"
+import "go:runtime"
+
+fn const_count() -> float64 {
+  (1 << math.MaxInt8) as float64
+}
+
+fn var_count() -> float64 {
+  (1 << runtime.MemProfileRate) as float64
 }
 "#;
     assert_emit_snapshot!(input);
@@ -442,6 +577,43 @@ fn double(x: int) -> int { x * 2 }
 
 fn test() -> int {
   apply(double, 21)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn function_type_with_mut_parameter() {
+    let input = r#"
+fn run(items: mut Slice<int>, action: fn(mut Slice<int>) -> ()) {
+  action(items)
+}
+
+fn bump(items: mut Slice<int>) {
+  items[0] += 1
+}
+
+fn test() {
+  let mut data = [0]
+  run(data, bump)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn lambda_with_mut_parameter() {
+    let input = r#"
+fn apply(f: fn(mut Slice<int>) -> (), xs: mut Slice<int>) {
+  f(xs)
+}
+
+fn test() {
+  let bump = |xs: mut Slice<int>| {
+    xs[0] += 1
+  }
+  let mut data = [41]
+  apply(bump, data)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -647,6 +819,146 @@ fn main() {
 }
 
 #[test]
+fn go_keyword_generic_parameter() {
+    let input = r#"
+import "go:fmt"
+
+fn id<range>(x: range) -> range {
+  x
+}
+
+fn main() {
+  fmt.Println(id(7))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_predeclared_generic_parameter() {
+    let input = r#"
+import "go:fmt"
+
+fn f<int>(x: int) -> int {
+  let xs = [1, 2, 3]
+  let _ = xs.length()
+  x
+}
+
+fn main() {
+  fmt.Println(f("hello"))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_enum_constructor_with_predeclared_generic_parameter() {
+    let input = r#"
+import "go:fmt"
+
+enum Box<int> {
+  Some(int),
+  None,
+}
+
+fn main() {
+  let b = Box.Some("x")
+  match b {
+    Box.Some(v) => fmt.Println(v),
+    Box.None => fmt.Println("none"),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_go_predeclared_type_name_len() {
+    let input = r#"
+import "go:fmt"
+
+struct len {
+  v: int,
+}
+
+fn main() {
+  let xs = [1, 2, 3]
+  fmt.Println(xs.length())
+  let l = len { v: 1 }
+  fmt.Println(l.v)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn struct_go_predeclared_type_name_iota_with_enum() {
+    let input = r#"
+import "go:fmt"
+
+struct iota {
+  v: int,
+}
+
+enum Color {
+  Red,
+  Green,
+}
+
+fn main() {
+  let i = iota { v: 1 }
+  let c = Color.Red
+  match c {
+    Color.Red => fmt.Println("red"),
+    Color.Green => fmt.Println("green"),
+  }
+  fmt.Println(i.v)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn enum_tag_constant_spells_reserved_word() {
+    let input = r#"
+import "go:fmt"
+
+enum ma {
+  ke,
+  other,
+}
+
+fn main() {
+  let m = ma.ke
+  let mut counts = Map.new<string, int>()
+  counts["a"] = 1
+  match m {
+    ma.ke => fmt.Println(counts.length()),
+    ma.other => fmt.Println("other"),
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pub_function_uncased_name_gets_export_prefix() {
+    let input = r#"
+import "go:fmt"
+
+pub fn 挨拶() -> string {
+  "こんにちは"
+}
+
+fn main() {
+  fmt.Println(挨拶())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn struct_pattern_param_public_field() {
     let input = r#"
 struct Point { pub x: int, pub y: int }
@@ -705,6 +1017,33 @@ fn test() -> string {
 }
 
 #[test]
+fn never_bodied_lambda_into_unknown_emits_unit_return() {
+    let input = r#"
+fn take_any(x: Unknown) {}
+
+fn test() {
+  take_any(|| { panic("boom") })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn never_bodied_lambda_into_generic_keeps_struct_return() {
+    let input = r#"
+fn run<T>(f: fn() -> T) -> int {
+  let _ = f
+  0
+}
+
+fn test() -> int {
+  run(|| { panic("boom") })
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn doc_comment_on_public_function() {
     let input = r#"
 /// A publicly exported function.
@@ -757,8 +1096,8 @@ fn test() -> Option<int> {
 #[test]
 fn option_interface_type_param_in_match() {
     let input = r#"
-interface Printable {
-  fn to_string(self) -> string
+pub interface Printable {
+  fn to_string() -> string
 }
 
 struct Box { label: string }
@@ -815,8 +1154,8 @@ fn test() -> bool {
 #[test]
 fn generic_function_with_map_key_type_parameter() {
     let input = r#"
-fn put_in_map<K, V>(key: K, value: V) -> Map<K, V> {
-  let mut m: Map<K, V> = Map.new()
+fn put_in_map<K: Comparable, V>(key: K, value: V) -> Map<K, V> {
+  let mut m: mut Map<K, V> = Map.new()
   m[key] = value
   m
 }
@@ -827,24 +1166,8 @@ fn put_in_map<K, V>(key: K, value: V) -> Map<K, V> {
 #[test]
 fn generic_struct_with_map_field_comparable_constraint() {
     let input = r#"
-struct Cache<K, V> {
+struct Cache<K: Comparable, V> {
   data: Map<K, V>,
-}
-"#;
-    assert_emit_snapshot!(input);
-}
-
-#[test]
-fn go_array_return_temp_var_no_collision() {
-    let input = r#"
-import "go:crypto/sha256"
-
-fn main() {
-  let data = "hello" as Slice<uint8>
-  let hash = sha256.Sum256(data)
-  let arr_1 = 7
-  let _ = hash
-  let _ = arr_1
 }
 "#;
     assert_emit_snapshot!(input);
@@ -918,7 +1241,7 @@ import "go:strings"
 import "go:fmt"
 
 fn main() {
-  let body = strings.NewReader("hello")
+  let mut body = strings.NewReader("hello")
   let req = http.NewRequest("POST", "https://example.com", Some(body))
   fmt.Println(req)
 }
@@ -929,8 +1252,8 @@ fn main() {
 #[test]
 fn function_with_mut_parameter() {
     let input = r#"
-fn process(mut items: Slice<int>) {
-  items = [1, 2, 3]
+fn process(items: mut Slice<int>) {
+  items[0] = 1
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1010,7 +1333,7 @@ fn map_key_generic_in_expression_comparable() {
     let input = r#"
 fn foo<U>(u: U) {}
 
-fn make_map<T>(t: T) -> int {
+fn make_map<T: Comparable>(t: T) -> int {
   foo(Map.new<T, int>())
   0
 }
@@ -1136,6 +1459,20 @@ fn main() {
 }
 
 #[test]
+fn local_callable_shadow_does_not_inherit_global_abi() {
+    let input = r#"
+fn apply(x: int) -> Result<int, error> { Ok(x) }
+
+fn main() {
+  let apply = |x: int| -> int { x + 1 }
+  let value = apply(1)
+  let _ = value
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn go_fn_value_if_binding_wrapping() {
     let input = r#"
 import "go:fmt"
@@ -1167,9 +1504,9 @@ fn main() {
 #[test]
 fn generic_map_key_in_task_body() {
     let input = r#"
-fn use_map_in_task<K, V>(key: K, value: V) {
+fn use_map_in_task<K: Comparable, V>(key: K, value: V) {
   task {
-    let mut m: Map<K, V> = Map.new()
+    let mut m: mut Map<K, V> = Map.new()
     m[key] = value
   }
 }
@@ -1247,12 +1584,12 @@ fn go_method_value_receiver_hoisted() {
 import "go:bytes"
 import "go:fmt"
 
-fn make(counter: Ref<int>) -> Ref<bytes.Buffer> {
+fn make(counter: mut Ref<int>) -> mut Ref<bytes.Buffer> {
   counter.* = counter.* + 1
   bytes.NewBufferString("a\nb\n")
 }
 
-fn use_fn(f: fn(uint8) -> Result<string, error>) {
+fn use_fn(f: fn(uint8) -> Partial<string, error>) {
   let _ = f(10)
   let _ = f(10)
 }
@@ -1261,6 +1598,22 @@ fn main() {
   let mut count = 0
   use_fn(make(&count).ReadString)
   fmt.Println(count)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn go_tuple_partial_fn_value_adapts_to_lowered_slot() {
+    let input = r#"
+import "go:mime"
+
+fn use_fn(f: fn(string) -> Partial<(string, Map<string, string>), error>) {
+  let _ = f("text/plain")
+}
+
+fn main() {
+  use_fn(mime.ParseMediaType)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1358,6 +1711,22 @@ fn main() {
 }
 
 #[test]
+fn go_callback_bound_to_aliased_fn_type() {
+    let input = r#"
+import "go:path/filepath"
+import "go:io/fs"
+
+fn main() {
+  let walker: filepath.WalkFunc = |_path: string, _info: fs.FileInfo, _err: error| -> Result<(), error> {
+    Ok(())
+  }
+  let _ = filepath.Walk("/tmp", walker)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
 fn unit_call_as_function_argument() {
     let input = r#"
 fn noop() {}
@@ -1397,6 +1766,131 @@ impl Box {
 fn test() {
   let b = Box {}
   Box.ping(b, noop())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_call_types_a_literal_of_another_default() {
+    let input = r#"
+fn ident<T>(v: T) -> T { v }
+
+fn test() -> float64 {
+  let widened: float64 = ident(1)
+  let already: float64 = ident(1.5)
+  let narrow: float32 = ident(2)
+  widened / already + narrow as float64
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_call_types_a_negated_literal() {
+    let input = r#"
+fn ident<T>(v: T) -> T { v }
+
+fn test() -> float64 {
+  let parenthesized: float64 = -(1)
+  let negated: float64 = ident(-(1))
+  parenthesized / 2.0 + negated / 2.0
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn method_call_types_a_literal_of_another_default() {
+    let input = r#"
+struct Box { label: string }
+
+impl Box {
+  fn scale<T>(self, v: T) -> T { v }
+}
+
+fn test() -> byte {
+  let b = Box { label: "x" }
+  let widened: float32 = b.scale(1)
+  let letter: byte = b.scale('a')
+  letter + widened as byte
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_call_leaves_a_literal_in_a_concrete_slot_alone() {
+    let input = r#"
+fn scaled<T>(v: T, _factor: float64) -> T { v }
+fn work() -> Result<int, error> { Ok(1) }
+
+fn test() -> int {
+  let r = work()
+  let t: (Result<int, error>, int) = (scaled(r, 1), 0)
+  t.1
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_call_types_a_literal_into_a_newtype() {
+    let input = r#"
+struct Flag(bool)
+struct Label(string)
+struct Ticket(int)
+struct Weight(float64)
+struct Letter(rune)
+
+fn ident<T>(v: T) -> T { v }
+
+fn test() -> Flag {
+  let label: Label = ident("x")
+  let ticket: Ticket = ident(1)
+  let weight: Weight = ident(1.5)
+  let letter: Letter = ident('a')
+  let _ = (label, ticket, weight, letter)
+  ident(true)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_call_leaves_a_constant_alone_when_a_typed_sibling_binds_the_parameter() {
+    let input = r#"
+fn pick<T>(_a: T, b: T) -> T { b }
+fn ident<T>(v: T) -> T { v }
+
+fn test(w: int64, f: float64) -> float64 {
+  let a: int64 = pick(w, 1)
+  let b: float64 = pick(1, f)
+  let c: float64 = pick(1, 2)
+  let d: float64 = ident(min(1, 2))
+  let _ = a
+  b + c + d
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn method_call_leaves_a_constant_alone_when_the_receiver_binds_the_parameter() {
+    let input = r#"
+struct Wrapper<T> { value: T }
+
+impl<T> Wrapper<T> {
+  fn replace(self, v: T) -> Wrapper<T> { Wrapper { value: v } }
+  fn with<U>(self, u: U) -> U { u }
+}
+
+fn test() -> float32 {
+  let w: Wrapper<float64> = Wrapper { value: 1 }
+  let r = w.replace(2)
+  let u: float32 = w.with(3)
+  let _ = r
+  u
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1459,7 +1953,7 @@ fn spread_arg_into_go_variadic() {
 import filepath "go:path/filepath"
 
 fn test(parts: Slice<string>) -> string {
-  filepath.Join(..parts)
+  filepath.Join(parts...)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1471,7 +1965,7 @@ fn spread_arg_with_leading_args_into_go_variadic() {
 import filepath "go:path/filepath"
 
 fn test(base: string, rest: Slice<string>) -> string {
-  filepath.Join(base, ..rest)
+  filepath.Join(base, rest...)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1487,7 +1981,7 @@ impl Logger {
 }
 
 fn test(l: Logger, parts: Slice<string>) {
-  l.push(..parts)
+  l.push(parts...)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1503,7 +1997,7 @@ impl Logger {
 }
 
 fn test(l: Logger, parts: Slice<string>) {
-  Logger.push(l, ..parts)
+  Logger.push(l, parts...)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1513,7 +2007,7 @@ fn test(l: Logger, parts: Slice<string>) {
 fn spread_arg_into_native_slice_append() {
     let input = r#"
 fn test(s: Slice<int>, more: Slice<int>) -> Slice<int> {
-  s.append(..more)
+  s.append(more...)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1522,8 +2016,9 @@ fn test(s: Slice<int>, more: Slice<int>) -> Slice<int> {
 #[test]
 fn spread_arg_into_native_slice_append_assignment() {
     let input = r#"
-fn test(mut s: Slice<int>, more: Slice<int>) -> Slice<int> {
-  s = s.append(..more)
+fn test(s: Slice<int>, more: Slice<int>) -> Slice<int> {
+  let mut s = s
+  s = s.append(more...)
   s
 }
 "#;
@@ -1533,8 +2028,9 @@ fn test(mut s: Slice<int>, more: Slice<int>) -> Slice<int> {
 #[test]
 fn spread_arg_with_leading_args_into_native_slice_append_assignment() {
     let input = r#"
-fn test(mut s: Slice<int>, extra: int, more: Slice<int>) -> Slice<int> {
-  s = s.append(extra, ..more)
+fn test(s: Slice<int>, extra: int, more: Slice<int>) -> Slice<int> {
+  let mut s = s
+  s = s.append(extra, more...)
   s
 }
 "#;
@@ -1548,7 +2044,7 @@ import "go:fmt"
 
 fn main() {
   let xs = ["a", "b", "c"]
-  fmt.Println(..xs)
+  fmt.Println(xs...)
 }
 "#;
     assert_emit_snapshot!(input);
@@ -1564,7 +2060,415 @@ fn get_xs() -> Result<Slice<int>, error> { Ok([1, 2, 3]) }
 fn variadic(_first: int, _rest: VarArgs<int>) -> int { 0 }
 
 fn run() -> Result<int, error> {
-  Ok(variadic(side_a(), ..get_xs()?))
+  Ok(variadic(side_a(), get_xs()?...))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn auto_addressed_receiver_is_not_copied_before_effectful_arg() {
+    let input = r#"
+struct Foo { count: int }
+
+impl Foo {
+  fn add<T>(self: mut Ref<Foo>, _val: Bar) {
+    self.count += 1
+  }
+}
+
+struct Bar {}
+
+impl Bar {
+  fn new() -> Bar {
+    Bar {}
+  }
+}
+
+fn run() {
+  let mut foo = Foo { count: 0 }
+  foo.add<int>(Bar.new())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn auto_addressed_index_receiver_pinned_before_effectful_arg() {
+    let input = r#"
+struct Cell { v: int }
+
+impl Cell {
+  fn add<T>(self: mut Ref<Cell>, delta: int) {
+    self.v += delta
+  }
+}
+
+fn bump(i: mut Ref<int>) -> int {
+  i.* = 1
+  7
+}
+
+fn run() {
+  let mut items = [Cell { v: 0 }, Cell { v: 0 }]
+  let mut i = 0
+  items[i].add<int>(bump(&i))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn auto_addressed_struct_literal_receiver_pinned_before_effectful_arg() {
+    let input = r#"
+struct Cell { v: int }
+
+impl Cell {
+  fn add<T>(self: mut Ref<Cell>, delta: int) {
+    self.v += delta
+  }
+}
+
+fn bump(i: mut Ref<int>) -> int {
+  i.* = 1
+  7
+}
+
+fn run() {
+  let mut i = 0
+  Cell { v: i }.add<int>(bump(&i))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn auto_addressed_receiver_with_own_setup_pinned_before_effectful_arg() {
+    let input = r#"
+struct Cell { a: int, b: int }
+
+impl Cell {
+  fn add<T>(self: mut Ref<Cell>, delta: int) {
+    self.b += delta
+  }
+}
+
+fn seed() -> Result<int, error> {
+  Ok(1)
+}
+
+fn bump(i: mut Ref<int>) -> Result<int, error> {
+  i.* = 99
+  Ok(7)
+}
+
+fn run() -> Result<(), error> {
+  let mut i = 0
+  Cell { a: seed()?, b: i }.add<int>(bump(&i)?)
+  Ok(())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn discarded_tail_call_to_go_builtin_uses_underscore() {
+    let input = r#"
+fn test() {
+  "test".length()
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn abi_transition_lowered_tail_return_partial_ok() {
+    let input = r#"
+fn run(x: int) -> Partial<int, error> {
+  Partial.Ok(x)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn abi_transition_lowered_tail_return_tuple_with_nullable_slot() {
+    let input = r#"
+fn run(x: int, y: Option<Ref<int>>) -> (int, Option<Ref<int>>) {
+  (x, y)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn abi_transition_callback_adapter_lowered_to_tagged() {
+    let input = r#"
+fn double(x: int) -> Option<int> { Some(x + x) }
+
+fn run() -> Option<int> {
+  Option.and_then(Some(2), double)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+// A plain function whose return type and arity coincide with a variant
+// (`prepend` vs `Cons(int, IntList)`) is a normal call, not a constructor: its
+// recursive arg is passed by value, never addressed.
+#[test]
+fn function_returning_enum_with_variant_arity_is_not_a_constructor() {
+    let input = r#"
+enum IntList {
+  Empty,
+  Cons(int, IntList),
+}
+
+fn prepend(value: int, list: IntList) -> IntList {
+  IntList.Cons(value, list)
+}
+
+fn small() -> IntList {
+  prepend(1, prepend(2, IntList.Empty))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+// A recursive-enum constructor is a first-class value: its make-function takes
+// the recursive field by value (`arg1 IntList`), so passing it to a higher-order
+// function matches the expected `fn(int, IntList) -> IntList` signature.
+#[test]
+fn recursive_enum_constructor_passed_to_higher_order_function() {
+    let input = r#"
+enum IntList {
+  Empty,
+  Cons(int, IntList),
+}
+
+fn apply(f: fn(int, IntList) -> IntList, x: int, xs: IntList) -> IntList {
+  f(x, xs)
+}
+
+fn build() -> IntList {
+  apply(IntList.Cons, 1, apply(IntList.Cons, 2, IntList.Empty))
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+// `...T` in the signature, `[]T` in the body, as in Go.
+#[test]
+fn varargs_param_declares_variadic_and_bodies_use_a_slice() {
+    let input = r#"
+fn test(xs: VarArgs<int>) -> int {
+  let mut n = xs.length() + xs[0]
+  for x in xs {
+    n = n + x
+  };
+  n
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+// Zero variadic args, so `T` must be forwarded explicitly: `first[int]()`.
+#[test]
+fn empty_varargs_call_forwards_inferred_type_arg() {
+    let input = r#"
+fn first<T>(xs: VarArgs<T>) -> Option<T> { None }
+
+fn test() {
+  let r: Option<int> = first()
+  if r.unwrap_or(7) != 7 {
+    panic("expected 7")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+// The fixed arg doesn't determine `T`; the variadic got none, so forward it:
+// `g[int](5)`.
+#[test]
+fn empty_varargs_with_fixed_arg_forwards_inferred_type_arg() {
+    let input = r#"
+fn g<T>(head: int, rest: VarArgs<T>) -> Option<T> { None }
+
+fn test() {
+  let r: Option<int> = g(5)
+  if r.unwrap_or(9) != 9 {
+    panic("expected 9")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn empty_varargs_method_call_forwards_inferred_type_arg() {
+    let input = r#"
+struct Box {}
+
+impl Box {
+  fn first<T>(self, xs: VarArgs<T>) -> Option<T> { None }
+}
+
+fn test() {
+  let b = Box {}
+  let r: Option<int> = b.first()
+  if r.unwrap_or(7) != 7 {
+    panic("expected 7")
+  }
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn pub_function_same_package_call_uses_exported_name() {
+    let input = r#"
+import "go:fmt"
+
+pub fn greet_all() -> string {
+  "hi"
+}
+
+fn main() {
+  fmt.Println(greet_all())
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_param_shadows_package_struct() {
+    let input = r#"
+struct T {
+  v: int,
+}
+
+fn make_t() -> T {
+  T { v: 7 }
+}
+
+fn f<T>(x: T) -> int {
+  let mut opt = None
+  opt = Some(make_t())
+  match opt {
+    Some(t) => t.v,
+    None => 0,
+  }
+}
+
+fn test() -> int {
+  f("hi")
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_param_shadows_enum_variant_constant_and_constructor() {
+    let input = r#"
+enum Wrap {
+  Empty,
+  Full(int),
+  Partial(int),
+}
+
+fn describe<WrapFull>(w: Wrap, _tag: WrapFull) -> int {
+  match w {
+    Wrap.Empty => 0,
+    Wrap.Full(n) => n,
+    Wrap.Partial(m) => m + 100,
+  }
+}
+
+fn build<MakeWrapFull>(_seed: MakeWrapFull) -> int {
+  match Wrap.Full(7) {
+    Wrap.Full(n) => n,
+    _ => 0,
+  }
+}
+
+fn test() -> int {
+  describe(Wrap.Full(42), "x") + build(true)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn generic_param_shadows_import_qualifier() {
+    let input = r#"
+import sc "go:strconv"
+
+fn label<sc>(_tag: sc) -> string {
+  sc.Itoa(5)
+}
+
+fn test() -> string {
+  label(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn renamed_generic_freshens_colliding_value_param() {
+    let input = r#"
+import sc "go:strconv"
+
+fn label<sc>(sc_2: int, _tag: sc) -> string {
+  sc.Itoa(sc_2)
+}
+
+fn test() -> string {
+  label(5, 1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn renamed_generic_freshens_colliding_local() {
+    let input = r#"
+import sc "go:strconv"
+
+fn label<sc>(_tag: sc) -> string {
+  let sc_2 = 9
+  sc.Itoa(sc_2)
+}
+
+fn test() -> string {
+  label(1)
+}
+"#;
+    assert_emit_snapshot!(input);
+}
+
+#[test]
+fn renamed_generic_type_in_closure_after_colliding_local() {
+    let input = r#"
+import sc "go:strconv"
+
+fn make<sc>(x: sc) -> fn() -> sc {
+  || -> sc {
+    let sc_2 = 1
+    let _ = sc.Itoa(sc_2)
+    let mut opt = None
+    opt = Some(x)
+    match opt {
+      Some(v) => v,
+      None => x,
+    }
+  }
+}
+
+fn test() -> int {
+  let f = make(7)
+  f()
 }
 "#;
     assert_emit_snapshot!(input);

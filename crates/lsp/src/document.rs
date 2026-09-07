@@ -1,88 +1,145 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 
-use tower_lsp::lsp_types::Url;
+use crate::heap;
+use crate::protocol::Url;
 
-use crate::paths::uri_to_module_file;
-use crate::position::LineIndex;
-use crate::state::{DocumentState, SharedState};
+use crate::state::{AnalysisKey, CancellationToken, DocumentState, SharedState};
 
 impl SharedState {
-    pub(crate) async fn ensure_config(
-        &self,
-        file_uri: &Url,
-    ) -> Option<crate::project::ProjectConfig> {
-        if let Some(config) = self.project_config.read().await.as_ref() {
-            return Some(config.clone());
-        }
-
-        let file_path = file_uri.to_file_path().ok()?;
-
-        let config = crate::project::find_project_root(&file_path)
-            .unwrap_or_else(|| crate::project::resolve_standalone_root(&file_path));
-
+    pub(crate) fn open_document(self: &Arc<Self>, uri: Url, content: String, version: i32) {
+        let mut workspace = self.workspace_mut();
+        self.project.update_overlay(&uri, content.clone());
+        let key = self.key_for(&uri);
+        workspace.invalidate_unseen(&uri, &content);
+        let mut document = DocumentState::new(content, version);
+        if let Some(key) = &key
+            && let Some(snapshot) = workspace.snapshot(key)
+            && self.validate(&uri).is_none()
+            && snapshot.is_usable(&uri)
         {
-            let mut loader = self.loader.write().await;
-            loader.set_config(config.clone());
+            document.set_last_usable(snapshot);
         }
+        workspace.documents.insert(uri, document);
+        if let Some(key) = key {
+            workspace.ensure(&key);
+        }
+        drop(workspace);
 
-        *self.project_config.write().await = Some(config.clone());
-        Some(config)
+        self.reschedule_all();
     }
 
-    pub(crate) async fn update_document(&self, uri: Url, content: String, version: i32) {
-        let line_index = LineIndex::new(&content);
-
-        if let Some(config) = self.ensure_config(&uri).await
-            && let Some((module_id, filename)) = uri_to_module_file(&config, &uri)
-        {
-            let mut loader = self.loader.write().await;
-            loader.set_overlay(&module_id, &filename, content.clone());
+    pub(crate) fn change_document(self: &Arc<Self>, uri: Url, content: String, version: i32) {
+        let mut workspace = self.workspace_mut();
+        self.project.update_overlay(&uri, content.clone());
+        let key = self.key_for(&uri);
+        match workspace.documents.get_mut(&uri) {
+            Some(document) => document.update(content, version),
+            None => {
+                workspace
+                    .documents
+                    .insert(uri.clone(), DocumentState::new(content, version));
+            }
         }
+        if let Some(key) = key {
+            workspace.ensure(&key);
+        }
+        workspace.invalidate_all();
+        drop(workspace);
 
-        self.documents.insert(
-            uri,
-            DocumentState {
-                content,
-                line_index,
-                version,
-            },
-        );
+        self.reschedule_all();
     }
 
-    pub(crate) async fn publish_diagnostics(&self, uri: Url) {
-        let version = self.documents.get(&uri).map(|d| d.version);
-
-        let diagnostics = self.analyze_and_convert(&uri).await;
-
-        let current_version = self.documents.get(&uri).map(|d| d.version);
-        if version != current_version {
-            return; // Discard stale results
-        }
-
-        self.client
-            .publish_diagnostics(uri, diagnostics, version)
-            .await;
-    }
-
-    pub(crate) async fn schedule_diagnostics(self: &Arc<Self>, uri: Url) {
-        if let Some((_, (_, old_handle))) = self.pending_diagnostics.remove(&uri) {
-            old_handle.abort();
-        }
-
-        let generation = self.diagnostics_generation.fetch_add(1, Ordering::Relaxed);
-        let state = Arc::clone(self);
-        let diagnostics_uri = uri.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            state.publish_diagnostics(diagnostics_uri.clone()).await;
-            state
-                .pending_diagnostics
-                .remove_if(&diagnostics_uri, |_, (g, _)| *g == generation);
+    pub(crate) fn close_document(self: &Arc<Self>, uri: &Url) {
+        let mut workspace = self.workspace_mut();
+        let key = self.key_for(uri);
+        self.project.remove_overlay(uri);
+        workspace.documents.remove(uri);
+        let evicted = key.is_some_and(|key| {
+            let still_open = workspace
+                .documents
+                .keys()
+                .any(|open| self.key_for(open).as_ref() == Some(&key));
+            if still_open {
+                return false;
+            }
+            workspace.evict(&key);
+            true
         });
+        workspace.invalidate_all();
+        drop(workspace);
 
-        self.pending_diagnostics
-            .insert(uri, (generation, handle.abort_handle()));
+        if evicted {
+            heap::release_freed_pages();
+        }
+        self.client.publish_diagnostics(uri.clone(), vec![], None);
+        self.reschedule_all();
+    }
+
+    pub(crate) fn publish_diagnostics(&self, uri: Url) {
+        if uri
+            .to_file_path()
+            .is_ok_and(|p| deps::is_generated_typedef_path(&p))
+        {
+            self.client.publish_diagnostics(uri, vec![], None);
+            return;
+        }
+
+        let (version, generation) = {
+            let workspace = self.workspace();
+            let Some(document) = workspace.documents.get(&uri) else {
+                return;
+            };
+            (document.version(), workspace.generation())
+        };
+
+        let Some(diagnostics) = self.diagnostics_for(&uri) else {
+            return;
+        };
+
+        let workspace = self.workspace();
+        if workspace.generation() != generation || !workspace.documents.contains_key(&uri) {
+            return;
+        }
+        self.client
+            .publish_diagnostics(uri, diagnostics, Some(version));
+    }
+
+    fn reschedule_all(self: &Arc<Self>) {
+        let keys = self.workspace().keys();
+        for key in keys {
+            self.schedule_diagnostics(key);
+        }
+    }
+
+    fn schedule_diagnostics(self: &Arc<Self>, key: AnalysisKey) {
+        let state = Arc::clone(self);
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+        let run_key = key.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            if run_token.is_cancelled() {
+                return;
+            }
+            for uri in state.documents_for(&run_key) {
+                if run_token.is_cancelled() {
+                    return;
+                }
+                state.publish_diagnostics(uri);
+            }
+            state
+                .workspace_mut()
+                .finish_diagnostics(&run_key, &run_token);
+        });
+        self.workspace_mut().set_pending_diagnostics(&key, token);
+    }
+
+    fn documents_for(&self, key: &AnalysisKey) -> Vec<Url> {
+        let uris: Vec<Url> = self.workspace().documents.keys().cloned().collect();
+        uris.into_iter()
+            .filter(|uri| self.key_for(uri).as_ref() == Some(key))
+            .collect()
     }
 }

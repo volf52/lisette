@@ -1,0 +1,251 @@
+use diagnostics::{Edit, Fix};
+use rustc_hash::FxHashSet as HashSet;
+use syntax::ast::{Expression, Literal, Span, StructFieldAssignment, StructSpread};
+use syntax::program::{DefinitionBody, DotAccessResolution};
+use syntax::types::{SubstitutionMap, Type, substitute, unqualified_name};
+
+use super::helpers::replacement_drops_comment;
+use crate::passes::walk::NodeCtx;
+use semantics::store::Store;
+use semantics::zero::{MapZero, has_zero};
+
+const ZERO_FIELD_THRESHOLD: usize = 3;
+
+pub fn check_replaceable_with_autofill(expression: &Expression, ctx: &NodeCtx) {
+    let Expression::StructCall {
+        name,
+        field_assignments,
+        spread,
+        ty,
+        span,
+        ..
+    } = expression
+    else {
+        return;
+    };
+    if !matches!(spread, StructSpread::None) {
+        return;
+    }
+
+    let zero_count = field_assignments
+        .iter()
+        .filter(|f| is_obvious_zero(&f.value, ctx.store))
+        .count();
+    if zero_count < ZERO_FIELD_THRESHOLD {
+        return;
+    }
+
+    let Some(unspecified) = unspecified_fields(ctx.store, ty, name, field_assignments) else {
+        return;
+    };
+    if !unspecified.is_empty() {
+        return;
+    }
+    if !rewrite_would_typecheck(ctx.store, ty, name, field_assignments, ctx.package_id()) {
+        return;
+    }
+
+    let kept = render_kept_fields(ctx.source(), field_assignments, ctx.store);
+    let owner_span = Span::new(span.file_id, span.byte_offset, name.len() as u32);
+    let replacement = if kept.is_empty() {
+        format!("{name} {{ .. }}")
+    } else {
+        format!("{name} {{ {kept}, .. }}")
+    };
+    let mut diagnostic = diagnostics::lint::replaceable_with_autofill(&owner_span, &kept, name);
+    if !replacement_drops_comment(ctx.source(), *span, &replacement) {
+        diagnostic = diagnostic.with_fix(Fix::new(
+            format!("Replace with `{replacement}`"),
+            Edit::replacement(*span, replacement),
+        ));
+    }
+    ctx.sink.push(diagnostic);
+}
+
+fn render_kept_fields(source: &str, fields: &[StructFieldAssignment], store: &Store) -> String {
+    fields
+        .iter()
+        .filter(|f| !is_obvious_zero(&f.value, store))
+        .map(|f| {
+            let value_span = f.value.get_span();
+            let start = f.name_span.byte_offset as usize;
+            let end = (value_span.byte_offset + value_span.byte_length) as usize;
+            source
+                .get(start..end)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| f.name.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn is_obvious_zero(value: &Expression, store: &Store) -> bool {
+    match value {
+        Expression::Literal { literal, .. } => match literal {
+            Literal::Integer { value, .. } => *value == 0,
+            Literal::Float { value, .. } => *value == 0.0,
+            Literal::Boolean(b) => !*b,
+            Literal::String { value, .. } => value.is_empty(),
+            _ => false,
+        },
+        Expression::Identifier { value, .. } => value.as_str() == "None",
+        Expression::DotAccess { resolution, .. } => is_default_variant(resolution, store),
+        _ => false,
+    }
+}
+
+fn is_default_variant(resolution: &DotAccessResolution, store: &Store) -> bool {
+    let DotAccessResolution::EnumVariant { definition } = resolution else {
+        return false;
+    };
+    let Some((enum_id, variant_name)) = definition.as_str().rsplit_once('.') else {
+        return false;
+    };
+    let Some(DefinitionBody::Enum {
+        variants,
+        default_variant: Some(index),
+        ..
+    }) = store.get_definition(enum_id).map(|d| &d.body)
+    else {
+        return false;
+    };
+    variants
+        .get(*index)
+        .is_some_and(|variant| variant.name == variant_name)
+}
+
+fn is_go_imported(ty: &Type) -> bool {
+    let Type::Nominal { id, .. } = ty.strip_refs() else {
+        return false;
+    };
+    id.as_str().starts_with("go:")
+}
+
+fn struct_package(ty: &Type) -> Option<String> {
+    let Type::Nominal { id, .. } = ty.strip_refs() else {
+        return None;
+    };
+    id.as_str().split_once('.').map(|(m, _)| m.to_string())
+}
+
+fn rewrite_would_typecheck(
+    store: &Store,
+    ty: &Type,
+    name: &str,
+    field_assignments: &[StructFieldAssignment],
+    from_package: &str,
+) -> bool {
+    if is_go_imported(ty) {
+        return true;
+    }
+    let Some(omitted) = post_rewrite_unspecified_fields(store, ty, name, field_assignments) else {
+        return false;
+    };
+    let is_cross_package = struct_package(ty).is_some_and(|m| m.as_str() != from_package);
+    omitted.iter().all(|f| {
+        (!is_cross_package || f.is_public)
+            && has_zero(store, &f.ty, from_package, MapZero::Built).is_ok()
+    })
+}
+
+struct OmittedField {
+    ty: Type,
+    is_public: bool,
+}
+
+fn unspecified_fields(
+    store: &Store,
+    ty: &Type,
+    name: &str,
+    field_assignments: &[StructFieldAssignment],
+) -> Option<Vec<OmittedField>> {
+    let assigned: HashSet<&str> = field_assignments.iter().map(|f| f.name.as_str()).collect();
+    fields_filtered(store, ty, name, &assigned)
+}
+
+fn post_rewrite_unspecified_fields(
+    store: &Store,
+    ty: &Type,
+    name: &str,
+    field_assignments: &[StructFieldAssignment],
+) -> Option<Vec<OmittedField>> {
+    let kept: HashSet<&str> = field_assignments
+        .iter()
+        .filter(|f| !is_obvious_zero(&f.value, store))
+        .map(|f| f.name.as_str())
+        .collect();
+    fields_filtered(store, ty, name, &kept)
+}
+
+fn fields_filtered(
+    store: &Store,
+    ty: &Type,
+    name: &str,
+    keep_specified: &HashSet<&str>,
+) -> Option<Vec<OmittedField>> {
+    let stripped = ty.strip_refs();
+    let Type::Nominal { id, params, .. } = &stripped else {
+        return None;
+    };
+
+    let def = store.get_definition(id.as_str())?;
+    match &def.body {
+        DefinitionBody::Struct { fields, .. } => {
+            let map = build_substitution(&def.ty, params);
+            Some(
+                fields
+                    .iter()
+                    .filter(|f| !keep_specified.contains(f.name.as_str()))
+                    .map(|f| OmittedField {
+                        ty: substitute_or_clone(&f.ty, &map),
+                        is_public: f.visibility.is_public(),
+                    })
+                    .collect(),
+            )
+        }
+        DefinitionBody::Enum {
+            variants, generics, ..
+        } => {
+            let variant_name = unqualified_name(name);
+            let variant = variants.iter().find(|v| v.name == variant_name)?;
+            let mut map = SubstitutionMap::default();
+            if generics.len() == params.len() {
+                for (g, p) in generics.iter().zip(params.iter()) {
+                    map.insert(g.name.clone(), p.clone());
+                }
+            }
+            Some(
+                variant
+                    .fields
+                    .iter()
+                    .filter(|f| !keep_specified.contains(f.name.as_str()))
+                    .map(|f| OmittedField {
+                        ty: substitute_or_clone(&f.ty, &map),
+                        is_public: true,
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn build_substitution(def_ty: &Type, params: &[Type]) -> SubstitutionMap {
+    let mut map = SubstitutionMap::default();
+    if let Type::Forall { vars, .. } = def_ty
+        && vars.len() == params.len()
+    {
+        for (var, param) in vars.iter().zip(params.iter()) {
+            map.insert(var.clone(), param.clone());
+        }
+    }
+    map
+}
+
+fn substitute_or_clone(ty: &Type, map: &SubstitutionMap) -> Type {
+    if map.is_empty() {
+        ty.clone()
+    } else {
+        substitute(ty, map)
+    }
+}

@@ -1,11 +1,14 @@
 ---
 source: tests/spec/emit/prelude.rs
-description: "input: \nfn test(m: Map<string, int>, key: string) -> Option<int> {\n  m.get(key)\n}\n"
+description: |
+  
+  fn test(m: Map<string, int>, key: string) -> Option<int> {
+    m.get(key)
+  }
 ---
 package main
 
-import lisette "github.com/ivov/lisette/prelude"
-
-func test(m map[string]int, key string) lisette.Option[int] {
-	return lisette.MapGet(m, key)
+func test(m map[string]int, key string) (int, bool) {
+	ret_1, ok_2 := m[key]
+	return ret_1, ok_2
 }

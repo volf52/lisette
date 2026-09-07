@@ -1,0 +1,25 @@
+---
+source: tests/spec/emit/types.rs
+description: |
+  
+  type Numbers = Slice<int>
+  
+  fn test() {
+    let xs: Numbers = [1, 2, 3]
+    let view = xs[0..2]
+    let grown = view.append(9)
+    let _ = grown
+    let _ = xs
+  }
+---
+package main
+
+type Numbers = []int
+
+func test() {
+	xs := []int{1, 2, 3}
+	view := xs[0:2:2]
+	grown := append(view[:len(view):len(view)], 9)
+	_ = grown
+	_ = xs
+}

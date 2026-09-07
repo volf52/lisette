@@ -1,0 +1,509 @@
+//! Lowered body IR: the typed vocabulary `plan::lower` produces and `render/`
+//! consumes. `RawGo` is a transitional node holding pre-rendered Go.
+
+use crate::plan::values::{GoExpression, ValuePlan};
+use syntax::types::Type;
+
+/// Destination for a lowered block's tail. The enclosing function's return
+/// context (for nested `return`/`?`) is read from the scope stack via
+/// `Planner::return_ctx`; `Return` is also the tail target.
+pub(crate) enum PlacePlan<'a> {
+    Statement,
+    Return,
+    Assign {
+        local: &'a str,
+        target_ty: Option<&'a Type>,
+    },
+}
+
+impl PlacePlan<'_> {
+    pub(crate) fn is_return(&self) -> bool {
+        matches!(self, PlacePlan::Return)
+    }
+}
+
+pub(crate) struct LoweredBlock {
+    pub(crate) statements: Vec<LoweredStatement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoopId(pub(crate) u32);
+
+pub(crate) enum LoopTransfer {
+    Unlabeled,
+    Source(LoopId),
+    Labeled(String),
+}
+
+pub(crate) fn directed(directive: String, stmt: LoweredStatement) -> LoweredStatement {
+    if directive.is_empty() {
+        stmt
+    } else {
+        LoweredStatement::Directed {
+            directive,
+            inner: Box::new(stmt),
+        }
+    }
+}
+
+pub(crate) enum LoweredStatement {
+    If(IfPlan),
+    Loop(LoopPlan),
+    Block(LoweredBlock),
+    /// A nested block rendered without adding braces.
+    Body(LoweredBlock),
+    Break(LoopTransfer),
+    Continue(LoopTransfer),
+    Const(ConstPlan),
+    Return(ReturnForm),
+    BreakValue(BreakValuePlan),
+    Let(LetPlan),
+    Assign(AssignForm),
+    Expression(ExpressionStatementForm),
+    Select(SelectStatementPlan),
+    Switch(SwitchStatementPlan),
+    WhileLet(LoweredBlock),
+    /// Eval-order temp capture: `name := value`.
+    TempBind {
+        name: String,
+        value: String,
+    },
+    /// `var name go_type` (with `= value` when `value` is set).
+    VarDecl {
+        name: String,
+        go_type: String,
+        value: Option<String>,
+    },
+    /// `name := <closure_open><body><closure_close>` (try-block IIFE,
+    /// recover-block closure). `closure_open`/`close` are opaque Go text.
+    ClosureBind {
+        name: String,
+        closure_open: String,
+        body: LoweredBlock,
+        closure_close: String,
+    },
+    /// A statement preceded by a sourcemap `//line` directive.
+    Directed {
+        directive: String,
+        inner: Box<LoweredStatement>,
+    },
+    RawGo(String),
+    /// Raw Go whose tail diverges (a never-typed call such as `panic(...)`).
+    /// Tracked separately from `RawGo` so divergence is structural rather than
+    /// re-derived by scanning text.
+    DivergingRawGo(String),
+    /// `panic("unreachable")` tail after a non-exhaustive branch in return
+    /// position: a structured diverging leaf.
+    UnreachablePanic,
+}
+
+/// A source `const` (or `var` when the value is not Go-const-eligible).
+pub(crate) struct ConstPlan {
+    pub(crate) is_const: bool,
+    pub(crate) name: String,
+    pub(crate) ty_str: String,
+    pub(crate) value: ValuePlan,
+}
+
+/// A source `return expr` statement, classified by `ReturnForm`.
+pub(crate) enum ReturnForm {
+    Plain {
+        value: ValuePlan,
+    },
+    /// Bare `return` for a unit-typed function. `side_effect` is run first
+    /// when the returned expression is impure.
+    Unit {
+        side_effect: Option<LoweredBlock>,
+    },
+    /// `return v0, v1, ...` for a lowered multi-value ABI return.
+    Multi {
+        values: Vec<String>,
+    },
+    /// An already-lowered return sequence.
+    Body {
+        body: LoweredBlock,
+    },
+}
+
+/// A `break value` statement. A diverged value terminates on its own; all
+/// other values carry the action and transfer needed to finish the break.
+pub(crate) enum BreakValuePlan {
+    Diverged {
+        value: ValuePlan,
+    },
+    Transfer {
+        value: ValuePlan,
+        action: BreakValueAction,
+        target: LoopTransfer,
+    },
+}
+
+/// What to do with a non-diverging `break value` after its setup has run.
+pub(crate) enum BreakValueAction {
+    /// Inside a loop with a result slot, when the value is a unit-typed
+    /// call: emit `<value>` as a side-effect statement (skipped if value
+    /// text is empty), then `<result_var> = struct{}{}`, then break.
+    UnitCallIntoResult { result_var: String },
+    /// Inside a loop with a result slot: emit `<result_var> = <value>`
+    /// (skipped if value text is empty), then break.
+    AssignToResult { result_var: String },
+    /// No result slot: emit `_ = <value>` (skipped if value text is empty),
+    /// then break.
+    Discard,
+}
+
+/// A lowered `let` binding.
+pub(crate) struct LetPlan {
+    /// Optional `var X T` emitted before a never-typed value so dead code can
+    /// still reference the binding.
+    pub(crate) declaration: Option<Box<LoweredStatement>>,
+    pub(crate) body: LoweredBlock,
+}
+
+/// An assignment statement, structured by shape.
+pub(crate) enum AssignForm {
+    /// `target++`, `target--`, or `target op= rhs`.
+    Compound {
+        target_capture: Vec<LoweredStatement>,
+        target_str: String,
+        kind: CompoundKind,
+    },
+    /// `target = value`.
+    Simple {
+        target_capture: Vec<LoweredStatement>,
+        target_str: String,
+        value: ValuePlan,
+    },
+}
+
+pub(crate) enum CompoundKind {
+    Increment,
+    Decrement,
+    /// `target op= rhs`. An effectful RHS forces the target's prior value
+    /// into `pinned_left`, rendered as `target = pinned_left op rhs`.
+    OpAssign {
+        op_text: String,
+        rhs: ValuePlan,
+        pinned_left: Option<String>,
+    },
+}
+
+/// A bare expression statement.
+pub(crate) enum ExpressionStatementForm {
+    /// `go <value>` / `defer <value>` at statement position.
+    Async { value: ValuePlan },
+    /// `<keyword> func() { <body> }()` IIFE wrapper for Task/Defer block
+    /// forms and inner expressions requiring an IIFE (`needs_iife_for_async`).
+    AsyncBlock { keyword: String, body: LoweredBlock },
+}
+
+/// A `switch` statement (value or type switch). The renderer owns the
+/// `switch`/`case`/`default:` syntax.
+pub(crate) struct SwitchStatementPlan {
+    pub(crate) kind: SwitchKind,
+    pub(crate) cases: Vec<SwitchCasePlan>,
+    pub(crate) default: Option<LoweredBlock>,
+    /// Statements after the switch, such as an unreachable panic.
+    pub(crate) postlude: Vec<LoweredStatement>,
+}
+
+pub(crate) enum SwitchKind {
+    Conditional,
+    /// `switch <subject> {`
+    Value {
+        subject: String,
+    },
+    /// `switch <binding> := <subject>.(type) {` when `binding` is set,
+    /// otherwise `switch <subject>.(type) {`.
+    Type {
+        subject: String,
+        binding: Option<String>,
+    },
+}
+
+/// A single `case <labels>:` plus its body.
+pub(crate) struct SwitchCasePlan {
+    pub(crate) labels: String,
+    pub(crate) body: LoweredBlock,
+}
+
+impl SwitchStatementPlan {
+    fn ends_with_diverge(&self) -> bool {
+        self.postlude
+            .last()
+            .is_some_and(LoweredStatement::ends_with_diverge)
+    }
+}
+
+/// A `select` statement: optional retry-loop wrapper around the `select`, an
+/// ordered set of arms, plus hoisted setup and a trailing postlude (e.g. an
+/// unreachable panic). The renderer owns the `for`/`select`/`case`/`default:`
+/// syntax.
+pub(crate) struct SelectStatementPlan {
+    /// Side-effecting setup hoisted before the `select` (channel/value temps).
+    pub(crate) setup: Vec<LoweredStatement>,
+    /// When set, the `select` is wrapped in `for { ... break }` for retry.
+    pub(crate) retry_loop: bool,
+    pub(crate) arms: Vec<SelectArmPlan>,
+    /// Statements after the `select`/retry loop, such as an unreachable panic.
+    pub(crate) postlude: Vec<LoweredStatement>,
+}
+
+/// A single `select` arm: a `case`/`default:` header plus its body block.
+pub(crate) enum SelectArmPlan {
+    /// `case <receive_vars> := <-<channel>:`, or `case <-<channel>:` when
+    /// `receive_vars` is `None`.
+    Receive {
+        receive_vars: Option<String>,
+        channel: String,
+        body: LoweredBlock,
+    },
+    /// `case <operation>:` where `operation` is `ch <- val` or `<-ch`.
+    Send {
+        operation: GoExpression,
+        body: LoweredBlock,
+    },
+    /// `default:`
+    Default { body: LoweredBlock },
+}
+
+impl SelectStatementPlan {
+    fn ends_with_diverge(&self) -> bool {
+        self.postlude
+            .last()
+            .is_some_and(LoweredStatement::ends_with_diverge)
+            || self.all_arms_diverge()
+    }
+
+    pub(crate) fn all_arms_diverge(&self) -> bool {
+        !self.arms.is_empty() && self.arms.iter().all(|arm| arm.body().ends_with_diverge())
+    }
+}
+
+impl SelectArmPlan {
+    pub(crate) fn body(&self) -> &LoweredBlock {
+        match self {
+            SelectArmPlan::Receive { body, .. }
+            | SelectArmPlan::Send { body, .. }
+            | SelectArmPlan::Default { body } => body,
+        }
+    }
+
+    pub(crate) fn body_mut(&mut self) -> &mut LoweredBlock {
+        match self {
+            SelectArmPlan::Receive { body, .. }
+            | SelectArmPlan::Send { body, .. }
+            | SelectArmPlan::Default { body } => body,
+        }
+    }
+}
+
+/// A statement-position loop. `prologue` is pre-loop setup (a for-loop's
+/// iterable capture); `header` is the rendered Go loop opener through the body's
+/// opening brace; its kind records whether transfers inside it can target an
+/// enclosing source loop.
+pub(crate) struct LoopPlan {
+    pub(crate) prologue: Vec<LoweredStatement>,
+    pub(crate) kind: LoopKind,
+    pub(crate) header: String,
+    pub(crate) body: LoweredBlock,
+}
+
+pub(crate) enum LoopKind {
+    Source { label: Option<String> },
+    Generated { label: Option<String> },
+}
+
+impl LoopKind {
+    pub(crate) fn label(&self) -> Option<&str> {
+        match self {
+            LoopKind::Source { label } | LoopKind::Generated { label } => label.as_deref(),
+        }
+    }
+}
+
+pub(crate) struct IfPlan {
+    /// Side-effecting setup hoisted before the `if` condition (temps from a
+    /// condition that lowered to statements).
+    pub(crate) condition_setup: Vec<LoweredStatement>,
+    pub(crate) condition: String,
+    pub(crate) then_body: LoweredBlock,
+    pub(crate) else_arm: ElseArm,
+}
+
+pub(crate) enum ElseArm {
+    None,
+    ElseIf(Box<IfPlan>),
+    /// `inline` is set when the preceding branch diverges so Go would reject
+    /// a dead `else`: the body emits unwrapped after `}` instead of `else {}`.
+    Else {
+        body: LoweredBlock,
+        inline: bool,
+    },
+}
+
+impl ElseArm {
+    pub(crate) fn from_body(body: LoweredBlock, inline: bool) -> Self {
+        if body.renders_empty() {
+            return ElseArm::None;
+        }
+        ElseArm::Else { body, inline }
+    }
+}
+
+impl LoweredBlock {
+    /// Whether the block's last rendered line is `break`, `continue`,
+    /// `return`, or `panic(...)`.
+    pub(crate) fn ends_with_diverge(&self) -> bool {
+        self.statements
+            .last()
+            .is_some_and(LoweredStatement::ends_with_diverge)
+    }
+
+    /// Whether the block has no statements.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.statements.is_empty()
+    }
+
+    pub(crate) fn renders_empty(&self) -> bool {
+        self.statements
+            .iter()
+            .all(|statement| !statement.emits_output())
+    }
+}
+
+impl LoweredStatement {
+    /// The Go name this statement binds, seeing through a sourcemap directive.
+    pub(crate) fn bound_name(&self) -> Option<&str> {
+        match self {
+            LoweredStatement::Directed { inner, .. } => inner.bound_name(),
+            LoweredStatement::TempBind { name, .. }
+            | LoweredStatement::ClosureBind { name, .. }
+            | LoweredStatement::VarDecl {
+                name,
+                value: Some(_),
+                ..
+            } => Some(name),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn binds_name(&self, go_name: &str) -> bool {
+        self.bound_name() == Some(go_name)
+    }
+
+    /// `false` when the statement binds nothing.
+    pub(crate) fn rename_bound_name(&mut self, go_name: &str) -> bool {
+        let bound = match self {
+            LoweredStatement::Directed { inner, .. } => return inner.rename_bound_name(go_name),
+            LoweredStatement::TempBind { name, .. }
+            | LoweredStatement::ClosureBind { name, .. }
+            | LoweredStatement::VarDecl {
+                name,
+                value: Some(_),
+                ..
+            } => name,
+            _ => return false,
+        };
+        *bound = go_name.to_string();
+        true
+    }
+
+    fn emits_output(&self) -> bool {
+        match self {
+            LoweredStatement::If(_)
+            | LoweredStatement::Loop(_)
+            | LoweredStatement::Block(_)
+            | LoweredStatement::Break(_)
+            | LoweredStatement::Continue(_)
+            | LoweredStatement::Const(_)
+            | LoweredStatement::Select(_)
+            | LoweredStatement::Switch(_)
+            | LoweredStatement::TempBind { .. }
+            | LoweredStatement::VarDecl { .. }
+            | LoweredStatement::ClosureBind { .. }
+            | LoweredStatement::UnreachablePanic => true,
+            LoweredStatement::Body(body) => !body.renders_empty(),
+            LoweredStatement::Return(plan) => match plan {
+                ReturnForm::Body { body } => !body.renders_empty(),
+                ReturnForm::Plain { .. } | ReturnForm::Unit { .. } | ReturnForm::Multi { .. } => {
+                    true
+                }
+            },
+            LoweredStatement::BreakValue(plan) => match plan {
+                BreakValuePlan::Diverged { value } => {
+                    value.setup.iter().any(LoweredStatement::emits_output)
+                }
+                BreakValuePlan::Transfer { .. } => true,
+            },
+            LoweredStatement::Let(plan) => plan.declaration.is_some() || !plan.body.renders_empty(),
+            LoweredStatement::Assign(plan) => match plan {
+                AssignForm::Compound { .. } | AssignForm::Simple { .. } => true,
+            },
+            LoweredStatement::Expression(plan) => match plan {
+                ExpressionStatementForm::Async { value } => {
+                    !value.is_empty() || value.setup.iter().any(LoweredStatement::emits_output)
+                }
+                ExpressionStatementForm::AsyncBlock { .. } => true,
+            },
+            LoweredStatement::WhileLet(body) => !body.renders_empty(),
+            LoweredStatement::Directed { directive, inner } => {
+                !directive.is_empty() || inner.emits_output()
+            }
+            LoweredStatement::RawGo(code) | LoweredStatement::DivergingRawGo(code) => {
+                !code.is_empty()
+            }
+        }
+    }
+
+    fn ends_with_diverge(&self) -> bool {
+        match self {
+            LoweredStatement::If(plan) => plan.ends_with_diverge(),
+            LoweredStatement::Loop(_) | LoweredStatement::Block(_) | LoweredStatement::Const(_) => {
+                false
+            }
+            LoweredStatement::Body(body) => body.ends_with_diverge(),
+            LoweredStatement::Break(_) | LoweredStatement::Continue(_) => true,
+            LoweredStatement::Return(_) => true,
+            LoweredStatement::BreakValue(_) => true,
+            LoweredStatement::Let(plan) => plan.body.ends_with_diverge(),
+            LoweredStatement::Assign(plan) => match plan {
+                AssignForm::Compound { .. } | AssignForm::Simple { .. } => false,
+            },
+            LoweredStatement::Expression(plan) => match plan {
+                ExpressionStatementForm::Async { .. }
+                | ExpressionStatementForm::AsyncBlock { .. } => false,
+            },
+            LoweredStatement::Select(plan) => plan.ends_with_diverge(),
+            LoweredStatement::Switch(plan) => plan.ends_with_diverge(),
+            LoweredStatement::WhileLet(body) => body.ends_with_diverge(),
+            LoweredStatement::TempBind { .. }
+            | LoweredStatement::VarDecl { .. }
+            | LoweredStatement::ClosureBind { .. } => false,
+            LoweredStatement::Directed { inner, .. } => inner.ends_with_diverge(),
+            LoweredStatement::RawGo(_) => false,
+            LoweredStatement::DivergingRawGo(_) | LoweredStatement::UnreachablePanic => true,
+        }
+    }
+
+    pub(crate) fn blocks_fallthrough(&self) -> bool {
+        if let LoweredStatement::Directed { inner, .. } = self {
+            return inner.blocks_fallthrough();
+        }
+        !matches!(self, LoweredStatement::WhileLet(_)) && self.ends_with_diverge()
+    }
+}
+
+impl IfPlan {
+    fn ends_with_diverge(&self) -> bool {
+        if !self.then_body.ends_with_diverge() {
+            return false;
+        }
+        match &self.else_arm {
+            ElseArm::None => false,
+            ElseArm::ElseIf(inner) if inner.condition_setup.is_empty() => inner.ends_with_diverge(),
+            ElseArm::ElseIf(_) => false,
+            ElseArm::Else { body, .. } => body.ends_with_diverge(),
+        }
+    }
+}

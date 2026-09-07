@@ -1,10 +1,20 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nenum Color {\n  Red,\n  Green,\n  Blue,\n}\n\ntype MyColor = Color\n\nfn test() -> MyColor {\n  MyColor.Red\n}\n"
+description: |
+  
+  enum Color {
+    Red,
+    Green,
+    Blue,
+  }
+  
+  type MyColor = Color
+  
+  fn test() -> MyColor {
+    MyColor.Red
+  }
 ---
 package main
-
-import "fmt"
 
 func MakeColorRed() Color {
 	return Color{Tag: ColorRed}
@@ -18,7 +28,7 @@ func MakeColorBlue() Color {
 	return Color{Tag: ColorBlue}
 }
 
-type ColorTag int
+type ColorTag uint8
 
 const (
 	ColorRed ColorTag = iota
@@ -28,19 +38,6 @@ const (
 
 type Color struct {
 	Tag ColorTag
-}
-
-func (c Color) String() string {
-	switch c.Tag {
-	case ColorRed:
-		return "Color.Red"
-	case ColorGreen:
-		return "Color.Green"
-	case ColorBlue:
-		return "Color.Blue"
-	default:
-		return fmt.Sprintf("Color(%d)", c.Tag)
-	}
 }
 
 type MyColor = Color

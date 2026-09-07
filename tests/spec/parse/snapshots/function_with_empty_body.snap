@@ -1,6 +1,10 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nfn noop() {\n  // does nothing\n}\n"
+description: |
+  
+  fn noop() {
+    // does nothing
+  }
 ---
 [
     Function {
@@ -15,24 +19,26 @@ description: "input: \nfn noop() {\n  // does nothing\n}\n"
         generics: [],
         params: [],
         return_annotation: Unknown,
-        return_type: Variable(
-            -1,
-        ),
-        visibility: Private,
-        body: Block {
-            items: [],
-            ty: Variable(
-                -1,
-            ),
-            span: Span {
-                file_id: 0,
-                byte_offset: 11,
-                byte_length: 21,
-            },
+        return_type: Var {
+            id: uninferred,
         },
-        ty: Variable(
-            -1,
+        visibility: Private,
+        body: Definition(
+            Block {
+                items: [],
+                ty: Var {
+                    id: uninferred,
+                },
+                span: Span {
+                    file_id: 0,
+                    byte_offset: 11,
+                    byte_length: 21,
+                },
+            },
         ),
+        ty: Var {
+            id: uninferred,
+        },
         span: Span {
             file_id: 0,
             byte_offset: 1,

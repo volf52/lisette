@@ -1,43 +1,44 @@
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProjectConfig {
-    pub(crate) root: PathBuf,
-    pub(crate) standalone_mode: bool,
+pub(crate) enum ProjectConfig {
+    Script(PathBuf),
+    Workspace(PathBuf),
 }
 
-pub(crate) fn find_project_root(start_path: &Path) -> Option<ProjectConfig> {
-    let mut current = if start_path.is_file() {
-        start_path.parent()?.to_path_buf()
-    } else {
-        start_path.to_path_buf()
-    };
-
-    loop {
-        let manifest = current.join("lisette.toml");
-        if manifest.exists() {
-            return Some(ProjectConfig {
-                root: current,
-                standalone_mode: false,
-            });
-        }
-
-        if !current.pop() {
-            break;
+impl ProjectConfig {
+    pub(crate) fn root(&self) -> &Path {
+        match self {
+            Self::Script(root) | Self::Workspace(root) => root,
         }
     }
 
-    None
+    pub(crate) fn source_root(&self) -> PathBuf {
+        match self {
+            Self::Script(root) => root.clone(),
+            Self::Workspace(root) => root.join("src"),
+        }
+    }
+
+    pub(crate) fn is_script(&self) -> bool {
+        matches!(self, Self::Script(_))
+    }
 }
 
-pub(crate) fn resolve_standalone_root(file_path: &Path) -> ProjectConfig {
+pub(crate) fn find_project_root(start_path: &Path) -> Option<ProjectConfig> {
+    let root = deps::find_project_root(start_path)?;
+    let belongs = start_path.extension().is_some_and(|ext| ext == "lis")
+        && start_path
+            .strip_prefix(&root)
+            .is_ok_and(|relative| relative.starts_with("src") || relative.starts_with("tests"));
+    belongs.then_some(ProjectConfig::Workspace(root))
+}
+
+pub(crate) fn resolve_script_root(file_path: &Path) -> ProjectConfig {
     let root = file_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    ProjectConfig {
-        root,
-        standalone_mode: true,
-    }
+    ProjectConfig::Script(root)
 }

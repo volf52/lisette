@@ -1,0 +1,19 @@
+---
+source: tests/spec/emit/control_flow.rs
+description: |
+  
+  fn test() -> int {
+    let x | x = 42 else {
+      return 0
+    }
+    x
+  }
+---
+package main
+
+func test() int {
+	subject_1 := 42
+	var x int
+	x = subject_1
+	return x
+}

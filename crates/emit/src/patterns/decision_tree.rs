@@ -1,57 +1,114 @@
+use crate::patterns::binding_decls::pattern_has_bindings;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use syntax::ast::{MatchArm, Pattern, RestPattern, StructFieldPattern, TypedPattern};
+use syntax::ast::{
+    ConstructorPatternResolution, EnumFieldDefinition, MatchArm, Pattern, RecordPatternResolution,
+    RestPattern, SequencePatternResolution, StructFieldPattern,
+};
 use syntax::parse::TUPLE_FIELDS;
-use syntax::types::Type;
+use syntax::program::DefinitionBody;
+use syntax::types::{Type, unqualified_name};
 
-use crate::Emitter;
-use crate::names::go_name;
-use crate::patterns::bindings::emit_pattern_literal;
-use crate::write_line;
+use crate::Planner;
+use crate::names::packages::PackageRequirements;
+use crate::names::{generics, go_name};
+use crate::patterns::binding_decls::emit_pattern_literal;
+use crate::types::go_type::render_conversion;
 
-/// A single step in navigating from the match subject to a nested value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PathSegment {
-    /// `.FieldName` — access a named field (Go name, already resolved)
+    /// `.FieldName` (Go name, already resolved).
     Field(String),
-    /// `[i]` — index into a slice
     Index(usize),
-    /// `[offset:]` — slice from offset to end
+    /// `[offset:]`.
     SliceFrom(usize),
-    /// `(*expression)` — dereference an auto-pointer (recursive enum fields)
+    ArraySliceFrom {
+        offset: usize,
+        go_type: String,
+    },
+    /// `(*expression)`: auto-pointer deref for recursive enum fields.
     Deref,
-    /// `GoType(expression)` — newtype cast to underlying Go type
+    /// `GoType(expression)`: newtype cast to underlying Go type.
     NewtypeCast(String),
+    /// `expression.(GoType)`: Go interface type assertion, inserted when a
+    /// concrete pattern targets a Go interface at a non-root path.
+    AssertedAs(String),
 }
 
-/// A path from the match subject to a nested value, built up during compilation.
+fn element_index(segments: &[PathSegment]) -> usize {
+    let [PathSegment::Field(field), ..] = segments else {
+        unreachable!("a tuple-element subject only resolves field paths")
+    };
+    TUPLE_FIELDS
+        .iter()
+        .position(|tuple_field| tuple_field == field)
+        .expect("a tuple-element subject only resolves tuple fields")
+}
+
+fn checked_tuple_element(path: &AccessPath, arity: usize) -> Option<usize> {
+    let PathSegment::Field(field) = path.segments.first()? else {
+        return None;
+    };
+    TUPLE_FIELDS
+        .iter()
+        .take(arity)
+        .position(|tuple_field| tuple_field == field)
+}
+
+/// One subject, or one name per element when the match never builds its tuple.
+#[derive(Clone, Copy)]
+pub(crate) enum SubjectRoot<'a> {
+    Var(&'a str),
+    Elements(&'a [String]),
+}
+
+impl<'a> SubjectRoot<'a> {
+    fn resolve<'p>(&self, segments: &'p [PathSegment]) -> (String, &'p [PathSegment]) {
+        match self {
+            Self::Var(var) => ((*var).to_string(), segments),
+            Self::Elements(names) => (names[element_index(segments)].clone(), &segments[1..]),
+        }
+    }
+
+    pub(crate) fn names(&self) -> Vec<&'a str> {
+        match self {
+            Self::Var(var) => vec![var],
+            Self::Elements(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccessPath {
     pub segments: Vec<PathSegment>,
 }
 
 impl AccessPath {
-    /// The root path (the match subject itself).
-    pub(crate) fn root() -> Self {
+    fn root() -> Self {
         Self { segments: vec![] }
     }
 
-    /// Append a segment, returning a new path (non-mutating).
-    pub(crate) fn push(&self, seg: PathSegment) -> Self {
+    fn is_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn push(&self, seg: PathSegment) -> Self {
         let mut new = self.clone();
         new.segments.push(seg);
         new
     }
 
-    /// Render this path as a Go expression, given the subject variable name.
-    pub(crate) fn render(&self, subject: &str) -> String {
-        let mut result = subject.to_string();
-        let last = self.segments.len().saturating_sub(1);
-        for (i, seg) in self.segments.iter().enumerate() {
+    pub(crate) fn render(&self, subject: SubjectRoot<'_>) -> String {
+        let (mut result, segments) = subject.resolve(&self.segments);
+        let last = segments.len().saturating_sub(1);
+        for (i, seg) in segments.iter().enumerate() {
             match seg {
                 PathSegment::Field(name) => result = format!("{}.{}", result, name),
-                PathSegment::Index(idx) => result = format!("{}[{}]", result, idx),
+                PathSegment::Index(index) => result = format!("{}[{}]", result, index),
                 PathSegment::SliceFrom(offset) => result = format!("{}[{}:]", result, offset),
+                PathSegment::ArraySliceFrom { offset, go_type } => {
+                    result = render_conversion(go_type, &format!("{}[{}:]", result, offset))
+                }
                 PathSegment::Deref => {
                     if i == last {
                         result = format!("*{}", result);
@@ -59,69 +116,112 @@ impl AccessPath {
                         result = format!("(*{})", result);
                     }
                 }
-                PathSegment::NewtypeCast(ty) => result = format!("{}({})", ty, result),
+                PathSegment::NewtypeCast(go_type) => result = render_conversion(go_type, &result),
+                PathSegment::AssertedAs(ty) => {
+                    result = format!("{}.({})", result, ty);
+                }
             }
         }
         result
     }
+
+    /// Like `render`, but a tail-`Deref` is parenthesized so the result is
+    /// safe as a selector receiver, index target, or call callee.
+    pub(crate) fn render_composable(&self, subject: SubjectRoot<'_>) -> String {
+        let rendered = self.render(subject);
+        if matches!(self.segments.last(), Some(PathSegment::Deref)) {
+            format!("({})", rendered)
+        } else {
+            rendered
+        }
+    }
+
+    pub(crate) fn contains_deferred_evaluation(&self) -> bool {
+        self.segments.iter().any(|segment| {
+            matches!(
+                segment,
+                PathSegment::ArraySliceFrom { .. }
+                    | PathSegment::Deref
+                    | PathSegment::NewtypeCast(_)
+                    | PathSegment::AssertedAs(_)
+            )
+        })
+    }
 }
 
-/// A single runtime check that must be true for a pattern to match.
 #[derive(Clone, Debug)]
 pub(crate) enum Check {
-    /// Enum tag equality: `path.Tag == TAG_CONSTANT`
     EnumTag {
         path: AccessPath,
         tag_constant: String,
-        needs_stdlib: bool,
     },
-    /// Literal equality: `path == literal`
     Literal {
         path: AccessPath,
         go_literal: String,
     },
-    /// Exact slice length: `len(path) == length`
-    SliceLenEq { path: AccessPath, length: usize },
-    /// Minimum slice length: `len(path) >= min_length`
-    SliceLenGe { path: AccessPath, min_length: usize },
-    /// Or-pattern: at least one alternative's checks must all pass.
-    /// Each inner `Vec<Check>` is one alternative (checks ANDed together);
-    /// the alternatives are ORed.
-    Or { alternatives: Vec<Vec<Check>> },
-    /// Go interface type assertion: the value at `path` implements `go_type`.
-    /// Emitted as a case label in a `switch x := x.(type)` statement.
-    TypeAssert { path: AccessPath, go_type: String },
+    SliceLenEq {
+        path: AccessPath,
+        length: usize,
+    },
+    SliceLenGe {
+        path: AccessPath,
+        min_length: usize,
+    },
+    /// At least one alternative's inner checks must all pass.
+    Or {
+        alternatives: Vec<Vec<Check>>,
+    },
+    /// Go interface type assertion; emitted as a case label in
+    /// `switch x := x.(type)`.
+    TypeAssert {
+        path: AccessPath,
+        go_type: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum CheckPolarity {
+    Positive,
+    Negative,
 }
 
 impl Check {
-    /// Render this check as a Go boolean expression.
-    pub(crate) fn render(&self, subject: &str) -> String {
+    pub(crate) fn render(&self, subject: SubjectRoot<'_>) -> String {
+        self.render_with_polarity(subject, CheckPolarity::Positive)
+    }
+
+    pub(crate) fn render_negated(&self, subject: SubjectRoot<'_>) -> String {
+        self.render_with_polarity(subject, CheckPolarity::Negative)
+    }
+
+    fn render_with_polarity(&self, subject: SubjectRoot<'_>, polarity: CheckPolarity) -> String {
+        let negative = matches!(polarity, CheckPolarity::Negative);
         match self {
-            Check::EnumTag {
-                path, tag_constant, ..
-            } => {
+            Check::EnumTag { path, tag_constant } => {
                 let rendered_path = path.render(subject);
-                format!("{}.Tag == {}", rendered_path, tag_constant)
+                let operator = if negative { "!=" } else { "==" };
+                format!("{rendered_path}.Tag {operator} {tag_constant}")
             }
-            Check::Literal {
-                path, go_literal, ..
-            } => {
+            Check::Literal { path, go_literal } => {
                 let rendered_path = path.render(subject);
-                match go_literal.as_str() {
-                    "true" => rendered_path,
-                    "false" => format!("!{}", rendered_path),
-                    _ => format!("{} == {}", rendered_path, go_literal),
+                match (go_literal.as_str(), negative) {
+                    ("true", false) | ("false", true) => rendered_path,
+                    ("true", true) | ("false", false) => format!("!{rendered_path}"),
+                    (_, false) => format!("{rendered_path} == {go_literal}"),
+                    (_, true) => format!("{rendered_path} != {go_literal}"),
                 }
             }
             Check::SliceLenEq { path, length } => {
                 let rendered_path = path.render(subject);
-                format!("len({}) == {}", rendered_path, length)
+                let operator = if negative { "!=" } else { "==" };
+                format!("len({rendered_path}) {operator} {length}")
             }
             Check::SliceLenGe { path, min_length } => {
                 let rendered_path = path.render(subject);
-                format!("len({}) >= {}", rendered_path, min_length)
+                let operator = if negative { "<" } else { ">=" };
+                format!("len({rendered_path}) {operator} {min_length}")
             }
-            Check::Or { alternatives } => {
+            Check::Or { alternatives } if !negative => {
                 let alt_strs: Vec<String> = alternatives
                     .iter()
                     .map(|checks| {
@@ -146,13 +246,20 @@ impl Check {
                     joined
                 }
             }
-            // Type assertions are emitted via type switches, not boolean conditions.
-            // This path is only reached when a guard prevents switch compilation.
-            Check::TypeAssert { .. } => "false".to_string(),
+            Check::TypeAssert { path, go_type } if !negative => format!(
+                "func() bool {{ _, ok := {}.({}); return ok }}()",
+                path.render(subject),
+                go_type,
+            ),
+            Check::Or { .. } | Check::TypeAssert { .. } => {
+                format!(
+                    "!({})",
+                    self.render_with_polarity(subject, CheckPolarity::Positive)
+                )
+            }
         }
     }
 
-    /// Returns the access path being checked (for switch grouping).
     fn path(&self) -> Option<&AccessPath> {
         match self {
             Check::EnumTag { path, .. }
@@ -164,72 +271,87 @@ impl Check {
         }
     }
 
-    /// Returns the tag constant if this is an EnumTag check.
-    pub(crate) fn as_enum_tag(&self) -> Option<(&str, bool)> {
+    fn as_enum_tag(&self) -> Option<&str> {
         match self {
-            Check::EnumTag {
-                tag_constant,
-                needs_stdlib,
-                ..
-            } => Some((tag_constant, *needs_stdlib)),
+            Check::EnumTag { tag_constant, .. } => Some(tag_constant),
             _ => None,
         }
     }
 
-    /// Returns the literal value if this is a Literal check.
-    pub(crate) fn as_literal(&self) -> Option<&str> {
+    fn as_literal(&self) -> Option<&str> {
         match self {
             Check::Literal { go_literal, .. } => Some(go_literal),
             _ => None,
         }
     }
-
-    pub(crate) fn as_type_switch_case(&self) -> Option<(Vec<&str>, &AccessPath)> {
-        match self {
-            Check::TypeAssert { go_type, path } => Some((vec![go_type.as_str()], path)),
-            Check::Or { alternatives } => {
-                let [
-                    Check::TypeAssert {
-                        go_type,
-                        path: shared_path,
-                    },
-                ] = alternatives.first()?.as_slice()
-                else {
-                    return None;
-                };
-                let mut labels = Vec::with_capacity(alternatives.len());
-                labels.push(go_type.as_str());
-                for alt in &alternatives[1..] {
-                    let [Check::TypeAssert { go_type, path }] = alt.as_slice() else {
-                        return None;
-                    };
-                    if path != shared_path {
-                        return None;
-                    }
-                    labels.push(go_type.as_str());
-                }
-                Some((labels, shared_path))
-            }
-            _ => None,
-        }
-    }
 }
 
-/// A variable binding produced by a pattern match.
+pub(crate) fn tested_tuple_elements(checks: &[Check], arity: usize) -> Option<Vec<bool>> {
+    let mut tested = vec![false; arity];
+    for check in checks {
+        if let Some(path) = check.path() {
+            tested[checked_tuple_element(path, arity)?] = true;
+            continue;
+        }
+        let Check::Or { alternatives } = check else {
+            unreachable!("only Or checks lack a path")
+        };
+        let mut alternatives = alternatives
+            .iter()
+            .map(|checks| tested_tuple_elements(checks, arity));
+        let first = alternatives.next()??;
+        if !alternatives.all(|alternative| alternative.as_ref() == Some(&first)) {
+            return None;
+        }
+        for (tested, alternative) in tested.iter_mut().zip(first) {
+            *tested |= alternative;
+        }
+    }
+    Some(tested)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PatternBinding {
-    /// The Lisette identifier name (for bindings registration).
     pub lisette_name: String,
-    /// The Go variable name, or None if unused (emit `_` or skip).
+    /// `None` when the binding is unused.
     pub go_name: Option<String>,
-    /// How to access the value from the match subject.
     pub path: AccessPath,
 }
 
-/// Accumulates checks and bindings during pattern compilation.
+/// Root-path Go-interface type assertion lifted out of `checks`.
+#[derive(Clone, Debug)]
+pub(crate) struct TypeAssertion {
+    pub path: AccessPath,
+    pub go_types: Vec<String>,
+}
+
+pub(crate) struct PatternInfo {
+    pub root_assertion: Option<TypeAssertion>,
+    pub checks: Vec<Check>,
+    pub bindings: Vec<PatternBinding>,
+    pub packages: PackageRequirements,
+    pub requires_materialized_subject: bool,
+}
+
+impl PatternInfo {
+    /// True when a downstream consumer will reference the asserted value.
+    pub(super) fn requires_asserted_subject(&self) -> bool {
+        !self.checks.is_empty() || self.bindings.iter().any(|b| b.go_name.is_some())
+    }
+}
+
+/// Result of compiling a list of expanded arms into a `Decision`.
+pub(crate) struct CompiledDecision {
+    pub decision: Decision,
+    pub packages: PackageRequirements,
+}
+
+/// Accumulates checks, bindings, and package requirements during compilation.
 struct PatternCollector {
     checks: Vec<Check>,
     bindings: Vec<PatternBinding>,
+    packages: PackageRequirements,
+    requires_materialized_subject: bool,
 }
 
 impl PatternCollector {
@@ -237,79 +359,150 @@ impl PatternCollector {
         Self {
             checks: Vec::new(),
             bindings: Vec::new(),
+            packages: PackageRequirements::default(),
+            requires_materialized_subject: false,
         }
     }
 }
 
 /// A pre-computed decision tree for pattern matching.
 ///
-/// Each node represents either a successful match, a runtime test, or
-/// unreachable code. The tree is walked by `TreeEmitter` to produce Go code.
 #[derive(Debug)]
 pub(crate) enum Decision {
-    /// Pattern matched — emit bindings and arm body.
     Success {
         arm_index: usize,
         bindings: Vec<PatternBinding>,
     },
-    /// Test a guard expression. If true, emit the guarded arm body.
-    /// If false, continue with the failure subtree.
+    /// Guarded success: emit body iff the guard holds, else continue with
+    /// `failure`.
     Guard {
         arm_index: usize,
         bindings: Vec<PatternBinding>,
         success: Box<Decision>,
         failure: Box<Decision>,
     },
-    /// Branch on a value — emits as Go `switch` when eligible.
+    /// Emits as Go `switch` when eligible.
     Switch {
         path: AccessPath,
         kind: SwitchKind,
+        shape: SwitchShape,
         branches: Vec<SwitchBranch>,
         fallback: Option<Box<Decision>>,
     },
-    /// Sequential tests — emits as if/else if/else chain.
+    /// Emits as `if`/`else if`/`else`.
     Chain {
         tests: Vec<ChainTest>,
         fallback: Box<Decision>,
     },
-    /// Unreachable code — emits `panic("unreachable")` in tail position.
+    /// Emits `panic("unreachable")` in tail position.
     Unreachable,
 }
 
-/// What kind of switch to emit.
 #[derive(Debug, Clone)]
 pub(crate) enum SwitchKind {
-    /// Switch on `.Tag` — enum discriminant
     EnumTag,
-    /// Switch on value directly — literals, booleans, units
     Value,
-    /// Switch on dynamic Go type — `switch x := x.(type)`
     TypeSwitch,
 }
 
-/// A single branch in a Switch node.
+/// Structural shape of a switch site, chosen at build time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwitchShape {
+    TypeSwitch,
+    /// Two branches with `"true"`/`"false"` labels, no fallback.
+    Bool,
+    /// Two branches, no fallback, not `Bool`.
+    Binary,
+    SingleArm,
+    Multi,
+}
+
+fn classify_switch_shape(
+    kind: &SwitchKind,
+    branches: &[SwitchBranch],
+    fallback: &Option<Box<Decision>>,
+) -> SwitchShape {
+    match (kind, branches, fallback) {
+        (SwitchKind::TypeSwitch, _, _) => SwitchShape::TypeSwitch,
+        (SwitchKind::Value, [left, right], None)
+            if matches!(
+                (left.case_label.as_str(), right.case_label.as_str()),
+                ("true", "false") | ("false", "true")
+            ) =>
+        {
+            SwitchShape::Bool
+        }
+        (_, [_, _], None) => SwitchShape::Binary,
+        (_, [_], _) => SwitchShape::SingleArm,
+        _ => SwitchShape::Multi,
+    }
+}
+
+/// True when the tree has an unconditional success path.
+pub(crate) fn decision_is_exhaustive(tree: &Decision) -> bool {
+    match tree {
+        Decision::Success { .. } => true,
+        Decision::Chain {
+            tests, fallback, ..
+        } => {
+            (matches!(fallback.as_ref(), Decision::Unreachable) && tests.len() > 1)
+                || decision_is_exhaustive(fallback)
+        }
+        Decision::Switch {
+            fallback, branches, ..
+        } => fallback.is_some() || !branches.is_empty(),
+        _ => false,
+    }
+}
+
+/// True when the tree has a terminal Success reachable without passing a guard.
+pub(crate) fn tree_has_unguarded_terminal(tree: &Decision) -> bool {
+    match tree {
+        Decision::Success { .. } => true,
+        Decision::Guard { failure, .. } => tree_has_unguarded_terminal(failure),
+        Decision::Chain {
+            tests, fallback, ..
+        } => {
+            tree_has_unguarded_terminal(fallback)
+                || (matches!(fallback.as_ref(), Decision::Unreachable)
+                    && tests
+                        .last()
+                        .is_some_and(|t| tree_has_unguarded_terminal(&t.decision)))
+        }
+        Decision::Switch {
+            fallback, branches, ..
+        } => fallback
+            .as_ref()
+            .map_or(!branches.is_empty(), |fb| tree_has_unguarded_terminal(fb)),
+        Decision::Unreachable => false,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SwitchBranch {
-    /// The case label (tag constant for enums, literal value for values)
     pub case_label: String,
-    pub needs_stdlib: bool,
     pub decision: Decision,
 }
 
-/// A single test in a Chain node.
 #[derive(Debug)]
 pub(crate) struct ChainTest {
     pub checks: Vec<Check>,
     pub decision: Decision,
 }
 
-/// Intermediate representation of a single arm during compilation.
 #[derive(Clone)]
 struct ArmInfo {
     arm_index: usize,
+    root_assertion: Option<TypeAssertion>,
     checks: Vec<Check>,
     bindings: Vec<PatternBinding>,
     has_guard: bool,
+}
+
+impl ArmInfo {
+    fn is_catchall(&self) -> bool {
+        self.checks.is_empty() && self.root_assertion.is_none()
+    }
 }
 
 /// Build a Decision tree from a list of arm infos.
@@ -318,16 +511,16 @@ fn build_tree(arms: Vec<ArmInfo>) -> Decision {
         return Decision::Unreachable;
     }
 
-    // If the first arm has no checks (catchall), it matches unconditionally
-    if arms[0].checks.is_empty() && !arms[0].has_guard {
+    let first_is_catchall = arms[0].is_catchall();
+
+    if first_is_catchall && !arms[0].has_guard {
         return Decision::Success {
             arm_index: arms[0].arm_index,
             bindings: arms[0].bindings.clone(),
         };
     }
 
-    // If the first arm has no checks but has a guard, wrap in Guard node
-    if arms[0].checks.is_empty() && arms[0].has_guard {
+    if first_is_catchall && arms[0].has_guard {
         let rest = arms[1..].to_vec();
         return Decision::Guard {
             arm_index: arms[0].arm_index,
@@ -349,104 +542,151 @@ fn build_tree(arms: Vec<ArmInfo>) -> Decision {
 
 /// Try to build a Switch node from the arms.
 ///
-/// Returns Some(Switch) if ALL non-catchall arms have a single switchable
-/// check (EnumTag or Literal) on the same path, with no guards.
+/// Returns Some(Switch) if ALL non-catchall arms agree on a switchable shape:
+/// a root TypeAssertion (TypeSwitch), or a single same-path EnumTag/Literal
+/// first check (EnumTag/Value), with guards permitted only for TypeSwitch.
 fn try_build_switch(arms: &[ArmInfo]) -> Option<Decision> {
-    let first_checked_arm = arms.iter().find(|a| !a.checks.is_empty())?;
-    let first_check = first_checked_arm.checks.first()?;
+    let first_relevant = arms.iter().find(|a| !a.is_catchall())?;
+    let (kind, switch_path) = pick_switch_kind(first_relevant)?;
 
-    let (kind, switch_path) = if first_check.as_enum_tag().is_some() {
-        (SwitchKind::EnumTag, first_check.path()?.clone())
-    } else if first_check.as_literal().is_some() {
-        (SwitchKind::Value, first_check.path()?.clone())
-    } else if let Some((_, path)) = first_check.as_type_switch_case() {
-        (SwitchKind::TypeSwitch, path.clone())
+    validate_switch_arms(arms, &kind, &switch_path)?;
+
+    let grouped = group_switch_branches(arms, &kind);
+    let branches = build_switch_branches(grouped.branches, &grouped.fallback);
+
+    let fallback = if grouped.fallback.is_empty() {
+        None
     } else {
-        return None;
+        Some(Box::new(build_tree(grouped.fallback)))
     };
 
+    let shape = classify_switch_shape(&kind, &branches, &fallback);
+    Some(Decision::Switch {
+        path: switch_path,
+        kind,
+        shape,
+        branches,
+        fallback,
+    })
+}
+
+fn pick_switch_kind(arm: &ArmInfo) -> Option<(SwitchKind, AccessPath)> {
+    if let Some(assertion) = &arm.root_assertion {
+        return Some((SwitchKind::TypeSwitch, assertion.path.clone()));
+    }
+    let first_check = arm.checks.first()?;
+    let path = first_check.path()?.clone();
+    if first_check.as_enum_tag().is_some() {
+        Some((SwitchKind::EnumTag, path))
+    } else if first_check.as_literal().is_some() {
+        Some((SwitchKind::Value, path))
+    } else {
+        None
+    }
+}
+
+fn validate_switch_arms(
+    arms: &[ArmInfo],
+    kind: &SwitchKind,
+    switch_path: &AccessPath,
+) -> Option<()> {
     for arm in arms {
-        if arm.checks.is_empty() {
+        if arm.is_catchall() {
             continue;
         }
-        // Type switches handle guards inside the case body; other switches cannot.
         if arm.has_guard && !matches!(kind, SwitchKind::TypeSwitch) {
             return None;
         }
-        let first = arm.checks.first()?;
 
-        let arm_path = match &kind {
+        let arm_path = match kind {
             SwitchKind::EnumTag => {
+                if arm.root_assertion.is_some() {
+                    return None;
+                }
+                let first = arm.checks.first()?;
                 first.as_enum_tag()?;
                 first.path()?
             }
             SwitchKind::Value => {
+                if arm.root_assertion.is_some() {
+                    return None;
+                }
+                let first = arm.checks.first()?;
                 first.as_literal()?;
                 if arm.checks.len() != 1 {
                     return None;
                 }
                 first.path()?
             }
-            SwitchKind::TypeSwitch => first.as_type_switch_case()?.1,
+            SwitchKind::TypeSwitch => &arm.root_assertion.as_ref()?.path,
         };
-        if arm_path != &switch_path {
+        if arm_path != switch_path {
             return None;
         }
     }
+    Some(())
+}
 
-    let mut branch_map: HashMap<String, (bool, Vec<ArmInfo>)> = HashMap::default();
-    let mut branch_order: Vec<String> = Vec::new();
-    let mut fallback_arms = Vec::new();
+struct GroupedBranches {
+    branches: Vec<(String, Vec<ArmInfo>)>,
+    fallback: Vec<ArmInfo>,
+}
+
+fn group_switch_branches(arms: &[ArmInfo], kind: &SwitchKind) -> GroupedBranches {
+    let mut branches: Vec<(String, Vec<ArmInfo>)> = Vec::new();
+    let mut fallback = Vec::new();
 
     for arm in arms {
-        if arm.checks.is_empty() {
-            fallback_arms.push(arm.clone());
+        if arm.is_catchall() {
+            fallback.push(arm.clone());
             continue;
         }
 
-        let first_check = &arm.checks[0];
-        let (case_label, needs_stdlib) = match &kind {
+        let (case_label, inner_checks) = match kind {
             SwitchKind::EnumTag => {
-                let (tag, needs) = first_check.as_enum_tag().unwrap();
-                (tag.to_string(), needs)
+                let tag = arm.checks[0].as_enum_tag().unwrap();
+                (tag.to_string(), arm.checks[1..].to_vec())
             }
             SwitchKind::Value => {
-                let lit = first_check.as_literal().unwrap();
-                (lit.to_string(), false)
+                let lit = arm.checks[0].as_literal().unwrap();
+                (lit.to_string(), arm.checks[1..].to_vec())
             }
             SwitchKind::TypeSwitch => {
-                let (labels, _) = first_check.as_type_switch_case().unwrap();
-                (labels.join(", "), false)
+                let assertion = arm.root_assertion.as_ref().unwrap();
+                (assertion.go_types.join(", "), arm.checks.clone())
             }
         };
-
         let inner_arm = ArmInfo {
             arm_index: arm.arm_index,
-            checks: arm.checks[1..].to_vec(),
+            root_assertion: None,
+            checks: inner_checks,
             bindings: arm.bindings.clone(),
             has_guard: arm.has_guard,
         };
 
-        branch_map
-            .entry(case_label.clone())
-            .and_modify(|(_, arms)| arms.push(inner_arm.clone()))
-            .or_insert_with(|| {
-                branch_order.push(case_label);
-                (needs_stdlib, vec![inner_arm])
-            });
+        if let Some((_, arms)) = branches.iter_mut().find(|(label, _)| label == &case_label) {
+            arms.push(inner_arm);
+        } else {
+            branches.push((case_label, vec![inner_arm]));
+        }
     }
 
-    let branches = branch_order
+    GroupedBranches { branches, fallback }
+}
+
+/// Splice the catchall into any fail-prone case body: Go `switch` cases do not
+/// fall through to `default`, so a failed inner check has nowhere else to go.
+fn build_switch_branches(
+    branches: Vec<(String, Vec<ArmInfo>)>,
+    fallback_arms: &[ArmInfo],
+) -> Vec<SwitchBranch> {
+    branches
         .into_iter()
-        .map(|label| {
-            let (needs_stdlib, inner_arms) = branch_map.remove(&label).unwrap();
-            // For type switches: if any inner arm can fail (via guard or remaining
-            // checks), the catchall arms must be appended so the case body stays
-            // exhaustive — Go type-switch cases don't fall through automatically.
+        .map(|(label, inner_arms)| {
             let any_inner_can_fail = inner_arms
                 .iter()
                 .any(|a| a.has_guard || !a.checks.is_empty());
-            let decision = if matches!(kind, SwitchKind::TypeSwitch) && any_inner_can_fail {
+            let decision = if any_inner_can_fail {
                 let mut arms_with_fallback = inner_arms;
                 arms_with_fallback.extend(fallback_arms.iter().cloned());
                 build_tree(arms_with_fallback)
@@ -455,24 +695,10 @@ fn try_build_switch(arms: &[ArmInfo]) -> Option<Decision> {
             };
             SwitchBranch {
                 case_label: label,
-                needs_stdlib,
                 decision,
             }
         })
-        .collect();
-
-    let fallback = if fallback_arms.is_empty() {
-        None
-    } else {
-        Some(Box::new(build_tree(fallback_arms)))
-    };
-
-    Some(Decision::Switch {
-        path: switch_path,
-        kind,
-        branches,
-        fallback,
-    })
+        .collect()
 }
 
 /// Build a Chain (if/else if/else) from the arms.
@@ -480,8 +706,7 @@ fn build_chain(arms: Vec<ArmInfo>) -> Decision {
     let mut tests = Vec::new();
 
     for (i, arm) in arms.iter().enumerate() {
-        if arm.checks.is_empty() && !arm.has_guard {
-            // This is a catchall — everything after it is unreachable
+        if arm.is_catchall() && !arm.has_guard {
             let fallback = Decision::Success {
                 arm_index: arm.arm_index,
                 bindings: arm.bindings.clone(),
@@ -514,28 +739,50 @@ fn build_chain(arms: Vec<ArmInfo>) -> Decision {
             }
         };
 
-        tests.push(ChainTest {
-            checks: arm.checks.clone(),
-            decision,
-        });
+        let mut checks = arm.checks.clone();
+        if let Some(assertion) = arm.root_assertion.clone() {
+            checks.insert(0, type_assertion_to_check(assertion));
+        }
+        tests.push(ChainTest { checks, decision });
     }
 
-    // No catchall found — remaining arms are all checked
     Decision::Chain {
         tests,
         fallback: Box::new(Decision::Unreachable),
     }
 }
 
+/// Re-encode a lifted `TypeAssertion` back as a renderable `Check` for chain
+/// emission when a type switch cannot consolidate the arms.
+fn type_assertion_to_check(assertion: TypeAssertion) -> Check {
+    let TypeAssertion { path, mut go_types } = assertion;
+    if go_types.len() == 1 {
+        return Check::TypeAssert {
+            path,
+            go_type: go_types.pop().unwrap(),
+        };
+    }
+    Check::Or {
+        alternatives: go_types
+            .into_iter()
+            .map(|go_type| {
+                vec![Check::TypeAssert {
+                    path: path.clone(),
+                    go_type,
+                }]
+            })
+            .collect(),
+    }
+}
+
 /// Recursively walk a pattern, collecting checks and bindings.
 ///
-/// `path_ty` is the expected type of the value at `path` — used to detect
+/// `path_ty` is the expected type of the value at `path`, used to detect
 /// when a struct pattern is matched against a Go interface (type switch).
 fn collect_checks_and_bindings(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     pattern: &Pattern,
-    typed: Option<&TypedPattern>,
     path_ty: Option<&Type>,
     collector: &mut PatternCollector,
 ) {
@@ -543,7 +790,7 @@ fn collect_checks_and_bindings(
         Pattern::WildCard { .. } | Pattern::Unit { .. } => {}
 
         Pattern::Identifier { identifier, .. } => {
-            let go_name = emitter.go_name_for_binding(pattern);
+            let go_name = planner.go_name_for_binding(pattern);
             collector.bindings.push(PatternBinding {
                 lisette_name: identifier.to_string(),
                 go_name,
@@ -558,82 +805,39 @@ fn collect_checks_and_bindings(
             });
         }
 
-        Pattern::EnumVariant { .. } => {
-            collect_enum_variant_checks(emitter, path, pattern, typed, collector);
+        Pattern::EnumVariant { resolution, ty, .. } => {
+            let can_split_tuple =
+                matches!(
+                    resolution,
+                    ConstructorPatternResolution::Const { .. }
+                        | ConstructorPatternResolution::ConstValue { .. }
+                ) || matches!(resolution, ConstructorPatternResolution::EnumVariant { .. })
+                    && !planner.is_tuple_struct_type(ty);
+            collector.requires_materialized_subject |= !can_split_tuple;
+            collect_enum_variant_checks(planner, path, pattern, path_ty, collector);
         }
 
         Pattern::Struct { .. } => {
-            collect_struct_checks(emitter, path, pattern, typed, path_ty, collector);
+            collector.requires_materialized_subject = true;
+            collect_struct_checks(planner, path, pattern, path_ty, collector);
         }
 
         Pattern::Tuple { elements, .. } => {
-            let typed_elements: Vec<Option<&TypedPattern>> = match typed {
-                Some(TypedPattern::Tuple { elements: te, .. }) => te.iter().map(Some).collect(),
-                _ => vec![None; elements.len()],
-            };
-
-            for (i, element) in elements.iter().enumerate() {
-                let field_name = TUPLE_FIELDS.get(i).expect("oversize tuple arity");
-                let field_path = path.push(PathSegment::Field(field_name.to_string()));
-                collect_checks_and_bindings(
-                    emitter,
-                    &field_path,
-                    element,
-                    typed_elements.get(i).copied().flatten(),
-                    None,
-                    collector,
-                );
-            }
+            collect_tuple_checks(planner, path, elements, path_ty, collector);
         }
 
-        Pattern::Slice { prefix, rest, .. } => {
-            let has_rest = rest.is_present();
-            if has_rest {
-                if !prefix.is_empty() {
-                    collector.checks.push(Check::SliceLenGe {
-                        path: path.clone(),
-                        min_length: prefix.len(),
-                    });
-                }
-            } else {
-                collector.checks.push(Check::SliceLenEq {
-                    path: path.clone(),
-                    length: prefix.len(),
-                });
-            }
-
-            let typed_prefix: Vec<Option<&TypedPattern>> = match typed {
-                Some(TypedPattern::Slice {
-                    prefix: tp_prefix, ..
-                }) => tp_prefix.iter().map(Some).collect(),
-                _ => vec![None; prefix.len()],
-            };
-
-            for (i, elem) in prefix.iter().enumerate() {
-                let elem_path = path.push(PathSegment::Index(i));
-                collect_checks_and_bindings(
-                    emitter,
-                    &elem_path,
-                    elem,
-                    typed_prefix.get(i).copied().flatten(),
-                    None,
-                    collector,
-                );
-            }
-
-            // Rest binding
-            if let RestPattern::Bind { name, .. } = rest {
-                let go_name = emitter.go_name_for_rest_binding(rest);
-                collector.bindings.push(PatternBinding {
-                    lisette_name: name.to_string(),
-                    go_name,
-                    path: path.push(PathSegment::SliceFrom(prefix.len())),
-                });
-            }
+        Pattern::Slice {
+            prefix,
+            rest,
+            resolution,
+            ..
+        } => {
+            collector.requires_materialized_subject = true;
+            collect_slice_checks(planner, path, prefix, rest, resolution, collector);
         }
 
         Pattern::Or { patterns, .. } => {
-            collect_or_pattern_checks(emitter, path, patterns, typed, pattern, path_ty, collector);
+            collect_or_pattern_checks(planner, path, patterns, pattern, path_ty, collector);
         }
 
         p @ Pattern::AsBinding {
@@ -641,8 +845,8 @@ fn collect_checks_and_bindings(
             name,
             ..
         } => {
-            collect_checks_and_bindings(emitter, path, inner, typed, path_ty, collector);
-            let go_name = emitter.go_name_for_binding(p);
+            collect_checks_and_bindings(planner, path, inner, path_ty, collector);
+            let go_name = planner.go_name_for_binding(p);
             collector.bindings.push(PatternBinding {
                 lisette_name: name.to_string(),
                 go_name,
@@ -652,55 +856,144 @@ fn collect_checks_and_bindings(
     }
 }
 
+fn collect_tuple_checks(
+    planner: &Planner,
+    path: &AccessPath,
+    elements: &[Pattern],
+    path_ty: Option<&Type>,
+    collector: &mut PatternCollector,
+) {
+    let stripped_path_ty = path_ty.map(Type::strip_refs);
+    let element_tys: Option<&[Type]> = match &stripped_path_ty {
+        Some(Type::Tuple(tys)) => Some(tys.as_slice()),
+        _ => None,
+    };
+
+    for (i, element) in elements.iter().enumerate() {
+        let field_name = TUPLE_FIELDS.get(i).expect("oversize tuple arity");
+        let field_path = path.push(PathSegment::Field(field_name.to_string()));
+        collect_checks_and_bindings(
+            planner,
+            &field_path,
+            element,
+            element_tys.and_then(|tys| tys.get(i)),
+            collector,
+        );
+    }
+}
+
+fn collect_slice_checks(
+    planner: &Planner,
+    path: &AccessPath,
+    prefix: &[Pattern],
+    rest: &RestPattern,
+    resolution: &SequencePatternResolution,
+    collector: &mut PatternCollector,
+) {
+    let array_info = match resolution {
+        SequencePatternResolution::Array {
+            length,
+            element_type,
+        } => Some((*length, element_type)),
+        _ => None,
+    };
+
+    if array_info.is_none() {
+        if !rest.is_present() {
+            collector.checks.push(Check::SliceLenEq {
+                path: path.clone(),
+                length: prefix.len(),
+            });
+        } else if !prefix.is_empty() {
+            collector.checks.push(Check::SliceLenGe {
+                path: path.clone(),
+                min_length: prefix.len(),
+            });
+        }
+    }
+
+    let element_type = match resolution {
+        SequencePatternResolution::Slice { element_type }
+        | SequencePatternResolution::Array { element_type, .. } => Some(element_type),
+        SequencePatternResolution::Unresolved => None,
+    };
+
+    for (i, element) in prefix.iter().enumerate() {
+        let element_path = path.push(PathSegment::Index(i));
+        collect_checks_and_bindings(planner, &element_path, element, element_type, collector);
+    }
+
+    if let RestPattern::Bind { name, .. } = rest {
+        let go_name = planner.go_name_for_rest_binding(rest);
+        let segment = match &array_info {
+            Some((length, element_type)) => {
+                let sub_length = length.saturating_sub(prefix.len() as u64);
+                let sub_ty = Type::Array {
+                    length: sub_length,
+                    element: Box::new((*element_type).clone()),
+                };
+                let go_type = planner.go_type(&sub_ty);
+                collector.packages.extend(go_type.requirements());
+                PathSegment::ArraySliceFrom {
+                    offset: prefix.len(),
+                    go_type: go_type.code,
+                }
+            }
+            None => PathSegment::SliceFrom(prefix.len()),
+        };
+        collector.bindings.push(PatternBinding {
+            lisette_name: name.to_string(),
+            go_name,
+            path: path.push(segment),
+        });
+    }
+}
+
 /// Handle or-patterns without bindings by collecting conditions from each
 /// alternative and combining with `||`.
 fn collect_or_pattern_checks(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     patterns: &[Pattern],
-    typed: Option<&TypedPattern>,
     pattern: &Pattern,
     path_ty: Option<&Type>,
     collector: &mut PatternCollector,
 ) {
-    let has_bindings = Emitter::pattern_has_bindings(pattern);
+    let has_bindings = pattern_has_bindings(pattern);
     if !has_bindings {
-        let typed_alternatives: Vec<Option<&TypedPattern>> = match typed {
-            Some(TypedPattern::Or { alternatives }) => alternatives.iter().map(Some).collect(),
-            _ => vec![None; patterns.len()],
-        };
-
-        let alternatives: Vec<Vec<Check>> = patterns
+        let alt_collectors: Vec<PatternCollector> = patterns
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
+            .map(|p| {
                 let mut alt_collector = PatternCollector::new();
-                let tc = typed_alternatives.get(i).copied().flatten();
-                collect_checks_and_bindings(emitter, path, p, tc, path_ty, &mut alt_collector);
-                alt_collector.checks
+                collect_checks_and_bindings(planner, path, p, path_ty, &mut alt_collector);
+                alt_collector
             })
             .collect();
 
-        if alternatives.iter().any(|checks| checks.is_empty()) {
+        if alt_collectors.iter().any(|c| c.checks.is_empty()) {
             return;
         }
 
-        collector.checks.push(Check::Or { alternatives });
+        for alt in &alt_collectors {
+            collector.packages.extend(&alt.packages);
+        }
+        collector.checks.push(Check::Or {
+            alternatives: alt_collectors.into_iter().map(|c| c.checks).collect(),
+        });
     }
 }
 
 /// Compute the access path for a struct field, handling enum struct variants
 /// and auto-pointer dereference.
 fn compute_struct_field_path(
-    emitter: &mut Emitter,
+    planner: &Planner,
     parent_path: &AccessPath,
     field: &StructFieldPattern,
     ty: &Type,
     enum_info: Option<&(String, String)>,
-    typed_variant_fields: Option<&[syntax::ast::EnumFieldDefinition]>,
 ) -> AccessPath {
     let go_field_name = if let Some((enum_id, variant_name)) = enum_info {
-        emitter
+        planner
             .enum_struct_field_name(enum_id, variant_name, &field.name)
             .unwrap_or_else(|| {
                 panic!(
@@ -708,42 +1001,66 @@ fn compute_struct_field_path(
                     enum_id, variant_name, field.name
                 )
             })
-    } else if emitter.field_is_public(ty, &field.name) {
+    } else if planner.struct_field_is_exported(ty, &field.name) {
         go_name::make_exported(&field.name)
-    } else {
+    } else if planner.field_is_embedded(ty, &field.name) {
         go_name::escape_keyword(&field.name).into_owned()
+    } else {
+        go_name::unexported_method_go_name(&field.name)
     };
 
     if let Some((_, variant_name)) = enum_info
         && let Some(field_index) =
-            emitter.get_enum_struct_field_index(ty, variant_name, &field.name)
+            planner.get_enum_struct_field_index(ty, variant_name, &field.name)
+        && planner.is_enum_field_recursive(ty, variant_name, field_index)
     {
-        let is_source_ref = typed_variant_fields
-            .and_then(|vf| vf.get(field_index).map(|f| f.ty.is_ref()))
-            .unwrap_or_else(|| emitter.is_enum_field_source_ref(ty, variant_name, field_index));
-        let is_auto_pointer =
-            emitter.is_enum_field_pointer(ty, variant_name, field_index) && !is_source_ref;
-        if is_auto_pointer {
-            return parent_path
-                .push(PathSegment::Field(go_field_name))
-                .push(PathSegment::Deref);
-        }
+        return parent_path
+            .push(PathSegment::Field(go_field_name))
+            .push(PathSegment::Deref);
     }
 
     parent_path.push(PathSegment::Field(go_field_name))
 }
 
+/// When a concrete pattern targets a Go-interface scrutinee, push a TypeAssert
+/// check and return the path child patterns should read from. At root, child
+/// paths stay as-is and the type switch shadows the subject; at nested paths,
+/// child paths gain an `AssertedAs` segment so they reach the asserted value.
+fn interface_assert_child_path(
+    planner: &Planner,
+    path: &AccessPath,
+    pattern_ty: &Type,
+    path_ty: Option<&Type>,
+    collector: &mut PatternCollector,
+) -> Option<AccessPath> {
+    path_ty.filter(|st| planner.facts.as_interface(st).is_some())?;
+    let go_type_result = planner.go_type(pattern_ty);
+    collector.packages.extend(go_type_result.requirements());
+    let go_type = go_type_result.code;
+    let child_path = if path.is_root() {
+        path.clone()
+    } else {
+        path.push(PathSegment::AssertedAs(go_type.clone()))
+    };
+    collector.checks.push(Check::TypeAssert {
+        path: path.clone(),
+        go_type,
+    });
+    Some(child_path)
+}
+
 /// Collect checks and bindings for an enum variant pattern (tuple or tagged).
 fn collect_enum_variant_checks(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     pattern: &Pattern,
-    typed: Option<&TypedPattern>,
+    path_ty: Option<&Type>,
     collector: &mut PatternCollector,
 ) {
     let Pattern::EnumVariant {
         identifier,
         fields,
+        resolution,
         ty,
         ..
     } = pattern
@@ -751,81 +1068,160 @@ fn collect_enum_variant_checks(
         return;
     };
 
-    let (typed_children, typed_variant_fields) = match typed {
-        Some(TypedPattern::EnumVariant {
-            fields: tf,
-            variant_fields: vf,
-            ..
-        }) => (tf.iter().map(Some).collect::<Vec<_>>(), Some(vf.as_slice())),
-        _ => (vec![None; fields.len()], None),
+    // A const pattern is a value comparison against a named constant, emitted
+    // as a Go `case` expression rather than an enum tag or newtype destructure.
+    if let ConstructorPatternResolution::Const { qualified_name }
+    | ConstructorPatternResolution::ConstValue { qualified_name, .. } = resolution
+    {
+        collect_const_pattern_check(planner, path, qualified_name, collector);
+        return;
+    }
+
+    let ConstructorPatternResolution::EnumVariant {
+        enum_name,
+        variant_name,
+    } = resolution
+    else {
+        return;
+    };
+    let params = pattern_type_args(planner, ty);
+    let Some(definition) = planner.facts.definition(enum_name) else {
+        return;
+    };
+    let field_types: Vec<Type> = match &definition.body {
+        DefinitionBody::Struct {
+            fields, generics, ..
+        } => fields
+            .iter()
+            .map(|field| generics::resolve_field_type(generics, &params, &field.ty))
+            .collect(),
+        DefinitionBody::Enum {
+            variants, generics, ..
+        } => {
+            let Some(variant) = variants
+                .iter()
+                .find(|variant| variant.name == unqualified_name(variant_name))
+            else {
+                return;
+            };
+            variant
+                .fields
+                .iter()
+                .map(|field| generics::resolve_field_type(generics, &params, &field.ty))
+                .collect()
+        }
+        _ => return,
     };
 
     let variant_data = EnumVariantData {
         identifier,
         fields,
         ty,
-        typed_children: &typed_children,
-        typed_variant_fields,
+        field_types: &field_types,
     };
 
-    if emitter.is_tuple_struct_type(ty) {
-        if emitter.is_newtype_struct(ty) {
-            collect_newtype_checks(emitter, path, &variant_data, collector);
+    if planner.is_tuple_struct_type(ty) {
+        let child_path = interface_assert_child_path(planner, path, ty, path_ty, collector)
+            .unwrap_or_else(|| path.clone());
+        if planner.is_newtype_struct(ty) {
+            collect_newtype_checks(planner, &child_path, &variant_data, collector);
         } else {
-            collect_tuple_struct_checks(emitter, path, fields, &typed_children, collector);
+            collect_tuple_struct_checks(planner, &child_path, fields, &field_types, collector);
         }
         return;
     }
 
-    if emitter.is_go_value_enum(ty) {
-        let Type::Constructor { id, .. } = ty.resolve().strip_refs() else {
-            return;
-        };
-        let variant_name = go_name::unqualified_name(identifier);
-        let module = go_name::module_of_type_id(id.as_str());
-        let qualifier = emitter.go_pkg_qualifier(module);
-        let go_literal = if qualifier.is_empty() || qualifier == emitter.current_module() {
-            variant_name.to_string()
-        } else {
-            format!("{}.{}", qualifier, variant_name)
-        };
-        collector.checks.push(Check::Literal {
-            path: path.clone(),
-            go_literal,
-        });
+    if handle_foreign_variant_literal(planner, path, ty, identifier, collector) {
         return;
     }
 
-    if emitter.as_enum(ty).is_none() && identifier.contains('.') {
-        collector.checks.push(Check::Literal {
-            path: path.clone(),
-            go_literal: identifier.to_string(),
-        });
-        return;
-    }
+    collect_tagged_enum_checks(planner, path, &variant_data, collector);
+}
 
-    collect_tagged_enum_checks(emitter, path, &variant_data, collector);
+/// Emit a const pattern as a Go `case` constant (e.g. `time.Friday`), requiring
+/// the constant's package import when it is cross-package.
+fn collect_const_pattern_check(
+    planner: &Planner,
+    path: &AccessPath,
+    qualified_name: &str,
+    collector: &mut PatternCollector,
+) {
+    let const_name = unqualified_name(qualified_name);
+    let go_literal = match planner.facts.package_for_qualified_name(qualified_name) {
+        Some(package) => {
+            if planner.facts.is_current_package(package) {
+                local_const_go_name(planner, const_name)
+            } else {
+                let member = if go_name::is_go_import(package) {
+                    const_name.to_string()
+                } else {
+                    go_name::screaming_snake_to_camel(const_name)
+                };
+                let qualifier = planner.record_package_import(package, &mut collector.packages);
+                format!("{}.{}", qualifier, member)
+            }
+        }
+        None => local_const_go_name(planner, const_name),
+    };
+    collector.checks.push(Check::Literal {
+        path: path.clone(),
+        go_literal,
+    });
+}
+
+fn local_const_go_name(planner: &Planner, const_name: &str) -> String {
+    planner
+        .package
+        .escape_remap(const_name)
+        .map(str::to_string)
+        .unwrap_or_else(|| go_name::escape_reserved(const_name).into_owned())
+}
+
+/// `true` when the variant is a foreign-package dotted name (e.g.
+/// `httpkg.MethodGet`) emitted as a `Check::Literal`.
+fn handle_foreign_variant_literal(
+    planner: &Planner,
+    path: &AccessPath,
+    ty: &Type,
+    identifier: &str,
+    collector: &mut PatternCollector,
+) -> bool {
+    if planner.as_enum(ty).is_some() || !identifier.contains('.') {
+        return false;
+    }
+    if let Some((package, _)) = identifier.split_once('.')
+        && planner.facts.is_foreign_package(package)
+    {
+        collector
+            .packages
+            .require(planner.package_use_for_package(&planner.canonical_package(package)));
+    }
+    collector.checks.push(Check::Literal {
+        path: path.clone(),
+        go_literal: identifier.to_string(),
+    });
+    true
 }
 
 /// Collect checks and bindings for a newtype struct pattern (single-field wrapper).
 fn collect_newtype_checks(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     variant: &EnumVariantData,
     collector: &mut PatternCollector,
 ) {
-    let Some(underlying_ty) = emitter.get_newtype_underlying(variant.ty) else {
+    let Some(underlying_ty) = planner.get_newtype_underlying(variant.ty) else {
         return;
     };
-    let go_underlying_ty = emitter.go_type_as_string(&underlying_ty);
-    let field_path = path.push(PathSegment::NewtypeCast(go_underlying_ty));
+    let go_underlying = planner.go_type(&underlying_ty);
+    collector.packages.extend(go_underlying.requirements());
+    let field_path = path.push(PathSegment::NewtypeCast(go_underlying.code));
     if let Some(field) = variant.fields.first() {
         collect_checks_and_bindings(
-            emitter,
+            planner,
             &field_path,
             field,
-            variant.typed_children.first().copied().flatten(),
-            None,
+            variant.field_types.first(),
             collector,
         );
     }
@@ -833,22 +1229,15 @@ fn collect_newtype_checks(
 
 /// Collect checks and bindings for a tuple struct pattern (positional fields).
 fn collect_tuple_struct_checks(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     fields: &[Pattern],
-    typed_children: &[Option<&TypedPattern>],
+    field_types: &[Type],
     collector: &mut PatternCollector,
 ) {
     for (i, field) in fields.iter().enumerate() {
         let field_path = path.push(PathSegment::Field(format!("F{}", i)));
-        collect_checks_and_bindings(
-            emitter,
-            &field_path,
-            field,
-            typed_children.get(i).copied().flatten(),
-            None,
-            collector,
-        );
+        collect_checks_and_bindings(planner, &field_path, field, field_types.get(i), collector);
     }
 }
 
@@ -856,31 +1245,42 @@ struct EnumVariantData<'a> {
     identifier: &'a str,
     fields: &'a [Pattern],
     ty: &'a Type,
-    typed_children: &'a [Option<&'a TypedPattern>],
-    typed_variant_fields: Option<&'a [syntax::ast::EnumFieldDefinition]>,
+    field_types: &'a [Type],
+}
+
+fn enum_package_of<'a>(planner: &Planner<'a>, ty: &'a Type) -> &'a str {
+    match ty {
+        Type::Nominal { id, .. } => planner.facts.package_for_qualified_name(id).unwrap_or(id),
+        _ => "",
+    }
 }
 
 /// Collect checks and bindings for a tagged enum variant pattern.
 fn collect_tagged_enum_checks(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     variant: &EnumVariantData,
     collector: &mut PatternCollector,
 ) {
-    let alias = emitter.module_alias_for_type(variant.ty);
+    let enum_package = enum_package_of(planner, variant.ty);
+    let alias = if planner.facts.is_foreign_package(enum_package) {
+        Some(planner.record_package_import(enum_package, &mut collector.packages))
+    } else {
+        None
+    };
     let resolved = go_name::variant(
         variant.identifier,
         variant.ty,
-        emitter.current_module(),
+        enum_package,
+        planner.facts.current_package(),
         alias.as_deref(),
     );
-    if resolved.needs_stdlib {
-        emitter.flags.needs_stdlib = true;
+    if let Some(package) = resolved.package {
+        collector.packages.require_generated(package);
     }
     collector.checks.push(Check::EnumTag {
         path: path.clone(),
         tag_constant: resolved.name.clone(),
-        needs_stdlib: resolved.needs_stdlib,
     });
 
     let variant_name = variant
@@ -889,18 +1289,11 @@ fn collect_tagged_enum_checks(
         .next_back()
         .unwrap_or(variant.identifier);
     for (i, field) in variant.fields.iter().enumerate() {
-        let field_name = emitter.get_enum_tuple_field_name(variant.ty, variant_name, i);
+        let field_name = planner.get_enum_tuple_field_name(variant.ty, variant_name, i);
 
-        let is_source_ref = variant
-            .typed_variant_fields
-            .and_then(|vf| vf.get(i).map(|f| f.ty.is_ref()))
-            .unwrap_or_else(|| emitter.is_enum_field_source_ref(variant.ty, variant_name, i));
-        let is_auto_pointer =
-            emitter.is_enum_field_pointer(variant.ty, variant_name, i) && !is_source_ref;
+        let is_unit = planner.is_enum_field_unit(variant.ty, variant_name, i);
 
-        let is_unit = emitter.is_enum_field_unit(variant.ty, variant_name, i);
-
-        let field_path = if is_auto_pointer {
+        let field_path = if planner.is_enum_field_recursive(variant.ty, variant_name, i) {
             path.push(PathSegment::Field(field_name))
                 .push(PathSegment::Deref)
         } else {
@@ -917,11 +1310,10 @@ fn collect_tagged_enum_checks(
             }
         } else {
             collect_checks_and_bindings(
-                emitter,
+                planner,
                 &field_path,
                 field,
-                variant.typed_children.get(i).copied().flatten(),
-                None,
+                variant.field_types.get(i),
                 collector,
             );
         }
@@ -931,114 +1323,166 @@ fn collect_tagged_enum_checks(
 /// Collect checks and bindings for a struct pattern (plain struct or enum struct variant).
 /// Detect whether a struct pattern is actually an enum struct variant,
 /// returning `(enum_id, variant_name)` if so.
-fn detect_enum_info(
-    emitter: &mut Emitter,
-    ty: &Type,
-    identifier: &str,
-    typed: Option<&TypedPattern>,
-) -> Option<(String, String)> {
-    match typed {
-        Some(TypedPattern::EnumStructVariant {
-            variant_name: vn, ..
-        }) => {
-            let variant_name_str = vn.split('.').next_back().unwrap_or(vn);
-            let id = emitter.as_enum(ty).unwrap_or_else(|| {
-                vn.rsplit_once('.')
-                    .map_or(vn.to_string(), |(e, _)| e.to_string())
-            });
-            Some((id, variant_name_str.to_string()))
-        }
-        Some(TypedPattern::Struct { .. }) => None,
-        _ => emitter.as_enum(ty).map(|id| {
-            let variant_name_str = identifier.split('.').next_back().unwrap_or(identifier);
-            (id, variant_name_str.to_string())
-        }),
+fn detect_enum_info(resolution: &RecordPatternResolution) -> Option<(String, String)> {
+    match resolution {
+        RecordPatternResolution::EnumVariant {
+            enum_name,
+            variant_name,
+            ..
+        } => Some((
+            enum_name.to_string(),
+            unqualified_name(variant_name).to_string(),
+        )),
+        RecordPatternResolution::Struct { .. } | RecordPatternResolution::Unresolved => None,
     }
 }
 
 fn collect_struct_checks(
-    emitter: &mut Emitter,
+    planner: &Planner,
     path: &AccessPath,
     pattern: &Pattern,
-    typed: Option<&TypedPattern>,
     path_ty: Option<&Type>,
     collector: &mut PatternCollector,
 ) {
     let Pattern::Struct {
         fields,
         ty,
-        identifier,
+        resolution,
         ..
     } = pattern
     else {
         return;
     };
 
-    let enum_info = if path_ty.is_some_and(|st| emitter.as_interface(st).is_some()) {
-        let go_type = emitter.go_type_as_string(ty);
-        collector.checks.push(Check::TypeAssert {
-            path: path.clone(),
-            go_type,
-        });
-        None
-    } else {
-        let enum_info = detect_enum_info(emitter, ty, identifier, typed);
-        if enum_info.is_some() {
-            let alias = emitter.module_alias_for_type(ty);
-            let resolved =
-                go_name::variant(identifier, ty, emitter.current_module(), alias.as_deref());
-            if resolved.needs_stdlib {
-                emitter.flags.needs_stdlib = true;
-            }
-            collector.checks.push(Check::EnumTag {
-                path: path.clone(),
-                tag_constant: resolved.name.clone(),
-                needs_stdlib: resolved.needs_stdlib,
-            });
-        }
-        enum_info
-    };
-
-    let typed_fields_map: Option<Vec<(&str, Option<&TypedPattern>)>> = match typed {
-        Some(TypedPattern::Struct { pattern_fields, .. })
-        | Some(TypedPattern::EnumStructVariant { pattern_fields, .. }) => Some(
-            pattern_fields
-                .iter()
-                .map(|(name, tp)| (name.as_str(), Some(tp)))
-                .collect(),
-        ),
-        _ => None,
-    };
-
-    let typed_variant_fields = match typed {
-        Some(TypedPattern::EnumStructVariant { variant_fields, .. }) => {
-            Some(variant_fields.as_slice())
-        }
-        _ => None,
-    };
+    let (enum_info, child_path) =
+        resolve_struct_child_path(planner, path, pattern, path_ty, collector);
 
     for field in fields {
-        let typed_child = typed_fields_map
-            .as_ref()
-            .and_then(|m| m.iter().find(|(name, _)| *name == field.name))
-            .and_then(|(_, tp)| *tp);
-
-        let field_path = compute_struct_field_path(
-            emitter,
-            path,
-            field,
-            ty,
-            enum_info.as_ref(),
-            typed_variant_fields,
-        );
+        let field_path =
+            compute_struct_field_path(planner, &child_path, field, ty, enum_info.as_ref());
+        let field_ty = record_field_type(planner, resolution, ty, &field.name);
         collect_checks_and_bindings(
-            emitter,
+            planner,
             &field_path,
             &field.value,
-            typed_child,
-            None,
+            field_ty.as_ref(),
             collector,
         );
+    }
+}
+
+/// Resolve the access path for struct-pattern field lookups. Returns the
+/// enum-variant identity (when the pattern is an enum-struct variant) and the
+/// child path used for field projection: either the interface-assertion alias
+/// or the input path. Pushes the variant's tag check into `collector` when
+/// applicable.
+fn resolve_struct_child_path(
+    planner: &Planner,
+    path: &AccessPath,
+    pattern: &Pattern,
+    path_ty: Option<&Type>,
+    collector: &mut PatternCollector,
+) -> (Option<(String, String)>, AccessPath) {
+    let Pattern::Struct {
+        ty,
+        identifier,
+        resolution,
+        ..
+    } = pattern
+    else {
+        unreachable!("resolve_struct_child_path requires a Struct pattern");
+    };
+    if let Some(asserted) = interface_assert_child_path(planner, path, ty, path_ty, collector) {
+        return (None, asserted);
+    }
+    let enum_info = detect_enum_info(resolution);
+    if enum_info.is_some() {
+        let enum_package = enum_package_of(planner, ty);
+        let alias = if planner.facts.is_foreign_package(enum_package) {
+            Some(planner.record_package_import(enum_package, &mut collector.packages))
+        } else {
+            None
+        };
+        let resolved = go_name::variant(
+            identifier,
+            ty,
+            enum_package,
+            planner.facts.current_package(),
+            alias.as_deref(),
+        );
+        if let Some(package) = resolved.package {
+            collector.packages.require_generated(package);
+        }
+        collector.checks.push(Check::EnumTag {
+            path: path.clone(),
+            tag_constant: resolved.name.clone(),
+        });
+    }
+    (enum_info, path.clone())
+}
+
+fn pattern_type_args(planner: &Planner, ty: &Type) -> Vec<Type> {
+    match planner.facts.peel_alias(ty) {
+        Type::Nominal { params, .. } => params,
+        _ => vec![],
+    }
+}
+
+fn record_variant_fields<'a>(
+    planner: &'a Planner,
+    resolution: &RecordPatternResolution,
+) -> Option<&'a [EnumFieldDefinition]> {
+    let RecordPatternResolution::EnumVariant {
+        enum_name,
+        variant_name,
+    } = resolution
+    else {
+        return None;
+    };
+    let DefinitionBody::Enum { variants, .. } = &planner.facts.definition(enum_name)?.body else {
+        return None;
+    };
+    variants
+        .iter()
+        .find(|variant| variant.name == unqualified_name(variant_name))
+        .map(|variant| variant.fields.as_slice())
+}
+
+fn record_field_type(
+    planner: &Planner,
+    resolution: &RecordPatternResolution,
+    pattern_ty: &Type,
+    field_name: &str,
+) -> Option<Type> {
+    let params = pattern_type_args(planner, pattern_ty);
+    match resolution {
+        RecordPatternResolution::Struct { struct_name } => {
+            let DefinitionBody::Struct {
+                fields, generics, ..
+            } = &planner.facts.definition(struct_name)?.body
+            else {
+                return None;
+            };
+            fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .map(|field| generics::resolve_field_type(generics, &params, &field.ty))
+        }
+        RecordPatternResolution::EnumVariant { .. } => {
+            let fields = record_variant_fields(planner, resolution)?;
+            let RecordPatternResolution::EnumVariant { enum_name, .. } = resolution else {
+                unreachable!()
+            };
+            let DefinitionBody::Enum { generics, .. } = &planner.facts.definition(enum_name)?.body
+            else {
+                return None;
+            };
+            fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .map(|field| generics::resolve_field_type(generics, &params, &field.ty))
+        }
+        RecordPatternResolution::Unresolved => None,
     }
 }
 
@@ -1051,19 +1495,12 @@ pub(super) fn expand_or_patterns<'a>(arms: &'a [MatchArm]) -> Vec<ExpandedArm<'a
     let mut result = Vec::new();
     for (i, arm) in arms.iter().enumerate() {
         if let Pattern::Or { patterns, .. } = &arm.pattern
-            && Emitter::pattern_has_bindings(&arm.pattern)
+            && pattern_has_bindings(&arm.pattern)
         {
-            let typed_alternatives: Vec<Option<&TypedPattern>> =
-                if let Some(TypedPattern::Or { alternatives }) = &arm.typed_pattern {
-                    alternatives.iter().map(Some).collect()
-                } else {
-                    vec![None; patterns.len()]
-                };
-            for (j, alt) in patterns.iter().enumerate() {
+            for alt in patterns {
                 result.push(ExpandedArm {
                     arm_index: i,
                     pattern: alt,
-                    typed_pattern: typed_alternatives.get(j).copied().flatten(),
                     has_guard: arm.has_guard(),
                 });
             }
@@ -1072,7 +1509,6 @@ pub(super) fn expand_or_patterns<'a>(arms: &'a [MatchArm]) -> Vec<ExpandedArm<'a
         result.push(ExpandedArm {
             arm_index: i,
             pattern: &arm.pattern,
-            typed_pattern: arm.typed_pattern.as_ref(),
             has_guard: arm.has_guard(),
         });
     }
@@ -1083,7 +1519,6 @@ pub(super) fn expand_or_patterns<'a>(arms: &'a [MatchArm]) -> Vec<ExpandedArm<'a
 pub(super) struct ExpandedArm<'a> {
     pub arm_index: usize,
     pub pattern: &'a Pattern,
-    pub typed_pattern: Option<&'a TypedPattern>,
     pub has_guard: bool,
 }
 
@@ -1111,9 +1546,12 @@ fn expand_interface_or_checks(arm_infos: Vec<ArmInfo>) -> Vec<ArmInfo> {
                 unreachable!()
             };
             for alt in alternatives {
+                let mut checks = alt.clone();
+                let root_assertion = extract_root_assertion(&mut checks);
                 result.push(ArmInfo {
                     arm_index: arm.arm_index,
-                    checks: alt.clone(),
+                    root_assertion,
+                    checks,
                     bindings: arm.bindings.clone(),
                     has_guard: arm.has_guard,
                 });
@@ -1125,28 +1563,23 @@ fn expand_interface_or_checks(arm_infos: Vec<ArmInfo>) -> Vec<ArmInfo> {
     result
 }
 
-/// Compile expanded arms into a decision tree.
+/// Compile expanded arms into a decision tree plus package requirements.
 pub(super) fn compile_expanded_arms<'a>(
-    emitter: &mut Emitter,
+    planner: &Planner,
     expanded: &'a [ExpandedArm<'a>],
     subject_ty: &Type,
-) -> Decision {
+) -> CompiledDecision {
+    let mut packages = PackageRequirements::default();
     let arm_infos: Vec<ArmInfo> = expanded
         .iter()
         .map(|ea| {
-            let mut collector = PatternCollector::new();
-            collect_checks_and_bindings(
-                emitter,
-                &AccessPath::root(),
-                ea.pattern,
-                ea.typed_pattern,
-                Some(subject_ty),
-                &mut collector,
-            );
+            let info = collect_pattern_info(planner, ea.pattern, subject_ty);
+            packages.extend(&info.packages);
             ArmInfo {
                 arm_index: ea.arm_index,
-                checks: collector.checks,
-                bindings: collector.bindings,
+                root_assertion: info.root_assertion,
+                checks: info.checks,
+                bindings: info.bindings,
                 has_guard: ea.has_guard,
             }
         })
@@ -1181,30 +1614,80 @@ pub(super) fn compile_expanded_arms<'a>(
         }
     }
 
-    build_tree(arm_infos)
+    CompiledDecision {
+        decision: build_tree(arm_infos),
+        packages,
+    }
 }
 
-/// Collect checks and bindings from a single pattern for use outside match
-/// emission (let-else, while-let, for-loop, complex let).
+/// Collect checks, bindings, and any root type assertion from a single pattern
+/// for use outside match emission (let-else, while-let, for-loop, complex let,
+/// function param). `subject_ty` is the static type of the scrutinee; sites
+/// that pass a wrong type would silently miss root-level Go-interface type
+/// assertions, so the public entry takes it by reference rather than `Option`.
 pub(crate) fn collect_pattern_info(
-    emitter: &mut Emitter,
+    planner: &Planner,
     pattern: &Pattern,
-    typed: Option<&TypedPattern>,
-) -> (Vec<Check>, Vec<PatternBinding>) {
+    subject_ty: &Type,
+) -> PatternInfo {
     let mut collector = PatternCollector::new();
     collect_checks_and_bindings(
-        emitter,
+        planner,
         &AccessPath::root(),
         pattern,
-        typed,
-        None,
+        Some(subject_ty),
         &mut collector,
     );
-    (collector.checks, collector.bindings)
+    let root_assertion = extract_root_assertion(&mut collector.checks);
+    PatternInfo {
+        root_assertion,
+        checks: collector.checks,
+        bindings: collector.bindings,
+        packages: collector.packages,
+        requires_materialized_subject: collector.requires_materialized_subject,
+    }
 }
 
-/// Render checks as a Go condition string.
-pub(crate) fn render_condition(checks: &[Check], subject_var: &str) -> String {
+/// Move a root-path type assertion out of `checks` into a `TypeAssertion`.
+/// Recognizes both a single `Check::TypeAssert` at root and a `Check::Or` whose
+/// alternatives are each a single root `TypeAssert` at the same path.
+fn extract_root_assertion(checks: &mut Vec<Check>) -> Option<TypeAssertion> {
+    let position = checks.iter().position(|c| match c {
+        Check::TypeAssert { path, .. } => path.is_root(),
+        Check::Or { alternatives } => alternatives.iter().all(
+            |alt| matches!(alt.as_slice(), [Check::TypeAssert { path, .. }] if path.is_root()),
+        ),
+        _ => false,
+    })?;
+    match checks.remove(position) {
+        Check::TypeAssert { path, go_type } => Some(TypeAssertion {
+            path,
+            go_types: vec![go_type],
+        }),
+        Check::Or { alternatives } => {
+            let mut go_types = Vec::with_capacity(alternatives.len());
+            let mut shared_path: Option<AccessPath> = None;
+            for alt in alternatives {
+                let [Check::TypeAssert { path, go_type }] = alt.as_slice() else {
+                    unreachable!("predicate above confirmed shape")
+                };
+                if let Some(existing) = &shared_path {
+                    debug_assert_eq!(existing, path);
+                } else {
+                    shared_path = Some(path.clone());
+                }
+                go_types.push(go_type.clone());
+            }
+            Some(TypeAssertion {
+                path: shared_path.expect("at least one alternative"),
+                go_types,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+pub(super) fn render_condition(checks: &[Check], subject_var: SubjectRoot<'_>) -> String {
     if checks.is_empty() {
         return "true".to_string();
     }
@@ -1212,65 +1695,4 @@ pub(crate) fn render_condition(checks: &[Check], subject_var: &str) -> String {
     let conditions: Vec<String> = checks.iter().map(|c| c.render(subject_var)).collect();
 
     conditions.join(" && ")
-}
-
-/// Emit bindings as Go `:=` declarations.
-pub(crate) fn emit_tree_bindings(
-    emitter: &mut Emitter,
-    output: &mut String,
-    bindings: &[PatternBinding],
-    subject_var: &str,
-) {
-    for binding in bindings {
-        let Some(ref go_name) = binding.go_name else {
-            emitter.scope.bindings.add(&binding.lisette_name, "");
-            continue;
-        };
-
-        let access_expression = binding.path.render(subject_var);
-
-        if emitter.scope.bindings.has_go_name(go_name) {
-            let fresh = emitter.fresh_var(Some(&binding.lisette_name));
-            emitter.scope.bindings.add(&binding.lisette_name, &fresh);
-            emitter.try_declare(&fresh);
-            write_line!(output, "{} := {}", fresh, access_expression);
-        } else {
-            let name = emitter
-                .scope
-                .bindings
-                .add(&binding.lisette_name, go_name.clone());
-            if emitter.try_declare(&name) {
-                write_line!(output, "{} := {}", name, access_expression);
-            } else {
-                let fresh = emitter.fresh_var(Some(&binding.lisette_name));
-                emitter.scope.bindings.add(&binding.lisette_name, &fresh);
-                emitter.try_declare(&fresh);
-                write_line!(output, "{} := {}", fresh, access_expression);
-            }
-        }
-    }
-}
-
-/// Emit bindings as Go `=` assignments (for pre-declared variables in or-patterns).
-/// Only emits for bindings that are already registered in the bindings map
-/// (i.e., pre-declared with `emit_binding_declarations_with_type`).
-pub(crate) fn emit_tree_assignments(
-    emitter: &mut Emitter,
-    output: &mut String,
-    bindings: &[PatternBinding],
-    subject_var: &str,
-) {
-    for binding in bindings {
-        if binding.go_name.is_none() {
-            continue;
-        }
-
-        // Only assign to variables that were pre-declared
-        let Some(registered_name) = emitter.scope.bindings.get(&binding.lisette_name) else {
-            continue;
-        };
-        let name = registered_name.to_string();
-        let access_expression = binding.path.render(subject_var);
-        write_line!(output, "{} = {}", name, access_expression);
-    }
 }

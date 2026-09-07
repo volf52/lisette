@@ -1,0 +1,53 @@
+[changelog]
+header = """# Changelog
+
+Lisette is under active development. Any version before 1.0.0 may include breaking changes.
+"""
+body = '''
+
+## [{{ version | trim_start_matches(pat="lisette-v") }}](https://github.com/ivov/lisette/compare/{{ previous.version }}...{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits | sort(attribute="author.timestamp") | reverse %}
+{%- set subject = commit.raw_message | split(pat="\n") | first | trim -%}
+{%- if commit.remote.pr_labels is defined and commit.remote.pr_labels is containing("breaking") and subject is matching("^[a-z]+(\([^)]*\))?: ") -%}
+{%- set parts = subject | split(pat=": ") -%}
+{%- set breaking_type = parts | first -%}
+{%- set breaking_rest = parts | slice(start=1) | join(sep=": ") -%}
+{%- set subject = breaking_type ~ "!: " ~ breaking_rest -%}
+{%- endif -%}
+{%- set sha = commit.id | truncate(length=7, end="") -%}
+{%- if subject is matching("\(\[#\d+\]\([^)]*\)\)$") -%}
+{%- set head = subject | split(pat=" ([#") | slice(end=-1) | join(sep=" ([#") -%}
+{%- set pr = subject | split(pat="[#") | last | split(pat="]") | first %}
+- {{ head }} [#{{ pr }}](https://github.com/ivov/lisette/pull/{{ pr }}) [`{{ sha }}`](https://github.com/ivov/lisette/commit/{{ commit.id }})
+{%- else %}
+- {{ subject }} [`{{ sha }}`](https://github.com/ivov/lisette/commit/{{ commit.id }})
+{%- endif %}
+{%- endfor %}
+{% endfor %}
+
+'''
+trim = true
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+commit_preprocessors = [
+  { pattern = "\\(#([0-9]+)\\)", replace = "([#${1}](https://github.com/ivov/lisette/pull/${1}))" },
+]
+commit_parsers = [
+  { message = "^chore: bump stdlib typedefs", skip = true },
+  { message = "^chore: bump to .* for breaking-labeled changes", skip = true },
+  { message = "^chore: release", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Fixes" },
+  { message = ".*", group = "<!-- 2 -->Internals" },
+]
+include_paths = ["**"]
+tag_pattern = "lisette-v[0-9]*"
+sort_commits = "newest"
+
+[remote.github]
+owner = "ivov"
+repo = "lisette"

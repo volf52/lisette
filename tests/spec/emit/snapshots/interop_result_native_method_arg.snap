@@ -1,6 +1,17 @@
 ---
 source: tests/spec/emit/interop_matrix.rs
-description: "input: \nimport \"go:strconv\"\n\nfn main() {\n  let xs: Slice<string> = [\"1\"]\n  let ys = xs.map(strconv.Atoi)\n  match ys[0] {\n    Ok(v) => { let _ = v },\n    Err(_) => { let _ = 0 },\n  }\n}\n"
+description: |
+  
+  import "go:strconv"
+  
+  fn main() {
+    let xs: Slice<string> = ["1"]
+    let ys = xs.map(strconv.Atoi)
+    match ys[0] {
+      Ok(v) => { let _ = v },
+      Err(_) => { let _ = 0 },
+    }
+  }
 ---
 package main
 
@@ -15,13 +26,12 @@ func main() {
 		ret_1, ret_2 := strconv.Atoi(arg0)
 		if ret_2 != nil {
 			return lisette.MakeResultErr[int, error](ret_2)
+		} else {
+			return lisette.MakeResultOk[int, error](ret_1)
 		}
-		return lisette.MakeResultOk[int, error](ret_1)
 	})
-	subject_4 := ys[0]
-	if subject_4.Tag == lisette.ResultOk {
-		_ = subject_4.OkVal
-	} else {
-		_ = 0
+	subject_3 := ys[0]
+	if subject_3.Tag == lisette.ResultOk {
+		_ = subject_3.OkVal
 	}
 }

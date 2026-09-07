@@ -42,17 +42,17 @@ type Fetcher struct {
 	Fetch func(url string) ([]byte, error)
 }
 
-// Function type returning skipped type with error - tests analyzeReturns skip in Result path
+// Function type returning an anonymous struct with error - synthesized into the Result path
 type BadResultFn struct {
 	Run func() (struct{ X int }, error)
 }
 
-// Function type returning skipped type with ok - tests analyzeReturns skip in Option path
+// Function type returning an anonymous struct with ok - synthesized into the Option path
 type BadOptionFn struct {
 	Check func() (v struct{ X int }, ok bool)
 }
 
-// Function type returning multiple skipped types - tests collectReturnTypes skip in tuple path
+// Function type returning two anonymous structs - synthesized into the tuple path
 type TupleSkip struct {
 	GetPair func() (struct{ A int }, struct{ B int })
 }
@@ -65,6 +65,15 @@ type ErrorOnly struct {
 // Node for testing pointer returns in comma-ok
 type Node struct {
 	Value int
+}
+
+// Function type params are writable
+type Callbacks struct {
+	OnNode   func(node *Node)
+	OnBytes  func(data []byte)
+	OnLookup func(table map[string][]int)
+	OnValue  func(n Node)
+	OnNodes  func(first *Node, rest ...*Node)
 }
 
 // Comma-ok with pointer inner type - produces tuple to avoid

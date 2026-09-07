@@ -1,7 +1,12 @@
 ---
 source: tests/spec/format/mod.rs
-description: "input: fn foo() {\n  recover {}\n  // comment\n}"
+description: |-
+  fn foo() {
+    recover {}
+    // comment
+  }
 ---
 fn foo() {
-  recover {} // comment
+  recover {}
+  // comment
 }

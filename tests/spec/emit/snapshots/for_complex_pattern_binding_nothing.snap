@@ -1,22 +1,24 @@
 ---
 source: tests/spec/emit/expressions.rs
-description: "input: \nstruct Foo { x: int }\n\nfn main() {\n  let items = [Foo { x: 1 }, Foo { x: 2 }]\n  for Foo { x: _ } in items {\n    let _ = 0\n  }\n}\n"
+description: |
+  
+  struct Foo { x: int }
+  
+  fn main() {
+    let items = [Foo { x: 1 }, Foo { x: 2 }]
+    for Foo { x: _ } in items {
+      let _ = 0
+    }
+  }
 ---
 package main
-
-import "fmt"
 
 type Foo struct {
 	x int
 }
 
-func (f Foo) String() string {
-	return fmt.Sprintf("Foo { x: %v }", f.x)
-}
-
 func main() {
-	items := []Foo{Foo{x: 1}, Foo{x: 2}}
+	items := []Foo{{x: 1}, {x: 2}}
 	for range items {
-		_ = 0
 	}
 }

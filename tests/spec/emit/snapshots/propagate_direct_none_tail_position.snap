@@ -1,19 +1,31 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn f() -> Option<int> {\n  None?\n}\n\nfn test() -> Option<int> {\n  f()\n}\n"
+description: |
+  
+  fn f() -> Option<int> {
+    None?
+  }
+  
+  fn test() -> Option<int> {
+    f()
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func f() lisette.Option[int] {
+func f() (int, bool) {
 	check_1 := lisette.MakeOptionNone[lisette.Option[int]]()
 	if check_1.Tag != lisette.OptionSome {
-		return lisette.MakeOptionNone[int]()
+		return 0, false
 	}
-	return check_1.SomeVal
+	v_2 := check_1.SomeVal
+	if v_2.Tag == lisette.OptionSome {
+		return v_2.SomeVal, true
+	}
+	return 0, false
 }
 
-func test() lisette.Option[int] {
+func test() (int, bool) {
 	return f()
 }

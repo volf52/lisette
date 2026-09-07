@@ -1,12 +1,15 @@
 ---
 source: tests/ui/lint/mod.rs
 ---
-  [warning] `Result` is silently discarded
+  ✕ Mismatch between return type and return value
    ╭─[test.lis:7:3]
+ 5 │ 
  6 │ fn do_work() {
+   ·              ┬
+   ·              ╰── has `()` as implicit return type
  7 │   get_result()
    ·   ──────┬─────
-   ·         ╰── failure will go unnoticed
+   ·         ╰── returns `Result<int, string>`
  8 │ }
    ╰────
-  help: Handle this `Result` with `?` or `match`, explicitly discard it with `let _ = ...`, or return it by adding `-> Result<int, string>` to the function signature · code: [lint.unused_result]
+  help: If the `()` return type is intended, discard the return value with `let _ = ...`. If the `Result<int, string>` return value is intended, add `-> Result<int, string>` to the function signature · code: [infer.mismatched_return_value]

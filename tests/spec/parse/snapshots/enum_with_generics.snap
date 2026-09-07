@@ -1,6 +1,11 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
+description: |
+  
+  enum Result<T, E> {
+    Ok(T),
+    Err(E),
+  }
 ---
 [
     Enum {
@@ -16,6 +21,7 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
             Generic {
                 name: "T",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 13,
@@ -25,6 +31,7 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
             Generic {
                 name: "E",
                 bounds: [],
+                resolved_bounds: [],
                 span: Span {
                     file_id: 0,
                     byte_offset: 16,
@@ -35,6 +42,7 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
         variants: [
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Ok",
                 name_span: Span {
                     file_id: 0,
@@ -46,7 +54,7 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
                         EnumFieldDefinition {
                             name: "field0",
                             name_span: Span {
-                                file_id: 0,
+                                file_id: 4294967295,
                                 byte_offset: 0,
                                 byte_length: 0,
                             },
@@ -59,15 +67,16 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
                                     byte_length: 1,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                     ],
                 ),
             },
             EnumVariant {
                 doc: None,
+                attributes: [],
                 name: "Err",
                 name_span: Span {
                     file_id: 0,
@@ -79,7 +88,7 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
                         EnumFieldDefinition {
                             name: "field0",
                             name_span: Span {
-                                file_id: 0,
+                                file_id: 4294967295,
                                 byte_offset: 0,
                                 byte_length: 0,
                             },
@@ -92,9 +101,9 @@ description: "input: \nenum Result<T, E> {\n  Ok(T),\n  Err(E),\n}\n"
                                     byte_length: 1,
                                 },
                             },
-                            ty: Variable(
-                                -1,
-                            ),
+                            ty: Var {
+                                id: uninferred,
+                            },
                         },
                     ],
                 ),

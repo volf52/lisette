@@ -1,17 +1,26 @@
 ---
 source: tests/spec/emit/result_option_patterns.rs
-description: "input: \nfn returns_int() -> Result<int, string> {\n  Ok(42)\n}\n\nfn returns_unit() -> Result<(), string> {\n  let _ = returns_int()?;\n  Ok(())\n}\n"
+description: |
+  
+  fn returns_int() -> Result<int, string> {
+    Ok(42)
+  }
+  
+  fn returns_unit() -> Result<(), string> {
+    let _ = returns_int()?;
+    Ok(())
+  }
 ---
 package main
 
 import lisette "github.com/ivov/lisette/prelude"
 
-func returns_int() lisette.Result[int, string] {
+func returnsInt() lisette.Result[int, string] {
 	return lisette.MakeResultOk[int, string](42)
 }
 
-func returns_unit() lisette.Result[struct{}, string] {
-	check_1 := returns_int()
+func returnsUnit() lisette.Result[struct{}, string] {
+	check_1 := returnsInt()
 	if check_1.Tag != lisette.ResultOk {
 		return lisette.MakeResultErr[struct{}, string](check_1.ErrVal)
 	}

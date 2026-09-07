@@ -1,7 +1,7 @@
 ---
 source: tests/ui/errors/mod.rs
 ---
-  [error] Syntax error
+  ✕ Syntax error
    ╭─[test.lis:5:16]
  4 │ impl Counter {
  5 │   fn get_count(&self) -> int {
@@ -9,4 +9,4 @@ source: tests/ui/errors/mod.rs
    ·                  ╰── invalid syntax
  6 │     self.count
    ╰────
-  help: Lisette methods receive `self` by reference. Use `self` instead · code: [parse.syntax_error]
+  help: A read-only receiver is `self: Ref<T>`, where `T` is the type this `impl` targets. For a copy, use `self` · code: [parse.syntax_error]

@@ -473,16 +473,27 @@ fn for_loop_with_wrong_annotation_fails() {
 }
 
 #[test]
-fn for_loop_over_string() {
+fn for_loop_over_string_runes() {
     infer(
         r#"{
     let s = "hello";
-    for ch in s {
+    for ch in s.runes() {
       let c = ch;
     }
   }"#,
     )
     .assert_no_errors();
+}
+
+#[test]
+fn for_loop_over_string_rejected() {
+    infer(
+        r#"{
+    let s = "hello";
+    for _ch in s {}
+  }"#,
+    )
+    .assert_infer_code("string_not_iterable");
 }
 
 #[test]
@@ -1036,12 +1047,15 @@ fn select_wildcard_only() {
 #[test]
 fn select_arm_type_mismatch() {
     infer(
-        r#"{
-    select {
-      _ => 42,
-      _ => "wrong",
+        r#"
+    fn test() -> int {
+      let ch = Channel.new<int>();
+      select {
+        let Some(x) = ch.receive() => x,
+        _ => "wrong",
+      }
     }
-  }"#,
+  "#,
     )
     .assert_type_mismatch();
 }
@@ -1886,6 +1900,86 @@ fn recursive_enum_pattern_matching() {
 }
 
 #[test]
+fn match_on_variant_named_never() {
+    infer(
+        r#"
+    enum Signal {
+      Never,
+      Sometimes,
+    }
+
+    fn test(s: Signal) -> int {
+      match s {
+        Never => 0,
+        Sometimes => 1,
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_tuple_struct_through_alias() {
+    infer(
+        r#"
+    struct Wrap(int)
+    type Alias = Wrap
+
+    fn test(w: Wrap) -> int {
+      match w {
+        Alias(x) => x,
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_variant_name_sharing_struct_name() {
+    infer(
+        r#"
+    struct Foo { a: int }
+
+    enum E {
+      Foo,
+      Bar,
+    }
+
+    fn test(e: E) -> int {
+      match e {
+        Foo => 1,
+        Bar => 2,
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn variant_pattern_field_type_ignores_shadowing_function() {
+    infer(
+        r#"
+    enum E { V(string), W }
+
+    fn V(x: int) -> E {
+      E.V("")
+    }
+
+    fn test(e: E) {
+      if let V(x) = e {
+        let y: string = x
+        let _ = y
+      }
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
 fn for_loop_over_channel() {
     infer(
         r#"
@@ -2385,7 +2479,7 @@ fn if_branches_coerce_to_interface_return_type() {
     infer(
         r#"
     interface Printable {
-      fn to_string(self) -> string
+      fn to_string() -> string
     }
 
     struct Box { label: string }
@@ -2566,4 +2660,507 @@ fn test() {
 #[test]
 fn panic_in_assignment_expression() {
     infer(r#"{ let x: int = panic("boom") }"#).assert_infer_code("panic_in_expression_position");
+}
+
+#[test]
+fn match_value_arm_with_unit_arm_errors() {
+    infer(
+        r#"
+    fn discard(_x: int) {}
+
+    fn test() {
+      let result = match 1 {
+        1 => 42,
+        _ => discard(1),
+      };
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn match_value_arm_with_diverging_arm_ok() {
+    infer(
+        r#"
+    fn test() {
+      let result = match 1 {
+        1 => 42,
+        _ => panic("unreachable"),
+      };
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_value_arms_scalar_mismatch_errors() {
+    infer(
+        r#"
+    fn test() {
+      let result = match 1 {
+        1 => "one",
+        _ => 42,
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn match_value_arms_unrelated_structs_error() {
+    infer(
+        r#"
+    struct A {}
+    struct B {}
+
+    fn test() {
+      let result = match 1 {
+        1 => A {},
+        _ => B {},
+      }
+      let _ = result
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn match_value_arms_widen_to_interface_via_use_site_ok() {
+    infer(
+        r#"
+    import "go:io"
+
+    struct R1 {}
+    struct R2 {}
+
+    impl R1 {
+      fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(0) }
+    }
+    impl R2 {
+      fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(1) }
+    }
+
+    fn pick(flag: bool) -> io.Reader {
+      let r = match flag {
+        true => R1 {},
+        false => R2 {},
+      }
+      r
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn select_value_arm_with_unit_arm_errors() {
+    infer(
+        r#"
+    fn discard(_x: int) {}
+
+    fn test() -> int {
+      let ch = Channel.new<int>()
+      let x = select {
+        let Some(v) = ch.receive() => v,
+        _ => discard(1),
+      }
+      x
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn select_match_receive_inner_value_arm_with_unit_arm_errors() {
+    infer(
+        r#"
+    fn discard(_x: int) {}
+
+    fn test() {
+      let ch = Channel.new<int>()
+      let x = select {
+        match ch.receive() {
+          Some(v) => v,
+          None => discard(1),
+        },
+      }
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn match_unit_arm_first_does_not_cascade() {
+    let result = infer(
+        r#"
+    fn discard(_x: int) {}
+
+    fn test() -> int {
+      let x = match 1 {
+        1 => discard(1),
+        _ => 42,
+      }
+      x
+    }
+        "#,
+    );
+    assert_eq!(
+        result.errors.len(),
+        1,
+        "expected only the no-value arm diagnostic, got {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn select_nested_match_unit_arm_does_not_cascade() {
+    let result = infer(
+        r#"
+    fn discard(_x: int) {}
+
+    fn test() {
+      let ch = Channel.new<int>()
+      let x = select {
+        match ch.receive() {
+          Some(v) => discard(v),
+          None => 0,
+        },
+        _ => 99,
+      }
+    }
+        "#,
+    );
+    assert_eq!(
+        result.errors.len(),
+        1,
+        "expected only the no-value arm diagnostic, got {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn match_value_arm_with_unit_alias_arm_errors() {
+    infer(
+        r#"
+    type Void = Unit
+
+    fn discard() -> Void { () }
+
+    fn test() {
+      let x = match 1 {
+        1 => 42,
+        _ => discard(),
+      }
+      let _ = x
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn match_value_arm_with_alias_named_value_type_ok() {
+    infer(
+        r#"
+    type Count = int
+
+    fn make() -> Count { 7 }
+
+    fn test() {
+      let x = match 1 {
+        1 => 42,
+        _ => make(),
+      }
+      let _ = x
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_value_arms_widen_with_diverging_arm_ok() {
+    infer(
+        r#"
+    import "go:io"
+
+    struct R1 {}
+    struct R2 {}
+
+    impl R1 {
+      fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(0) }
+    }
+    impl R2 {
+      fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(1) }
+    }
+
+    fn pick(n: int) -> io.Reader {
+      let r = match n {
+        1 => R1 {},
+        2 => R2 {},
+        _ => panic("unreachable"),
+      }
+      r
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_leading_diverging_arm_does_not_mask_mismatch() {
+    infer(
+        r#"
+    fn test() {
+      let x = match 1 {
+        1 => panic("boom"),
+        2 => "a",
+        _ => 42,
+      }
+      let _ = x
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn nested_value_match_widens_to_interface_ok() {
+    let prelude = r#"
+import "go:io"
+struct R1 {}
+struct R2 {}
+struct R3 {}
+impl R1 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(0) } }
+impl R2 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(1) } }
+impl R3 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(2) } }
+"#;
+    infer(&format!(
+        "{prelude}\nfn pick(n: int, m: int) -> io.Reader {{\n  let r = match n {{ 1 => match m {{ 1 => R1 {{}}, _ => R2 {{}} }}, _ => R3 {{}} }}\n  r\n}}"
+    ))
+    .assert_no_errors();
+    infer(&format!(
+        "{prelude}\nfn pick(n: int, m: int) -> io.Reader {{\n  let r = match n {{ 1 => R3 {{}}, _ => match m {{ 1 => R1 {{}}, _ => R2 {{}} }} }}\n  r\n}}"
+    ))
+    .assert_no_errors();
+}
+
+#[test]
+fn deferred_select_widening_arms_still_non_exhaustive() {
+    infer(
+        r#"
+import "go:io"
+struct R1 {}
+struct R2 {}
+impl R1 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(0) } }
+impl R2 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(1) } }
+fn pick() -> io.Reader {
+  let ch = Channel.new<int>()
+  let r = select {
+    let Some(v) = ch.receive() => R1 {},
+    ch.send(1) => R2 {},
+  }
+  r
+}
+"#,
+    )
+    .assert_infer_code("non_exhaustive_select_expression");
+}
+
+#[test]
+fn nested_value_match_in_tuple_widens_to_interface_ok() {
+    infer(
+        r#"
+import "go:io"
+struct R1 {}
+struct R2 {}
+struct R3 {}
+impl R1 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(0) } }
+impl R2 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(1) } }
+impl R3 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(2) } }
+fn pick(n: int, m: int) -> (io.Reader, int) {
+  let r = match n {
+    1 => (match m { 1 => R1 {}, _ => R2 {} }, 0),
+    _ => (R3 {}, 0),
+  }
+  r
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn if_branches_widen_to_interface_via_use_site_ok() {
+    infer(
+        r#"
+import "go:io"
+struct R1 {}
+struct R2 {}
+impl R1 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(0) } }
+impl R2 { fn Read(self, _p: mut Slice<uint8>) -> Partial<int, error> { Partial.Ok(1) } }
+fn pick(flag: bool) -> io.Reader {
+  let r = if flag { R1 {} } else { R2 {} }
+  r
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn if_branches_scalar_mismatch_errors() {
+    infer(
+        r#"
+    fn test() {
+      let x = if true { "a" } else { 42 }
+      let _ = x
+    }
+        "#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn if_branches_scalar_mismatch_errors_at_unknown_use_site() {
+    infer(
+        r#"
+import "go:fmt"
+fn test() {
+  let x = if true { 1 } else { 2.0 }
+  fmt.Println(x)
+}
+"#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn if_branches_scalar_mismatch_errors_at_unknown_alias_use_site() {
+    infer(
+        r#"
+type Any = Unknown
+fn takes(value: Any) -> Any { value }
+fn test() {
+  let x = if true { 1 } else { 2.0 }
+  let _ = takes(x)
+}
+"#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn nested_if_branches_scalar_mismatch_errors_at_unknown_use_site() {
+    infer(
+        r#"
+import "go:fmt"
+fn test() {
+  let x = if true { if false { 1 } else { 2.0 } } else { 3 }
+  fmt.Println(x)
+}
+"#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn match_arms_scalar_mismatch_errors_at_unknown_use_site() {
+    infer(
+        r#"
+import "go:fmt"
+fn test() {
+  let x = match 1 {
+    1 => 1,
+    _ => "x",
+  }
+  fmt.Println(x)
+}
+"#,
+    )
+    .assert_type_mismatch();
+}
+
+#[test]
+fn if_branches_widen_to_written_unknown_ok() {
+    infer(
+        r#"
+import "go:fmt"
+fn test() {
+  let x: Unknown = if true { 1 } else { 2.0 }
+  fmt.Println(x)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn if_branches_widen_to_written_unknown_alias_ok() {
+    infer(
+        r#"
+type Any = Unknown
+fn takes(value: Any) -> Any { value }
+fn test() {
+  let x: Any = if true { 1 } else { 2.0 }
+  let _ = takes(x)
+}
+"#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_value_ref_arm_with_diverging_arm_resolves_receiver() {
+    infer(
+        r#"
+    struct File {}
+
+    impl File {
+      fn Close(self) {}
+    }
+
+    fn create(f: Ref<File>) -> Result<Ref<File>, error> { Ok(f) }
+
+    fn run(f: Ref<File>) {
+      let file = match create(f) {
+        Ok(handle) => handle,
+        Err(err) => { return },
+      }
+      file.Close()
+    }
+        "#,
+    )
+    .assert_no_errors();
+}
+
+#[test]
+fn match_value_diverging_arm_first_with_ref_arm_resolves_receiver() {
+    infer(
+        r#"
+    struct File {}
+
+    impl File {
+      fn Close(self) {}
+    }
+
+    fn create(f: Ref<File>) -> Result<Ref<File>, error> { Ok(f) }
+
+    fn run(f: Ref<File>) {
+      let file = match create(f) {
+        Err(err) => { return },
+        Ok(handle) => handle,
+      }
+      file.Close()
+    }
+        "#,
+    )
+    .assert_no_errors();
 }

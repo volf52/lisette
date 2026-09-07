@@ -1,14 +1,16 @@
 ---
 source: tests/spec/emit/types.rs
-description: "input: \nstruct Empty {}\n\nfn test() -> Empty {\n  Empty {}\n}\n"
+description: |
+  
+  struct Empty {}
+  
+  fn test() -> Empty {
+    Empty {}
+  }
 ---
 package main
 
 type Empty struct{}
-
-func (e Empty) String() string {
-	return "Empty"
-}
 
 func test() Empty {
 	return Empty{}

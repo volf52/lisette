@@ -1,12 +1,26 @@
 ---
 source: tests/spec/emit/concurrency.rs
-description: "input: \nfn process(v: int) {}\nfn handle_close() {}\n\nfn test() {\n  let ch = Channel.new<int>();\n  select {\n    match ch.receive() {\n      Some(v) => process(v),\n      None => handle_close(),\n    },\n    _ => {},\n  }\n}\n"
+description: |
+  
+  fn process(v: int) {}
+  fn handle_close() {}
+  
+  fn test() {
+    let ch = Channel.new<int>();
+    select {
+      match ch.receive() {
+        Some(v) => process(v),
+        None => handle_close(),
+      },
+      _ => {},
+    }
+  }
 ---
 package main
 
 func process(_ int) {}
 
-func handle_close() {}
+func handleClose() {}
 
 func test() {
 	ch := make(chan int)
@@ -15,7 +29,7 @@ func test() {
 		if ok {
 			process(v)
 		} else {
-			handle_close()
+			handleClose()
 		}
 	default:
 	}

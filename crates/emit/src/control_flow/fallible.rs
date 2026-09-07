@@ -1,5 +1,7 @@
-use crate::Emitter;
+use crate::Planner;
+use crate::abi::coercion::CoercionPlan;
 use crate::names::go_name;
+use crate::plan::bodies::LoweredStatement;
 use syntax::ast::Expression;
 use syntax::types::Type;
 
@@ -19,17 +21,11 @@ const RESULT_ERR_CTOR: &str = "lisette.MakeResultErr";
 const OPTION_NONE_CTOR: &str = "lisette.MakeOptionNone";
 pub(crate) const PARTIAL_OK_CTOR: &str = "lisette.MakePartialOk";
 pub(crate) const PARTIAL_BOTH_CTOR: &str = "lisette.MakePartialBoth";
+pub(crate) const PARTIAL_ERR_CTOR: &str = "lisette.MakePartialErr";
 
-pub(crate) struct Fallible {
-    kind: FallibleKind,
-    ok_ty: Type,
-    err_ty: Option<Type>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FallibleKind {
-    Result,
-    Option,
+pub(crate) enum Fallible {
+    Result { ok_ty: Type, err_ty: Type },
+    Option { ok_ty: Type },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,16 +38,13 @@ impl Fallible {
     pub(crate) fn from_type(ty: &Type) -> Option<Self> {
         if ty.is_result() {
             let args = ty.get_type_params()?;
-            Some(Self {
-                kind: FallibleKind::Result,
+            Some(Self::Result {
                 ok_ty: args.first()?.clone(),
-                err_ty: args.get(1).cloned(),
+                err_ty: args.get(1)?.clone(),
             })
         } else if ty.is_option() {
-            Some(Self {
-                kind: FallibleKind::Option,
+            Some(Self::Option {
                 ok_ty: ty.ok_type(),
-                err_ty: None,
             })
         } else {
             None
@@ -59,7 +52,7 @@ impl Fallible {
     }
 
     pub(crate) fn is_result(&self) -> bool {
-        self.kind == FallibleKind::Result
+        matches!(self, Self::Result { .. })
     }
 
     pub(crate) fn classify_constructor(&self, expression: &Expression) -> Option<ConstructorKind> {
@@ -76,59 +69,64 @@ impl Fallible {
     }
 
     pub(crate) fn ok_ty(&self) -> &Type {
-        &self.ok_ty
+        match self {
+            Self::Result { ok_ty, .. } | Self::Option { ok_ty } => ok_ty,
+        }
     }
 
     pub(crate) fn err_ty(&self) -> Option<&Type> {
-        self.err_ty.as_ref()
+        match self {
+            Self::Result { err_ty, .. } => Some(err_ty),
+            Self::Option { .. } => None,
+        }
     }
 
-    pub(crate) fn struct_name(&self) -> &'static str {
-        match self.kind {
-            FallibleKind::Result => "Result",
-            FallibleKind::Option => "Option",
+    fn struct_name(&self) -> &'static str {
+        match self {
+            Self::Result { .. } => "Result",
+            Self::Option { .. } => "Option",
         }
     }
 
     pub(crate) fn success_tag(&self) -> &'static str {
-        match self.kind {
-            FallibleKind::Result => RESULT_OK_TAG,
-            FallibleKind::Option => OPTION_SOME_TAG,
+        match self {
+            Self::Result { .. } => RESULT_OK_TAG,
+            Self::Option { .. } => OPTION_SOME_TAG,
         }
     }
 
     pub(crate) fn ok_field(&self) -> &'static str {
-        match self.kind {
-            FallibleKind::Result => RESULT_OK_FIELD,
-            FallibleKind::Option => OPTION_SOME_FIELD,
+        match self {
+            Self::Result { .. } => RESULT_OK_FIELD,
+            Self::Option { .. } => OPTION_SOME_FIELD,
         }
     }
 
     pub(crate) fn ok_constructor(&self) -> &'static str {
-        match self.kind {
-            FallibleKind::Result => RESULT_OK_CTOR,
-            FallibleKind::Option => OPTION_SOME_CTOR,
+        match self {
+            Self::Result { .. } => RESULT_OK_CTOR,
+            Self::Option { .. } => OPTION_SOME_CTOR,
         }
     }
 
     pub(crate) fn err_constructor(&self) -> &'static str {
-        match self.kind {
-            FallibleKind::Result => RESULT_ERR_CTOR,
-            FallibleKind::Option => OPTION_NONE_CTOR,
+        match self {
+            Self::Result { .. } => RESULT_ERR_CTOR,
+            Self::Option { .. } => OPTION_NONE_CTOR,
         }
     }
 
     pub(crate) fn err_constructor_takes_arg(&self) -> bool {
-        self.kind == FallibleKind::Result
+        self.is_result()
     }
 
-    pub(crate) fn make_success(&self, value: &str, inner_ty: &str, err_ty: Option<&str>) -> String {
+    fn make_success(&self, value: &str, inner_ty: &str, err_ty: Option<&str>) -> String {
         let pkg = go_name::GO_STDLIB_PKG;
-        match self.kind {
-            FallibleKind::Option => {
+        match self {
+            Self::Option { .. } => {
                 format!("{pkg}.MakeOptionSome[{}]({})", inner_ty, value)
             }
-            FallibleKind::Result => {
+            Self::Result { .. } => {
                 let err_ty = err_ty.expect("Result must have error type");
                 format!("{pkg}.MakeResultOk[{}, {}]({})", inner_ty, err_ty, value)
             }
@@ -136,47 +134,81 @@ impl Fallible {
     }
 }
 
-/// Helper for emitting fallible type wrappers with access to type strings.
-///
-/// This struct consolidates the duplicated wrapper emission logic by providing
-/// a unified interface for generating Result/Option constructors.
-pub(crate) struct FallibleEmitter<'a, 'e> {
-    pub(crate) emitter: &'a mut Emitter<'e>,
+impl Planner<'_> {
+    pub(crate) fn contextual_err_ty(&self, fallible: &Fallible) -> Option<Type> {
+        if let Some(ty) = self.return_ctx().ty() {
+            let peeled = self.facts.peel_alias(ty);
+            if peeled.is_result() {
+                return Some(peeled.err_type());
+            }
+        }
+        fallible.err_ty().cloned()
+    }
+
+    pub(crate) fn coerce_value(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        value: String,
+        from: &Type,
+        to: &Type,
+    ) -> String {
+        let coercion = CoercionPlan::internal(self, from, to);
+        let (setup, value) = coercion.lower(self, value);
+        statements.extend(setup);
+        value
+    }
+
+    pub(crate) fn convert_error_to_return_context(
+        &mut self,
+        statements: &mut Vec<LoweredStatement>,
+        value: String,
+        fallible: &Fallible,
+    ) -> String {
+        let (Some(from), Some(to)) = (fallible.err_ty().cloned(), self.contextual_err_ty(fallible))
+        else {
+            return value;
+        };
+        self.coerce_value(statements, value, &from, &to)
+    }
+}
+
+/// Emits Result/Option success and failure constructors with resolved Go
+/// type strings.
+pub(crate) struct FalliblePlanner<'a, 'e> {
+    pub(crate) planner: &'a mut Planner<'e>,
     fallible: &'a Fallible,
 }
 
-impl<'a, 'e> FallibleEmitter<'a, 'e> {
-    pub(crate) fn new(emitter: &'a mut Emitter<'e>, fallible: &'a Fallible) -> Self {
-        Self { emitter, fallible }
+impl<'a, 'e> FalliblePlanner<'a, 'e> {
+    pub(crate) fn new(planner: &'a mut Planner<'e>, fallible: &'a Fallible) -> Self {
+        Self { planner, fallible }
     }
 
-    /// Get the Go type string for the ok type.
-    pub(crate) fn ok_type_string(&mut self) -> String {
-        self.emitter.go_type_as_string(self.fallible.ok_ty())
+    fn ok_type_string(&mut self) -> String {
+        self.planner.use_go_type(self.fallible.ok_ty())
     }
 
-    /// Get the Go type string for the error type (Result only).
-    pub(crate) fn err_type_string(&mut self) -> Option<String> {
-        self.fallible
-            .err_ty()
-            .map(|t| self.emitter.go_type_as_string(t))
+    fn err_type_string(&mut self) -> Option<String> {
+        self.fallible.err_ty().map(|t| self.planner.use_go_type(t))
     }
 
-    /// Get the ok type string from the current return context, falling back to the fallible's ok type.
-    pub(crate) fn contextual_ok_type_string(&mut self) -> String {
-        if let Some(ty) = &self.emitter.current_return_context {
-            self.emitter.go_type_as_string(&ty.ok_type())
+    /// Ok type from the enclosing return context, with the fallible's own ok type as fallback.
+    fn contextual_ok_type_string(&mut self) -> String {
+        let return_ctx = self.planner.return_ctx();
+        if let Some(ty) = return_ctx.ty() {
+            let ok_ty = ty.ok_type();
+            self.planner.use_go_type(&ok_ty)
         } else {
             self.ok_type_string()
         }
     }
 
-    /// Format the full type string (e.g., `lisette.Result[int, error]`).
     pub(crate) fn full_type_string(&mut self) -> String {
+        self.planner.require_stdlib();
         let pkg = go_name::GO_STDLIB_PKG;
         let inner_ty = self.ok_type_string();
         if self.fallible.is_result() {
-            let err_ty = self.emitter.go_type(
+            let err_ty = self.planner.use_go_type(
                 self.fallible
                     .err_ty()
                     .expect("Result type must have an error type"),
@@ -193,16 +225,16 @@ impl<'a, 'e> FallibleEmitter<'a, 'e> {
         }
     }
 
-    /// Emit a success wrapper (MakeResultOk or MakeOptionSome).
     pub(crate) fn emit_success(&mut self, value: &str) -> String {
+        self.planner.require_stdlib();
         let inner_ty = self.ok_type_string();
         let err_ty = self.err_type_string();
         self.fallible
             .make_success(value, &inner_ty, err_ty.as_deref())
     }
 
-    /// Emit a failure wrapper (MakeResultErr or MakeOptionNone).
     pub(crate) fn emit_failure(&mut self, error_value: Option<&str>) -> String {
+        self.planner.require_stdlib();
         let pkg = go_name::GO_STDLIB_PKG;
         let inner_ty = self.ok_type_string();
         if self.fallible.is_result() {
@@ -218,12 +250,17 @@ impl<'a, 'e> FallibleEmitter<'a, 'e> {
         }
     }
 
-    /// Emit a failure wrapper using the contextual ok type (from return context).
+    /// Emit a failure wrapper using the contextual ok and err types (from return context).
     pub(crate) fn emit_contextual_failure(&mut self, error_value: Option<&str>) -> String {
+        self.planner.require_stdlib();
         let pkg = go_name::GO_STDLIB_PKG;
         let inner_ty = self.contextual_ok_type_string();
         if self.fallible.is_result() {
-            let err_ty = self.err_type_string().expect("Result must have error type");
+            let err_ty = self
+                .planner
+                .contextual_err_ty(self.fallible)
+                .expect("Result must have error type");
+            let err_ty = self.planner.use_go_type(&err_ty);
             format!(
                 "{pkg}.MakeResultErr[{}, {}]({})",
                 inner_ty,
@@ -235,7 +272,6 @@ impl<'a, 'e> FallibleEmitter<'a, 'e> {
         }
     }
 
-    /// Format a constructor call with the appropriate type parameters.
     pub(crate) fn format_constructor_call(
         &mut self,
         constructor: &str,
@@ -244,11 +280,9 @@ impl<'a, 'e> FallibleEmitter<'a, 'e> {
         let inner_ty = self.ok_type_string();
         let arg_str = arg.unwrap_or("");
         if self.fallible.is_result() {
-            let err_ty = self.emitter.go_type(
-                self.fallible
-                    .err_ty()
-                    .expect("Result type must have an error type"),
-            );
+            let err_ty = self
+                .err_type_string()
+                .expect("Result type must have an error type");
             format!("{}[{}, {}]({})", constructor, inner_ty, err_ty, arg_str)
         } else {
             format!("{}[{}]({})", constructor, inner_ty, arg_str)

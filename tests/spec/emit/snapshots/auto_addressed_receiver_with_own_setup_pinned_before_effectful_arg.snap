@@ -1,0 +1,64 @@
+---
+source: tests/spec/emit/functions.rs
+description: |
+  
+  struct Cell { a: int, b: int }
+  
+  impl Cell {
+    fn add<T>(self: mut Ref<Cell>, delta: int) {
+      self.b += delta
+    }
+  }
+  
+  fn seed() -> Result<int, error> {
+    Ok(1)
+  }
+  
+  fn bump(i: mut Ref<int>) -> Result<int, error> {
+    i.* = 99
+    Ok(7)
+  }
+  
+  fn run() -> Result<(), error> {
+    let mut i = 0
+    Cell { a: seed()?, b: i }.add<int>(bump(&i)?)
+    Ok(())
+  }
+---
+package main
+
+type Cell struct {
+	a int
+	b int
+}
+
+func Cell_add[T any](self *Cell, delta int) {
+	self.b += delta
+}
+
+func seed() (int, error) {
+	return 1, nil
+}
+
+func bump(i *int) (int, error) {
+	*i = 99
+	return 7, nil
+}
+
+func run() error {
+	i := 0
+	ret_1, ret_2 := seed()
+	if ret_2 != nil {
+		return ret_2
+	}
+	ref_3 := &Cell{
+		a: ret_1,
+		b: i,
+	}
+	ret_4, ret_5 := bump(&i)
+	if ret_5 != nil {
+		return ret_5
+	}
+	Cell_add[int](ref_3, ret_4)
+	return nil
+}

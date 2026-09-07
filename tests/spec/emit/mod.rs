@@ -1,3 +1,4 @@
+mod arrays;
 mod concurrency;
 mod control_flow;
 mod expressions;
@@ -7,6 +8,7 @@ mod imports;
 mod interop_matrix;
 mod line_directives;
 mod literals;
+mod opaque_handle;
 mod partial;
 mod patterns;
 mod prelude;

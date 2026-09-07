@@ -4,7 +4,7 @@ use crate::lex::TokenKind::*;
 use crate::types::Type;
 
 impl<'source> Parser<'source> {
-    pub fn parse_directive(&mut self) -> Expression {
+    pub(crate) fn parse_directive(&mut self) -> Expression {
         let start = self.current_token();
         let directive_name = start.text.strip_prefix('@').unwrap_or(start.text);
 
@@ -18,7 +18,7 @@ impl<'source> Parser<'source> {
                 }
                 Expression::Unit {
                     ty: Type::uninferred(),
-                    span: self.span_from_tokens(start),
+                    span: self.span_from_offset(start.byte_offset),
                 }
             }
         }
@@ -31,9 +31,9 @@ impl<'source> Parser<'source> {
 
         let text = match args.into_iter().next() {
             Some(Expression::Literal {
-                literal: Literal::String(s),
+                literal: Literal::String { value, .. },
                 ..
-            }) => s,
+            }) => value,
 
             _ => {
                 self.track_error("invalid call to rawgo", "Use `@rawgo(\"go code\")`.");

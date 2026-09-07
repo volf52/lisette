@@ -1,0 +1,31 @@
+---
+source: tests/spec/emit/interop_matrix.rs
+description: |
+  
+  import "go:flag"
+  
+  type MyFlag = flag.Flag
+  
+  fn main() {
+    let mut f: MyFlag = flag.Flag { .. }
+    f.Value = None
+  }
+---
+package main
+
+import (
+	"flag"
+	lisette "github.com/ivov/lisette/prelude"
+)
+
+type MyFlag = flag.Flag
+
+func main() {
+	f := flag.Flag{}
+	opt_1 := lisette.MakeOptionNone[flag.Value]()
+	var unwrap_2 flag.Value
+	if opt_1.Tag == lisette.OptionSome {
+		unwrap_2 = opt_1.SomeVal
+	}
+	f.Value = unwrap_2
+}

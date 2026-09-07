@@ -1,9 +1,13 @@
 ---
 source: tests/spec/parse/mod.rs
-description: "input: \nimport router \"go:github.com/gorilla/mux\"\nimport _ \"go:database/sql\"\nimport \"go:fmt\"\n"
+description: |
+  
+  import router "go:github.com/gorilla/mux"
+  import _ "go:database/sql"
+  import "go:fmt"
 ---
 [
-    ModuleImport {
+    PackageImport {
         name: "go:github.com/gorilla/mux",
         name_span: Span {
             file_id: 0,
@@ -26,7 +30,7 @@ description: "input: \nimport router \"go:github.com/gorilla/mux\"\nimport _ \"g
             byte_length: 41,
         },
     },
-    ModuleImport {
+    PackageImport {
         name: "go:database/sql",
         name_span: Span {
             file_id: 0,
@@ -48,7 +52,7 @@ description: "input: \nimport router \"go:github.com/gorilla/mux\"\nimport _ \"g
             byte_length: 26,
         },
     },
-    ModuleImport {
+    PackageImport {
         name: "go:fmt",
         name_span: Span {
             file_id: 0,
